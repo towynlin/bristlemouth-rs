@@ -49,9 +49,58 @@ mod tiers {
         "bm_common_messages/power_info_reply_msg.c",
     ];
 
+    /// T3 — the wire path. Needs an implementation of bm_ip.h and a
+    /// NetworkDevice underneath L2.
+    ///
+    /// bm_linux.c is bm_core's own bm_ip.h backend and turns out to be exactly
+    /// what an oracle wants: a software IPv6 stack that builds and parses
+    /// Ethernet/IPv6/UDP frames in malloc'd buffers, with no sockets, threads,
+    /// or clock anywhere in it. Using it rather than a hand-written stub means
+    /// the framing a Rust port is compared against is bm_core's real framing.
+    pub const T3: &[&str] = &[
+        "network/bm_linux.c",
+        "network/l2.c",
+        "bcmp/bcmp.c",
+        "bcmp/heartbeat.c",
+        "bcmp/info.c",
+        "bcmp/neighbors.c",
+        "bcmp/ping.c",
+        "bcmp/time.c",
+        "bcmp/resource_discovery.c",
+        "bcmp/config.c",
+        "middleware/middleware.c",
+        "middleware/pubsub.c",
+        "middleware/bm_service.c",
+        "middleware/bm_service_request.c",
+        "middleware/echo_service.c",
+        "middleware/sys_info_service.c",
+        "middleware/power_info_service.c",
+        "middleware/metrics_service.c",
+        "middleware/config_cbor_map_service.c",
+        "integrations/topology.c",
+        "integrations/spotter.c",
+        "integrations/file_ops.c",
+    ];
+
+    /// T4 — DFU. middleware/bristlemouth.c is excluded: it hard-wires
+    /// adin2111_network_device(), so it cannot be brought up on any device but
+    /// the real PHY. csrc/bm_stack_shim.c mirrors its init sequence against
+    /// the capture device instead, the same way bm_sbc's runtime does.
+    pub const T4: &[&str] = &[
+        "bcmp/dfu_core.c",
+        "bcmp/dfu_client.c",
+        "bcmp/dfu_host.c",
+        "middleware/bm_mavlink.c",
+    ];
+
     /// The platform layer bm_core leaves to the integrator, implemented in
     /// this repo rather than vendored. Paths are relative to csrc/.
-    pub const SHIM: &[&str] = &["bm_os_shim.c", "bm_generic_shim.c"];
+    pub const SHIM: &[&str] = &[
+        "bm_os_shim.c",
+        "bm_generic_shim.c",
+        "bm_net_device_shim.c",
+        "bm_stack_shim.c",
+    ];
 }
 
 fn main() {
@@ -96,7 +145,7 @@ fn main() {
         .define("CBOR_CUSTOM_ALLOC_INCLUDE", Some("\"tinycbor_alloc.h\""))
         .define("CBOR_PARSER_MAX_RECURSIONS", Some("10"));
 
-    for src in tiers::T0.iter().chain(tiers::T1).chain(tiers::T2) {
+    for src in tiers::T0.iter().chain(tiers::T1).chain(tiers::T2).chain(tiers::T3).chain(tiers::T4) {
         build.file(root.join(src));
     }
     for src in tiers::SHIM {

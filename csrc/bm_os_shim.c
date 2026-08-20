@@ -515,6 +515,7 @@ void bm_delay(uint32_t ms) { bm_shim_advance_ticks(ms); }
 
 void bm_shim_reset(void) {
   bm_shim_generic_reset();
+  bm_shim_network_device_reset();
   for (uint32_t i = 0; i < CTX.timer_count; i++) {
     free(CTX.timers[i]);
   }

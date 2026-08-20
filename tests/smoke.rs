@@ -488,3 +488,101 @@ fn sys_info_reply_survives_a_cbor_round_trip() {
         );
     }
 }
+
+// --- T3: the wire path ---
+
+const ETHERTYPE_IPV6: u16 = 0x86DD;
+const IPV6_NEXT_HEADER_OFFSET: usize = 20;
+const IP_PROTO_BCMP: u8 = 0xBC;
+
+/// Bring the whole stack up on the capture device, with the given node id.
+///
+/// bm_core exposes no deinit but bm_l2_deinit, so the modules brought up here
+/// keep their file-scope state for the life of the process; see README.md.
+/// Only one test may call this.
+fn init_stack(node_id: u64) {
+    let cfg = DeviceCfg {
+        node_id,
+        device_name: c"shim".as_ptr(),
+        version_string: c"0.0.0".as_ptr(),
+        ..Default::default()
+    };
+    unsafe {
+        assert_eq!(device_init(cfg), BmErr_BmOK);
+        assert_eq!(bm_shim_stack_init(), BmErr_BmOK, "stack init");
+    }
+}
+
+/// Drain one captured frame, or None.
+fn tx_pop() -> Option<(u8, Vec<u8>)> {
+    let mut buf = vec![0u8; 2048];
+    let mut port = 0u8;
+    let len = unsafe { bm_shim_tx_pop(buf.as_mut_ptr(), buf.len() as u32, &mut port) };
+    if len < 0 {
+        return None;
+    }
+    let len = len as usize;
+    assert!(len <= buf.len(), "captured frame truncated by the test buffer");
+    buf.truncate(len);
+    Some((port, buf))
+}
+
+#[test]
+fn stack_brings_up_and_transmits_a_bcmp_heartbeat() {
+    let _guard = shim();
+    init_stack(0xC0FF_EE00_1234_5678);
+
+    unsafe {
+        // The link must come up before BCMP will say anything.
+        bm_shim_link_change(1, true);
+        bm_shim_pump();
+
+        assert_eq!(bcmp_send_heartbeat(10), BmErr_BmOK);
+        bm_shim_pump();
+        assert_eq!(bm_shim_tx_dropped(), 0, "capture ring overflowed");
+    }
+
+    let (_port, frame) = tx_pop().expect("the heartbeat should have reached the device");
+
+    // The device sees a full Ethernet frame carrying IPv6 with BCMP inside.
+    assert!(frame.len() > IPV6_NEXT_HEADER_OFFSET);
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    assert_eq!(ethertype, ETHERTYPE_IPV6, "frame is not IPv6 over Ethernet");
+    assert_eq!(
+        frame[IPV6_NEXT_HEADER_OFFSET], IP_PROTO_BCMP,
+        "IPv6 next header is not BCMP"
+    );
+
+    // L2 is the one module with a deinit, so at least its queue and task do
+    // not outlive this test holding pointers the next bm_shim_reset frees.
+    unsafe { bm_l2_deinit() };
+}
+
+#[test]
+fn rx_inject_of_garbage_is_survivable() {
+    let _guard_ordering = SHIM.lock().unwrap_or_else(|p| p.into_inner());
+    // Deliberately no bm_shim_reset here: this test rides on whatever stack
+    // state exists, which is the same position a fuzz iteration is in.
+
+    // A frame too short to hold an Ethernet header, one that is all zeroes,
+    // and one claiming to be BCMP with a nonsense body. None may crash, and
+    // afterwards the stack must still be usable.
+    let cases: [&[u8]; 3] = [&[0x01, 0x02], &[0u8; 64], &{
+        let mut frame = [0u8; 128];
+        frame[12] = 0x86;
+        frame[13] = 0xDD;
+        frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
+        frame[54] = 0xFF; // a message type nothing handles
+        frame[55] = 0xFF;
+        frame
+    }];
+
+    unsafe {
+        for case in cases {
+            // BmENODEV just means L2 was never initialised, which is fine:
+            // the point is that none of these faults.
+            let _ = bm_shim_rx_inject(1, case.as_ptr(), case.len() as u32);
+            bm_shim_pump();
+        }
+    }
+}
