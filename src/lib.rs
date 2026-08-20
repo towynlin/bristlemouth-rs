@@ -19,5 +19,15 @@
 // bindgen's flexible-array-member accessors are unsafe fns with safe-by-default
 // bodies, which edition 2024 warns about. Also nothing we control.
 #![allow(unsafe_op_in_unsafe_fn)]
+// Clippy's findings here are all in the same generated code: bitfield
+// accessors that transmute a type to itself, `offset` where `add` would do,
+// and unsafe fns with no `# Safety` section. Silencing them crate-wide is
+// safe because this crate is nothing but `include!`d bindings -- and it means
+// a lint that does fire is one worth reading.
+#![allow(
+    clippy::useless_transmute,
+    clippy::ptr_offset_with_cast,
+    clippy::missing_safety_doc
+)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));

@@ -71,6 +71,12 @@ Two consequences:
   modules that can be re-initialised: `packet.c` via `packet_remove`, and
   anything in T0–T2.
 
+This is not theoretical. The wire-path tests originally shared a process with
+the rest of the suite and segfaulted intermittently, depending on which thread
+the harness happened to reset the shim from. They now live in `tests/stack.rs`,
+which cargo runs as its own process — the same one-stack-per-process rule a
+fuzz target has to follow.
+
 Adding deinit functions upstream would remove this constraint, and is the
 single highest-value change bm_core could make for the port effort.
 
@@ -124,6 +130,19 @@ emitted as callable out-of-line copies via bindgen's `wrap_static_fns`;
 Note that a header can declare a function whose `.c` file is excluded — the
 `.cpp` message types, for instance. Those come out as `pub fn` that fail at
 link time if called.
+
+## Compiler flags worth knowing about
+
+`build.rs` compiles everything at **`-std=c17`**, matching `CMAKE_C_STANDARD 17`
+in bm_core's CMakeLists. This is not cosmetic: gcc 15 defaults to `gnu23`,
+whose `stddef.h` defines `unreachable()` and collides with tinycbor's. An
+oracle should compile bm_core under the standard the firmware is built with.
+
+`middleware/bm_mavlink.c` compiles as its own unit so that
+`-Wno-address-of-packed-member` — which the mavlink headers need, and which
+bm_core applies to its own mavlink target for the same reason — is not
+blanketed over bm_core's code. The build is warning-free under both gcc and
+clang; if you see mavlink warnings, something has escaped that scoping.
 
 ### After bumping the submodule
 

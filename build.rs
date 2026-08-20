@@ -90,8 +90,11 @@ mod tiers {
         "bcmp/dfu_core.c",
         "bcmp/dfu_client.c",
         "bcmp/dfu_host.c",
-        "middleware/bm_mavlink.c",
     ];
+
+    /// Compiled on its own so the warning suppression the mavlink headers
+    /// need does not have to be applied to bm_core's own code.
+    pub const MAVLINK: &str = "middleware/bm_mavlink.c";
 
     /// The platform layer bm_core leaves to the integrator, implemented in
     /// this repo rather than vendored. Paths are relative to csrc/.
@@ -134,31 +137,30 @@ fn main() {
 
 
     // --- compile the C ---
-    let mut build = cc::Build::new();
-    for inc in &module_dirs {
-        build.include(inc);
-    }
-    build
-        // Matches the BM_HOSTED option in vendor/bm_core/CMakeLists.txt.
-        .define("BM_HOSTED", None)
-        // tinycbor configuration, from the same CMakeLists.
-        .define("CBOR_CUSTOM_ALLOC_INCLUDE", Some("\"tinycbor_alloc.h\""))
-        .define("CBOR_PARSER_MAX_RECURSIONS", Some("10"));
-
-    for src in tiers::T0.iter().chain(tiers::T1).chain(tiers::T2).chain(tiers::T3).chain(tiers::T4) {
+    let mut build = bm_core_build(&module_dirs);
+    for src in tiers::T0
+        .iter()
+        .chain(tiers::T1)
+        .chain(tiers::T2)
+        .chain(tiers::T3)
+        .chain(tiers::T4)
+    {
         build.file(root.join(src));
     }
     for src in tiers::SHIM {
         build.file(csrc.join(src));
     }
-
-    // Match the sanitizer cargo-fuzz is using on the Rust side.
-    if env::var("CARGO_CFG_FUZZING").is_ok() {
-        build
-            .flag("-fsanitize=address,undefined")
-            .flag("-fno-omit-frame-pointer");
-    }
     build.compile("bm_core"); // emits libbm_core.a and the link flags
+
+    // The mavlink headers take the address of packed members all over, which
+    // gcc warns about 60 times over. bm_core suppresses exactly this on its
+    // mavlink target, citing mavlink's own build-warnings advice, so do the
+    // same -- scoped to the one translation unit that includes them rather
+    // than blanketed over bm_core's own code.
+    bm_core_build(&module_dirs)
+        .flag("-Wno-address-of-packed-member")
+        .file(root.join(tiers::MAVLINK))
+        .compile("bm_core_mavlink");
 
     // --- generate the bindings ---
     let mut bindings = bindgen::Builder::default()
@@ -178,9 +180,6 @@ fn main() {
         bindings = bindings.clang_arg(format!("-I{}", inc.display()));
     }
 
-    // Bind everything declared by bm_core itself (and our shim control
-    // surface), and nothing from libc. Allowlisting by file rather than by
-    // symbol means coverage tracks the submodule as it moves upstream.
     // Everything in the guarded tree came from bm_core or csrc/, and nothing
     // from libc did, so allowlisting the tree binds exactly our surface.
     // Matching by file rather than by symbol means coverage tracks the
@@ -198,24 +197,14 @@ fn main() {
     // Compiled against the guarded header tree, not vendor/: static_fns.c
     // includes wrapper.h, so it hits the same missing-include-guard problem
     // bindgen does.
-    let mut statics = cc::Build::new();
-    for inc in &guarded_roots {
-        statics.include(inc);
-    }
-    statics
+    bm_core_build(&guarded_roots)
         .file(out.join("static_fns.c"))
-        .define("BM_HOSTED", None)
-        .define("CBOR_CUSTOM_ALLOC_INCLUDE", Some("\"tinycbor_alloc.h\""))
-        .define("CBOR_PARSER_MAX_RECURSIONS", Some("10"))
-        // The generated file redeclares each wrapped function, which clang
-        // warns about under the -Wall the rest of the build runs with.
-        .flag("-Wno-missing-prototypes");
-    if env::var("CARGO_CFG_FUZZING").is_ok() {
-        statics
-            .flag("-fsanitize=address,undefined")
-            .flag("-fno-omit-frame-pointer");
-    }
-    statics.compile("bm_core_static_fns");
+        // The generated file redeclares each wrapped function, which the -Wall
+        // the rest of the build runs with objects to.
+        .flag("-Wno-missing-prototypes")
+        // It includes wrapper.h, so it pulls in the mavlink headers too.
+        .flag("-Wno-address-of-packed-member")
+        .compile("bm_core_static_fns");
 
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed={}", csrc.display());
@@ -227,6 +216,36 @@ fn main() {
 fn file_regex(dir: &Path) -> String {
     let escaped = dir.display().to_string().replace('.', r"\.");
     format!("{escaped}/.*\\.h")
+}
+
+/// A cc::Build carrying the settings every translation unit in this crate
+/// needs, so the main build, the mavlink unit and bindgen's generated
+/// static-function wrappers cannot drift apart.
+fn bm_core_build(includes: &[PathBuf]) -> cc::Build {
+    let mut build = cc::Build::new();
+    for inc in includes {
+        build.include(inc);
+    }
+    build
+        // CMAKE_C_STANDARD 17 with C_EXTENSIONS NO, from
+        // vendor/bm_core/CMakeLists.txt. Not cosmetic: gcc 15 defaults to
+        // gnu23, whose stddef.h defines unreachable() and collides with
+        // tinycbor's. An oracle should compile bm_core under the same
+        // standard the firmware does.
+        .std("c17")
+        // Matches the BM_HOSTED option in the same CMakeLists.
+        .define("BM_HOSTED", None)
+        // tinycbor configuration, likewise.
+        .define("CBOR_CUSTOM_ALLOC_INCLUDE", Some("\"tinycbor_alloc.h\""))
+        .define("CBOR_PARSER_MAX_RECURSIONS", Some("10"));
+
+    // Match the sanitizer cargo-fuzz is using on the Rust side.
+    if env::var("CARGO_CFG_FUZZING").is_ok() {
+        build
+            .flag("-fsanitize=address,undefined")
+            .flag("-fno-omit-frame-pointer");
+    }
+    build
 }
 
 /// Copy every header from `module_dirs` into a parallel tree under `dest`,
