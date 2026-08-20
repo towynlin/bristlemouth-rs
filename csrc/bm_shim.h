@@ -24,6 +24,11 @@ extern "C" {
 // without one are listed in README.md as a per-iteration hazard.
 void bm_shim_reset(void);
 
+// Clears only the RAM standing in for NVM, the RTC, and the DFU flash slot.
+// bm_shim_reset calls this; it is exposed so a test can wipe storage without
+// tearing down queues and timers.
+void bm_shim_generic_reset(void);
+
 // bm_debug output. Silent by default so fuzzing is not I/O bound.
 void bm_shim_set_debug(bool on);
 void bm_shim_debug_printf(const char *format, ...);

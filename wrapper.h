@@ -22,5 +22,18 @@
 #include "timer_callback_handler.h"
 #include "packet.h"
 
+// --- T2: needs tinycbor ---
+#include "configuration.h"
+#include "cbor_service_helper.h"
+#include "bm_messages_helper.h"
+#include "config_cbor_map_srv_reply_msg.h"
+#include "config_cbor_map_srv_request_msg.h"
+#include "metrics_reply_msg.h"
+#include "sensor_header_msg.h"
+#include "sys_info_svc_reply_msg.h"
+#include "power_info_reply_msg.h"
+#include "bm_configs_generic.h"
+#include "bm_rtc.h"
+
 // --- the shim's own control surface ---
 #include "bm_shim.h"

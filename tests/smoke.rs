@@ -373,3 +373,118 @@ fn pump_drains_a_task_that_never_returns() {
         assert_eq!(*CALLBACKS_RUN.lock().unwrap(), 2);
     }
 }
+
+// --- T2: needs tinycbor ---
+
+#[test]
+fn config_round_trips_through_the_ram_partition() {
+    let _guard = shim();
+    unsafe {
+        config_init();
+
+        let key = c"sample_rate";
+        let key_len = key.count_bytes();
+        assert!(set_config_uint(
+            BmConfigPartition_BM_CFG_PARTITION_USER,
+            key.as_ptr(),
+            key_len,
+            48_000
+        ));
+
+        let mut value = 0u32;
+        assert!(get_config_uint(
+            BmConfigPartition_BM_CFG_PARTITION_USER,
+            key.as_ptr(),
+            key_len,
+            &mut value
+        ));
+        assert_eq!(value, 48_000);
+
+        // A string key alongside it, to prove the key table indexes correctly.
+        let name = c"node_name";
+        let text = c"dev_kit";
+        assert!(set_config_string(
+            BmConfigPartition_BM_CFG_PARTITION_USER,
+            name.as_ptr(),
+            name.count_bytes(),
+            text.as_ptr(),
+            text.count_bytes()
+        ));
+
+        let mut out = [0u8; 32];
+        let mut out_len = out.len();
+        assert!(get_config_string(
+            BmConfigPartition_BM_CFG_PARTITION_USER,
+            name.as_ptr(),
+            name.count_bytes(),
+            out.as_mut_ptr().cast(),
+            &mut out_len
+        ));
+        assert_eq!(&out[..out_len], b"dev_kit");
+
+        assert!(remove_key(
+            BmConfigPartition_BM_CFG_PARTITION_USER,
+            key.as_ptr(),
+            key_len
+        ));
+        assert!(!get_config_uint(
+            BmConfigPartition_BM_CFG_PARTITION_USER,
+            key.as_ptr(),
+            key_len,
+            &mut value
+        ));
+    }
+}
+
+#[test]
+fn sys_info_reply_survives_a_cbor_round_trip() {
+    let _guard = shim();
+    let app_name = c"bm_wire_sys";
+    let mut sent = SysInfoReplyData {
+        node_id: 0x0123_4567_89AB_CDEF,
+        git_sha: 0xDEAD_BEEF,
+        sys_config_crc: 0x1234_5678,
+        app_name_strlen: app_name.count_bytes() as u32,
+        app_name: app_name.as_ptr().cast_mut(),
+    };
+
+    let mut buf = [0u8; 256];
+    let mut encoded_len = 0usize;
+    unsafe {
+        assert_eq!(
+            sys_info_reply_encode(
+                &mut sent,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut encoded_len
+            ),
+            CborError_CborNoError
+        );
+        assert!(encoded_len > 0 && encoded_len <= buf.len());
+
+        let mut received = SysInfoReplyData::default();
+        assert_eq!(
+            sys_info_reply_decode(&mut received, buf.as_ptr(), encoded_len),
+            CborError_CborNoError
+        );
+        assert_eq!(received.node_id, sent.node_id);
+        assert_eq!(received.git_sha, sent.git_sha);
+        assert_eq!(received.sys_config_crc, sent.sys_config_crc);
+        assert_eq!(received.app_name_strlen, sent.app_name_strlen);
+
+        // The decoder allocates the string via bm_malloc.
+        let decoded_name = std::slice::from_raw_parts(
+            received.app_name.cast::<u8>(),
+            received.app_name_strlen as usize,
+        );
+        assert_eq!(decoded_name, app_name.to_bytes());
+        bm_free(received.app_name.cast());
+
+        // Truncated input must be rejected rather than read past the end.
+        let mut truncated = SysInfoReplyData::default();
+        assert_ne!(
+            sys_info_reply_decode(&mut truncated, buf.as_ptr(), encoded_len / 2),
+            CborError_CborNoError
+        );
+    }
+}

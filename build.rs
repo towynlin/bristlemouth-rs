@@ -26,9 +26,32 @@ mod tiers {
         "bcmp/packet.c",
     ];
 
+    /// T2 — needs tinycbor. The CBOR codecs are the payload half of the wire
+    /// format, so these are prime differential-fuzzing targets.
+    pub const T2: &[&str] = &[
+        "third_party/tinycbor/src/cborparser.c",
+        "third_party/tinycbor/src/cborencoder.c",
+        "third_party/tinycbor/src/cborencoder_float.c",
+        "third_party/tinycbor/src/cborerrorstrings.c",
+        "third_party/tinycbor/src/cborvalidation.c",
+        "third_party/tinycbor/src/cborpretty.c",
+        "bcmp/configuration.c",
+        "middleware/cbor_service_helper.c",
+        // bm_common_messages ships some types as .c and some as namespaced
+        // C++; only the C half is bound for now. sensor_header_msg exists as
+        // both -- take the .c.
+        "bm_common_messages/bm_messages_helper.c",
+        "bm_common_messages/config_cbor_map_srv_reply_msg.c",
+        "bm_common_messages/config_cbor_map_srv_request_msg.c",
+        "bm_common_messages/metrics_reply_msg.c",
+        "bm_common_messages/sensor_header_msg.c",
+        "bm_common_messages/sys_info_svc_reply_msg.c",
+        "bm_common_messages/power_info_reply_msg.c",
+    ];
+
     /// The platform layer bm_core leaves to the integrator, implemented in
     /// this repo rather than vendored. Paths are relative to csrc/.
-    pub const SHIM: &[&str] = &["bm_os_shim.c"];
+    pub const SHIM: &[&str] = &["bm_os_shim.c", "bm_generic_shim.c"];
 }
 
 fn main() {
@@ -73,7 +96,7 @@ fn main() {
         .define("CBOR_CUSTOM_ALLOC_INCLUDE", Some("\"tinycbor_alloc.h\""))
         .define("CBOR_PARSER_MAX_RECURSIONS", Some("10"));
 
-    for src in tiers::T0.iter().chain(tiers::T1) {
+    for src in tiers::T0.iter().chain(tiers::T1).chain(tiers::T2) {
         build.file(root.join(src));
     }
     for src in tiers::SHIM {

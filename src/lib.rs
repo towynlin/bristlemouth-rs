@@ -16,5 +16,8 @@
 // bindgen emits transmutes in its bitfield accessors that rustc can now do
 // with a cast. Nothing we control.
 #![allow(unnecessary_transmutes)]
+// bindgen's flexible-array-member accessors are unsafe fns with safe-by-default
+// bodies, which edition 2024 warns about. Also nothing we control.
+#![allow(unsafe_op_in_unsafe_fn)]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
