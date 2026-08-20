@@ -74,6 +74,22 @@ fn time_remaining_wraps_like_a_tick_counter() {
 }
 
 #[test]
+fn static_inline_helpers_are_callable() {
+    // These are `static inline` in util.h and only exist because build.rs asks
+    // bindgen to emit out-of-line copies. ip_to_nodeid is endianness code, so
+    // it is exactly the kind of thing a Rust port can get subtly wrong.
+    let mut addr = BmIpAddr::default();
+    addr.addr[8..].copy_from_slice(&0xDEAD_BEEF_1234_5678u64.to_be_bytes());
+    unsafe {
+        assert_eq!(ip_to_nodeid(&addr), 0xDEAD_BEEF_1234_5678);
+
+        let mut bytes = [0x12u8, 0x34, 0x56, 0x78];
+        assert_eq!(uint8_to_uint16(bytes.as_mut_ptr()), 0x1234);
+        assert_eq!(uint8_to_uint32(bytes.as_mut_ptr()), 0x1234_5678);
+    }
+}
+
+#[test]
 fn multicast_classification_reads_the_address_prefix() {
     // Bristlemouth uses FF03::1 for global and FF02::x for link-local; see
     // multicast_global_addr / multicast_ll_addr in vendor/bm_core/common/util.c.

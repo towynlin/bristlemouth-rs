@@ -166,7 +166,12 @@ fn main() {
         .derive_debug(true)
         .derive_default(true)
         .derive_partialeq(true)
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()));
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        // util.h defines ip_to_nodeid and the uint8_to_uint* helpers as
+        // `static inline`, which bindgen otherwise drops. They are endianness
+        // code, which is exactly what a differential test should cover.
+        .wrap_static_fns(true)
+        .wrap_static_fns_path(out.join("static_fns"));
 
     let guarded_roots = guarded_header_tree(&module_dirs, &out.join("guarded"));
     for inc in &guarded_roots {
@@ -187,6 +192,30 @@ fn main() {
     let bindings = bindings.generate().expect("bindgen failed");
 
     bindings.write_to_file(out.join("bindings.rs")).unwrap();
+
+    // wrap_static_fns emits callable out-of-line copies of the static inline
+    // functions; they have to be compiled and linked like any other source.
+    // Compiled against the guarded header tree, not vendor/: static_fns.c
+    // includes wrapper.h, so it hits the same missing-include-guard problem
+    // bindgen does.
+    let mut statics = cc::Build::new();
+    for inc in &guarded_roots {
+        statics.include(inc);
+    }
+    statics
+        .file(out.join("static_fns.c"))
+        .define("BM_HOSTED", None)
+        .define("CBOR_CUSTOM_ALLOC_INCLUDE", Some("\"tinycbor_alloc.h\""))
+        .define("CBOR_PARSER_MAX_RECURSIONS", Some("10"))
+        // The generated file redeclares each wrapped function, which clang
+        // warns about under the -Wall the rest of the build runs with.
+        .flag("-Wno-missing-prototypes");
+    if env::var("CARGO_CFG_FUZZING").is_ok() {
+        statics
+            .flag("-fsanitize=address,undefined")
+            .flag("-fno-omit-frame-pointer");
+    }
+    statics.compile("bm_core_static_fns");
 
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed={}", csrc.display());

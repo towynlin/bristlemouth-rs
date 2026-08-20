@@ -117,6 +117,10 @@ unguarded original and bypasses the stub. The C build still compiles against
 `vendor/`, so debug info points at real sources. Adding guards upstream would
 retire all of this.
 
+`util.h`'s `static inline` helpers (`ip_to_nodeid`, `uint8_to_uint16/32`) are
+emitted as callable out-of-line copies via bindgen's `wrap_static_fns`;
+`build.rs` compiles the generated `static_fns.c` as a second archive.
+
 Note that a header can declare a function whose `.c` file is excluded — the
 `.cpp` message types, for instance. Those come out as `pub fn` that fail at
 link time if called.
