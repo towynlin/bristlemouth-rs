@@ -1,0 +1,3 @@
+[submodule "vendor/bm_core"]
+	path = vendor/bm_core
+	url = https://github.com/bristlemouth/bm_core.git
