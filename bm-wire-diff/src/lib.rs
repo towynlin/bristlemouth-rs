@@ -19,6 +19,7 @@
 //! A comparator must never be relaxed to paper over a real behavioural
 //! difference — narrow the *input domain* instead, and say why.
 
+pub mod bcmp;
 pub mod checksum;
 pub mod crc;
 pub mod l2_policy;

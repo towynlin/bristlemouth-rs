@@ -28,6 +28,10 @@ Status values:
 | 5 | `utc_from_date_time` reads `MONTH_DAYS` out of bounds | domain-limited | reading |
 | 6 | `uint8_to_uint32` shifts into the sign bit | benign | **UBSan, via `cargo fuzz run addr`** |
 | 7 | `bm_l2_policy_rx_apply` doc claims an egress-nibble clear that is not in the code | replicated | reading |
+| 8 | `bcmp_tx`'s size guard uses `sizeof(BcmpHeartbeat)` where it means `sizeof(BcmpHeader)` | replicated | reading |
+| 9 | `process_received_message` rewrites the source address before verifying the checksum, undocumented | replicated | reading |
+| 10 | A rejected frame is left with its checksum field zeroed | replicated | reading |
+| 11 | `clear_ports_legacy` performs a misaligned 32-bit access on every received frame | benign | **UBSan** |
 
 ---
 
@@ -214,3 +218,134 @@ the copy.
 byte, and both implementations must end up with the same frame.
 
 **Both doc comments in `l2_policy.h` need correcting upstream.**
+
+## 8. `bcmp_tx`'s size guard uses the wrong `sizeof`
+
+`bcmp/bcmp.c`:
+
+```c
+if (dst && (uint32_t)size + sizeof(BcmpHeartbeat) <= max_payload_len) {
+  buf = bm_ip_tx_new(dst, size + sizeof(BcmpHeader));
+```
+
+The guard is meant to check that the message fits inside `max_payload_len`
+(1460 = a 1500-byte MTU less the 40-byte IPv6 header). What actually gets sent
+is `size + sizeof(BcmpHeader)`, which is what the very next line allocates —
+but the guard adds `sizeof(BcmpHeartbeat)` instead.
+
+`BcmpHeartbeat` is 12 bytes; `BcmpHeader` is 13. So a `size` of 1448 passes the
+guard and then builds a 1461-byte IPv6 payload: one byte over the budget. The
+`BcmpHeartbeat` in the expression is a leftover — heartbeat is simply the
+message this ceiling was first written for.
+
+**Status: replicated**, in the sense that `bm-wire` imposes no ceiling of its
+own — `bcmp::tx::serialize` takes a caller-sized frame and fails cleanly if it
+is too small, so the off-by-one has nowhere to land. The fix upstream is a
+one-word change to `sizeof(BcmpHeader)`, and it is not wire-visible: no
+conforming sender emits a message in the one-byte window.
+
+## 9. `process_received_message` rewrites the source address before verifying the checksum
+
+`bcmp/packet.c`, with the two macros it uses from the top of the same file:
+
+```c
+#define clear_ports_legacy(x) (x[1] &= (~(0xFFFFU)))
+#define clear_ingress_port(x) (((uint8_t *)x)[2] &= 0xF)
+/* ... */
+data.ingress_port = (((uint8_t *)data.src)[2] >> 4) & 0xF;
+clear_ports_legacy(((uint32_t *)data.src));
+clear_ingress_port(data.src);
+
+checksum_read = data.header->checksum;
+data.header->checksum = 0;
+checksum_calc = PACKET.cb.checksum(payload, size + sizeof(BcmpHeader));
+```
+
+Three bytes of the source address — bytes 2, 4 and 5, or frame offsets 24, 26
+and 27 — are rewritten **before** the checksum is computed, and the checksum
+covers the source address. So the value a receiver computes is the checksum of
+an address that never appeared on the wire.
+
+This is load-bearing and it is documented nowhere. It is what lets a receiving node
+stamp the ingress port into the source address on arrival (per spec 5.4.4.1/2)
+without invalidating the sender's checksum: the clear undoes the stamp. An
+implementation that verifies the checksum over the address as received rejects
+every frame a real Bristlemouth node sends.
+
+`clear_ports_legacy` is explicitly marked as backwards compatibility for
+bm_core < v0.13.0 and is expected to disappear once resource-based routing
+lands — which will be a wire-visible change and needs coordinating.
+
+**`bm-wire` reproduces the rewrite exactly**, in `bcmp::rx::accept`, and the
+differential harness covers it: the
+`ingress_stamp` and `legacy_ports` fields of `BcmpInput` stamp both after the
+frame is built, and both implementations must agree on the verdict and on the
+resulting buffer. **The upstream fix is a comment, not a code change.**
+
+## 10. A rejected frame is left with its checksum field zeroed
+
+Continuing the same function:
+
+```c
+checksum_read = data.header->checksum;
+data.header->checksum = 0;
+checksum_calc = PACKET.cb.checksum(payload, size + sizeof(BcmpHeader));
+if (checksum_calc != checksum_read) {
+  bm_debug(...);
+  err = BmEBADMSG;
+  return err;              /* <-- checksum field still zero */
+}
+data.header->checksum = checksum_read;
+```
+
+The field is zeroed to compute the checksum over it and restored afterwards —
+but the early return on mismatch skips the restore. A caller that inspects,
+logs, or forwards a rejected frame sees a header whose checksum reads `0x0000`
+rather than the value that arrived, so the one piece of evidence needed to
+diagnose the rejection has been destroyed by the code doing the rejecting.
+
+Nothing in bm_core reads the buffer after a rejection today, which is why this
+has gone unnoticed. It is still observable state, so `bm-wire` matches it and
+says so at `bcmp::rx::RxError::BadChecksum`. The fix upstream is to restore
+the field before returning, and it is not wire-visible.
+
+## 11. `clear_ports_legacy` performs a misaligned 32-bit access
+
+The same macro as in #9:
+
+```c
+#define clear_ports_legacy(x) (x[1] &= (~(0xFFFFU)))
+clear_ports_legacy(((uint32_t *)data.src));
+```
+
+`data.src` points at the IPv6 source address, frame offset 22. `x[1]` is
+therefore a `uint32_t` read-modify-write at frame offset **26**, which is
+`2 mod 4` no matter how the frame itself is aligned — bm_linux's buffers come
+from `malloc`, so the frame is at least 8-aligned and offset 26 is never
+4-aligned. It is also a strict-aliasing violation, the same one already noted
+against `ip_to_nodeid` in divergence #3.
+
+UndefinedBehaviorSanitizer reports both halves:
+
+```
+runtime error: load of misaligned address 0x... for type 'uint32_t',
+which requires 4 byte alignment
+runtime error: store to misaligned address 0x... for type 'uint32_t',
+which requires 4 byte alignment
+```
+
+This is on the path of **every BCMP frame bm_core receives**, so the alignment
+check fires on the first receive of any fuzz run. `bm-wire-sys/build.rs`
+therefore passes `-fno-sanitize=alignment` under `CARGO_CFG_FUZZING` and
+nothing else: `shift-base`, which found divergence #6, and every other UBSan
+check stay on, as does AddressSanitizer.
+
+**Status: benign in practice.** Both shipped targets — x86-64 and Cortex-M33 —
+permit unaligned word access, and `bm-wire` sidesteps it entirely by clearing
+the two bytes directly. The fix upstream is to write the macro in terms of
+`uint8_t`, which is what it means:
+
+```c
+#define clear_ports_legacy(x) (((uint8_t *)(x))[4] = 0, ((uint8_t *)(x))[5] = 0)
+```
+

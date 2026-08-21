@@ -78,6 +78,7 @@ A cargo workspace.
 ```
 cargo test                                       # workspace, incl. differential tests
 cargo build -p bm-wire --target thumbv7em-none-eabihf   # proves no_std, alloc-free
+cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Cortex-M33
 cargo tree -p bm-wire                            # must show no dependencies
 ./bm-wire-sys/scripts/check_symbols.sh           # only libc may be unresolved
 cd bm-wire && cargo fuzz run <target> corpus/<target> seeds/<target>
@@ -88,6 +89,12 @@ the C under `CARGO_CFG_FUZZING`, matching cargo-fuzz on the Rust side — so the
 fuzzers check the C for undefined behaviour as well as checking the port for
 divergence. That is how divergence #6 was found.
 
+One UBSan check is deliberately off: `-fno-sanitize=alignment`. Every BCMP
+frame bm_core receives trips it, because `clear_ports_legacy` does a 32-bit
+access at frame offset 26 — divergence #11. Leaving it on means aborting on the
+first receive rather than finding anything. Do not widen that exemption without
+a divergence entry saying why.
+
 When a fuzzer finds a crash: `cargo fuzz tmin <target> <artifact>`, drop the
 minimized file into `bm-wire/fuzz/seeds/<target>/`, and it becomes a permanent
 regression test the next time `cargo test` runs.
@@ -95,9 +102,17 @@ regression test the next time `cargo test` runs.
 ## Conventions
 
 - Tests touching the shim take the `SHIM` lock — the C state is process-global.
-  This does not apply to anything in `bm-wire-diff` yet: every surface ported so
-  far is a pure C function with no shim state, which is why it needs no
-  `bm_shim_reset` and no fork mode.
+- Most comparators in `bm-wire-diff` call a pure C function and need no shim
+  state at all. `bm-wire-diff/src/bcmp.rs` is the exception, and sets the
+  pattern for the ones that follow it: `serialize` and
+  `process_received_message` read `packet.c`'s file-scope `PACKET`, so the
+  module brings the oracle up **once per process** behind a `OnceLock` and
+  serialises every C call behind a `Mutex`.
+- **Nothing in `bm-wire-diff` may call `bm_shim_reset`.** `packet_init` hands
+  `PACKET` a shim mutex and a shim timer, and `packet.c` has no deinit, so a
+  reset frees objects the C still points at. Registering only non-sequenced
+  message types keeps the C's sequence list from growing, which is what lets
+  the `bcmp` fuzz target run in-process rather than needing fork mode.
 - Everything in `bm-wire-sys/csrc/` must stay deterministic: no threads, no
   sockets, no wall clock, no randomness. A fuzz input has to replay
   byte-identically.

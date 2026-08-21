@@ -70,3 +70,15 @@ path = "fuzz_targets/checksum.rs"
 test = false
 doc = false
 bench = false
+
+# Unlike most targets here this one drives stateful C: `packet.c` keeps a
+# file-scope registry that `bm_wire_diff::bcmp` brings up once per process.
+# Nothing accumulates between iterations, so the default in-process mode is
+# fine -- see the module docs for why, and why bm_shim_reset must not be
+# called here.
+[[bin]]
+name = "bcmp"
+path = "fuzz_targets/bcmp.rs"
+test = false
+doc = false
+bench = false

@@ -67,6 +67,9 @@ pub fn replay_target(target: &str) -> usize {
             "l2_policy" => replay_one::<crate::l2_policy::L2PolicyInput, _>(&bytes, |i| {
                 crate::l2_policy::check(i);
             }),
+            "bcmp" => replay_one::<crate::bcmp::BcmpInput, _>(&bytes, |i| {
+                crate::bcmp::check(i);
+            }),
             "checksum" => replay_one::<crate::checksum::ChecksumInput, _>(&bytes, |i| {
                 crate::checksum::check(i);
             }),
@@ -95,6 +98,7 @@ pub fn replay_target(target: &str) -> usize {
 /// Every fuzz target that has a seeds directory.
 pub const TARGETS: &[&str] = &[
     "addr",
+    "bcmp",
     "checksum",
     "crc",
     "date_time",
