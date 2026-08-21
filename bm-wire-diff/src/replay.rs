@@ -70,6 +70,9 @@ pub fn replay_target(target: &str) -> usize {
             "bcmp" => replay_one::<crate::bcmp::BcmpInput, _>(&bytes, |i| {
                 crate::bcmp::check(i);
             }),
+            "l2_egress" => replay_one::<crate::l2_egress::L2EgressInput, _>(&bytes, |i| {
+                crate::l2_egress::check(i);
+            }),
             "checksum" => replay_one::<crate::checksum::ChecksumInput, _>(&bytes, |i| {
                 crate::checksum::check(i);
             }),
@@ -95,7 +98,8 @@ pub fn replay_target(target: &str) -> usize {
     count
 }
 
-/// Every fuzz target that has a seeds directory.
+/// Fuzz targets whose comparators are safe to replay in one process, together,
+/// in any order.
 pub const TARGETS: &[&str] = &[
     "addr",
     "bcmp",
@@ -108,9 +112,47 @@ pub const TARGETS: &[&str] = &[
     "wildcard",
 ];
 
+/// Fuzz targets that bring bm_core's stack up and so need a process to
+/// themselves.
+///
+/// `bm_shim_stack_init` calls `packet_init` with `bm_linux.c`'s accessors,
+/// while [`crate::bcmp`] calls it with its own; whichever runs second wins.
+/// Anything listed here is replayed from its own integration test binary, not
+/// from the library test binary that walks [`TARGETS`].
+pub const STACK_TARGETS: &[&str] = &["l2_egress"];
+
+/// Every seeds directory on disk, so a new one cannot be added without being
+/// assigned to one of the two lists.
+#[cfg(test)]
+fn seed_directories() -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(seeds_dir())
+        .expect("the seeds directory exists")
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A seeds directory listed in neither target list would silently never
+    /// replay, which is the one failure mode this whole file exists to avoid.
+    #[test]
+    fn every_seeds_directory_is_assigned_to_exactly_one_list() {
+        for dir in seed_directories() {
+            let in_targets = TARGETS.contains(&dir.as_str());
+            let in_stack = STACK_TARGETS.contains(&dir.as_str());
+            assert!(
+                in_targets ^ in_stack,
+                "seeds/{dir} is in {} of TARGETS and STACK_TARGETS; it must be in exactly one",
+                usize::from(in_targets) + usize::from(in_stack)
+            );
+        }
+    }
 
     #[test]
     fn every_committed_seed_still_agrees_with_the_c() {

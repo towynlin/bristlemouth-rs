@@ -113,6 +113,14 @@ regression test the next time `cargo test` runs.
   reset frees objects the C still points at. Registering only non-sequenced
   message types keeps the C's sequence list from growing, which is what lets
   the `bcmp` fuzz target run in-process rather than needing fork mode.
+- A comparator that brings the **whole stack** up needs a process to itself,
+  and `bm-wire-diff/src/l2_egress.rs` is the first: `bm_shim_stack_init` calls
+  `packet_init` with `bm_linux.c`'s accessors, while `bcmp.rs` calls it with
+  its own, and whichever runs second wins. Such comparators are driven from
+  their own file under `bm-wire-diff/tests/`, which cargo runs as a separate
+  binary, and their seeds go in `replay::STACK_TARGETS` rather than
+  `replay::TARGETS`. A test asserts every `seeds/` directory is in exactly one
+  of the two, so a new corpus cannot silently go unreplayed.
 - Everything in `bm-wire-sys/csrc/` must stay deterministic: no threads, no
   sockets, no wall clock, no randomness. A fuzz input has to replay
   byte-identically.

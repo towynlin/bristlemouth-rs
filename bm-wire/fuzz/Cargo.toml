@@ -82,3 +82,18 @@ path = "fuzz_targets/bcmp.rs"
 test = false
 doc = false
 bench = false
+
+# This one brings bm_core's whole stack up, once per process, and drives it
+# through the TX capture ring. Nothing accumulates between iterations by
+# construction -- the virtual clock never advances so no timer fires, the L2
+# queue is drained by each pump, and every buffer is freed -- so in-process
+# running should be fine. If a crash proves otherwise, `-fork=1` is the fix:
+# the stack's statics cannot be torn down, so a fresh process is the only way
+# to get a clean one. It must not share a process with the `bcmp` target;
+# see bm-wire-diff/src/l2_egress.rs for why.
+[[bin]]
+name = "l2_egress"
+path = "fuzz_targets/l2_egress.rs"
+test = false
+doc = false
+bench = false

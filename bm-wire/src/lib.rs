@@ -24,6 +24,7 @@ pub mod bcmp;
 pub mod checksum;
 pub mod crc;
 pub mod frame;
+pub mod l2;
 pub mod l2_policy;
 pub mod util;
 

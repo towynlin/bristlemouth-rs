@@ -32,6 +32,8 @@ Status values:
 | 9 | `process_received_message` rewrites the source address before verifying the checksum, undocumented | replicated | reading |
 | 10 | A rejected frame is left with its checksum field zeroed | replicated | reading |
 | 11 | `clear_ports_legacy` performs a misaligned 32-bit access on every received frame | benign | **UBSan** |
+| 12 | The egress-port checksum patch drops the one's-complement end-around carry | replicated | reading, then measured |
+| 13 | L2 silently drops any frame whose destination is not multicast | replicated | reading |
 
 ---
 
@@ -348,4 +350,107 @@ the two bytes directly. The fix upstream is to write the macro in terms of
 ```c
 #define clear_ports_legacy(x) (((uint8_t *)(x))[4] = 0, ((uint8_t *)(x))[5] = 0)
 ```
+
+## 12. The egress-port checksum patch drops the end-around carry
+
+`network/l2.c` stamps the egress port into the IPv6 source address on the way
+out, which changes a byte the upper-layer checksum covers. Rather than
+recompute the checksum it patches it, in `network_add_egress_port`:
+
+```c
+add_egress_port(payload, port_num);   /* payload[24] |= port_num */
+
+if (ipv6_get_next_header(payload) == ip_proto_udp) {
+  payload[udp_checksum_offset] ^= 0xFFFF;
+  payload[udp_checksum_offset] += port_num;
+  payload[udp_checksum_offset] ^= 0xFFFF;
+} else if (ipv6_get_next_header(payload) == ip_proto_bcmp) {
+  BcmpHeader *header = (BcmpHeader *)&payload[bcmp_packet_offset];
+  header->checksum ^= 0xFFFF;
+  header->checksum += port_num;
+  header->checksum ^= 0xFFFF;
+}
+```
+
+The idea is sound. Frame offset 24 is the high byte of a 16-bit word in the
+one's-complement sum, so stamping it raises the sum by `port_num << 8`, and
+the checksum's high byte can be adjusted by `port_num` to match. The patch is
+also *necessary*, not merely an optimisation: `process_received_message`
+clears only the ingress nibble (`src[2] &= 0xF`), so the egress nibble the
+sender stamped is still there when the receiver checksums the frame.
+
+**What is missed is the carry.** A one's-complement sum wraps its carry around
+into the low end. Neither branch does that correctly, and they fail
+differently, because the two lvalues are different types:
+
+- **UDP.** `payload[udp_checksum_offset]` is a `uint8_t`. `^= 0xFFFF`
+  truncates to `^= 0xFF` — the constant says the author believed this was a
+  16-bit lvalue — and `+= port_num` is 8-bit, so a carry out of the high byte
+  is simply lost. Exhaustively over all 65536 sums and all 15 port numbers,
+  the result differs from a correct one's-complement patch in **30720 of
+  983040 cases (3.12%)**.
+- **BCMP.** `header->checksum` is a `uint16_t`, so the carry propagates one
+  place — and because the stored value is byte-swapped relative to the wire,
+  that propagation lands exactly where the end-around carry belongs. It is
+  right except when the carry itself carries, which needs the sum's low byte
+  to be `0xFF` as well: **120 of 983040 cases (0.0122%)**.
+
+The severity is the other way round from the rates. `bm_l2_process_tx_evt`
+only stamps **link-local multicast**, and bm_core's UDP traffic — pub/sub via
+`bm_pubsub_init` — goes to `multicast_global_addr`, which takes the unstamped
+branch. So the 3.12% path is latent, reachable only by an integrator who
+registers a middleware application on a link-local destination. BCMP, on the
+other hand, sends heartbeats, pings and info to `multicast_ll_addr` and is
+stamped on every transmission, so the 0.0122% path is **live on deployed
+hardware**: roughly one BCMP frame in 40 000 leaves a two-port node with a
+checksum the node at the other end will reject and silently drop.
+
+`bm-wire` reproduces both branches exactly, in `l2::add_egress_port`, and
+`bm-wire-diff/tests/l2_egress.rs` pins them down from both directions: the
+comparator asserts the port emits the same bytes as bm_core through the TX
+capture ring, and two further tests assert those bytes are *wrong* — that a
+carrying UDP frame's checksum does not match the frame, and that a
+double-carrying BCMP frame is rejected by `bcmp::rx::accept`. Both carry a
+note to say that if they start passing, the C has been fixed and the port must
+follow.
+
+The fix upstream is to fold the carry back in, in both branches. For BCMP:
+
+```c
+uint32_t sum = (uint32_t)(uint16_t)(header->checksum ^ 0xFFFF) + port_num;
+header->checksum = (uint16_t)(((sum & 0xFFFF) + (sum >> 16)) ^ 0xFFFF);
+```
+
+and for UDP the same, on a properly-read 16-bit field rather than a byte.
+`network_revert_checksum` needs the mirrored change. **This is wire-visible in
+the sense that it fixes frames that are currently discarded**; a node running
+the fix is strictly more interoperable, not less, so it does not need to be
+rolled out in lockstep.
+
+## 13. L2 silently drops any frame whose destination is not multicast
+
+`bm_l2_process_tx_evt` dispatches on the destination address:
+
+```c
+if (is_global_multicast(dst_ip)) {
+  send_global_multicast_packet(payload, tx_evt->length, tx_evt->port_mask);
+} else if (is_link_local_multicast(dst_ip)) {
+  /* ... stamp and send per port ... */
+}
+
+bm_l2_free(tx_evt->buf);
+```
+
+There is no `else`. A frame addressed to a unicast address — including the
+`FD00::/8` addresses `bm_ip_init` derives for every node — is accepted by
+`bm_l2_link_output`, queued, dequeued, and then freed without ever reaching
+the network device. No error is returned and nothing is logged: the caller
+sees `BmOK` from `bm_l2_link_output` and the frame simply never arrives.
+
+This is consistent with the protocol as it stands, where everything is
+multicast and the `//TODO: Add functionality for resource based routing`
+in `pubsub.c` marks unicast as future work. It is still a trap for an
+integrator, and it is the reason `bm-wire`'s `l2::tx_kind` names the case
+`TxKind::Dropped` explicitly rather than folding it into a default. The fix
+upstream is a `bm_debug` line and a returned error, and it is not wire-visible.
 
