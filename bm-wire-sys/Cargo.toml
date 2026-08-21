@@ -1,0 +1,9 @@
+[package]
+name = "bm-wire-sys"
+version = "0.1.0"
+edition = "2024"
+links = "bm_core"
+
+[build-dependencies]
+bindgen = "0.72"
+cc = "1"
