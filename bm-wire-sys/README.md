@@ -138,6 +138,24 @@ in bm_core's CMakeLists. This is not cosmetic: gcc 15 defaults to `gnu23`,
 whose `stddef.h` defines `unreachable()` and collides with tinycbor's. An
 oracle should compile bm_core under the standard the firmware is built with.
 
+`build.rs` also defines **`ENABLE_TESTING`**, which is what bm_core's own unit
+test build defines. Its only effect here is to give the pure helpers in
+`network/bm_linux.c` external linkage: `BM_LINUX_STATIC` expands to nothing, so
+`ipv6_pseudo_checksum`, `nodeid_to_ip`, `format_ipv6`, `mac_from_nodeid`,
+`multicast_mac_from_ipv6` and `is_multicast` become callable instead of
+file-static. They are the oracles for the Rust port's address and checksum
+layers — `ipv6_pseudo_checksum` in particular has to agree with lwIP's
+`ip6_chksum_pseudo` or a host node and an embedded node cannot validate each
+other's BCMP checksums.
+
+bm_core declares those six in no header, so `csrc/bm_shim.h` declares them for
+bindgen, in a block marked as test-only exports rather than public API. If
+upstream ever makes them static again, that block is what fails to link.
+
+The define is otherwise narrow: only `network/bm_linux.c`, `bcmp/dfu_core.c`,
+`bcmp/dfu_client.c` and `bcmp/dfu.h` consult it, and in the DFU files it only
+adds test accessors. The ADIN driver also consults it but is not compiled.
+
 `middleware/bm_mavlink.c` compiles as its own unit so that
 `-Wno-address-of-packed-member` — which the mavlink headers need, and which
 bm_core applies to its own mavlink target for the same reason — is not

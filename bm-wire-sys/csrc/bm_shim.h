@@ -103,6 +103,43 @@ void bm_shim_set_pump_budget(uint32_t calls);
 // Number of tasks bm_core has registered via bm_task_create.
 uint32_t bm_shim_task_count(void);
 
+
+// ---------------------------------------------------------------------------
+// Test-only exports of network/bm_linux.c
+//
+// These are the pure helpers inside bm_linux.c: no sockets, no allocation, no
+// state. They are file-static in a normal build and only gain external linkage
+// because build.rs defines ENABLE_TESTING (BM_LINUX_STATIC then expands to
+// nothing), which is what bm_core's own unit tests do.
+//
+// bm_core declares them in no header, so they are declared here to let bindgen
+// bind them. They are NOT public bm_core API: treat them as fuzzing oracles
+// for the Rust port and nothing else. If upstream ever makes them properly
+// static again, this block is what breaks, and loudly.
+// ---------------------------------------------------------------------------
+
+// Build an address from a 32-bit prefix and a 64-bit node id, big-endian.
+void nodeid_to_ip(BmIpAddr *out, uint32_t prefix, uint64_t id);
+
+// Format an address RFC 5952 style. `out` must have room for 40 bytes.
+void format_ipv6(char *out, const BmIpAddr *addr);
+
+// RFC 2460 IPv6 pseudo-header checksum. Must agree with lwIP's
+// ip6_chksum_pseudo or BCMP checksum validation fails between a host node and
+// an embedded one.
+uint16_t ipv6_pseudo_checksum(const BmIpAddr *src, const BmIpAddr *dst,
+                              uint8_t next_header, uint32_t length,
+                              const void *data);
+
+// Derive a locally-administered unicast MAC from a node id.
+void mac_from_nodeid(uint8_t *mac, uint64_t id);
+
+// Map an IPv6 multicast address onto its 33:33 Ethernet MAC.
+void multicast_mac_from_ipv6(uint8_t *mac, const BmIpAddr *dst);
+
+// True for any IPv6 multicast address.
+bool is_multicast(const BmIpAddr *addr);
+
 #ifdef __cplusplus
 }
 #endif

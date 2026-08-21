@@ -2,5 +2,12 @@
 name = "bm-wire"
 version = "0.1.0"
 edition = "2024"
+description = "Pure, safe, no_std Rust port of bm_core's wire format"
+
+[features]
+# Off by default: bm-wire must build for a bare-metal target untouched.
+# Only test and fuzz builds turn this on.
+default = []
+std = []
 
 [dependencies]

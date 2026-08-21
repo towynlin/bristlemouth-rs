@@ -1,0 +1,11 @@
+[package]
+name = "bm-wire-diff"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Differential harness comparing bm-wire against the real bm_core C"
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+bm-wire = { path = "../bm-wire", features = ["std"] }
+bm-wire-sys = { path = "../bm-wire-sys" }

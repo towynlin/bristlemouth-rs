@@ -237,7 +237,17 @@ fn bm_core_build(includes: &[PathBuf]) -> cc::Build {
         .define("BM_HOSTED", None)
         // tinycbor configuration, likewise.
         .define("CBOR_CUSTOM_ALLOC_INCLUDE", Some("\"tinycbor_alloc.h\""))
-        .define("CBOR_PARSER_MAX_RECURSIONS", Some("10"));
+        .define("CBOR_PARSER_MAX_RECURSIONS", Some("10"))
+        // What bm_core's own unit-test build defines. It gives the pure
+        // helpers in network/bm_linux.c external linkage (BM_LINUX_STATIC
+        // expands to nothing) so they can be bound and used as fuzzing
+        // oracles; without it, ipv6_pseudo_checksum and the address
+        // derivations are file-static and unreachable.
+        //
+        // Narrow blast radius, all of it wanted: only network/bm_linux.c,
+        // bcmp/dfu_core.c, bcmp/dfu_client.c and bcmp/dfu.h consult it, and in
+        // the DFU files it only adds test accessors.
+        .define("ENABLE_TESTING", None);
 
     // Match the sanitizer cargo-fuzz is using on the Rust side.
     if env::var("CARGO_CFG_FUZZING").is_ok() {

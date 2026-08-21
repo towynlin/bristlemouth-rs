@@ -7,17 +7,66 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+# Its own workspace: the fuzz profile and the nightly-only sanitizer flags must
+# not leak into the outer workspace, and cargo-fuzz expects it this way.
 [workspace]
 
 [dependencies]
 libfuzzer-sys = "0.4"
-
-[dependencies.bm-wire]
-path = ".."
+bm-wire-diff = { path = "../../bm-wire-diff" }
 
 [[bin]]
-name = "fuzz_target_1"
-path = "fuzz_targets/fuzz_target_1.rs"
+name = "crc"
+path = "fuzz_targets/crc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "time_remaining"
+path = "fuzz_targets/time_remaining.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "date_time"
+path = "fuzz_targets/date_time.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wildcard"
+path = "fuzz_targets/wildcard.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "strnlen"
+path = "fuzz_targets/strnlen.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "addr"
+path = "fuzz_targets/addr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "l2_policy"
+path = "fuzz_targets/l2_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "checksum"
+path = "fuzz_targets/checksum.rs"
 test = false
 doc = false
 bench = false
