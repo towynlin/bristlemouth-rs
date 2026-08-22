@@ -12,6 +12,8 @@
 
 pub mod header;
 pub mod heartbeat;
+pub mod info;
+pub mod neighbors;
 pub mod rx;
 pub mod tx;
 
@@ -20,5 +22,10 @@ pub use header::{
     MessageType,
 };
 pub use heartbeat::Heartbeat;
+pub use info::{DeviceInfo, DeviceInfoReply, DeviceInfoRequest};
+pub use neighbors::{
+    NeighborInfo, NeighborTableReply, NeighborTableRequest, PortInfo, encode_neighbor_table_reply,
+    neighbor_table_reply_len,
+};
 pub use rx::{Received, RxError, accept};
 pub use tx::serialize;

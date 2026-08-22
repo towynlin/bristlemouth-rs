@@ -97,3 +97,14 @@ path = "fuzz_targets/l2_egress.rs"
 test = false
 doc = false
 bench = false
+
+# Also stack-backed, and subject to the same rule: it must not share a process
+# with `bcmp`. It only ever hands bm_core well-formed requests -- see
+# divergence #14 for why a malformed reply must not be injected -- and drives
+# the decoders with the input's `decode_probe` bytes instead.
+[[bin]]
+name = "bcmp_messages"
+path = "fuzz_targets/bcmp_messages.rs"
+test = false
+doc = false
+bench = false

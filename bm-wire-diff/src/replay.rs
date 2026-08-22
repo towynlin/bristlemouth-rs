@@ -70,6 +70,11 @@ pub fn replay_target(target: &str) -> usize {
             "bcmp" => replay_one::<crate::bcmp::BcmpInput, _>(&bytes, |i| {
                 crate::bcmp::check(i);
             }),
+            "bcmp_messages" => {
+                replay_one::<crate::bcmp_messages::BcmpMessagesInput, _>(&bytes, |i| {
+                    crate::bcmp_messages::check(i);
+                })
+            }
             "l2_egress" => replay_one::<crate::l2_egress::L2EgressInput, _>(&bytes, |i| {
                 crate::l2_egress::check(i);
             }),
@@ -119,7 +124,7 @@ pub const TARGETS: &[&str] = &[
 /// while [`crate::bcmp`] calls it with its own; whichever runs second wins.
 /// Anything listed here is replayed from its own integration test binary, not
 /// from the library test binary that walks [`TARGETS`].
-pub const STACK_TARGETS: &[&str] = &["l2_egress"];
+pub const STACK_TARGETS: &[&str] = &["bcmp_messages", "l2_egress"];
 
 /// Every seeds directory on disk, so a new one cannot be added without being
 /// assigned to one of the two lists.
@@ -150,6 +155,22 @@ mod tests {
                 in_targets ^ in_stack,
                 "seeds/{dir} is in {} of TARGETS and STACK_TARGETS; it must be in exactly one",
                 usize::from(in_targets) + usize::from(in_stack)
+            );
+        }
+    }
+
+    /// Each stack target needs its own process, so each has its own test
+    /// binary that replays it. A target without one would never be replayed.
+    #[test]
+    fn every_stack_target_has_a_test_binary() {
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        for target in STACK_TARGETS {
+            let file = tests.join(format!("{target}.rs"));
+            assert!(
+                file.is_file(),
+                "STACK_TARGETS names {target}, but {} does not exist; \
+                 a stack target needs its own test binary to be replayed in",
+                file.display()
             );
         }
     }

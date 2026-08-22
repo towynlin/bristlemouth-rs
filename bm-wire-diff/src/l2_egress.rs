@@ -24,8 +24,6 @@
 //! `bm_shim_reset` must not be called here either, for the reason the crate
 //! docs give: the stack's statics outlive it.
 
-use std::sync::{Mutex, MutexGuard, OnceLock};
-
 use arbitrary::{Arbitrary, Result, Unstructured};
 
 use bm_wire::bcmp::{BCMP_HEADER_LEN, MessageType, tx};
@@ -39,81 +37,11 @@ use bm_wire::l2::{self, REQUESTED_EGRESS_PORT_OFFSET, TxKind};
 use bm_wire::util::BmIpAddr;
 
 use crate::Domain;
-
-/// Ports the capture device reports, from `SHIM_NUM_PORTS` in
-/// `bm-wire-sys/csrc/bm_net_device_shim.c`.
-pub const NUM_PORTS: u8 = 2;
-
-/// Node id the oracle's stack is brought up with.
-const NODE_ID: u64 = 0xC0FF_EE00_1234_5678;
+use crate::stack::{NUM_PORTS, drain, oracle, pump};
 
 /// Largest body the comparator will build. Keeps frames well inside the
 /// capture ring's per-frame allocation and inside bm_core's own MTU budget.
 pub const MAX_BODY: usize = 256;
-
-static ORACLE: OnceLock<Mutex<()>> = OnceLock::new();
-
-/// Bring the stack up once, then serialise every use of it.
-///
-/// # Panics
-///
-/// If `device_init` or `bm_shim_stack_init` fails.
-pub fn oracle() -> MutexGuard<'static, ()> {
-    let lock = ORACLE.get_or_init(|| {
-        unsafe {
-            let cfg = bm_wire_sys::DeviceCfg {
-                node_id: NODE_ID,
-                device_name: c"l2-egress-oracle".as_ptr(),
-                version_string: c"0.0.0".as_ptr(),
-                ..Default::default()
-            };
-            assert_eq!(bm_wire_sys::device_init(cfg), bm_wire_sys::BmErr_BmOK);
-            assert_eq!(
-                bm_wire_sys::bm_shim_stack_init(),
-                bm_wire_sys::BmErr_BmOK,
-                "stack init"
-            );
-            // Both ports up. The shim passes this index straight to l2.c's
-            // link_change, which is zero-based, so 0 and 1 are ports 1 and 2.
-            bm_wire_sys::bm_shim_link_change(0, true);
-            bm_wire_sys::bm_shim_link_change(1, true);
-            bm_shim_pump();
-            // Bringing a link up makes BCMP emit a heartbeat. Drop it: the
-            // comparator only wants the frames it asked for.
-            drain();
-        }
-        Mutex::new(())
-    });
-    lock.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-unsafe fn bm_shim_pump() {
-    unsafe { bm_wire_sys::bm_shim_pump() };
-}
-
-/// Drain the capture ring, returning `(egress port, frame)` in transmit order.
-///
-/// A port of 0 is the device's "all ports" encoding, which L2 uses for global
-/// multicast when the mask covers every port.
-fn drain() -> Vec<(u8, Vec<u8>)> {
-    let mut out = Vec::new();
-    loop {
-        let mut buf = vec![0u8; 2048];
-        let mut port = 0u8;
-        let len =
-            unsafe { bm_wire_sys::bm_shim_tx_pop(buf.as_mut_ptr(), buf.len() as u32, &mut port) };
-        if len < 0 {
-            return out;
-        }
-        let len = len as usize;
-        assert!(
-            len <= buf.len(),
-            "captured frame truncated by the drain buffer"
-        );
-        buf.truncate(len);
-        out.push((port, buf));
-    }
-}
 
 /// Which upper-layer protocol the frame carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,7 +223,7 @@ fn oracle_transmit(frame: &[u8]) -> Vec<(u8, Vec<u8>)> {
 
         let err = bm_wire_sys::bm_l2_link_output(buf, frame.len() as u32);
         assert_eq!(err, bm_wire_sys::BmErr_BmOK, "bm_l2_link_output");
-        bm_shim_pump();
+        pump();
         assert_eq!(
             bm_wire_sys::bm_shim_tx_dropped(),
             0,

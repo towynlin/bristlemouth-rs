@@ -12,8 +12,9 @@ use bm_wire::frame::{
     IPV6_SOURCE_ADDRESS_OFFSET, MIN_FRAME_WITH_ADDRESSES, UDP_CHECKSUM_OFFSET,
 };
 use bm_wire::util::BmIpAddr;
-use bm_wire_diff::l2_egress::{Destination, L2EgressInput, NUM_PORTS, Upper, build_frame, check};
+use bm_wire_diff::l2_egress::{Destination, L2EgressInput, Upper, build_frame, check};
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
+use bm_wire_diff::stack::NUM_PORTS;
 
 fn input(
     upper: Upper,
@@ -247,15 +248,15 @@ fn the_bcmp_patch_emits_an_invalid_checksum_on_a_double_carry() {
     );
 }
 
+/// Only this binary's own target: each stack target has its own test binary,
+/// because each needs its own process. `replay::STACK_TARGETS` is checked
+/// against the files under `tests/` so none can go without one.
 #[test]
 fn every_committed_seed_still_agrees_with_the_c() {
-    let mut total = 0;
-    for target in STACK_TARGETS {
-        total += replay_target(target);
-    }
-    assert!(total > 0, "no stack-target seeds replayed");
-    eprintln!(
-        "replayed {total} seeds across {} stack targets",
-        STACK_TARGETS.len()
+    let replayed = replay_target("l2_egress");
+    assert!(
+        replayed > 0,
+        "no l2_egress seeds replayed; STACK_TARGETS is {STACK_TARGETS:?}"
     );
+    eprintln!("replayed {replayed} l2_egress seeds");
 }

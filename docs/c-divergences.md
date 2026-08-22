@@ -34,6 +34,7 @@ Status values:
 | 11 | `clear_ports_legacy` performs a misaligned 32-bit access on every received frame | benign | **UBSan** |
 | 12 | The egress-port checksum patch drops the one's-complement end-around carry | replicated | reading, then measured |
 | 13 | L2 silently drops any frame whose destination is not multicast | replicated | reading |
+| 14 | Device-info and neighbour-table replies are parsed with unchecked, attacker-supplied lengths | domain-limited | reading |
 
 ---
 
@@ -453,4 +454,78 @@ in `pubsub.c` marks unicast as future work. It is still a trap for an
 integrator, and it is the reason `bm-wire`'s `l2::tx_kind` names the case
 `TxKind::Dropped` explicitly rather than folding it into a default. The fix
 upstream is a `bm_debug` line and a returned error, and it is not wire-visible.
+
+## 14. Device-info and neighbour-table replies are parsed with unchecked lengths
+
+Both variable-length BCMP replies declare their own sizes, and bm_core copies
+according to those declarations without ever comparing them to how many bytes
+arrived. `BcmpProcessData` carries a `size` field; neither parser reads it.
+
+**`bcmp/info.c`**, in `populate_neighbor_info`:
+
+```c
+neighbor->version_str = (char *)bm_malloc(dev_info->ver_str_len + 1);
+memcpy(neighbor->version_str, &dev_info->strings[0], dev_info->ver_str_len);
+/* ... */
+neighbor->device_name = (char *)bm_malloc(dev_info->dev_name_len + 1);
+memcpy(neighbor->device_name, &dev_info->strings[dev_info->ver_str_len],
+       dev_info->dev_name_len);
+```
+
+`ver_str_len` and `dev_name_len` are `uint8_t` fields taken straight off the
+wire, so a reply carrying only its 38-byte fixed part but declaring 255 and 255
+copies **510 bytes past the end of the received frame** into two heap buffers.
+Those buffers are then held in the neighbour table and printed by
+`bcmp_print_neighbor_info`.
+
+**`integrations/topology.c`**, in `neighbor_request_cb`, is worse:
+
+```c
+uint16_t neighbor_table_len =
+    sizeof(BcmpNeighborTableReply) +
+    sizeof(BcmpPortInfo) * reply->port_len +
+    sizeof(BcmpNeighborInfo) * reply->neighbor_len;
+neighbor_entry->neighbor_table_reply =
+    (BcmpNeighborTableReply *)bm_malloc(neighbor_table_len);
+/* ... */
+memcpy(neighbor_entry->neighbor_table_reply, reply, neighbor_table_len);
+```
+
+`port_len` is a `uint8_t` and `neighbor_len` a `uint16_t`, both off the wire.
+Saturated, they ask for `11 + 255*2 + 65535*10` = 655 871 bytes, copied out of
+a frame that may have carried eleven. Note also that the sum is accumulated in
+a `uint16_t`, so it wraps: the `bm_malloc` and the `memcpy` agree with each
+other but not with reality, and large declarations produce a small allocation
+and a large copy in some combinations and the reverse in others.
+
+**Reachability.** Neither is gated on anything an attacker cannot arrange.
+
+- The info path requires an entry in `INFO_REQUEST_LIST` for the sender's node
+  id. `bcmp_process_heartbeat` calls `bcmp_request_info` whenever a neighbour's
+  `time_since_boot_us` goes backwards, which the neighbour itself chooses. So a
+  node on the link sends a heartbeat, sends a second with a lower uptime, and
+  is then asked for its info — at which point its reply is parsed this way.
+- The topology path requires `SENT_REQUEST` and a matching `TARGET_NODE_ID`,
+  which is the node being asked. Node ids are in every heartbeat.
+
+Both need only link access, which is the threat model Bristlemouth already
+assumes for a physical bus, but neither should be a memory-safety boundary.
+
+**Status: domain-limited.** There is no defined C behaviour to reproduce, so
+`bm-wire` does not reproduce it: `DeviceInfoReply::decode` and
+`NeighborTableReply::decode` validate every declared length against the buffer
+and return `BmWireError::Truncated` otherwise, and the decoded message borrows
+the frame rather than copying out of it, so the bounds are checked once and the
+iterators cannot walk past them.
+
+The differential harness constrains its input to match: `BcmpMessagesInput`
+only ever hands bm_core **well-formed requests**, and its `decode_probe` bytes
+— which is where a fuzzer's malformed replies go — are fed to the Rust decoders
+and never to the C. Injecting a malformed reply into the oracle would be
+exercising undefined behaviour, not comparing against it.
+
+The fix upstream is to check `data.size` before trusting any declared length,
+in both parsers, and to accumulate the neighbour-table length in a `uint32_t`.
+It is not wire-visible: no conforming sender emits a reply whose declared
+lengths exceed the message.
 
