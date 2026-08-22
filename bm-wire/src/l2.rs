@@ -183,11 +183,47 @@ pub fn with_egress_port<R>(
     port: u8,
     send: impl FnOnce(&[u8]) -> R,
 ) -> Result<R, BmWireError> {
+    let stamped = stamp_egress_port(frame, port)?;
+    Ok(send(&stamped))
+}
+
+/// A frame stamped for one egress port, restored when the stamp is dropped.
+///
+/// [`with_egress_port`] cannot help a caller whose transmit is `async`, since
+/// the send happens inside a closure. This is the same guarantee in a form
+/// that can be held across an `await`: stamp, transmit, and let the scope end.
+#[derive(Debug)]
+pub struct Stamped<'a> {
+    frame: &'a mut [u8],
+    port: u8,
+}
+
+impl core::ops::Deref for Stamped<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.frame
+    }
+}
+
+impl Drop for Stamped<'_> {
+    fn drop(&mut self) {
+        // Neither can fail: `stamp_egress_port` already established that the
+        // frame is long enough, and nothing here can shorten it.
+        let _ = clear_ports(self.frame);
+        let _ = revert_checksum(self.frame, self.port);
+    }
+}
+
+/// Stamp `port` into `frame`, giving back a view that restores it on drop.
+///
+/// # Errors
+///
+/// [`BmWireError::Truncated`] if the frame is shorter than
+/// [`MIN_STAMPABLE_FRAME`].
+pub fn stamp_egress_port(frame: &mut [u8], port: u8) -> Result<Stamped<'_>, BmWireError> {
     add_egress_port(frame, port)?;
-    let result = send(frame);
-    clear_ports(frame)?;
-    revert_checksum(frame, port)?;
-    Ok(result)
+    Ok(Stamped { frame, port })
 }
 
 #[derive(Clone, Copy)]
@@ -365,6 +401,18 @@ mod tests {
             crate::bcmp::rx::accept(&mut frame[..end]),
             Err(crate::bcmp::RxError::BadChecksum)
         );
+    }
+
+    #[test]
+    fn a_stamp_restores_the_frame_when_it_is_dropped() {
+        let original = bcmp_frame(12);
+        let mut frame = original;
+        {
+            let stamped = stamp_egress_port(&mut frame, 2).unwrap();
+            assert_eq!(stamped[IPV6_INGRESS_EGRESS_PORTS_OFFSET] & 0x0F, 2);
+            assert_ne!(&stamped[..], &original[..]);
+        }
+        assert_eq!(frame, original);
     }
 
     #[test]

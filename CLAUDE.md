@@ -10,8 +10,10 @@ here makes a fuzzer fail, that file is the first place to look.
 
 ## The point of this repo
 
-`bm-wire` is a pure Rust port of bm_core, intended to run as firmware on
-Bristlemouth dev kits alongside nodes running the C/C++ firmware. Compatibility
+`bm-wire` is a pure Rust port of bm_core's wire format and protocol logic;
+`bm-stack` is the embassy runtime that turns it into a node. Together they are
+intended to run as firmware on Bristlemouth dev kits alongside nodes running
+the C/C++ firmware. Compatibility
 is *proven*, not assumed: `bm-wire-sys` compiles the real C as an oracle, and
 `bm-wire-diff` feeds identical input to both and asserts identical output.
 
@@ -31,9 +33,22 @@ A cargo workspace.
     each; the real work is in `bm-wire-diff`.
   - `fuzz/seeds/` — committed seed corpora, one directory per target, replayed
     by `cargo test`. `fuzz/corpus/` is gitignored, so durable inputs live here.
-- `bm-wire-diff/` — the differential harness. Host-only, depends on both other
-  crates. One comparator per surface, shared by the fuzz targets and by
+- `bm-stack/` — the node. `no_std`, no `alloc` (except behind the test-only
+  `mock` feature), and the only crate here that knows about time or I/O. It
+  supplies what `bm-wire` deliberately lacks: a clock, a timer, and a PHY.
+  - `src/port.rs` — the seams bm_core leaves to the integrator, as traits
+    rather than link-time symbols, so a test and the firmware can differ.
+  - `src/node.rs` — `Node::on_frame` and `Node::on_tick` are synchronous and
+    take the current time; `Node::run` is the only async code. All the protocol
+    is in the synchronous half.
+  - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock, so
+    the real `run` loop can be tested with no hardware.
+- `bm-wire-diff/` — the differential harness. Host-only, depends on the other
+  three crates. One comparator per surface, shared by the fuzz targets and by
   ordinary `#[test]`s.
+  - `tests/node_frames.rs` — compares whole frames `bm-stack` builds against
+    the ones bm_core emits for the same question from the same identity. If
+    those agree, a node running this firmware is indistinguishable on the wire.
 - `bm-wire-sys/` — raw FFI bindings to the real bm_core C. The oracle.
   - `vendor/bm_core/` — the C submodule. **Never edit it from here.** Changes
     go upstream to `bristlemouth/bm_core`.
@@ -92,6 +107,7 @@ Same as above, with two additions.
 cargo test                                       # workspace, incl. differential tests
 cargo build -p bm-wire --target thumbv7em-none-eabihf   # proves no_std, alloc-free
 cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Cortex-M33
+cargo build -p bm-stack --target thumbv8m.main-none-eabihf # the node, same target
 cargo tree -p bm-wire                            # must show no dependencies
 ./bm-wire-sys/scripts/check_symbols.sh           # only libc may be unresolved
 cd bm-wire && cargo fuzz run <target> corpus/<target> seeds/<target>

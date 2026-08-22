@@ -36,8 +36,33 @@ pub fn serialize(
     seq_num: u32,
     body: &[u8],
 ) -> Result<(), BmWireError> {
+    let end = BCMP_HEADER_OFFSET + BCMP_HEADER_LEN + body.len();
+    frame
+        .get_mut(BCMP_HEADER_OFFSET + BCMP_HEADER_LEN..end)
+        .ok_or(BmWireError::Truncated)?
+        .copy_from_slice(body);
+    serialize_in_place(frame, message_type, seq_num, body.len())
+}
+
+/// The same, for a body the caller has already written into the frame.
+///
+/// A node building a reply has one buffer, not two: it encodes the message
+/// straight into the frame at [`BCMP_HEADER_OFFSET`] + [`BCMP_HEADER_LEN`] and
+/// then calls this to put the header and checksum around it. `body_len` is how
+/// many bytes it wrote.
+///
+/// # Errors
+///
+/// [`BmWireError::Truncated`] if `frame` cannot hold the frame header, the
+/// BCMP header and `body_len` bytes.
+pub fn serialize_in_place(
+    frame: &mut [u8],
+    message_type: MessageType,
+    seq_num: u32,
+    body_len: usize,
+) -> Result<(), BmWireError> {
     let payload_len = BCMP_HEADER_LEN
-        .checked_add(body.len())
+        .checked_add(body_len)
         .ok_or(BmWireError::Truncated)?;
     let end = BCMP_HEADER_OFFSET
         .checked_add(payload_len)
@@ -53,7 +78,6 @@ pub fn serialize(
         ..BcmpHeader::default()
     };
     header.encode(&mut frame[BCMP_HEADER_OFFSET..])?;
-    frame[BCMP_HEADER_OFFSET + BCMP_HEADER_LEN..end].copy_from_slice(body);
 
     let src = read_addr(frame, IPV6_SOURCE_ADDRESS_OFFSET);
     let dst = read_addr(frame, IPV6_DESTINATION_ADDRESS_OFFSET);
@@ -116,6 +140,22 @@ mod tests {
         assert_eq!(header.frag_id, 0);
         assert_eq!(header.next_header, 0);
         assert_eq!(header.seq_num, 0x1234_5678);
+    }
+
+    #[test]
+    fn in_place_matches_copying_the_body_in() {
+        let body = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        let mut copied = [0u8; MIN_FRAME_WITH_ADDRESSES + BCMP_HEADER_LEN + 8];
+        copied[IPV6_SOURCE_ADDRESS_OFFSET] = 0xFE;
+        let mut in_place = copied;
+
+        serialize(&mut copied, MessageType::HEARTBEAT, 7, &body).unwrap();
+
+        let at = BCMP_HEADER_OFFSET + BCMP_HEADER_LEN;
+        in_place[at..at + body.len()].copy_from_slice(&body);
+        serialize_in_place(&mut in_place, MessageType::HEARTBEAT, 7, body.len()).unwrap();
+
+        assert_eq!(copied, in_place);
     }
 
     #[test]
