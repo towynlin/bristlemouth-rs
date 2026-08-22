@@ -26,6 +26,7 @@ pub mod crc;
 pub mod frame;
 pub mod l2;
 pub mod l2_policy;
+pub mod neighbor;
 pub mod util;
 
 /// Why a parse or encode could not be completed.

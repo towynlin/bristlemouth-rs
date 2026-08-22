@@ -25,6 +25,7 @@ pub mod checksum;
 pub mod crc;
 pub mod l2_egress;
 pub mod l2_policy;
+pub mod neighbor;
 pub mod replay;
 pub mod stack;
 pub mod util;

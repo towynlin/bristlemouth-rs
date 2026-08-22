@@ -75,6 +75,9 @@ pub fn replay_target(target: &str) -> usize {
                     crate::bcmp_messages::check(i);
                 })
             }
+            "neighbor" => replay_one::<crate::neighbor::NeighborInput, _>(&bytes, |i| {
+                crate::neighbor::check(i);
+            }),
             "l2_egress" => replay_one::<crate::l2_egress::L2EgressInput, _>(&bytes, |i| {
                 crate::l2_egress::check(i);
             }),
@@ -124,7 +127,7 @@ pub const TARGETS: &[&str] = &[
 /// while [`crate::bcmp`] calls it with its own; whichever runs second wins.
 /// Anything listed here is replayed from its own integration test binary, not
 /// from the library test binary that walks [`TARGETS`].
-pub const STACK_TARGETS: &[&str] = &["bcmp_messages", "l2_egress"];
+pub const STACK_TARGETS: &[&str] = &["bcmp_messages", "l2_egress", "neighbor"];
 
 /// Every seeds directory on disk, so a new one cannot be added without being
 /// assigned to one of the two lists.

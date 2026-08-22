@@ -47,6 +47,19 @@ A cargo workspace.
     defines. Everything left should be libc. Run it from the workspace root.
 - `docs/c-divergences.md` — the upstream bug list.
 
+## Porting a state machine to bm-wire
+
+Same as above, with two additions.
+
+1. Write it **sans-io**: no clock, no timers, no transmission. Entry points
+   take the current time and return what the caller owes the network.
+   `bm-wire/src/neighbor.rs` is the pattern.
+2. Compare the *notifications*, not just the resulting state. bm_core's
+   application-facing callbacks are registerable from Rust
+   (`bcmp_neighbor_register_discovery_callback`, ...), and a comparator that
+   only diffs the table misses everything the application actually sees --
+   divergence #17 is invisible in the table and obvious in the callbacks.
+
 ## Porting a function to bm-wire
 
 1. Read the C. Note anything that wraps, truncates, reads out of bounds, or

@@ -18,6 +18,9 @@ Status values:
   constraint is documented at the comparator.
 - **benign** — the C is technically undefined but every real toolchain produces
   the intended value, and the port produces that value by construction.
+- **c-only** — a defect in state or an API that bm_core keeps and `bm-wire` has
+  no counterpart for. There is nothing to replicate; it is recorded because it
+  is worth fixing upstream.
 
 | # | Where | Status | Found by |
 |---|---|---|---|
@@ -35,6 +38,11 @@ Status values:
 | 12 | The egress-port checksum patch drops the one's-complement end-around carry | replicated | reading, then measured |
 | 13 | L2 silently drops any frame whose destination is not multicast | replicated | reading |
 | 14 | Device-info and neighbour-table replies are parsed with unchecked, attacker-supplied lengths | domain-limited | reading |
+| 15 | `bcmp_remove_neighbor_from_table` frees, and reports the free's result as the removal's | c-only | **a double free while writing the comparator** |
+| 16 | An advertised liveliness lease is doubled and scaled in 32-bit arithmetic, so it wraps | replicated | reading, confirmed differentially |
+| 17 | A new neighbour is announced to the application twice | replicated | reading, confirmed differentially |
+| 18 | A node id of zero is never recognised, so its node is rediscovered forever | replicated | reading, confirmed differentially |
+| 19 | `INFO_REQUEST_LIST` grows without de-duplication or expiry | c-only | reading |
 
 ---
 
@@ -528,4 +536,178 @@ The fix upstream is to check `data.size` before trusting any declared length,
 in both parsers, and to accumulate the neighbour-table length in a `uint32_t`.
 It is not wire-visible: no conforming sender emits a reply whose declared
 lengths exceed the message.
+
+## 15. `bcmp_remove_neighbor_from_table` frees, and reports the wrong result
+
+`bcmp/messages/neighbors.h` presents the two halves of a removal as separate:
+
+```c
+bool bcmp_remove_neighbor_from_table(BcmpNeighbor *neighbor);
+bool bcmp_free_neighbor(BcmpNeighbor *neighbor);
+```
+
+and `bcmp_free_neighbor`'s own doc comment says, in capitals, *"NOTE: this does
+NOT remove neighbor from table"* — which reads as an instruction to call the
+other one too. Doing so is a **double free**: `bcmp_remove_neighbor_from_table`
+ends with
+
+```c
+    if (!rval) {
+      bm_debug("Something went wrong...\n");
+    }
+
+    // Free the neighbor
+    rval = bcmp_free_neighbor(neighbor);
+  }
+  return rval;
+```
+
+Two problems in those four lines:
+
+* It frees unconditionally, **including when it did not find the node in the
+  list**. A caller passing a stale or foreign pointer gets it freed anyway,
+  with whatever still points at it left dangling.
+* `rval` is overwritten by `bcmp_free_neighbor`'s result, so the function
+  returns "did the free succeed" while its doc comment promises "true if
+  successful" at removing. It returns `true` for a node that was never in the
+  list.
+
+**Found the hard way.** `bm-wire-diff/src/neighbor.rs` clears the oracle's table
+between runs, and the first version called both functions, as the header reads.
+It aborted on the second test; valgrind put the first free inside
+`bcmp_remove_neighbor_from_table`. The comparator now calls only that one.
+
+**Status: c-only.** The port has no such API — `NeighborTable` owns its storage
+and removal is an array shift. The fix upstream is to rename the function to
+say that it frees, or to split it honestly and fix the return value.
+
+## 16. An advertised liveliness lease wraps in 32-bit arithmetic
+
+`neighbor_check` in `bcmp/neighbors.c`:
+
+```c
+if (neighbor->online &&
+    !time_remaining(neighbor->last_heartbeat_ticks, bm_get_tick_count(),
+                    bm_ms_to_ticks(2 * neighbor->heartbeat_period_s * 1000))) {
+```
+
+`heartbeat_period_s` is a `uint32_t` taken straight from the heartbeat's
+`liveliness_lease_dur_s`, so `2 * period * 1000` is evaluated in 32-bit
+unsigned arithmetic and wraps at 2^32. A neighbour advertising 2 147 483 648
+seconds — nominally 68 years, "effectively forever" — produces a lease of
+**zero milliseconds**, and is marked offline by the very next check.
+
+The wrap starts at 2 147 484 seconds, which is far below the field's range, so
+a well-meaning integrator asking for a long lease gets a short one. bm_core
+itself always sends `bcmp_heartbeat_s` = 10, so this is only reachable from a
+peer's advertised value.
+
+`bm-wire` reproduces it with `wrapping_mul` in `Neighbor::lease_ms`, and the
+differential harness sweeps the boundary: `advertised_leases_across_the_range`
+in `bm-wire-diff/tests/neighbor.rs` covers 0, 1, 10, 2 147 483, 2 147 484,
+2 147 483 648 and `u32::MAX`, and replacing the wrapping multiply with a
+saturating one makes the tables diverge. The fix upstream is to widen the
+expression to 64-bit and clamp.
+
+## 17. A new neighbour is announced to the application twice
+
+`bcmp_update_neighbor` invokes the discovery callback as soon as the entry
+exists:
+
+```c
+neighbor = bcmp_add_neighbor(node_id, port);
+if (neighbor) {
+  bcmp_neighbor_invoke_discovery_cb(true, neighbor);
+  bcmp_request_info(node_id, &multicast_ll_addr, NULL);
+}
+```
+
+and `bcmp_process_heartbeat`, having just called it, then invokes it again:
+
+```c
+if (!neighbor->online || neighbor_reset) {
+  bcmp_neighbor_invoke_discovery_cb(true, neighbor);
+}
+```
+
+`bcmp_add_neighbor` zeroes the entry, so `online` is still false at that
+second test and the condition holds. **Every newly discovered neighbour is
+therefore reported to the application twice**, on the same heartbeat, with the
+same pointer. An application that counts discoveries, or that does work per
+discovery, does it twice.
+
+Confirmed differentially rather than assumed: the comparator registers a real
+`NeighborDiscoveryCallback` and compares call counts, and reducing the port to
+a single announcement makes it fail with `left: appeared: 2, right: appeared: 1`.
+
+`bm-wire` matches it: `HeartbeatOutcome::discovery_callbacks` is 2 for a new
+neighbour. The fix upstream is to drop the call in `bcmp_update_neighbor`,
+whose caller already covers the case.
+
+## 18. A node id of zero is never recognised
+
+`bcmp_find_neighbor`:
+
+```c
+while (neighbor != NULL) {
+  if (node_id && node_id == neighbor->node_id) {
+    break;
+  }
+  neighbor = neighbor->next;
+}
+```
+
+The `node_id &&` guard means a lookup for zero always fails, even when a
+zero-id neighbour is sitting in the table. Node ids come from
+`ip_to_nodeid(data.src)`, the low 8 bytes of the source address, so a node
+whose link-local address is exactly `fe80::` has one.
+
+Every heartbeat from such a node is therefore treated as a first sighting:
+`bcmp_update_neighbor` adds it again, which evicts the previous copy of itself
+from the port, fires the discovery callback (twice, per #17) and sends another
+`bcmp_request_info`. The table does not grow — eviction by port sees to that —
+but the node is permanently "new", its uptime history is reset on every
+heartbeat so a genuine restart can never be detected, and each heartbeat costs
+an info request on the wire and an `INFO_REQUEST_LIST` entry that is never
+reclaimed (#19).
+
+`bm-wire`'s `NeighborTable::find` reproduces the guard, and the harness covers
+it: `a_zero_node_id_is_rediscovered_on_every_heartbeat`. Letting zero match
+makes the discovery counts diverge immediately.
+
+The fix upstream is to drop the `node_id &&` guard and reject a zero id where
+it is *received* instead, which is where the real question lies.
+
+## 19. `INFO_REQUEST_LIST` grows without de-duplication or expiry
+
+`bcmp_request_info` records every request:
+
+```c
+item = ll_create_item(item, &info_cb, sizeof(info_cb), target_node_id);
+if (item) {
+  err = ll_item_add(&INFO_REQUEST_LIST, item);
+```
+
+`ll_item_add` in `common/ll.c` appends unconditionally — it does not look at
+the id — so requesting information about the same node twice leaves two
+entries. The only removal is in `bcmp_process_info_reply`, which removes one
+entry when a reply arrives. A node that is asked and never answers leaves its
+entry behind for the life of the process, and `ll_get_item` walks the list
+linearly, so the cost of every subsequent reply grows with it.
+
+Ordinary operation is bounded by how often neighbours appear. Combined with
+#18 it is not: a node sending heartbeats from `fe80::` is "new" every time, so
+each heartbeat appends an entry that will never be removed.
+
+Contrast `bcmp/packet.c`, which has exactly this problem solved — its
+`sequence_list` has a 150 ms sweep that expires entries and fires their
+callbacks with `NULL`. `INFO_REQUEST_LIST` has no equivalent.
+
+**Status: c-only.** `bm-wire` is sans-io and keeps no such list;
+`HeartbeatOutcome::request_info` tells the runtime a request is owed and the
+runtime owns any bookkeeping. The fix upstream is to de-duplicate on the id in
+`bcmp_request_info`, and to expire entries the way `packet.c` does.
+
+This is also why the `neighbor` fuzz target needs `-fork=1`: the growth is
+bounded per iteration but not across a run.
 

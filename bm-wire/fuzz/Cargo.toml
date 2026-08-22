@@ -108,3 +108,17 @@ path = "fuzz_targets/bcmp_messages.rs"
 test = false
 doc = false
 bench = false
+
+# Stack-backed like the two above, and the one target here that genuinely
+# accumulates: every new neighbour makes bcmp_update_neighbor call
+# bcmp_request_info, which appends to INFO_REQUEST_LIST with no de-duplication
+# and no expiry (divergence #19). Bounded per iteration, unbounded across a
+# run, so give this one fork mode:
+#
+#   cargo fuzz run neighbor corpus/neighbor seeds/neighbor -- -fork=1
+[[bin]]
+name = "neighbor"
+path = "fuzz_targets/neighbor.rs"
+test = false
+doc = false
+bench = false
