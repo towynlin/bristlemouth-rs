@@ -164,16 +164,17 @@ impl<'a> NeighborTableReply<'a> {
 
     /// The local ports, in order.
     pub fn ports(&self) -> impl Iterator<Item = PortInfo> + '_ {
-        self.ports.chunks_exact(PortInfo::LEN).map(|c| PortInfo {
+        self.ports.as_chunks::<{ PortInfo::LEN }>().0.iter().map(|c| PortInfo {
             state: c[0],
             port_type: c[1],
         })
     }
 
     /// The neighbours, in order.
+    #[allow(clippy::useless_conversion)]
     pub fn neighbors(&self) -> impl Iterator<Item = NeighborInfo> + '_ {
         self.neighbors
-            .chunks_exact(NeighborInfo::LEN)
+            .as_chunks::<{ NeighborInfo::LEN }>().0.iter()
             .map(|c| NeighborInfo::decode(c.try_into().expect("chunk is NeighborInfo::LEN")))
     }
 
