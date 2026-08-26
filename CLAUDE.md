@@ -61,6 +61,10 @@ A cargo workspace.
   - `scripts/check_symbols.sh` — what `libbm_core.a` references but nothing
     defines. Everything left should be libc. Run it from the workspace root.
 - `docs/c-divergences.md` — the upstream bug list.
+- `docs/embassy-port-tracking-prompt.md` — a self-contained brief for a
+  separate agent working in `embassy-rs/embassy`, to make
+  `embassy-net-adin1110` report the ingress port and take an egress port per
+  frame. `bm-stack`'s `Phy` trait is waiting on it.
 
 ## Porting a state machine to bm-wire
 
