@@ -43,6 +43,13 @@ A cargo workspace.
     is in the synchronous half.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock, so
     the real `run` loop can be tested with no hardware.
+- `bm-phy-adin2111/` — [`bm_stack::Phy`] for the ADIN2111 over OPEN Alliance
+  TC6 SPI. **Its own workspace**, like `bm-wire/fuzz`, because it pins embassy
+  to a git branch: `embassy-time-driver` carries `links = "embassy-time"`, so a
+  git embassy and a crates.io embassy cannot coexist in one dependency graph.
+  Keeping the pin here means the main workspace stays on released crates and
+  `cargo test` at the root needs no network. It is not built by the root
+  `cargo test`; verify it explicitly.
 - `bm-wire-diff/` — the differential harness. Host-only, depends on the other
   three crates. One comparator per surface, shared by the fuzz targets and by
   ordinary `#[test]`s.
@@ -112,6 +119,8 @@ cargo test                                       # workspace, incl. differential
 cargo build -p bm-wire --target thumbv7em-none-eabihf   # proves no_std, alloc-free
 cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Cortex-M33
 cargo build -p bm-stack --target thumbv8m.main-none-eabihf # the node, same target
+cd bm-phy-adin2111 && cargo test                 # own workspace, needs network
+cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
 cargo tree -p bm-wire                            # must show no dependencies
 ./bm-wire-sys/scripts/check_symbols.sh           # only libc may be unresolved
 cd bm-wire && cargo fuzz run <target> corpus/<target> seeds/<target>

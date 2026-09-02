@@ -54,6 +54,8 @@ pub struct MockPhy {
     port_count: u8,
     script: Vec<Script>,
     next: usize,
+    /// Link state per port, bit 0 for port 1.
+    link_mask: u16,
     /// Everything the node transmitted, in order.
     pub sent: Vec<Sent>,
 }
@@ -66,7 +68,22 @@ impl MockPhy {
             port_count,
             script,
             next: 0,
+            // Every port up, which is what a bench with both wires connected
+            // looks like. Use `set_link_up` for anything else.
+            link_mask: (1u16 << port_count) - 1,
             sent: Vec::new(),
+        }
+    }
+
+    /// Bring a port up or down. Ports are 1-based.
+    pub fn set_link_up(&mut self, port: u8, up: bool) {
+        let Some(bit) = port.checked_sub(1).filter(|b| *b < 16) else {
+            return;
+        };
+        if up {
+            self.link_mask |= 1 << bit;
+        } else {
+            self.link_mask &= !(1 << bit);
         }
     }
 
@@ -86,6 +103,11 @@ impl Phy for MockPhy {
 
     fn port_count(&self) -> u8 {
         self.port_count
+    }
+
+    fn link_up(&self, port: u8) -> bool {
+        port.checked_sub(1)
+            .is_some_and(|bit| bit < 16 && self.link_mask & (1 << bit) != 0)
     }
 
     async fn send(&mut self, frame: &[u8], egress: Egress) -> Result<(), Self::Error> {

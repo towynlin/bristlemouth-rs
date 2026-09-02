@@ -51,8 +51,14 @@ impl Identity for OracleIdentity {
     }
 }
 
+/// A node with the same link state the oracle has: `stack::oracle` brings both
+/// ports up before any comparison, and a neighbour-table reply carries that.
 fn node() -> Node<OracleIdentity, 4> {
-    Node::new(OracleIdentity, NUM_PORTS)
+    let mut node = Node::new(OracleIdentity, NUM_PORTS);
+    for port in 1..=NUM_PORTS {
+        node.set_link_up(port, true);
+    }
+    node
 }
 
 fn assert_same_frame(what: &str, port: u8, c: &[u8], rs: &[u8]) {

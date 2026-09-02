@@ -203,6 +203,9 @@ fn a_request_for_another_node_is_ignored() {
 #[test]
 fn a_neighbor_table_request_reports_our_ports_and_neighbours() {
     let mut node = node();
+    for port in 1..=PORTS {
+        node.set_link_up(port, true);
+    }
     node.on_frame(1000, 2, &mut heartbeat_frame(1_000_000));
 
     let mut frame = peer_frame(
@@ -234,6 +237,28 @@ fn a_neighbor_table_request_reports_our_ports_and_neighbours() {
         NeighborTableRequest::decode(&0u64.to_le_bytes()).unwrap(),
         NeighborTableRequest { target_node_id: 0 }
     );
+}
+
+/// The reply carries the link state the node was told about, not a constant.
+#[test]
+fn a_neighbor_table_reply_reports_a_down_port_as_down() {
+    let mut node = node();
+    node.set_link_up(1, true);
+    node.set_link_up(2, false);
+    assert!(node.link_up(1) && !node.link_up(2));
+
+    let mut frame = peer_frame(
+        MessageType::NEIGHBOR_TABLE_REQUEST,
+        &0u64.to_le_bytes(),
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    );
+    let outbound = node.on_frame(1000, 1, &mut frame).expect("answered");
+    let mut reply = outbound.frame().to_vec();
+    let received = rx::accept(&mut reply).unwrap();
+    let table = NeighborTableReply::decode(received.payload).unwrap();
+
+    let states: Vec<bool> = table.ports().map(|p| p.is_up()).collect();
+    assert_eq!(states, vec![true, false]);
 }
 
 #[test]

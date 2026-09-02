@@ -62,6 +62,11 @@ pub struct Node<I, const NEIGHBORS: usize = 4> {
     identity: I,
     neighbors: NeighborTable<NEIGHBORS>,
     port_count: u8,
+    /// Link state per port, bit 0 for port 1. Cached rather than read from the
+    /// PHY on demand, so the synchronous half stays free of I/O — the same
+    /// arrangement bm_core has, where L2 keeps `enabled_ports_mask` up to date
+    /// from link-change callbacks and `bm_l2_get_port_state` only reads it.
+    link_mask: u16,
     tx: [u8; MTU],
 }
 
@@ -72,8 +77,31 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
             identity,
             neighbors: NeighborTable::new(),
             port_count,
+            link_mask: 0,
             tx: [0u8; MTU],
         }
+    }
+
+    /// Record that `port` came up or went down. Ports are 1-based.
+    ///
+    /// [`Node::run`] does this from the PHY; a caller driving the synchronous
+    /// half itself has to keep it current.
+    pub fn set_link_up(&mut self, port: u8, up: bool) {
+        let Some(bit) = port.checked_sub(1).filter(|b| *b < 16) else {
+            return;
+        };
+        if up {
+            self.link_mask |= 1 << bit;
+        } else {
+            self.link_mask &= !(1 << bit);
+        }
+    }
+
+    /// Whether `port` is up, as last recorded.
+    #[must_use]
+    pub fn link_up(&self, port: u8) -> bool {
+        port.checked_sub(1)
+            .is_some_and(|bit| bit < 16 && self.link_mask & (1 << bit) != 0)
     }
 
     /// This node's identity.
@@ -219,17 +247,17 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
             identity,
             neighbors,
             port_count,
+            link_mask,
             tx,
         } = self;
         let node_id = identity.node_id();
 
         // bm_core reports every port with the link state it has and a type it
-        // never fills in. The PHY here has no per-port link state yet, so every
-        // port reports up; that is the next thing the driver work brings.
+        // never fills in.
         let mut ports = [PortInfo::default(); MAX_REPORTED_PORTS];
         let ports = &mut ports[..usize::from(*port_count).min(MAX_REPORTED_PORTS)];
-        for port in ports.iter_mut() {
-            port.state = 1;
+        for (index, port) in ports.iter_mut().enumerate() {
+            port.state = u8::from(*link_mask & (1 << index) != 0);
         }
 
         let mut table = [bm_wire::bcmp::NeighborInfo::default(); NEIGHBORS];
@@ -380,6 +408,13 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
         let port_count = self.port_count;
 
         loop {
+            // Cheap: the driver keeps this as an array it updates when it
+            // services a PHY interrupt, so this is a read, not a transfer.
+            for port in 1..=port_count {
+                let up = phy.link_up(port);
+                self.set_link_up(port, up);
+            }
+
             let uptime_ms = |()| -> u32 {
                 // Wraps at 49.7 days, which is what bm_core's tick counter
                 // does too; `time_remaining` is written to survive it.

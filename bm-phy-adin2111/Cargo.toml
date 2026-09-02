@@ -1,0 +1,41 @@
+[package]
+name = "bm-phy-adin2111"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "bm-stack Phy for the ADIN2111 over OPEN Alliance TC6 SPI"
+
+# Its own workspace, like bm-wire/fuzz, and for a related reason: this crate
+# pins embassy to a git branch, and `embassy-time-driver` carries
+# `links = "embassy-time"`, so a git embassy and a crates.io embassy cannot
+# coexist in one dependency graph. Keeping the pin here means the main
+# workspace stays on released crates and `cargo test` at the root needs no
+# network. Verify this crate explicitly; see CLAUDE.md.
+[workspace]
+
+[dependencies]
+bm-stack = { path = "../bm-stack" }
+bm-wire = { path = "../bm-wire" }
+embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
+embedded-hal-async = "1.0"
+
+# TEMPORARY: per-port frame I/O is not in a released embassy-net-adin1110.
+# This tracks the branch the change is proposed from; move to a crates.io
+# version as soon as it lands upstream.
+[dependencies.embassy-net-adin1110]
+git = "https://github.com/towynlin/embassy"
+branch = "claude/adin2111-per-port-io-gzzrnm"
+default-features = false
+features = ["tc6"]
+
+# bm-stack depends on released embassy-time and embassy-futures; the driver
+# above brings the git ones. Only one crate may claim `links = "embassy-time"`,
+# so point everything at the git tree.
+[patch.crates-io]
+embassy-time = { git = "https://github.com/towynlin/embassy", branch = "claude/adin2111-per-port-io-gzzrnm" }
+embassy-futures = { git = "https://github.com/towynlin/embassy", branch = "claude/adin2111-per-port-io-gzzrnm" }
+
+[dev-dependencies]
+# The three a board would otherwise supply; see bm-stack's Cargo.toml.
+embassy-time = { version = "0.5", features = ["mock-driver", "generic-queue-8"] }
+critical-section = { version = "1", features = ["std"] }

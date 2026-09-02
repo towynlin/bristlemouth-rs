@@ -39,6 +39,14 @@ pub trait Phy {
     /// How many ports the device has. Ports are numbered 1..=`port_count`.
     fn port_count(&self) -> u8;
 
+    /// Whether the link on `port` is up, as of the last time the driver
+    /// serviced the PHY. Ports are 1-based; a port the device does not have
+    /// reports `false`.
+    ///
+    /// A neighbour-table reply carries this for every port, which is the one
+    /// place bm_core reads `bm_l2_get_port_state`.
+    fn link_up(&self, port: u8) -> bool;
+
     /// Transmit one frame.
     async fn send(&mut self, frame: &[u8], egress: Egress) -> Result<(), Self::Error>;
 
