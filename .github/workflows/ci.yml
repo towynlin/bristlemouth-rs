@@ -31,7 +31,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
       - run: rustup default stable
       - name: Root workspace
@@ -46,7 +46,7 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           # bm-wire-sys compiles vendor/bm_core, which has submodules of its
           # own -- tinycbor and mavlink are in the tier lists.
@@ -56,7 +56,7 @@ jobs:
       - run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
       - run: rustup default stable
       - run: rustup target add thumbv8m.main-none-eabihf
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -76,14 +76,14 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: libclang, for bindgen
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
       - run: rustup toolchain install stable --profile minimal --no-self-update
       - run: rustup default stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -115,11 +115,11 @@ jobs:
     # No submodules on purpose: if this job ever needs vendor/bm_core, the
     # oracle has leaked into a crate that must build for firmware without it.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --no-self-update
       - run: rustup default stable
       - run: rustup target add thumbv7em-none-eabihf thumbv8m.main-none-eabihf
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -145,7 +145,7 @@ jobs:
     # rust-toolchain.toml already pins that same version, so its job below is
     # its own MSRV check.
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - name: libclang, for bindgen
@@ -157,7 +157,7 @@ jobs:
           echo "declared MSRV: $msrv"
           rustup toolchain install "$msrv" --profile minimal --no-self-update
           echo "toolchain=$msrv" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
@@ -172,7 +172,7 @@ jobs:
     name: dependency invariants
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --no-self-update
       - run: rustup default stable
       # "zero dependencies" is a property of the crate, not an aspiration:
@@ -209,7 +209,7 @@ jobs:
       run:
         working-directory: bm-phy-adin2111
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install the toolchain rust-toolchain.toml pins
         run: |
           channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
@@ -217,7 +217,7 @@ jobs:
           rustup toolchain install "$channel" --profile minimal \
             --component rustfmt --component clippy \
             --target thumbv8m.main-none-eabihf --no-self-update
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index/
