@@ -6,5 +6,5 @@ rust-version.workspace = true
 links = "bm_core"
 
 [build-dependencies]
-bindgen = "0.72"
+bindgen = "0.73"
 cc = "1"
