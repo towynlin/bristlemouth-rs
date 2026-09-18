@@ -1,6 +1,6 @@
 #![no_main]
 
-use bm_wire_diff::util::{check_strnlen, StrnlenInput};
+use bm_wire_diff::util::{StrnlenInput, check_strnlen};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|input: StrnlenInput| {
