@@ -202,7 +202,7 @@ pub struct BcmpInput {
     pub dst: [u8; 16],
     /// Index into [`REGISTERED`]; kept in range by [`Domain`].
     pub type_index: u8,
-    /// Use [`UNREGISTERED`] instead, so the receive path validates a frame it
+    /// Use `UNREGISTERED` instead, so the receive path validates a frame it
     /// cannot dispatch.
     pub unregistered: bool,
     /// Sequence number.

@@ -1,0 +1,199 @@
+# Everything CLAUDE.md's "Verifying" section runs by hand, run on every push.
+#
+# Three workspaces live here and none of them is reachable from the others:
+# the root one, `bm-wire/fuzz`, and `bm-phy-adin2111` (its own toolchain pin
+# and its own git dependencies). Each needs its own invocation.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a PR cancels the run it supersedes; pushes to main all finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Nothing is reused across jobs, and the artefacts are large.
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+      - run: rustup default stable
+      - name: Root workspace
+        run: cargo fmt --all --check
+      # `--all` stops at the workspace boundary, so the fuzz crate needs its
+      # own pass. bm-phy-adin2111 is formatted in the job that installs its
+      # pinned toolchain, below.
+      - name: Fuzz workspace
+        run: cargo fmt --all --check --manifest-path bm-wire/fuzz/Cargo.toml
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # bm-wire-sys compiles vendor/bm_core, which has submodules of its
+          # own -- tinycbor and mavlink are in the tier lists.
+          submodules: recursive
+      - name: libclang, for bindgen
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
+      - run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
+      - run: rustup default stable
+      - run: rustup target add thumbv8m.main-none-eabihf
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-clippy-
+      - name: Host
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The firmware view. The host lint above never compiles this cfg, and
+      # bare-metal is where bm-wire and bm-stack actually have to hold up.
+      - name: Cortex-M33
+        run: cargo clippy -p bm-wire -p bm-stack --target thumbv8m.main-none-eabihf --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: libclang, for bindgen
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - run: rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-test-
+      # The differential tests and every committed fuzz seed.
+      - name: Workspace
+        run: cargo test --workspace --locked
+      # bm-wire on its own, with `std` off, the way firmware gets it. The
+      # workspace run above always has it on, through bm-wire-diff.
+      - name: bm-wire, default features
+        run: cargo test -p bm-wire --locked
+      - name: Only libc left unresolved
+        run: ./bm-wire-sys/scripts/check_symbols.sh --check
+      # bm-wire-sys is left out on purpose: bindgen re-emits bm_core's own C
+      # comments as doc comments, bare URLs and all, and rustdoc is right to
+      # complain about prose this repo does not own.
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --all-features --locked -p bm-wire -p bm-stack -p bm-wire-diff
+
+  embedded:
+    name: bare-metal builds
+    runs-on: ubuntu-latest
+    # No submodules on purpose: if this job ever needs vendor/bm_core, the
+    # oracle has leaked into a crate that must build for firmware without it.
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - run: rustup default stable
+      - run: rustup target add thumbv7em-none-eabihf thumbv8m.main-none-eabihf
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-embedded-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-embedded-
+      - name: bm-wire (thumbv7em) -- no_std, alloc-free
+        run: cargo build -p bm-wire --target thumbv7em-none-eabihf --locked
+      - name: bm-wire (thumbv8m, the dev kit's Cortex-M33)
+        run: cargo build -p bm-wire --target thumbv8m.main-none-eabihf --locked
+      - name: bm-stack (thumbv8m)
+        run: cargo build -p bm-stack --target thumbv8m.main-none-eabihf --locked
+
+  invariants:
+    name: dependency invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - run: rustup default stable
+      # "zero dependencies" is a property of the crate, not an aspiration:
+      # `cargo tree` prints bm-wire and nothing else, in every configuration.
+      - name: bm-wire depends on nothing
+        run: |
+          for args in "" "--all-features"; do
+            tree=$(cargo tree --locked -p bm-wire $args)
+            if [ "$(printf '%s\n' "$tree" | wc -l)" -ne 1 ]; then
+              echo "::error::bm-wire grew a dependency (cargo tree $args):"
+              printf '%s\n' "$tree"
+              exit 1
+            fi
+          done
+      # The host-only oracle must never be reachable from a crate that ships.
+      - name: The oracle stays out of the firmware crates
+        run: |
+          status=0
+          for pkg in bm-wire bm-stack; do
+            if cargo tree --locked -p "$pkg" --all-features | grep -q 'bm-wire-sys'; then
+              echo "::error::$pkg reaches bm-wire-sys; the oracle would end up in firmware"
+              status=1
+            fi
+          done
+          exit $status
+
+  phy:
+    name: bm-phy-adin2111
+    runs-on: ubuntu-latest
+    # Its own workspace, its own toolchain pin, and git dependencies rather
+    # than crates.io ones -- so it needs network, and the root `cargo test`
+    # never touches it. See CLAUDE.md for why it is kept separate.
+    defaults:
+      run:
+        working-directory: bm-phy-adin2111
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "pinned channel: $channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy \
+            --target thumbv8m.main-none-eabihf --no-self-update
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            bm-phy-adin2111/target/
+          key: ${{ runner.os }}-cargo-phy-${{ hashFiles('bm-phy-adin2111/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-phy-
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --target thumbv8m.main-none-eabihf --locked

@@ -73,6 +73,9 @@ A cargo workspace.
     each links and runs.
   - `scripts/check_symbols.sh` — what `libbm_core.a` references but nothing
     defines. Everything left should be libc. Run it from the workspace root.
+    `--check` fails on anything outside its libc allowlist, which is what CI
+    runs; the allowlist deliberately omits `rand`, `time` and friends, so a
+    non-deterministic reach from `csrc/` trips it.
 - `docs/c-divergences.md` — the upstream bug list.
 - `docs/embassy-port-tracking-prompt.md` — a self-contained brief for a
   separate agent working in `embassy-rs/embassy`, to make
@@ -128,14 +131,22 @@ cargo build -p bm-stack --target thumbv8m.main-none-eabihf # the node, same targ
 cd bm-phy-adin2111 && cargo test                 # own workspace, needs network
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
 cargo tree -p bm-wire                            # must show no dependencies
-./bm-wire-sys/scripts/check_symbols.sh           # only libc may be unresolved
-cd bm-wire && cargo fuzz run <target> corpus/<target> seeds/<target>
+./bm-wire-sys/scripts/check_symbols.sh --check   # only libc may be unresolved
+cd bm-wire/fuzz && mkdir -p corpus/<target>      # libFuzzer wants it to exist
+cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 ```
 
-`cargo fuzz` needs nightly. `build.rs` adds `-fsanitize=address,undefined` to
-the C under `CARGO_CFG_FUZZING`, matching cargo-fuzz on the Rust side — so the
-fuzzers check the C for undefined behaviour as well as checking the port for
-divergence. That is how divergence #6 was found.
+CI runs all of this on every push; see `.github/workflows/`. Fuzzing is the
+exception — `cargo test` replays the committed seeds, and `fuzz.yml` does the
+open-ended runs nightly and on demand.
+
+`cargo fuzz` needs nightly, and wants `bm-wire/fuzz` as the working directory
+rather than `bm-wire`: cargo-fuzz finds the crate either way, but libFuzzer
+resolves the corpus paths against the shell's own directory. `build.rs` adds
+`-fsanitize=address,undefined` to the C under `CARGO_CFG_FUZZING`, matching
+cargo-fuzz on the Rust side — so the fuzzers check the C for undefined
+behaviour as well as checking the port for divergence. That is how divergence
+#6 was found.
 
 One UBSan check is deliberately off: `-fno-sanitize=alignment`. Every BCMP
 frame bm_core receives trips it, because `clear_ports_legacy` does a 32-bit
