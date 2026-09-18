@@ -1,0 +1,49 @@
+[package]
+name = "bm-phy-adin2111"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "bm-stack Phy for the ADIN2111 over OPEN Alliance TC6 SPI"
+
+# Its own workspace, like bm-wire/fuzz, and for a related reason: this crate
+# pins embassy to a git branch, and `embassy-time-driver` carries
+# `links = "embassy-time"`, so a git embassy and a crates.io embassy cannot
+# coexist in one dependency graph. Keeping the pin here means the main
+# workspace stays on released crates and `cargo test` at the root needs no
+# network. Verify this crate explicitly; see CLAUDE.md.
+[workspace]
+
+[dependencies]
+bm-stack = { path = "../bm-stack" }
+bm-wire = { path = "../bm-wire" }
+embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
+embedded-hal-async = "1.0"
+
+# TEMPORARY: per-port frame I/O is not in a released embassy-net-adin1110.
+# This is the head of embassy-rs/embassy#7024; move to a crates.io version
+# once it lands. Cargo.lock pins the exact commit, so `cargo update -p
+# embassy-net-adin1110` is what follows the PR as it is reviewed.
+[dependencies.embassy-net-adin1110]
+git = "https://github.com/towynlin/embassy"
+branch = "feat/adin2111-port-specific-txrx"
+default-features = false
+features = ["tc6", "packetmeta-id"]
+
+# The packet type the driver and this crate exchange. Must be the same source
+# and rev the driver uses, or there would be two incompatible `PacketBuf`s.
+[dependencies.xarxa-driver]
+git = "https://github.com/embassy-rs/xarxa"
+rev = "d26bf86997757e5bdb635a0eb42abcf6d6340293"
+features = ["async", "packetmeta-id"]
+
+# bm-stack depends on released embassy-time and embassy-futures; the driver
+# above brings the git ones. Only one crate may claim `links = "embassy-time"`,
+# so point everything at the git tree.
+[patch.crates-io]
+embassy-time = { git = "https://github.com/towynlin/embassy", branch = "feat/adin2111-port-specific-txrx" }
+embassy-futures = { git = "https://github.com/towynlin/embassy", branch = "feat/adin2111-port-specific-txrx" }
+
+[dev-dependencies]
+# The three a board would otherwise supply; see bm-stack's Cargo.toml.
+embassy-time = { version = "0.5", features = ["mock-driver", "generic-queue-8"] }
+critical-section = { version = "1", features = ["std"] }

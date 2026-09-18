@@ -61,6 +61,17 @@ pub const IP_PROTO_BCMP: u8 = 0xBC;
 /// IP protocol number for UDP.
 pub const IP_PROTO_UDP: u8 = 17;
 
+/// Offset of the UDP source-port field, immediately after the IPv6 header.
+pub const UDP_SOURCE_PORT_OFFSET: usize = IPV6_DESTINATION_ADDRESS_OFFSET + IPV6_ADDRESS_SIZE;
+/// Offset of the UDP destination-port field.
+pub const UDP_DESTINATION_PORT_OFFSET: usize = UDP_SOURCE_PORT_OFFSET + 2;
+/// Offset of the UDP length field.
+pub const UDP_LENGTH_OFFSET: usize = UDP_DESTINATION_PORT_OFFSET + 2;
+/// Offset of the UDP checksum field.
+pub const UDP_CHECKSUM_OFFSET: usize = UDP_LENGTH_OFFSET + 2;
+/// Size of a UDP header.
+pub const UDP_HEADER_LEN: usize = 8;
+
 /// Read the EtherType from a frame, or `None` if it is too short.
 #[must_use]
 pub fn ethernet_type(frame: &[u8]) -> Option<u16> {
@@ -81,6 +92,15 @@ mod tests {
         assert_eq!(IPV6_INGRESS_EGRESS_PORTS_OFFSET, 24);
         assert_eq!(IPV6_DESTINATION_ADDRESS_OFFSET, 38);
         assert_eq!(MIN_FRAME_WITH_ADDRESSES, 54);
+    }
+
+    #[test]
+    fn udp_offsets_match_the_c_macros() {
+        // udp_src_offset and friends in network/l2.c.
+        assert_eq!(UDP_SOURCE_PORT_OFFSET, 54);
+        assert_eq!(UDP_DESTINATION_PORT_OFFSET, 56);
+        assert_eq!(UDP_LENGTH_OFFSET, 58);
+        assert_eq!(UDP_CHECKSUM_OFFSET, 60);
     }
 
     #[test]

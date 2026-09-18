@@ -86,11 +86,7 @@ mod tiers {
     /// adin2111_network_device(), so it cannot be brought up on any device but
     /// the real PHY. csrc/bm_stack_shim.c mirrors its init sequence against
     /// the capture device instead, the same way bm_sbc's runtime does.
-    pub const T4: &[&str] = &[
-        "bcmp/dfu_core.c",
-        "bcmp/dfu_client.c",
-        "bcmp/dfu_host.c",
-    ];
+    pub const T4: &[&str] = &["bcmp/dfu_core.c", "bcmp/dfu_client.c", "bcmp/dfu_host.c"];
 
     /// Compiled on its own so the warning suppression the mavlink headers
     /// need does not have to be applied to bm_core's own code.
@@ -134,7 +130,6 @@ fn main() {
     ]
     .into_iter()
     .collect();
-
 
     // --- compile the C ---
     let mut build = bm_core_build(&module_dirs);
@@ -253,6 +248,17 @@ fn bm_core_build(includes: &[PathBuf]) -> cc::Build {
     if env::var("CARGO_CFG_FUZZING").is_ok() {
         build
             .flag("-fsanitize=address,undefined")
+            // clear_ports_legacy in bcmp/packet.c reads and writes a uint32_t
+            // at the IPv6 source address plus four -- frame offset 26, which
+            // is 2 mod 4 however the frame itself is aligned. So every BCMP
+            // frame bm_core receives trips the alignment check, and the fuzzer
+            // would abort on its first receive instead of finding anything.
+            //
+            // The misalignment is real and is divergence #11; it is recorded
+            // rather than sanitized for. Only this one check is dropped --
+            // shift-base, which found divergence #6, and every other UBSan
+            // check stay on, as does ASan.
+            .flag("-fno-sanitize=alignment")
             .flag("-fno-omit-frame-pointer");
     }
     build

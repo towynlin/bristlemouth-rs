@@ -70,3 +70,55 @@ path = "fuzz_targets/checksum.rs"
 test = false
 doc = false
 bench = false
+
+# Unlike most targets here this one drives stateful C: `packet.c` keeps a
+# file-scope registry that `bm_wire_diff::bcmp` brings up once per process.
+# Nothing accumulates between iterations, so the default in-process mode is
+# fine -- see the module docs for why, and why bm_shim_reset must not be
+# called here.
+[[bin]]
+name = "bcmp"
+path = "fuzz_targets/bcmp.rs"
+test = false
+doc = false
+bench = false
+
+# This one brings bm_core's whole stack up, once per process, and drives it
+# through the TX capture ring. Nothing accumulates between iterations by
+# construction -- the virtual clock never advances so no timer fires, the L2
+# queue is drained by each pump, and every buffer is freed -- so in-process
+# running should be fine. If a crash proves otherwise, `-fork=1` is the fix:
+# the stack's statics cannot be torn down, so a fresh process is the only way
+# to get a clean one. It must not share a process with the `bcmp` target;
+# see bm-wire-diff/src/l2_egress.rs for why.
+[[bin]]
+name = "l2_egress"
+path = "fuzz_targets/l2_egress.rs"
+test = false
+doc = false
+bench = false
+
+# Also stack-backed, and subject to the same rule: it must not share a process
+# with `bcmp`. It only ever hands bm_core well-formed requests -- see
+# divergence #14 for why a malformed reply must not be injected -- and drives
+# the decoders with the input's `decode_probe` bytes instead.
+[[bin]]
+name = "bcmp_messages"
+path = "fuzz_targets/bcmp_messages.rs"
+test = false
+doc = false
+bench = false
+
+# Stack-backed like the two above, and the one target here that genuinely
+# accumulates: every new neighbour makes bcmp_update_neighbor call
+# bcmp_request_info, which appends to INFO_REQUEST_LIST with no de-duplication
+# and no expiry (divergence #19). Bounded per iteration, unbounded across a
+# run, so give this one fork mode:
+#
+#   cargo fuzz run neighbor corpus/neighbor seeds/neighbor -- -fork=1
+[[bin]]
+name = "neighbor"
+path = "fuzz_targets/neighbor.rs"
+test = false
+doc = false
+bench = false

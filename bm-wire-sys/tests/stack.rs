@@ -23,7 +23,10 @@ fn tx_pop() -> Option<(u8, Vec<u8>)> {
         return None;
     }
     let len = len as usize;
-    assert!(len <= buf.len(), "captured frame truncated by the test buffer");
+    assert!(
+        len <= buf.len(),
+        "captured frame truncated by the test buffer"
+    );
     buf.truncate(len);
     Some((port, buf))
 }

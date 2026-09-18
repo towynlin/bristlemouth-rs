@@ -19,10 +19,15 @@
 //! A comparator must never be relaxed to paper over a real behavioural
 //! difference — narrow the *input domain* instead, and say why.
 
+pub mod bcmp;
+pub mod bcmp_messages;
 pub mod checksum;
 pub mod crc;
+pub mod l2_egress;
 pub mod l2_policy;
+pub mod neighbor;
 pub mod replay;
+pub mod stack;
 pub mod util;
 
 /// Inputs restricted to a domain where the C has defined behaviour.

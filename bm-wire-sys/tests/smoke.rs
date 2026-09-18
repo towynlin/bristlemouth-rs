@@ -256,7 +256,12 @@ fn packet_serializes_and_dispatches_a_heartbeat() {
 
     unsafe {
         assert_eq!(
-            packet_init(Some(get_src), Some(get_dst), Some(get_data), Some(zero_checksum)),
+            packet_init(
+                Some(get_src),
+                Some(get_dst),
+                Some(get_data),
+                Some(zero_checksum)
+            ),
             BmErr_BmOK
         );
         let mut cfg = BcmpPacketCfg {
@@ -468,12 +473,7 @@ fn sys_info_reply_survives_a_cbor_round_trip() {
     let mut encoded_len = 0usize;
     unsafe {
         assert_eq!(
-            sys_info_reply_encode(
-                &mut sent,
-                buf.as_mut_ptr(),
-                buf.len(),
-                &mut encoded_len
-            ),
+            sys_info_reply_encode(&mut sent, buf.as_mut_ptr(), buf.len(), &mut encoded_len),
             CborError_CborNoError
         );
         assert!(encoded_len > 0 && encoded_len <= buf.len());

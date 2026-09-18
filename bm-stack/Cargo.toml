@@ -1,0 +1,27 @@
+[package]
+name = "bm-stack"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Async Bristlemouth node runtime on embassy, built on bm-wire"
+
+[features]
+default = []
+# A PHY that captures what is transmitted and replays a script of receives.
+# Enabled for tests, and useful for bringing firmware up before the board is
+# on the bench.
+mock = ["embassy-time/mock-driver"]
+
+[dependencies]
+bm-wire = { path = "../bm-wire" }
+embassy-time = "0.5"
+embassy-futures = "0.1"
+
+[dev-dependencies]
+bm-stack = { path = ".", features = ["mock"] }
+# Host tests have to supply what a board otherwise would: a time driver (the
+# mock one, via the `mock` feature above), somewhere for embassy-time to keep
+# its pending timers, and a critical section. Firmware gets all three from its
+# HAL and its executor.
+embassy-time = { version = "0.5", features = ["generic-queue-8"] }
+critical-section = { version = "1", features = ["std"] }

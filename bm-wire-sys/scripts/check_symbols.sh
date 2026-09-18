@@ -7,7 +7,7 @@
 set -euo pipefail
 export LC_ALL=C
 
-archive=$(ls -t target/debug/build/bm-wire-sys/*/out/libbm_core.a | head -1)
+archive=$(ls -t target/debug/build/bm-wire-sys-*/out/libbm_core.a | head -1)
 echo "archive: $archive"
 
 defined=$(nm --defined-only "$archive" | awk '{print $NF}' | sort -u)

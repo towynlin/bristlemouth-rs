@@ -67,6 +67,20 @@ pub fn replay_target(target: &str) -> usize {
             "l2_policy" => replay_one::<crate::l2_policy::L2PolicyInput, _>(&bytes, |i| {
                 crate::l2_policy::check(i);
             }),
+            "bcmp" => replay_one::<crate::bcmp::BcmpInput, _>(&bytes, |i| {
+                crate::bcmp::check(i);
+            }),
+            "bcmp_messages" => {
+                replay_one::<crate::bcmp_messages::BcmpMessagesInput, _>(&bytes, |i| {
+                    crate::bcmp_messages::check(i);
+                })
+            }
+            "neighbor" => replay_one::<crate::neighbor::NeighborInput, _>(&bytes, |i| {
+                crate::neighbor::check(i);
+            }),
+            "l2_egress" => replay_one::<crate::l2_egress::L2EgressInput, _>(&bytes, |i| {
+                crate::l2_egress::check(i);
+            }),
             "checksum" => replay_one::<crate::checksum::ChecksumInput, _>(&bytes, |i| {
                 crate::checksum::check(i);
             }),
@@ -92,9 +106,11 @@ pub fn replay_target(target: &str) -> usize {
     count
 }
 
-/// Every fuzz target that has a seeds directory.
+/// Fuzz targets whose comparators are safe to replay in one process, together,
+/// in any order.
 pub const TARGETS: &[&str] = &[
     "addr",
+    "bcmp",
     "checksum",
     "crc",
     "date_time",
@@ -104,9 +120,63 @@ pub const TARGETS: &[&str] = &[
     "wildcard",
 ];
 
+/// Fuzz targets that bring bm_core's stack up and so need a process to
+/// themselves.
+///
+/// `bm_shim_stack_init` calls `packet_init` with `bm_linux.c`'s accessors,
+/// while [`crate::bcmp`] calls it with its own; whichever runs second wins.
+/// Anything listed here is replayed from its own integration test binary, not
+/// from the library test binary that walks [`TARGETS`].
+pub const STACK_TARGETS: &[&str] = &["bcmp_messages", "l2_egress", "neighbor"];
+
+/// Every seeds directory on disk, so a new one cannot be added without being
+/// assigned to one of the two lists.
+#[cfg(test)]
+fn seed_directories() -> Vec<String> {
+    let mut found: Vec<String> = std::fs::read_dir(seeds_dir())
+        .expect("the seeds directory exists")
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    found.sort();
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A seeds directory listed in neither target list would silently never
+    /// replay, which is the one failure mode this whole file exists to avoid.
+    #[test]
+    fn every_seeds_directory_is_assigned_to_exactly_one_list() {
+        for dir in seed_directories() {
+            let in_targets = TARGETS.contains(&dir.as_str());
+            let in_stack = STACK_TARGETS.contains(&dir.as_str());
+            assert!(
+                in_targets ^ in_stack,
+                "seeds/{dir} is in {} of TARGETS and STACK_TARGETS; it must be in exactly one",
+                usize::from(in_targets) + usize::from(in_stack)
+            );
+        }
+    }
+
+    /// Each stack target needs its own process, so each has its own test
+    /// binary that replays it. A target without one would never be replayed.
+    #[test]
+    fn every_stack_target_has_a_test_binary() {
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+        for target in STACK_TARGETS {
+            let file = tests.join(format!("{target}.rs"));
+            assert!(
+                file.is_file(),
+                "STACK_TARGETS names {target}, but {} does not exist; \
+                 a stack target needs its own test binary to be replayed in",
+                file.display()
+            );
+        }
+    }
 
     #[test]
     fn every_committed_seed_still_agrees_with_the_c() {
