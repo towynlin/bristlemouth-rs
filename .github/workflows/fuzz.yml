@@ -1,0 +1,113 @@
+# The differential fuzzers, run for real rather than only replayed.
+#
+# `cargo test` already replays every committed seed on each push, so this is
+# about finding new inputs: each target gets a slice of wall clock nightly,
+# and anything that crashes comes back as an artefact to minimise with
+# `cargo fuzz tmin` and commit into bm-wire/fuzz/seeds/.
+#
+# It also builds the C with -fsanitize=address,undefined (build.rs does that
+# under CARGO_CFG_FUZZING), so these runs check bm_core for undefined
+# behaviour as well as checking the port for divergence.
+name: Fuzz
+
+on:
+  schedule:
+    # 04:17 UTC, off the hour so it is not queued behind everyone else's cron.
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Wall clock per target, in seconds
+        required: false
+        default: '300'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - addr
+          - bcmp
+          - bcmp_messages
+          - checksum
+          - crc
+          - date_time
+          - l2_egress
+          - l2_policy
+          - neighbor
+          - strnlen
+          - time_remaining
+          - wildcard
+        include:
+          # The one target that genuinely accumulates: every new neighbour
+          # appends to INFO_REQUEST_LIST, which has no de-duplication and no
+          # expiry (divergence #19). Bounded per iteration, unbounded across a
+          # run, so it gets a fresh process per input.
+          - target: neighbor
+            libfuzzer_args: '-fork=1'
+    defaults:
+      run:
+        # cargo-fuzz finds the fuzz crate by walking up for a fuzz/ directory,
+        # and libFuzzer resolves corpus paths against the process's own cwd --
+        # so run from inside the fuzz crate and both agree.
+        working-directory: bm-wire/fuzz
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: libclang, for bindgen
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
+      # cargo-fuzz needs nightly: the sanitizer flags on the Rust side are
+      # nightly-only, and build.rs matches them on the C side.
+      - run: rustup toolchain install nightly --profile minimal --no-self-update
+      - run: rustup default nightly
+      - name: Cache cargo-fuzz
+        id: cargo-fuzz
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          # Bump the suffix to force a rebuild of the tool itself.
+          key: ${{ runner.os }}-cargo-fuzz-bin-v1
+      - if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install cargo-fuzz --locked
+        working-directory: .
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            bm-wire/fuzz/target/
+          key: ${{ runner.os }}-cargo-fuzz-${{ matrix.target }}-${{ hashFiles('bm-wire/fuzz/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-fuzz-${{ matrix.target }}-
+      - name: Fuzz
+        run: |
+          # libFuzzer refuses to start if the corpus directory is missing, and
+          # fuzz/corpus is gitignored -- the durable inputs live in seeds/.
+          mkdir -p corpus/${{ matrix.target }}
+          cargo fuzz run ${{ matrix.target }} \
+            corpus/${{ matrix.target }} seeds/${{ matrix.target }} \
+            -- -max_total_time=${{ github.event.inputs.seconds || '300' }} \
+            ${{ matrix.libfuzzer_args }}
+      - name: Keep what crashed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: bm-wire/fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

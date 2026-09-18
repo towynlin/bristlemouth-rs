@@ -2,6 +2,7 @@
 name = "bm-wire"
 version = "0.1.0"
 edition = "2024"
+rust-version.workspace = true
 description = "Pure, safe, no_std Rust port of bm_core's wire format"
 
 [features]

@@ -1,0 +1,54 @@
+# RustSec advisories against the three committed lockfiles.
+#
+# bm-wire itself has no dependencies to advise on -- that is enforced in
+# ci.yml -- so this is about the host-side build: bindgen, cc, arbitrary,
+# libfuzzer-sys, and the embassy tree bm-stack and the PHY pull in.
+name: Audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - '**/Cargo.lock'
+      - '.github/workflows/audit.yml'
+  schedule:
+    # Advisories land whether or not anyone touches a lockfile.
+    - cron: '41 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+      - run: rustup default stable
+      - name: Cache cargo-audit
+        id: cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          # Bump the suffix to force a rebuild of the tool itself.
+          key: ${{ runner.os }}-cargo-audit-bin-v1
+      - if: steps.cargo-audit.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked
+      # One per workspace: each has its own lockfile, and the fuzz and PHY
+      # ones are not reachable from the root.
+      - run: cargo audit --file Cargo.lock
+      - run: cargo audit --file bm-wire/fuzz/Cargo.lock
+      - run: cargo audit --file bm-phy-adin2111/Cargo.lock

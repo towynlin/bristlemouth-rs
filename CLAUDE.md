@@ -52,8 +52,8 @@ A cargo workspace.
   a crates.io embassy cannot coexist in one dependency graph; and it needs
   **toolchain 1.97**, pinned by its own `rust-toolchain.toml`, because
   `xarxa-driver` uses `cfg_select!`. Keeping both here means the main workspace
-  stays on released crates and older stable, and `cargo test` at the root needs
-  no network. It is not built by the root `cargo test`; verify it explicitly.
+  stays on released crates, and `cargo test` at the root needs no network. It
+  is not built by the root `cargo test`; verify it explicitly.
   Note that the driver's `Runner` must be spawned by the firmware — it owns the
   SPI bus, and until it runs no frame moves.
 - `bm-wire-diff/` — the differential harness. Host-only, depends on the other
@@ -73,6 +73,9 @@ A cargo workspace.
     each links and runs.
   - `scripts/check_symbols.sh` — what `libbm_core.a` references but nothing
     defines. Everything left should be libc. Run it from the workspace root.
+    `--check` fails on anything outside its libc allowlist, which is what CI
+    runs; the allowlist deliberately omits `rand`, `time` and friends, so a
+    non-deterministic reach from `csrc/` trips it.
 - `docs/c-divergences.md` — the upstream bug list.
 - `docs/embassy-port-tracking-prompt.md` — a self-contained brief for a
   separate agent working in `embassy-rs/embassy`, to make
@@ -127,15 +130,31 @@ cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Corte
 cargo build -p bm-stack --target thumbv8m.main-none-eabihf # the node, same target
 cd bm-phy-adin2111 && cargo test                 # own workspace, needs network
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
+cargo +1.97 check --workspace --all-targets      # the declared MSRV
 cargo tree -p bm-wire                            # must show no dependencies
-./bm-wire-sys/scripts/check_symbols.sh           # only libc may be unresolved
-cd bm-wire && cargo fuzz run <target> corpus/<target> seeds/<target>
+./bm-wire-sys/scripts/check_symbols.sh --check   # only libc may be unresolved
+cd bm-wire/fuzz && mkdir -p corpus/<target>      # libFuzzer wants it to exist
+cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 ```
 
-`cargo fuzz` needs nightly. `build.rs` adds `-fsanitize=address,undefined` to
-the C under `CARGO_CFG_FUZZING`, matching cargo-fuzz on the Rust side — so the
-fuzzers check the C for undefined behaviour as well as checking the port for
-divergence. That is how divergence #6 was found.
+The MSRV is 1.97, declared once in `[workspace.package]` and repeated in
+bm-phy-adin2111's own manifest. It is embassy's number, not one of ours:
+embassy's README promises only that it compiles on the latest stable, and
+`bm-stack` depends on embassy-time, so 1.97 — the channel embassy's
+`rust-toolchain.toml` pins, and the oldest stable it actually tests — is the
+most this repo can honestly claim. Bump both manifests when embassy bumps.
+
+CI runs all of this on every push; see `.github/workflows/`. Fuzzing is the
+exception — `cargo test` replays the committed seeds, and `fuzz.yml` does the
+open-ended runs nightly and on demand.
+
+`cargo fuzz` needs nightly, and wants `bm-wire/fuzz` as the working directory
+rather than `bm-wire`: cargo-fuzz finds the crate either way, but libFuzzer
+resolves the corpus paths against the shell's own directory. `build.rs` adds
+`-fsanitize=address,undefined` to the C under `CARGO_CFG_FUZZING`, matching
+cargo-fuzz on the Rust side — so the fuzzers check the C for undefined
+behaviour as well as checking the port for divergence. That is how divergence
+#6 was found.
 
 One UBSan check is deliberately off: `-fno-sanitize=alignment`. Every BCMP
 frame bm_core receives trips it, because `clear_ports_legacy` does a 32-bit
