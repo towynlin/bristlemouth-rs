@@ -77,6 +77,11 @@ A cargo workspace.
     runs; the allowlist deliberately omits `rand`, `time` and friends, so a
     non-deterministic reach from `csrc/` trips it.
 - `docs/c-divergences.md` — the upstream bug list.
+- `docs/bcmp-port-todo.md` — what of BCMP is still unported, as
+  dependency-ordered task cards sized for one agent each. Read its shared
+  contract before starting a card: it records the constraints that are easy
+  to get wrong, including why `bm_core`'s gtest suite is not the source of
+  gold vectors most of the recipe assumes.
 - `docs/embassy-port-tracking-prompt.md` — a self-contained brief for a
   separate agent working in `embassy-rs/embassy`, to make
   `embassy-net-adin1110` report the ingress port and take an egress port per
