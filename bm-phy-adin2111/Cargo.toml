@@ -2,6 +2,9 @@
 name = "bm-phy-adin2111"
 version = "0.1.0"
 edition = "2024"
+# Its own workspace, so it repeats what the root one says. Same number, and
+# here it is a hard floor rather than a policy: `cfg_select!` is 1.97.
+rust-version = "1.97"
 publish = false
 description = "bm-stack Phy for the ADIN2111 over OPEN Alliance TC6 SPI"
 

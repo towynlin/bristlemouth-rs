@@ -135,6 +135,39 @@ jobs:
       - name: bm-stack (thumbv8m)
         run: cargo build -p bm-stack --target thumbv8m.main-none-eabihf --locked
 
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    # The floor `rust-version` declares, checked rather than asserted. The
+    # other jobs run on latest stable, which is what embassy's README actually
+    # promises; this one is what notices when a dependency outgrows the number
+    # in the manifest. bm-phy-adin2111 needs no entry here -- its
+    # rust-toolchain.toml already pins that same version, so its job below is
+    # its own MSRV check.
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+      - name: libclang, for bindgen
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
+      - name: Install the toolchain rust-version names
+        id: msrv
+        run: |
+          msrv=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
+          echo "declared MSRV: $msrv"
+          rustup toolchain install "$msrv" --profile minimal --no-self-update
+          echo "toolchain=$msrv" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-msrv-
+      - run: cargo +${{ steps.msrv.outputs.toolchain }} check --workspace --all-targets --locked
+
   invariants:
     name: dependency invariants
     runs-on: ubuntu-latest

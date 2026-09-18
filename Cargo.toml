@@ -1,3 +1,12 @@
 [workspace]
 resolver = "3"
 members = ["bm-stack", "bm-wire", "bm-wire-diff", "bm-wire-sys"]
+
+[workspace.package]
+# Embassy's README promises only that it compiles on the latest stable, and
+# `bm-stack` depends on embassy-time, so this repo cannot promise more. The
+# number is the channel embassy's own rust-toolchain.toml pins -- the oldest
+# stable embassy actually tests on, and the one bm-phy-adin2111 already
+# requires for `cfg_select!`. Bump it when embassy bumps; CI's `msrv` job is
+# what notices.
+rust-version = "1.97"

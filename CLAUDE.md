@@ -52,8 +52,8 @@ A cargo workspace.
   a crates.io embassy cannot coexist in one dependency graph; and it needs
   **toolchain 1.97**, pinned by its own `rust-toolchain.toml`, because
   `xarxa-driver` uses `cfg_select!`. Keeping both here means the main workspace
-  stays on released crates and older stable, and `cargo test` at the root needs
-  no network. It is not built by the root `cargo test`; verify it explicitly.
+  stays on released crates, and `cargo test` at the root needs no network. It
+  is not built by the root `cargo test`; verify it explicitly.
   Note that the driver's `Runner` must be spawned by the firmware — it owns the
   SPI bus, and until it runs no frame moves.
 - `bm-wire-diff/` — the differential harness. Host-only, depends on the other
@@ -130,11 +130,19 @@ cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Corte
 cargo build -p bm-stack --target thumbv8m.main-none-eabihf # the node, same target
 cd bm-phy-adin2111 && cargo test                 # own workspace, needs network
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
+cargo +1.97 check --workspace --all-targets      # the declared MSRV
 cargo tree -p bm-wire                            # must show no dependencies
 ./bm-wire-sys/scripts/check_symbols.sh --check   # only libc may be unresolved
 cd bm-wire/fuzz && mkdir -p corpus/<target>      # libFuzzer wants it to exist
 cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 ```
+
+The MSRV is 1.97, declared once in `[workspace.package]` and repeated in
+bm-phy-adin2111's own manifest. It is embassy's number, not one of ours:
+embassy's README promises only that it compiles on the latest stable, and
+`bm-stack` depends on embassy-time, so 1.97 — the channel embassy's
+`rust-toolchain.toml` pins, and the oldest stable it actually tests — is the
+most this repo can honestly claim. Bump both manifests when embassy bumps.
 
 CI runs all of this on every push; see `.github/workflows/`. Fuzzing is the
 exception — `cargo test` replays the committed seeds, and `fuzz.yml` does the
