@@ -19,6 +19,7 @@ dependencies = [
  "embassy-time",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
+ "xarxa-driver",
 ]
 
 [[package]]
@@ -64,7 +65,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor-timer-queue"
 version = "0.1.1"
-source = "git+https://github.com/towynlin/embassy?branch=claude%2Fadin2111-per-port-io-gzzrnm#f373d54816a3fb4628f0ec9bb3f88626f6627a9d"
+source = "git+https://github.com/towynlin/embassy?branch=feat%2Fadin2111-port-specific-txrx#afcd4bb79e991c89cdda95c7def7e86212f6c2f2"
 dependencies = [
  "unitrait",
 ]
@@ -72,12 +73,12 @@ dependencies = [
 [[package]]
 name = "embassy-futures"
 version = "0.1.2"
-source = "git+https://github.com/towynlin/embassy?branch=claude%2Fadin2111-per-port-io-gzzrnm#f373d54816a3fb4628f0ec9bb3f88626f6627a9d"
+source = "git+https://github.com/towynlin/embassy?branch=feat%2Fadin2111-port-specific-txrx#afcd4bb79e991c89cdda95c7def7e86212f6c2f2"
 
 [[package]]
 name = "embassy-net-adin1110"
 version = "0.4.0"
-source = "git+https://github.com/towynlin/embassy?branch=claude%2Fadin2111-per-port-io-gzzrnm#f373d54816a3fb4628f0ec9bb3f88626f6627a9d"
+source = "git+https://github.com/towynlin/embassy?branch=feat%2Fadin2111-port-specific-txrx#afcd4bb79e991c89cdda95c7def7e86212f6c2f2"
 dependencies = [
  "bitfield",
  "embassy-futures",
@@ -87,27 +88,23 @@ dependencies = [
  "embedded-hal-async",
  "embedded-hal-bus",
  "heapless",
+ "xarxa-driver",
 ]
-
-[[package]]
-name = "embassy-net-driver"
-version = "0.2.0"
-source = "git+https://github.com/towynlin/embassy?branch=claude%2Fadin2111-per-port-io-gzzrnm#f373d54816a3fb4628f0ec9bb3f88626f6627a9d"
 
 [[package]]
 name = "embassy-net-driver-channel"
 version = "0.4.0"
-source = "git+https://github.com/towynlin/embassy?branch=claude%2Fadin2111-per-port-io-gzzrnm#f373d54816a3fb4628f0ec9bb3f88626f6627a9d"
+source = "git+https://github.com/towynlin/embassy?branch=feat%2Fadin2111-port-specific-txrx#afcd4bb79e991c89cdda95c7def7e86212f6c2f2"
 dependencies = [
  "embassy-futures",
- "embassy-net-driver",
  "embassy-sync",
+ "xarxa-driver",
 ]
 
 [[package]]
 name = "embassy-sync"
 version = "0.8.0"
-source = "git+https://github.com/towynlin/embassy?branch=claude%2Fadin2111-per-port-io-gzzrnm#f373d54816a3fb4628f0ec9bb3f88626f6627a9d"
+source = "git+https://github.com/towynlin/embassy?branch=feat%2Fadin2111-port-specific-txrx#afcd4bb79e991c89cdda95c7def7e86212f6c2f2"
 dependencies = [
  "cfg-if",
  "critical-section",
@@ -120,7 +117,7 @@ dependencies = [
 [[package]]
 name = "embassy-time"
 version = "0.5.1"
-source = "git+https://github.com/towynlin/embassy?branch=claude%2Fadin2111-per-port-io-gzzrnm#f373d54816a3fb4628f0ec9bb3f88626f6627a9d"
+source = "git+https://github.com/towynlin/embassy?branch=feat%2Fadin2111-port-specific-txrx#afcd4bb79e991c89cdda95c7def7e86212f6c2f2"
 dependencies = [
  "cfg-if",
  "critical-section",
@@ -136,7 +133,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-driver"
 version = "0.2.2"
-source = "git+https://github.com/towynlin/embassy?branch=claude%2Fadin2111-per-port-io-gzzrnm#f373d54816a3fb4628f0ec9bb3f88626f6627a9d"
+source = "git+https://github.com/towynlin/embassy?branch=feat%2Fadin2111-port-specific-txrx#afcd4bb79e991c89cdda95c7def7e86212f6c2f2"
 dependencies = [
  "document-features",
 ]
@@ -144,7 +141,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-queue-utils"
 version = "0.3.2"
-source = "git+https://github.com/towynlin/embassy?branch=claude%2Fadin2111-per-port-io-gzzrnm#f373d54816a3fb4628f0ec9bb3f88626f6627a9d"
+source = "git+https://github.com/towynlin/embassy?branch=feat%2Fadin2111-port-specific-txrx#afcd4bb79e991c89cdda95c7def7e86212f6c2f2"
 dependencies = [
  "embassy-executor-timer-queue",
  "heapless",
@@ -296,18 +293,16 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "unitrait"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e1e3ee3aa62b245f34e2e52292a7dc2f97716f8d95f3ab384a6d9b19244ccdd"
+version = "2.0.0"
+source = "git+https://github.com/embassy-rs/unitrait?rev=bb96601b3d293fa27d1ca2891f6ea148e534e433#bb96601b3d293fa27d1ca2891f6ea148e534e433"
 dependencies = [
  "unitrait-macros",
 ]
 
 [[package]]
 name = "unitrait-macros"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0707a2f7725395e3c1a4ef68ba9c02b7253c9e8f45045d791bf2056e965ab14"
+version = "2.0.0"
+source = "git+https://github.com/embassy-rs/unitrait?rev=bb96601b3d293fa27d1ca2891f6ea148e534e433#bb96601b3d293fa27d1ca2891f6ea148e534e433"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -319,3 +314,12 @@ name = "void"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
+
+[[package]]
+name = "xarxa-driver"
+version = "0.1.0"
+source = "git+https://github.com/embassy-rs/xarxa?rev=d26bf86997757e5bdb635a0eb42abcf6d6340293#d26bf86997757e5bdb635a0eb42abcf6d6340293"
+dependencies = [
+ "critical-section",
+ "document-features",
+]

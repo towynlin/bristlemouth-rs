@@ -44,12 +44,18 @@ A cargo workspace.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock, so
     the real `run` loop can be tested with no hardware.
 - `bm-phy-adin2111/` — [`bm_stack::Phy`] for the ADIN2111 over OPEN Alliance
-  TC6 SPI. **Its own workspace**, like `bm-wire/fuzz`, because it pins embassy
-  to a git branch: `embassy-time-driver` carries `links = "embassy-time"`, so a
-  git embassy and a crates.io embassy cannot coexist in one dependency graph.
-  Keeping the pin here means the main workspace stays on released crates and
-  `cargo test` at the root needs no network. It is not built by the root
-  `cargo test`; verify it explicitly.
+  TC6 SPI, on the per-port frame I/O of
+  [embassy-rs/embassy#7024](https://github.com/embassy-rs/embassy/pull/7024).
+  The port of each frame rides in `PacketMeta::id`. **Its own workspace**, like
+  `bm-wire/fuzz`, for two reasons: it pins embassy to a git branch, and
+  `embassy-time-driver` carries `links = "embassy-time"`, so a git embassy and
+  a crates.io embassy cannot coexist in one dependency graph; and it needs
+  **toolchain 1.97**, pinned by its own `rust-toolchain.toml`, because
+  `xarxa-driver` uses `cfg_select!`. Keeping both here means the main workspace
+  stays on released crates and older stable, and `cargo test` at the root needs
+  no network. It is not built by the root `cargo test`; verify it explicitly.
+  Note that the driver's `Runner` must be spawned by the firmware — it owns the
+  SPI bus, and until it runs no frame moves.
 - `bm-wire-diff/` — the differential harness. Host-only, depends on the other
   three crates. One comparator per surface, shared by the fuzz targets and by
   ordinary `#[test]`s.

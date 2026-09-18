@@ -1,0 +1,7 @@
+# `xarxa-driver`, which the driver's `packetmeta-id` feature pulls in, uses
+# `cfg_select!`. That is stable from 1.97, and the rest of the repo builds on
+# older stable, so the pin is scoped to this workspace rather than the root.
+# It matches the channel embassy itself pins.
+[toolchain]
+channel = "1.97"
+targets = ["thumbv8m.main-none-eabihf"]
