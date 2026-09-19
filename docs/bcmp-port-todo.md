@@ -6,10 +6,10 @@ agent each.
 `bm-wire` currently carries three of BCMP's exchanges — heartbeat (`0x01`),
 device info (`0x04`/`0x05`, responder only) and neighbour table (`0x08`/`0x09`,
 responder only) — plus the wire engine under them (`bcmp::tx::serialize`,
-`bcmp::rx::accept`, L2 egress stamping, the link-local RX policy) and one state
-machine, `bm-wire/src/neighbor.rs`. `MessageType` in `bm-wire/src/bcmp/header.rs`
-already names all 45 of bm_core's constants, but only five body structs have a
-codec.
+`bcmp::rx::accept`, L2 egress stamping, the link-local RX policy) and two state
+machines, `bm-wire/src/neighbor.rs` and `bm-wire/src/bcmp/registry.rs`.
+`MessageType` in `bm-wire/src/bcmp/header.rs` already names all 45 of bm_core's
+constants, but only five body structs have a codec.
 
 Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
 
@@ -17,7 +17,6 @@ Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| Packet registry + sequence machinery | `bcmp/packet.c` (partially ported) | 578 | I1 |
 | Link-local forwarding | `bcmp/bcmp.c` `bcmp_ll_forward` | — | I2 |
 | Reply routing in `Node` | — (Rust-side plumbing) | — | I3 |
 | Echo / ping `0x02`,`0x03` | `bcmp/ping.c` | 176 | M1 |
@@ -33,9 +32,9 @@ Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-Dependency order: I1 and I2 and C1 and D1 are unblocked and may run in parallel.
-I3 needs I1. M1/M3/M4 need I3. M2 needs I2. M5 needs I3. C2 needs C1. C3 needs
-I1, I2, C1, C2. D2 needs D1; D3 and D4 each need D2.
+Dependency order: I2 and I3 and C1 and D1 are unblocked and may run in
+parallel. M1/M3/M4 need I3. M2 needs I2. M5 needs I3. C2 needs C1. C3 needs I2,
+C1, C2. D2 needs D1; D3 and D4 each need D2.
 
 ---
 
@@ -179,48 +178,6 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 
 # Infrastructure
 
-## I1 — packet registry and sequence machinery
-
-**Blocked by:** nothing.
-
-**C source.** `bcmp/packet.c` (578 LoC). `bcmp::tx`/`bcmp::rx` already port
-`serialize` and `process_received_message` as pure functions; what is missing is
-the state that sits around them:
-
-- the type→cfg registry (`packet_add`/`packet_remove`, a linked list);
-- `static uint32_t message_count`, the global outgoing sequence counter,
-  incremented **only** for `sequenced_request` types;
-- the `sequence_list` of `BcmpRequestElement`, guarded by a semaphore taken with
-  a 24 ms timeout;
-- the expiry timer, `message_timer_expiry_period_ms = 150` at `packet.c:12`,
-  against `default_message_timeout_ms = 24` at `packet.c:11`;
-- the **`cb(NULL)` means timed out** contract — the expiry path invokes the
-  caller's `BcmpSequencedRequestCb` with a null payload. A Rust port needs the
-  same contract, expressed as an `Option` or a distinct variant.
-
-**Rust to create.** `bm-wire/src/bcmp/registry.rs`, sans-io per `CLAUDE.md`:
-entry points take the current time and return what the caller owes the network
-and which requests expired. `bm-wire/src/neighbor.rs` is the shape to copy.
-Fixed capacity, no alloc.
-
-**Comparator and fuzz target.** New `bm-wire-diff/src/registry.rs` driving
-scripted register/serialize/receive/advance sequences. This touches `PACKET`
-state, so it belongs with the stack targets: its own `bm-wire-diff/tests/`
-binary, seeds in `replay::STACK_TARGETS`. Add `registry` to the matrix in
-`.github/workflows/fuzz.yml`.
-
-**Quirk to write up.** `default_message_timeout_ms` is 24 ms. A BCMP round trip
-across two ADIN2111 hops plausibly exceeds that, which would mean a sequenced
-reply routinely arrives after its sequence entry has already been expired with
-`cb(NULL)`. If the comparator confirms it, this is a divergence entry with real
-consequences for C3 — bm_core's config-over-BCMP may be unusable on a live link.
-Measure it; do not assert it from the constant alone.
-
-**Done when.** The comparator agrees with the C on which sequence entries exist
-and when they expire, for scripted sequences including the timeout boundary; the
-fuzz target runs clean; the timeout finding is either recorded in
-`docs/c-divergences.md` or explicitly refuted in the card's commit message.
-
 ## I2 — link-local forwarding
 
 **Blocked by:** nothing.
@@ -257,19 +214,30 @@ gains a multi-port relay case.
 
 ## I3 — request/reply routing in `Node`
 
-**Blocked by:** I1.
+**Blocked by:** nothing — I1 landed, and `bm_wire::bcmp::registry::Registry`
+is the table this card puts inside `Node`.
 
 **The gap.** `bm-stack/src/node.rs` handles requests and drops replies: a
 received `DEVICE_INFO_REPLY` falls through the `_ => None` arm of `on_frame`.
 There is nowhere for a reply to land, so M1, M3, M4 and M5 have no home.
 
-**Rust to create.** On top of I1's registry, a pending-request table in `Node`
-plus reply routing in `on_frame`, and the expiry sweep in `on_tick`. Fixed
-capacity, no alloc, generic over the node's neighbour count as `Node` already is.
+**Rust to create.** On top of I1's `Registry`, reply routing in `on_frame` and
+the expiry sweep in `on_tick`. Fixed capacity, no alloc, generic over the
+node's neighbour count as `Node` already is. `Registry::on_tick` carries the
+C's 150 ms sweep phase itself, so `Node::on_tick` only has to call it at least
+that often — it must not schedule the expiry on a grid of its own, or the port
+will give up on requests at different moments from a C node. See divergence
+#22.
 
 **Done when.** `Node` can issue a request, match its reply, and time it out;
 `bm-stack/tests/node.rs` covers all three paths against the mock PHY and mock
 clock.
+
+Note the two shapes I1's comparator found, because `Node` inherits both: a
+reply is matched on its sequence number alone, so a reply of the wrong type
+answers the request (divergence #21), and a request whose reply arrives after
+the sweep is reported to the application twice — once as a timeout with no
+payload, then again as an unsolicited message (divergence #22).
 
 ---
 
@@ -420,7 +388,7 @@ table's add/find behaviour matches the C under a scripted comparator.
 
 ## C1 — a `no_std`, alloc-free CBOR codec
 
-**Blocked by:** nothing. Schedulable in parallel with I1 and I2.
+**Blocked by:** nothing. Schedulable in parallel with I2 and I3.
 
 **Why this card exists at all.** Config values are CBOR-encoded, and `bm-wire`
 may not take a dependency. There is no way to port C3 without first having a
@@ -466,7 +434,7 @@ same corrupt images.
 
 ## C3 — config over BCMP, `0xA0`–`0xA9`
 
-**Blocked by:** I1, I2, C1, C2.
+**Blocked by:** I2, C1, C2.
 
 **C source.** `bcmp/config.c` (857 LoC), one handler
 (`bcmp_process_config_message`) for all ten types.
@@ -501,7 +469,9 @@ The flags, from the positional initializers at `config.c:789-835`
   than one key walks off into hyperspace. Confirm the exact consequence against
   the oracle and record it.
 - Messages not addressed to this node are forwarded — hence the I2 dependency.
-- Whatever I1 concludes about the 24 ms timeout applies here first and hardest.
+- Divergence #22 applies here first and hardest: a sequenced request's real
+  timeout is the 150 ms sweep it lands before, anywhere from 25 ms to 174 ms,
+  and the ten messages below are the only ones in bm_core that use it.
 
 **Test coverage to expect.** `config_test.cpp` has exactly two cases — `decode`
 and `ClearPartitionRequest`. Eight of the ten messages have no C test at all, so

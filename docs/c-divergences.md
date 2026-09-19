@@ -43,6 +43,9 @@ Status values:
 | 17 | A new neighbour is announced to the application twice | replicated | reading, confirmed differentially |
 | 18 | A node id of zero is never recognised, so its node is rediscovered forever | replicated | reading, confirmed differentially |
 | 19 | `INFO_REQUEST_LIST` grows without de-duplication or expiry | c-only | reading |
+| 20 | `ll_remove` leaves `LL::tail` pointing at a freed node | domain-limited | reading, then modelled to stay out of it |
+| 21 | A sequenced reply is matched on its sequence number alone, never its type | replicated | reading, confirmed differentially |
+| 22 | A sequenced request's timeout is the 150 ms sweep, not the 24 ms constant | replicated | reading, then measured |
 
 ---
 
@@ -711,3 +714,181 @@ runtime owns any bookkeeping. The fix upstream is to de-duplicate on the id in
 This is also why the `neighbor` fuzz target needs `-fork=1`: the growth is
 bounded per iteration but not across a run.
 
+## 20. `ll_remove` leaves `LL::tail` pointing at a freed node
+
+`common/ll.c` keeps `LL` doubly linked, but only `next` is maintained on
+removal. `ll_remove`:
+
+```c
+    if (current) {
+      if (current == ll->head) {
+        ll->head = current->next;
+        if (current == ll->tail) {
+          ll->tail = NULL;
+        }
+      } else {
+        ret = BmOK;
+        if (current == ll->tail) {
+          ll->tail = current->previous;
+        }
+        previous->next = current->next;
+      }
+      ret = ll_delete_item(current);
+    }
+```
+
+Two omissions, one of which bites:
+
+* removing the head does not clear the new head's `previous`, which is
+  harmless — the only read of `previous` is in the tail branch, and a node that
+  is the head takes the head branch first;
+* removing a node from the **middle** does not fix up the `previous` of the
+  node that follows it. That node's `previous` now points at freed memory, and
+  if it is later removed as the tail, `ll->tail = current->previous` stores the
+  freed pointer into the list itself.
+
+The next `ll_item_add` dereferences it:
+
+```c
+    if (ll->head) {
+      node->previous = ll->tail;
+      ll->tail->next = node;      // write through a freed pointer
+```
+
+Four operations reach it. In `bcmp/packet.c`'s `sequence_list`, which removes
+by sequence number in whatever order replies arrive, they are all ordinary:
+
+1. three sequenced requests are outstanding — `[A, B, C]`;
+2. the reply to `B` arrives, so `B` is unlinked from the middle and freed;
+   `C->previous` now dangles;
+3. the reply to `C` arrives; `C` is the tail and not the head, so
+   `ll->tail = C->previous`, the freed `B`;
+4. a fourth request is sent, and `ll_item_add` writes `node` into the freed
+   block.
+
+The write is what a sanitizer reports. What a deployed node sees is quieter and
+worse: `ll->head` still points at `A`, whose `next` was set to `NULL` in step 3,
+so **the request added in step 4 is not reachable from the head at all**.
+`ll_get_item` never finds it, so its reply is treated as unsolicited;
+`ll_traverse` never visits it, so the expiry sweep never fires its callback —
+not with a payload, and not with `NULL` either. The caller waits forever for a
+callback that cannot come, and every subsequent append extends an unreachable
+chain hanging off `ll->tail`.
+
+`ll_remove` is shared by every list in bm_core — `packet_list`,
+`INFO_REQUEST_LIST`, the resource-discovery lists — so anything that removes
+out of insertion order is exposed. `bcmp/config.c` is the module that will hit
+it first: it is the only one that issues sequenced requests, and it issues
+several concurrently.
+
+**Status: domain-limited.** There is nothing to replicate — the port's
+`Registry` keeps a fixed array and closes the gap on removal — and comparing
+against a freed-pointer write would be comparing against nothing. So
+`bm-wire-diff/src/registry.rs` carries a `LinkModel` that tracks exactly which
+of the C's `previous` pointers are stale, and declines to perform the fourth
+step above. Every step it does perform is compared in full; the seed
+`bm-wire/fuzz/seeds/registry/dangling-tail` drives the shape right up to the
+edge. The fix upstream is two lines: clear the new head's `previous` and set
+`current->next->previous = current->previous` before freeing.
+
+## 21. A sequenced reply is matched on its sequence number alone
+
+`new_sequence_list_item` records what was asked:
+
+```c
+  BcmpRequestElement element;
+  element.type = type;
+```
+
+and nothing ever reads that field again. `process_received_message` looks the
+entry up by number:
+
+```c
+      if (cfg->sequenced_reply && !cfg->sequenced_request) {
+        request_message = sequence_list_find_message(data.header->seq_num);
+```
+
+`sequence_list_find_message` is `ll_get_item(&PACKET.sequence_list, seq_num,
+...)`, an id lookup. So **any** reply type whose sequence number happens to
+match an outstanding request consumes that request and invokes its callback
+with a payload of an entirely different shape. A `BcmpConfigValue` reply
+answers a `BcmpNeighborProtoRequest`; the neighbour-proto callback is then
+handed config bytes and parses them as its own.
+
+The numbers are not hard to line up. They come from a single global counter
+that starts at zero on boot and increments by one per request, and the request
+carries the number in its header on the wire — so anything that can see a
+request can answer it with a message of any registered reply type, and be
+believed. Since `config.c` is the only module issuing sequenced requests today,
+the everyday case is milder: one config exchange's reply credited to another's,
+because both draw from the same counter.
+
+Confirmed differentially rather than assumed:
+`a_reply_of_the_wrong_type_answers_the_request_anyway` in
+`bm-wire-diff/tests/registry.rs` sends a `NEIGHBOR_PROTO_REQUEST` and answers
+it with a `CONFIG_VALUE`, and adding a type comparison to
+`Registry::on_received` makes the C and the port diverge immediately:
+
+```
+left:  [Reply { slot: 0, payload: [...] }]
+right: [Process { message_type: ConfigValue, seq_num: 0, payload: [...] }]
+```
+
+`bm-wire` matches the C — `Registry::on_received` compares `seq_num` and
+nothing else — and `PendingRequest::message_type` is carried for the caller's
+benefit, as the C carries it, without taking part in the match. The fix
+upstream is to compare `element->type` against the type the reply is a reply
+to, which needs the registry to say which request type each reply type answers.
+
+## 22. A sequenced request's timeout is the sweep period, not the timeout
+
+`bcmp/packet.c` opens with two constants:
+
+```c
+#define default_message_timeout_ms 24
+#define message_timer_expiry_period_ms 150
+```
+
+Every sequenced request is stamped with the first:
+`new_sequence_list_item(header->type, default_message_timeout_ms, ...)`. But
+nothing consults it except `timer_traverse_cb`, which only runs from
+`sequence_list_timer_callback`, which only runs when the 150 ms auto-reload
+timer fires. **The 24 ms is a threshold applied on a 150 ms grid**, so what a
+request actually gets is neither number.
+
+Measured rather than inferred. `the_effective_timeout_across_the_whole_phase`
+in `bm-wire-diff/tests/registry.rs` walks the clock a millisecond at a time for
+every offset in the sweep's phase, against the real timer in the shim rather
+than against the constant, and
+`the_effective_timeout_ranges_from_25_to_174_milliseconds` in `bm-wire`'s own
+unit tests asserts the resulting shape:
+
+| Sent at | Expired at | Lived for |
+|---|---|---|
+| 125 ms (25 before a sweep) | 150 ms | **25 ms** |
+| 0 ms (on a sweep) | 150 ms | 150 ms |
+| 126 ms (24 before a sweep) | 300 ms | **174 ms** |
+
+One millisecond earlier or later in the phase is the difference between 25 ms
+and 174 ms — a factor of seven, for identical traffic, decided by nothing the
+caller can see or control. The nominal 24 ms is the one value a request can
+never get, because the comparison is strict: a request exactly 24 ms old when
+the sweep reaches it survives to the next one.
+
+Whether that window is long enough for a real reply is a question about a real
+link, and this harness cannot answer it — the shim's clock only moves when the
+test says so. What it can say is that the answer differs by 7× depending on
+scheduling jitter of a single millisecond, which is not a property a timeout
+should have. Card C3 is where it will matter: `bcmp/config.c` is the only
+module that issues sequenced requests, and a config get whose reply arrives in
+the wrong part of the phase is reported to the application as a failure
+(`cb(NULL)`) and then delivered again as an unsolicited `BcmpConfigValue` a
+moment later.
+
+`bm-wire` reproduces the grid, not just the threshold: `Registry::on_tick`
+carries the sweep's phase and only sweeps when one comes due, so the port times
+out the same requests at the same instants a C node does. Deleting the phase
+check — sweeping on every tick, which is what a reasonable reading of the
+constants would suggest — makes six of the comparator's tests fail. The fix
+upstream is to make the sweep period the timeout, or to drive the expiry from
+the entry's own deadline rather than from a fixed tick.

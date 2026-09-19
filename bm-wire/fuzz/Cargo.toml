@@ -122,3 +122,16 @@ path = "fuzz_targets/neighbor.rs"
 test = false
 doc = false
 bench = false
+
+# Drives `packet.c`'s sequenced-request machinery: the type registry, the
+# outgoing sequence counter and the expiry timer. Like `bcmp` it owns
+# `packet_init`, so it must not share a process with that target -- or with
+# any of the stack-backed ones. It does not need `-fork=1`: the one thing
+# that would accumulate is the C's sequence list, and every iteration ends by
+# running the clock past the sweep and asserting the list is empty.
+[[bin]]
+name = "registry"
+path = "fuzz_targets/registry.rs"
+test = false
+doc = false
+bench = false

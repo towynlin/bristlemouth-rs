@@ -50,6 +50,7 @@ jobs:
           - l2_egress
           - l2_policy
           - neighbor
+          - registry
           - strnlen
           - time_remaining
           - wildcard

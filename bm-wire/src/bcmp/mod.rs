@@ -6,14 +6,16 @@
 //!
 //! The two halves of the wire path are [`tx::serialize`] and [`rx::accept`],
 //! ported from `serialize` and `process_received_message` in `bcmp/packet.c`.
-//! Both are pure functions over a caller-owned frame; the packet registry, the
-//! sequence-number policy and the per-message state machines that sit above
-//! them are protocol state rather than wire format and live elsewhere.
+//! Both are pure functions over a caller-owned frame. The state that decides
+//! what they are called with — the packet registry, the outgoing sequence
+//! counter and the list of requests still waiting for a reply — is protocol
+//! state rather than wire format, and lives in [`registry`].
 
 pub mod header;
 pub mod heartbeat;
 pub mod info;
 pub mod neighbors;
+pub mod registry;
 pub mod rx;
 pub mod tx;
 
@@ -26,6 +28,10 @@ pub use info::{DeviceInfo, DeviceInfoReply, DeviceInfoRequest};
 pub use neighbors::{
     NeighborInfo, NeighborTableReply, NeighborTableRequest, PortInfo, encode_neighbor_table_reply,
     neighbor_table_reply_len,
+};
+pub use registry::{
+    DEFAULT_MESSAGE_TIMEOUT_MS, Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, Outgoing, PacketCfg,
+    PendingRequest, Registry, RegistryError,
 };
 pub use rx::{Received, RxError, accept};
 pub use tx::serialize;

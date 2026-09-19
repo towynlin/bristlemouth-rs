@@ -81,6 +81,9 @@ pub fn replay_target(target: &str) -> usize {
             "l2_egress" => replay_one::<crate::l2_egress::L2EgressInput, _>(&bytes, |i| {
                 crate::l2_egress::check(i);
             }),
+            "registry" => replay_one::<crate::registry::RegistryInput, _>(&bytes, |i| {
+                crate::registry::check(i);
+            }),
             "checksum" => replay_one::<crate::checksum::ChecksumInput, _>(&bytes, |i| {
                 crate::checksum::check(i);
             }),
@@ -120,14 +123,15 @@ pub const TARGETS: &[&str] = &[
     "wildcard",
 ];
 
-/// Fuzz targets that bring bm_core's stack up and so need a process to
-/// themselves.
+/// Fuzz targets that take `packet.c`'s file-scope state for themselves, and so
+/// need a process to themselves.
 ///
 /// `bm_shim_stack_init` calls `packet_init` with `bm_linux.c`'s accessors,
-/// while [`crate::bcmp`] calls it with its own; whichever runs second wins.
-/// Anything listed here is replayed from its own integration test binary, not
-/// from the library test binary that walks [`TARGETS`].
-pub const STACK_TARGETS: &[&str] = &["bcmp_messages", "l2_egress", "neighbor"];
+/// while [`crate::bcmp`] and [`crate::registry`] each call it with their own;
+/// whichever runs second wins, and the registrations then belong to the loser
+/// as well. Anything listed here is replayed from its own integration test
+/// binary, not from the library test binary that walks [`TARGETS`].
+pub const STACK_TARGETS: &[&str] = &["bcmp_messages", "l2_egress", "neighbor", "registry"];
 
 /// Every seeds directory on disk, so a new one cannot be added without being
 /// assigned to one of the two lists.
