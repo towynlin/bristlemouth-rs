@@ -23,6 +23,7 @@ pub mod bcmp;
 pub mod bcmp_messages;
 pub mod checksum;
 pub mod crc;
+pub mod forward;
 pub mod l2_egress;
 pub mod l2_policy;
 pub mod neighbor;

@@ -32,5 +32,5 @@ pub mod mock;
 pub mod node;
 pub mod port;
 
-pub use node::{MTU, Node, Outbound, transmit};
+pub use node::{MTU, Node, Outbound, Owed, deliver, transmit};
 pub use port::{Egress, Identity, Phy};

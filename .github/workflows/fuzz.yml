@@ -47,6 +47,7 @@ jobs:
           - checksum
           - crc
           - date_time
+          - forward
           - l2_egress
           - l2_policy
           - neighbor

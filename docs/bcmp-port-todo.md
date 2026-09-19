@@ -6,8 +6,9 @@ agent each.
 `bm-wire` currently carries three of BCMP's exchanges — heartbeat (`0x01`),
 device info (`0x04`/`0x05`, responder only) and neighbour table (`0x08`/`0x09`,
 responder only) — plus the wire engine under them (`bcmp::tx::serialize`,
-`bcmp::rx::accept`, L2 egress stamping, the link-local RX policy) and two state
-machines, `bm-wire/src/neighbor.rs` and `bm-wire/src/bcmp/registry.rs`.
+`bcmp::rx::accept`, L2 egress stamping, the link-local RX policy, the two
+forwarding paths in `bcmp::forward`) and two state machines,
+`bm-wire/src/neighbor.rs` and `bm-wire/src/bcmp/registry.rs`.
 `MessageType` in `bm-wire/src/bcmp/header.rs` already names all 45 of bm_core's
 constants, but only five body structs have a codec.
 
@@ -17,7 +18,6 @@ Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| Link-local forwarding | `bcmp/bcmp.c` `bcmp_ll_forward` | — | I2 |
 | Reply routing in `Node` | — (Rust-side plumbing) | — | I3 |
 | Echo / ping `0x02`,`0x03` | `bcmp/ping.c` | 176 | M1 |
 | System time `0x10`–`0x12` | `bcmp/time.c` | 195 | M2 |
@@ -32,9 +32,9 @@ Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-Dependency order: I2 and I3 and C1 and D1 are unblocked and may run in
-parallel. M1/M3/M4 need I3. M2 needs I2. M5 needs I3. C2 needs C1. C3 needs I2,
-C1, C2. D2 needs D1; D3 and D4 each need D2.
+Dependency order: I3 and C1 and D1 are unblocked and may run in parallel.
+M1/M3/M4 need I3. M5 needs I3. C2 needs C1. C3 needs C1 and C2. D2 needs D1;
+D3 and D4 each need D2.
 
 ---
 
@@ -178,40 +178,6 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 
 # Infrastructure
 
-## I2 — link-local forwarding
-
-**Blocked by:** nothing.
-
-**C source.** `bcmp_ll_forward` in `bcmp/bcmp.c`, which re-floods a link-local
-message out the other ports. It writes the egress port as
-`((uint32_t *)dst)[3] = 0x1000000 | (egress_port << 8)` and recomputes the
-checksum against the plain multicast destination.
-
-**The gap this closes.** `bm-wire/src/l2_policy.rs` is fully ported —
-`rx_apply`, `prepare_forwarded_copy`, the `LinkLocalRouting` trait — but
-**nothing in `bm-stack` calls it**; `grep -rn l2_policy bm-stack/` returns
-nothing. `Node` does not forward between ports, so a three-node chain cannot
-relay today. M2, C3 and D2 all depend on forwarding, because all three re-flood
-messages not addressed to this node.
-
-**Rust to create.** Port `bcmp_ll_forward` into `bm-wire/src/bcmp/` (it is wire
-manipulation, not policy), then wire `l2_policy::rx_apply` and the forward path
-into `Node::on_frame` in `bm-stack/src/node.rs`, keeping the synchronous
-`on_frame`/`on_tick` split intact.
-
-**Comparator and fuzz target.** Extend `bm-wire-diff/src/l2_egress.rs` or add a
-sibling; a forwarded frame is compared byte-for-byte per egress port. Seeds in
-`replay::STACK_TARGETS`.
-
-**Quirks to reproduce.** Divergence #1 (`prepare_forwarded_copy` clears both
-nibbles though the header doc promises the egress nibble is kept) and #12 (the
-checksum patch drops the one's-complement end-around carry) are already
-recorded; the port must keep matching them.
-
-**Done when.** A frame injected on port 1 of the C stack and of a `bm-stack`
-`Node` produces identical frames on port 2, for every seed. `bm-stack/tests/node.rs`
-gains a multi-port relay case.
-
 ## I3 — request/reply routing in `Node`
 
 **Blocked by:** nothing — I1 landed, and `bm_wire::bcmp::registry::Registry`
@@ -283,7 +249,10 @@ it the right card to prove I3 on.
 
 ## M2 — system time, `0x10`, `0x11`, `0x12`
 
-**Blocked by:** I2.
+**Blocked by:** nothing — I2 landed. `bm_wire::bcmp::forward::egress_ports` and
+`bm_stack::Node::forward_link_local` are the re-flood this card needs; call the
+second once per port of the first, transmitting each frame before building the
+next, because there is one transmit buffer.
 
 **C source.** `bcmp/time.c` (195 LoC), one handler
 (`bcmp_time_process_time_message`) for all three types. No module state; it
@@ -296,15 +265,19 @@ flash slot are seams too, and they will arrive with the code that uses them."
 This is that code. Follow the existing `Phy`/`Identity` shape.
 
 **Quirks to reproduce.** A message whose `target_node_id` is neither ours nor 0
-is re-flooded via `bcmp_ll_forward` — hence the I2 dependency. A *request* with
+is re-flooded via `bcmp_ll_forward`, which is already ported — note divergences
+#23, #24 and #26, which the forward carries with it. A *request* with
 `target_node_id == 0` reaches the switch and is then dropped by an inner
 exact-match check, so broadcast time requests are silently ignored: probably a
 divergence. All transmits go to `multicast_ll_addr` with `seq_num` 0.
 
-**Done when.** The three codecs round-trip against the oracle, the forward path
-matches per port, and a `Node` with a mock RTC answers a time request
-byte-identically to the C — add the case to
-`bm-wire-diff/tests/node_frames.rs`.
+**Done when.** The three codecs round-trip against the oracle, and a `Node` with
+a mock RTC answers a time request byte-identically to the C — add the case to
+`bm-wire-diff/tests/node_frames.rs`. The forward path is already compared per
+port by `bm-wire-diff/tests/forward.rs`, which calls `bcmp_ll_forward` directly;
+what M2 adds is the *decision* to forward, so extend `check_relay` there with a
+system-time message whose target is another node, and it will compare the C's
+whole receive path against `Node::on_frame`.
 
 ## M3 — device-info reply consumption, `0x05` receive side
 
@@ -434,7 +407,8 @@ same corrupt images.
 
 ## C3 — config over BCMP, `0xA0`–`0xA9`
 
-**Blocked by:** I2, C1, C2.
+**Blocked by:** C1, C2. I2 landed, so the re-flood these messages need is
+`bm_stack::Node::forward_link_local`.
 
 **C source.** `bcmp/config.c` (857 LoC), one handler
 (`bcmp_process_config_message`) for all ten types.

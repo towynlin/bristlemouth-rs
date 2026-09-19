@@ -81,6 +81,9 @@ pub fn replay_target(target: &str) -> usize {
             "l2_egress" => replay_one::<crate::l2_egress::L2EgressInput, _>(&bytes, |i| {
                 crate::l2_egress::check(i);
             }),
+            "forward" => replay_one::<crate::forward::ForwardInput, _>(&bytes, |i| {
+                crate::forward::check(i);
+            }),
             "registry" => replay_one::<crate::registry::RegistryInput, _>(&bytes, |i| {
                 crate::registry::check(i);
             }),
@@ -131,7 +134,13 @@ pub const TARGETS: &[&str] = &[
 /// whichever runs second wins, and the registrations then belong to the loser
 /// as well. Anything listed here is replayed from its own integration test
 /// binary, not from the library test binary that walks [`TARGETS`].
-pub const STACK_TARGETS: &[&str] = &["bcmp_messages", "l2_egress", "neighbor", "registry"];
+pub const STACK_TARGETS: &[&str] = &[
+    "bcmp_messages",
+    "forward",
+    "l2_egress",
+    "neighbor",
+    "registry",
+];
 
 /// Every seeds directory on disk, so a new one cannot be added without being
 /// assigned to one of the two lists.
