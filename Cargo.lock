@@ -69,6 +69,7 @@ dependencies = [
  "bm-stack",
  "bm-wire",
  "bm-wire-sys",
+ "embassy-futures",
 ]
 
 [[package]]

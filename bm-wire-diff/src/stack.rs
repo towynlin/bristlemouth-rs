@@ -24,6 +24,10 @@
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+use bm_stack::port::{Egress, Identity, Phy};
+use bm_stack::{Node, Outbound};
+use bm_wire::bcmp::DeviceInfo;
+
 /// Ports the capture device reports, from `SHIM_NUM_PORTS` in
 /// `bm-wire-sys/csrc/bm_net_device_shim.c`.
 pub const NUM_PORTS: u8 = 2;
@@ -180,4 +184,115 @@ pub fn inject(port: u8, frame: &[u8]) {
             "capture ring overflowed"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The same node, in Rust
+// ---------------------------------------------------------------------------
+
+/// The identity the oracle's stack was brought up with, as a [`bm_stack`]
+/// [`Identity`].
+///
+/// Comparators that put the same question to both nodes need them to have
+/// nothing to differ about but their code, so both read their configuration
+/// from the constants above.
+#[derive(Debug, Clone, Copy)]
+pub struct OracleIdentity;
+
+impl Identity for OracleIdentity {
+    fn node_id(&self) -> u64 {
+        NODE_ID
+    }
+
+    fn device_info(&self) -> DeviceInfo {
+        DeviceInfo {
+            vendor_id: VENDOR_ID,
+            product_id: PRODUCT_ID,
+            serial_num: SERIAL_NUMBER,
+            git_sha: GIT_SHA,
+            ver_major: FIRMWARE_VERSION.0,
+            ver_minor: FIRMWARE_VERSION.1,
+            ver_rev: FIRMWARE_VERSION.2,
+            ver_hw: HW_VERSION,
+            ..DeviceInfo::default()
+        }
+    }
+
+    fn version_string(&self) -> &[u8] {
+        VERSION_STRING
+    }
+
+    fn device_name(&self) -> &[u8] {
+        DEVICE_NAME
+    }
+}
+
+/// A `bm-stack` node with the oracle's identity, port count and link state.
+///
+/// [`oracle`] brings both of the capture device's ports up before any
+/// comparison, and a neighbour-table reply carries that, so the port sets have
+/// to match too.
+#[must_use]
+pub fn node() -> Node<OracleIdentity, 4> {
+    let mut node = Node::new(OracleIdentity, NUM_PORTS);
+    for port in 1..=NUM_PORTS {
+        node.set_link_up(port, true);
+    }
+    node
+}
+
+/// A PHY that records what it is given and never receives anything.
+///
+/// Enough to drive `bm_stack::transmit`, which is the composition a comparator
+/// wants to check: the frames a real node hands its driver, with the egress
+/// port each copy went to. `bm_stack::mock::MockPhy` would do as well, but it
+/// needs an `embassy-time` driver in the test binary, and nothing here needs a
+/// clock.
+#[derive(Debug, Default)]
+pub struct CapturePhy {
+    /// Every frame handed to the PHY, as `(egress port, bytes)`, in order. A
+    /// port of 0 is the device's "all ports" encoding, matching [`drain`].
+    pub sent: Vec<(u8, Vec<u8>)>,
+}
+
+/// Why a [`CapturePhy`] transfer failed. It never does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unreachable;
+
+impl Phy for CapturePhy {
+    type Error = Unreachable;
+
+    fn port_count(&self) -> u8 {
+        NUM_PORTS
+    }
+
+    fn link_up(&self, port: u8) -> bool {
+        (1..=NUM_PORTS).contains(&port)
+    }
+
+    async fn send(&mut self, frame: &[u8], egress: Egress) -> Result<(), Self::Error> {
+        let port = match egress {
+            Egress::AllPorts => 0,
+            Egress::Port(port) => port,
+        };
+        self.sent.push((port, frame.to_vec()));
+        Ok(())
+    }
+
+    async fn receive(&mut self, _buf: &mut [u8]) -> Result<(u8, usize), Self::Error> {
+        Err(Unreachable)
+    }
+}
+
+/// Transmit one frame through a fresh [`CapturePhy`] and return what it saw.
+///
+/// # Panics
+///
+/// Never: [`CapturePhy`] cannot fail.
+#[must_use]
+pub fn capture(outbound: Outbound<'_>) -> Vec<(u8, Vec<u8>)> {
+    let mut phy = CapturePhy::default();
+    embassy_futures::block_on(bm_stack::transmit(&mut phy, outbound, NUM_PORTS))
+        .expect("CapturePhy cannot fail");
+    phy.sent
 }

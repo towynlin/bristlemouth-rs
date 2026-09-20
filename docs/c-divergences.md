@@ -46,6 +46,10 @@ Status values:
 | 20 | `ll_remove` leaves `LL::tail` pointing at a freed node | domain-limited | reading, then modelled to stay out of it |
 | 21 | A sequenced reply is matched on its sequence number alone, never its type | replicated | reading, confirmed differentially |
 | 22 | A sequenced request's timeout is the 150 ms sweep, not the 24 ms constant | replicated | reading, then measured |
+| 23 | `bcmp_ll_forward` replaces the originator's source address with the forwarder's | replicated | reading, confirmed differentially |
+| 24 | A forwarded frame's multicast MAC carries the egress port | replicated | reading, confirmed differentially |
+| 25 | `bcmp_ll_forward` writes its new checksum into the frame it was asked to forward | c-only | reading |
+| 26 | `bcmp_ll_forward` reports a forward with nowhere to go as `BmEINVAL` | replicated | reading |
 
 ---
 
@@ -892,3 +896,156 @@ check — sweeping on every tick, which is what a reasonable reading of the
 constants would suggest — makes six of the comparator's tests fail. The fix
 upstream is to make the sweep period the timeout, or to drive the expiry from
 the entry's own deadline rather than from a fixed tick.
+
+## 23. `bcmp_ll_forward` replaces the originator's source address with the forwarder's
+
+`bcmp/bcmp.c`'s doc comment says only this:
+
+> Forward the payload to all ports other than the ingress port.
+
+What the code does is build a **new datagram**:
+
+```c
+void *forward = bm_ip_tx_new(&multicast_ll_addr, size + sizeof(BcmpHeader));
+```
+
+`bm_ip_tx_new` fills in the source address itself, and it has only one to give:
+
+```c
+uint8_t *ip = (uint8_t *)bm_l2_get_payload(buf) + ETH_HDR_LEN;
+memcpy(ip + 8, &CTX.ll_addr, 16);   /* this node's link-local address */
+```
+
+So the frame that leaves the far port claims the **forwarder** as its IPv6
+source. The originator is not relayed; it survives only in whatever the message
+body carries, and the checksum is recomputed because the address changed.
+
+For the three exchanges that forward today this happens to be harmless: the
+system-time, config and DFU messages all carry a `source_node_id` in their own
+body headers, and their processors read that rather than the IPv6 source. But
+`process_received_message` hands every processor `data.src`, and
+`ip_to_nodeid(data.src)` is how several of them identify a peer — so anything
+that grows a reliance on it will silently see the last hop instead of the
+sender, and only on multi-hop networks. The hop count is not recoverable either:
+the hop limit is reset to 64 along with everything else in the header.
+
+`bm-wire` reproduces it. `bcmp::forward::serialize_forwarded` checksums against
+whatever source address the caller wrote, and `bm_stack::Node::forward_link_local`
+writes this node's own — `the_c_puts_its_own_address_on_a_forwarded_message` in
+`bm-wire-diff/tests/forward.rs` asserts the C does the same, so if upstream
+changes it the comparator fails first. The fix upstream is either to document
+the rewrite or to carry the originator's address over, and the second is
+wire-visible.
+
+## 24. A forwarded frame's multicast MAC carries the egress port
+
+bm_core has no per-port transmit call. To get one copy of a forwarded message
+onto one port, `bcmp_ll_forward` encodes the port into the IPv6 destination
+address and lets L2 read it back out:
+
+```c
+uint8_t port_specific_dst[sizeof(multicast_ll_addr)];
+memcpy(port_specific_dst, &multicast_ll_addr, sizeof(multicast_ll_addr));
+((uint32_t *)port_specific_dst)[3] = 0x1000000 | (egress_port << 8);
+
+BmErr tx_err = bm_ip_tx_perform(forward, (BmIpAddr *)port_specific_dst);
+```
+
+`bm_l2_link_output` then reads destination byte 13, sets the port mask from it,
+and clears the byte — so the address on the wire is a clean `FF02::1`. The C's
+own comment says as much, and it is careful to checksum before the byte goes on.
+
+The Ethernet header is not so lucky. `bm_ip_tx_perform` derives the destination
+MAC from the address it was handed, **before** L2 clears anything:
+
+```c
+if (is_multicast(effective_dst)) {
+  multicast_mac_from_ipv6(frame, effective_dst);   /* 33:33 + bytes 12..16 */
+}
+```
+
+`multicast_mac_from_ipv6` copies destination bytes 12..16, which at that moment
+are `00 <port> 00 01`. So a forwarded frame leaves port 2 addressed to
+`33:33:00:02:00:01` while its IPv6 destination says `FF02::1`, whose correct
+mapped MAC is `33:33:00:00:00:01`. The MAC and the address disagree, and the MAC
+is the one that reaches the wire.
+
+Whether that matters depends on what is between the two nodes. On a
+point-to-point Bristlemouth link there is nothing to filter on a multicast MAC
+group address, which is presumably why it has never been noticed. Anything that
+does filter — a switch, a host NIC that is not promiscuous, a capture matched on
+the mapped multicast MAC — sees a frame addressed to a group nobody joined. The
+two nibbles the protocol already borrows from the source address are documented;
+this one is not, and it is in the field the protocol has no claim on.
+
+`bm-wire` reproduces it. `bcmp::forward::apply_port_specific_destination` writes
+the address and re-derives the MAC from it in one step, in the order
+`bm_ip_tx_perform` does, and `the_egress_port_survives_in_the_multicast_mac` in
+`bm-wire-diff/tests/forward.rs` pins the resulting byte against the C. Deriving
+the MAC from the plain `FF02::1` instead — the reading a careful implementer
+would arrive at from the spec — makes the comparator diverge at Ethernet byte 3.
+The fix upstream is to build the MAC from `multicast_ll_addr` and pass the port
+to L2 some other way; it is wire-visible, but only to a receiver that was
+dropping these frames already.
+
+## 25. `bcmp_ll_forward` writes its new checksum into the frame it was asked to forward
+
+`header` points into the received frame — `process_received_message` sets
+`data.header = (BcmpHeader *)buf` where `buf` is the RX buffer — and
+`bcmp_ll_forward` uses it as scratch space:
+
+```c
+header->checksum = 0;
+bm_ip_tx_copy(forward, header, sizeof(BcmpHeader), 0);
+bm_ip_tx_copy(forward, payload, size, sizeof(BcmpHeader));
+header->checksum = packet_checksum(forward, size + sizeof(BcmpHeader));
+bm_ip_tx_copy(forward, header, sizeof(BcmpHeader), 0);
+```
+
+Two bytes of the caller's received frame are overwritten with a checksum
+computed for a *different* frame — one with a different source address. It is
+invisible today: the only readers of the RX buffer after a processor returns are
+`bm_ip_rx_cleanup` and the `free` under it, and the loop re-zeroes the field
+before each port, so every forwarded copy is still identical. A processor that
+forwarded a message and then went on to re-examine its own header would find the
+wrong checksum there, and nothing in the signature warns it.
+
+`bm-wire` has no counterpart: `bcmp::forward::serialize_forwarded` takes the
+received message as `&[u8]` and cannot write to it, and
+`bm_stack::Node::forward_link_local` builds the copy in the node's own transmit
+buffer. The fix upstream is a local `BcmpHeader` copy, which costs thirteen
+bytes of stack and nothing on the wire.
+
+## 26. `bcmp_ll_forward` reports a forward with nowhere to go as `BmEINVAL`
+
+```c
+BmErr err = BmEINVAL;
+for (uint8_t egress_port = 1; egress_port <= num_ports; egress_port++) {
+  if (egress_port == ingress_port) {
+    continue;
+  }
+  /* ... */
+  err = BmOK;   /* only ever set here */
+}
+return err;
+```
+
+The error starts as "bad argument" and is only cleared by a transmit that
+succeeded. On a one-port device — or on any device where `ingress_port` is the
+only port — the loop body never runs, and the caller is told its arguments were
+invalid for a forward that was correctly a no-op. `bcmp_time_process_time_message`,
+`bcmp_process_config_message` and `dfu_copy_and_process_message` all return that
+value as their own, so a single-port node reports every forwarded message as a
+failure.
+
+An `ingress_port` of zero has the opposite effect. `process_received_message`
+reads it out of the source address, so zero means the sender encoded no port,
+and then no port matches the `continue` — the message is forwarded straight back
+out the interface it arrived on. On a two-port node that is a duplicate on one
+port and a loop on the other.
+
+`bm-wire` names both cases rather than hiding them:
+`bcmp::forward::egress_ports` skips nothing for an ingress port of zero, and
+`bcmp::forward::ll_forward_is_a_no_op` is the predicate for the `BmEINVAL`. The
+fix upstream is to return `BmOK` when there was nothing to do, and to refuse an
+ingress port of zero.

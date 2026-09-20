@@ -10,7 +10,12 @@
 //! what they are called with — the packet registry, the outgoing sequence
 //! counter and the list of requests still waiting for a reply — is protocol
 //! state rather than wire format, and lives in [`registry`].
+//!
+//! [`forward`] is the third piece of the wire path: re-flooding a link-local
+//! message out the other ports, which `bcmp/time.c`, `bcmp/config.c` and
+//! `bcmp/dfu_core.c` all do for anything not addressed to this node.
 
+pub mod forward;
 pub mod header;
 pub mod heartbeat;
 pub mod info;
@@ -19,6 +24,10 @@ pub mod registry;
 pub mod rx;
 pub mod tx;
 
+pub use forward::{
+    apply_port_specific_destination, egress_ports, ll_forward_is_a_no_op,
+    port_specific_destination, serialize_forwarded,
+};
 pub use header::{
     BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, BcmpHeader, CHECKSUM_FIELD_OFFSET, MIN_BCMP_FRAME_SIZE,
     MessageType,

@@ -90,6 +90,20 @@ pub fn tx_kind(frame: &[u8]) -> TxKind {
 /// specific egress port, from `bm_l2_link_output`.
 pub const REQUESTED_EGRESS_PORT_OFFSET: usize = IPV6_DESTINATION_ADDRESS_OFFSET + 13;
 
+/// The mask covering every port a device has, `CTX.all_ports_mask` in `l2.c`.
+///
+/// Saturates at every bit set rather than shifting out of range: the mask is a
+/// `uint16_t` in the C too, so a device claiming more than sixteen ports has
+/// none to spare either way.
+#[must_use]
+pub const fn all_ports_mask(num_ports: u8) -> u16 {
+    if num_ports >= 16 {
+        u16::MAX
+    } else {
+        (1u16 << num_ports) - 1
+    }
+}
+
 /// Read and clear the egress port an application requested in the destination
 /// address, returning the port mask to transmit on.
 ///
@@ -114,11 +128,10 @@ pub fn take_requested_egress_port(frame: &mut [u8], num_ports: u8) -> Result<u16
     let requested = frame[REQUESTED_EGRESS_PORT_OFFSET];
     frame[REQUESTED_EGRESS_PORT_OFFSET] = 0;
 
-    let all_ports = (1u16 << num_ports) - 1;
     if requested > 0 && requested <= num_ports {
         Ok(1u16 << (requested - 1))
     } else {
-        Ok(all_ports)
+        Ok(all_ports_mask(num_ports))
     }
 }
 

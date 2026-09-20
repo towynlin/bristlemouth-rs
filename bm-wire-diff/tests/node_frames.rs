@@ -137,6 +137,7 @@ fn our_device_info_reply_is_byte_identical_to_the_c() {
     let mut frame = request.clone();
     let ours = node
         .on_frame(0, 1, &mut frame)
+        .reply
         .expect("a device-info request must be answered")
         .frame()
         .to_vec();
@@ -164,6 +165,7 @@ fn our_neighbor_table_reply_is_byte_identical_to_the_c() {
     let mut frame = request.clone();
     let ours = node
         .on_frame(0, 2, &mut frame)
+        .reply
         .expect("a neighbour-table request must be answered")
         .frame()
         .to_vec();
@@ -204,6 +206,7 @@ fn our_global_multicast_reply_is_byte_identical_to_the_c() {
     let mut frame = request.clone();
     let ours = node
         .on_frame(0, 1, &mut frame)
+        .reply
         .expect("answered")
         .frame()
         .to_vec();

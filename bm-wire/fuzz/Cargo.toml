@@ -98,6 +98,19 @@ test = false
 doc = false
 bench = false
 
+# Stack-backed too, and subject to the same rule: it must not share a process
+# with `bcmp`. Forwarding is the one comparison that spans both stages of the
+# receive path, so this target injects a frame *and* calls bcmp_ll_forward for
+# the same input. Nothing accumulates: heartbeats are outside the input domain
+# precisely because bm_core's neighbour table would remember them -- see
+# bm-wire-diff/src/forward.rs.
+[[bin]]
+name = "forward"
+path = "fuzz_targets/forward.rs"
+test = false
+doc = false
+bench = false
+
 # Also stack-backed, and subject to the same rule: it must not share a process
 # with `bcmp`. It only ever hands bm_core well-formed requests -- see
 # divergence #14 for why a malformed reply must not be injected -- and drives
