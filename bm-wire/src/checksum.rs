@@ -1,8 +1,7 @@
 //! IPv6 pseudo-header checksum, ported from `network/bm_linux.c`.
 //!
-//! This must agree bit-for-bit with lwIP's `ip6_chksum_pseudo`, because a host
-//! node and an embedded node validate each other's BCMP checksums with it. It
-//! is the tightest compatibility constraint in the wire path.
+//! Must agree bit-for-bit with lwIP's `ip6_chksum_pseudo`: a host node and an
+//! embedded node validate each other's BCMP checksums with it.
 
 use crate::util::BmIpAddr;
 

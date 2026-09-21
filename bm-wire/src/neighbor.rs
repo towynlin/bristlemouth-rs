@@ -1,12 +1,11 @@
 //! The neighbour table, ported from `bcmp/neighbors.c` and
 //! `bcmp_process_heartbeat` in `bcmp/heartbeat.c`.
 //!
-//! This is the first module here that is not a codec. It is written *sans-io*:
-//! it owns no clock, no timers and no transmission, and every entry point
-//! takes the current time as a parameter and returns what the caller should do
-//! about it. That keeps it testable without an executor and keeps `bm-wire`
-//! free of dependencies; the timer that drives [`NeighborTable::check`] and the
-//! transmission that answers [`HeartbeatOutcome::request_info`] belong to the
+//! Written *sans-io*: no clock, no timers, no transmission. Every entry point
+//! takes the current time and returns what the caller should do about it, so
+//! the module is testable without an executor and `bm-wire` stays free of
+//! dependencies. The timer driving [`NeighborTable::check`] and the
+//! transmission answering [`HeartbeatOutcome::request_info`] belong to the
 //! runtime above.
 //!
 //! # Time
@@ -18,11 +17,10 @@
 //!
 //! # Capacity
 //!
-//! bm_core keeps a `bm_malloc`'d linked list. This is a fixed-capacity array,
-//! because `bm-wire` has no allocator. That is not a limitation in practice:
-//! [`NeighborTable::on_heartbeat`] evicts whatever was on the ingress port
-//! before adding, exactly as the C does, so the table never holds more than one
-//! entry per port.
+//! bm_core keeps a `bm_malloc`'d linked list; this is a fixed-capacity array,
+//! because `bm-wire` has no allocator. [`NeighborTable::on_heartbeat`] evicts
+//! whatever was on the ingress port before adding, as the C does, so the table
+//! never holds more than one entry per port.
 
 use crate::bcmp::Heartbeat;
 use crate::util::time_remaining;

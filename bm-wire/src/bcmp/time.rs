@@ -2,29 +2,28 @@
 //! ported from `bcmp/messages.h` and `bcmp/time.c`.
 //!
 //! The three types `0x10`, `0x11` and `0x12` share a 16-byte head —
-//! [`SystemTimeHeader`], `BcmpSystemTimeHeader` in the C — and the two that
-//! carry a timestamp append one 64-bit field to it. The request carries
-//! nothing else, which is why it is the header and nothing more.
+//! [`SystemTimeHeader`], `BcmpSystemTimeHeader` in the C — and the two
+//! carrying a timestamp append one 64-bit field. The request is the header
+//! alone.
 //!
 //! # A second target field
 //!
-//! Every other BCMP message that is addressed at all puts its
-//! `target_node_id` first and stops there. These carry the **sender's** node id
-//! as well, in the body, even though the frame's source address already holds
-//! it. `bcmp_time_send_response` answers `msg->header.source_node_id` rather
-//! than the address the request arrived from, so the body's copy is the one
-//! that decides where a reply goes.
+//! Every other addressed BCMP message puts `target_node_id` first and stops
+//! there. These also carry the **sender's** node id in the body, though the
+//! frame's source address already holds it. `bcmp_time_send_response` answers
+//! `msg->header.source_node_id` rather than the address the request arrived
+//! from, so the body's copy decides where a reply goes.
 //!
 //! # `target_node_id` does not mean the same thing three times
 //!
 //! `bcmp_time_process_time_message` tests the target twice: once to decide
 //! whether to forward, where zero means "for everyone", and again inside the
-//! `switch`, where only an exact match will do. A **request** or a **response**
-//! addressed to zero therefore passes the first test and fails the second, and
-//! is dropped without an answer and without a forward; a **set** skips the
-//! inner test entirely and is honoured. So `0x12` broadcasts and `0x10` does
-//! not, from the same field. See divergence #27 — the port reproduces it, and
-//! [`SystemTimeRequest::is_for`] is where the asymmetry is written down.
+//! `switch`, where only an exact match will do. A **request** or **response**
+//! addressed to zero passes the first test, fails the second, and is dropped
+//! without an answer and without a forward; a **set** skips the inner test and
+//! is honoured. So `0x12` broadcasts and `0x10` does not, from the same field.
+//! See divergence #27; [`SystemTimeRequest::is_for`] is where the asymmetry is
+//! written down.
 
 use crate::BmWireError;
 

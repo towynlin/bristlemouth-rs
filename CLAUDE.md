@@ -1,29 +1,39 @@
 # Working in this repo
 
-If the toolchain or the `bm_core` submodule looks wrong, read **"Setting up a
-fresh sandbox"** below before investigating. On the web a `SessionStart` hook
-has usually done it for you already, and none of it is worth reporting back.
+Read `bm-wire-sys/README.md` (the shim contract, and state that outlives
+`bm_shim_reset`) and `docs/c-divergences.md` (every place the Rust port
+deliberately reproduces a bm_core quirk) before changing anything. If a fuzzer
+fails, `c-divergences.md` is the first place to look.
 
-Read `bm-wire-sys/README.md` first — especially the shim contract and the note
-on state that outlives `bm_shim_reset`. Both describe real behavioural
-divergence from the firmware, and both are easy to trip over.
+If the toolchain or the `bm_core` submodule looks wrong, see "Setting up a
+fresh sandbox" below.
 
-Then read `docs/c-divergences.md`. It lists every place bm_core's C does
-something surprising that the Rust port deliberately reproduces. If a change
-here makes a fuzzer fail, that file is the first place to look.
+## Writing style
+
+Docs, comments and commit messages here are **brief and factual**. State what
+the code does and why, once. Do not editorialise, dramatise, or repeat a point
+in a second phrasing. Drop narrative framing ("the interesting half", "found
+the hard way", "this is not theoretical"), value judgements about upstream, and
+sentences that only restate the preceding one. Prefer a table or a list to a
+paragraph. Cite file and symbol names rather than describing them.
+
+Apply the same rule to reports: say what changed, what was verified, and what
+was not.
 
 ## The point of this repo
 
-`bm-wire` is a pure Rust port of bm_core's wire format and protocol logic;
-`bm-stack` is the embassy runtime that turns it into a node. Together they are
-intended to run as firmware on Bristlemouth dev kits alongside nodes running
-the C/C++ firmware. Compatibility
-is *proven*, not assumed: `bm-wire-sys` compiles the real C as an oracle, and
-`bm-wire-diff` feeds identical input to both and asserts identical output.
+`bm-wire` is a Rust port of bm_core's wire format and protocol logic;
+`bm-stack` is the embassy runtime that turns it into a node. Together they run
+as firmware on Bristlemouth dev kits alongside nodes running the C/C++
+firmware.
 
-**The C is authoritative.** Where bm_core is surprising or wrong, `bm-wire`
-matches it anyway — deployed nodes are on the other end of the wire — and the
-finding is written up in `docs/c-divergences.md` for upstream repair.
+Compatibility is proven, not assumed: `bm-wire-sys` compiles the real C as an
+oracle, and `bm-wire-diff` feeds identical input to both and asserts identical
+output.
+
+**The C is authoritative.** Where bm_core is wrong, `bm-wire` matches it anyway
+— deployed nodes are on the other end of the wire — and the finding goes in
+`docs/c-divergences.md` for upstream repair.
 
 ## Layout
 
@@ -31,101 +41,81 @@ A cargo workspace.
 
 - `bm-wire/` — the port. `no_std`, no `alloc`, `forbid(unsafe_code)`, zero
   dependencies. **Must never depend on `bm-wire-sys`**, in any configuration:
-  that is what keeps the host-only oracle out of firmware builds. Its `std`
-  feature exists only for tests and fuzzing.
+  that keeps the host-only oracle out of firmware builds. The `std` feature is
+  for tests and fuzzing only.
   - `fuzz/` — a `cargo fuzz` crate, its own workspace. Targets are ~6 lines
-    each; the real work is in `bm-wire-diff`.
+    each; the work is in `bm-wire-diff`.
   - `fuzz/seeds/` — committed seed corpora, one directory per target, replayed
-    by `cargo test`. `fuzz/corpus/` is gitignored, so durable inputs live here.
+    by `cargo test`. `fuzz/corpus/` is gitignored.
 - `bm-stack/` — the node. `no_std`, no `alloc` (except behind the test-only
-  `mock` feature), and the only crate here that knows about time or I/O. It
-  supplies what `bm-wire` deliberately lacks: a clock, a timer, and a PHY.
+  `mock` feature), and the only crate that knows about time or I/O.
   - `src/port.rs` — the seams bm_core leaves to the integrator, as traits
-    rather than link-time symbols, so a test and the firmware can differ. A
-    card that ports an exchange needing a new one adds it here: `Rtc` arrived
-    with system time, and configuration storage and the DFU flash slot are
+    rather than link-time symbols. Config storage and the DFU flash slot are
     still to come.
-  - `src/node.rs` — `Node::on_frame`, `Node::on_tick` and `Node::on_expiry` are
+  - `src/node.rs` — `Node::on_frame`, `on_tick` and `on_expiry` are
     synchronous and take the current time; `Node::run` is the only async code.
-    All the protocol is in the synchronous half. Each has a `_with` twin that
-    reports `Event`s — a reply, a timeout, an unsolicited message — which is
-    where a ported exchange's requester half hangs. The two timers are
-    bm_core's two: the ten-second heartbeat and `packet.c`'s 150 ms expiry
-    sweep, which must not be put on a grid of the port's own (divergence #22).
-  - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock, so
-    the real `run` loop can be tested with no hardware.
-- `bm-phy-adin2111/` — [`bm_stack::Phy`] for the ADIN2111 over OPEN Alliance
-  TC6 SPI, on the per-port frame I/O of
+    Each has a `_with` twin that reports `Event`s. The two timers are
+    bm_core's: the 10 s heartbeat and `packet.c`'s 150 ms expiry sweep, which
+    must not be put on a grid of the port's own (divergence #22).
+  - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
+- `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
+  SPI, on the per-port frame I/O of
   [embassy-rs/embassy#7024](https://github.com/embassy-rs/embassy/pull/7024).
-  The port of each frame rides in `PacketMeta::id`. **Its own workspace**, like
-  `bm-wire/fuzz`, for two reasons: it pins embassy to a git branch, and
-  `embassy-time-driver` carries `links = "embassy-time"`, so a git embassy and
-  a crates.io embassy cannot coexist in one dependency graph; and it needs
-  **toolchain 1.97**, pinned by its own `rust-toolchain.toml`, because
-  `xarxa-driver` uses `cfg_select!`. Keeping both here means the main workspace
-  stays on released crates, and `cargo test` at the root needs no network. It
-  is not built by the root `cargo test`; verify it explicitly.
-  Note that the driver's `Runner` must be spawned by the firmware — it owns the
-  SPI bus, and until it runs no frame moves.
-- `bm-wire-diff/` — the differential harness. Host-only, depends on the other
-  three crates. One comparator per surface, shared by the fuzz targets and by
-  ordinary `#[test]`s.
+  Each frame's port rides in `PacketMeta::id`. **Its own workspace**, because
+  it pins embassy to a git branch and `embassy-time-driver` carries
+  `links = "embassy-time"`, so a git embassy and a crates.io embassy cannot
+  share a dependency graph. Not built by the root `cargo test`. Its `Runner`
+  must be spawned by the firmware — it owns the SPI bus, and until it runs no
+  frame moves.
+- `bm-wire-diff/` — the differential harness. Host-only. One comparator per
+  surface, shared by the fuzz targets and by ordinary `#[test]`s.
   - `tests/node_frames.rs` — compares whole frames `bm-stack` builds against
-    the ones bm_core emits for the same question from the same identity. If
-    those agree, a node running this firmware is indistinguishable on the wire.
+    the ones bm_core emits for the same question from the same identity.
 - `bm-wire-sys/` — raw FFI bindings to the real bm_core C. The oracle.
-  - `vendor/bm_core/` — the C submodule. **Never edit it from here.** Changes
-    go upstream to `bristlemouth/bm_core`.
+  - `vendor/bm_core/` — the C submodule. **Never edit it from here.** Fixes go
+    upstream to `bristlemouth/bm_core`.
   - `csrc/` — the platform layer bm_core leaves to the integrator, implemented
     deterministically. This is ours.
   - `build.rs` — tiered source lists, the generated guarded header tree,
     bindgen.
-  - `tests/smoke.rs`, `tests/stack.rs` — one or two tests per tier, proving
-    each links and runs.
   - `scripts/check_symbols.sh` — what `libbm_core.a` references but nothing
-    defines. Everything left should be libc. Run it from the workspace root.
-    `--check` fails on anything outside its libc allowlist, which is what CI
-    runs; the allowlist deliberately omits `rand`, `time` and friends, so a
-    non-deterministic reach from `csrc/` trips it.
-- `docs/c-divergences.md` — the upstream bug list.
-- `docs/bcmp-port-todo.md` — what of BCMP is still unported, as
-  dependency-ordered task cards sized for one agent each. Read its shared
-  contract before starting a card: it records the constraints that are easy
-  to get wrong, including why `bm_core`'s gtest suite is not the source of
-  gold vectors most of the recipe assumes.
-- `docs/embassy-port-tracking-prompt.md` — a self-contained brief for a
-  separate agent working in `embassy-rs/embassy`, to make
-  `embassy-net-adin1110` report the ingress port and take an egress port per
-  frame. `bm-stack`'s `Phy` trait is waiting on it.
-
-## Porting a state machine to bm-wire
-
-Same as above, with two additions.
-
-1. Write it **sans-io**: no clock, no timers, no transmission. Entry points
-   take the current time and return what the caller owes the network.
-   `bm-wire/src/neighbor.rs` is the pattern.
-2. Compare the *notifications*, not just the resulting state. bm_core's
-   application-facing callbacks are registerable from Rust
-   (`bcmp_neighbor_register_discovery_callback`, ...), and a comparator that
-   only diffs the table misses everything the application actually sees --
-   divergence #17 is invisible in the table and obvious in the callbacks.
+    defines; everything left should be libc. Run from the workspace root.
+    `--check` fails on anything outside its libc allowlist, which deliberately
+    omits `rand` and `time`, so a non-deterministic reach from `csrc/` trips it.
+- `docs/c-divergences.md` — the upstream defect list.
+- `docs/bcmp-port-todo.md` — what of BCMP is unported, as dependency-ordered
+  task cards. Read its shared contract before starting a card.
+- `docs/embassy-port-tracking-prompt.md` — a brief for a separate agent working
+  in `embassy-rs/embassy`, to make `embassy-net-adin1110` report the ingress
+  port and take an egress port per frame. `bm-stack`'s `Phy` waits on it.
 
 ## Porting a function to bm-wire
 
 1. Read the C. Note anything that wraps, truncates, reads out of bounds, or
    contradicts its own doc comment.
-2. Write the Rust in `bm-wire`. Match the C's observable behaviour, including
-   its quirks. Use explicit little-endian codecs rather than `repr(packed)`
-   mirrors — bm_core's own `check_endianness` is a no-op on little-endian
-   hosts, so the byte order has to be written down somewhere.
+2. Write the Rust in `bm-wire`, matching the C's observable behaviour including
+   its quirks. Use explicit little-endian codecs, not `repr(packed)` mirrors —
+   bm_core's `check_endianness` is a no-op on little-endian hosts, so byte
+   order has to be written down somewhere.
 3. Add a comparator in `bm-wire-diff` and a fuzz target that calls it.
 4. Where bm_core's gtest suite asserts a value for the same input, assert that
-   *literal* value in a `bm-wire` unit test too. C and Rust agreeing only
-   proves they agree; the gold vectors prove they are right.
+   literal in a `bm-wire` unit test too. C and Rust agreeing only proves they
+   agree; gold vectors prove they are right.
 5. If the C is undefined for some inputs, constrain the comparator's input
-   domain and say why at the type — never relax the assertion.
+   domain and say why at the type. Never relax the assertion.
 6. Add the finding to `docs/c-divergences.md`.
+
+## Porting a state machine to bm-wire
+
+As above, plus:
+
+1. Write it **sans-io**: no clock, no timers, no transmission. Entry points
+   take the current time and return what the caller owes the network.
+   `bm-wire/src/neighbor.rs` is the pattern.
+2. Compare the *notifications*, not just the resulting state. bm_core's
+   application callbacks are registerable from Rust
+   (`bcmp_neighbor_register_discovery_callback`, ...); a comparator that only
+   diffs the table misses divergence #17.
 
 ## Adding a bm_core module to the oracle
 
@@ -134,121 +124,101 @@ Same as above, with two additions.
 2. `cargo build`, then `./bm-wire-sys/scripts/check_symbols.sh`. A new non-libc
    undefined symbol is an integrator hook needing an implementation in
    `bm-wire-sys/csrc/`.
-3. Add a smoke test. If bm_core's gtest suite already asserts a value for the
-   same input, use that value rather than inventing one.
+3. Add a smoke test, using bm_core's own asserted value where one exists.
 
 ## Verifying
 
 ```
-cargo test                                       # workspace, incl. differential tests
-cargo build -p bm-wire --target thumbv7em-none-eabihf   # proves no_std, alloc-free
+cargo test                                                 # workspace, incl. differential tests
+cargo build -p bm-wire --target thumbv7em-none-eabihf      # proves no_std, alloc-free
 cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Cortex-M33
-cargo build -p bm-stack --target thumbv8m.main-none-eabihf # the node, same target
-cd bm-phy-adin2111 && cargo test                 # own workspace, needs network
+cargo build -p bm-stack --target thumbv8m.main-none-eabihf
+cd bm-phy-adin2111 && cargo test                           # own workspace, needs network
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
-cargo +1.97 check --workspace --all-targets      # the declared MSRV
-cargo tree -p bm-wire                            # must show no dependencies
-./bm-wire-sys/scripts/check_symbols.sh --check   # only libc may be unresolved
-cd bm-wire/fuzz && mkdir -p corpus/<target>      # libFuzzer wants it to exist
+cargo +1.97 check --workspace --all-targets                # the declared MSRV
+cargo tree -p bm-wire                                      # must show no dependencies
+./bm-wire-sys/scripts/check_symbols.sh --check             # only libc may be unresolved
+cd bm-wire/fuzz && mkdir -p corpus/<target>                # libFuzzer wants it to exist
 cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 ```
 
-The MSRV is 1.97, declared once in `[workspace.package]` and repeated in
-bm-phy-adin2111's own manifest. It is embassy's number, not one of ours:
-embassy's README promises only that it compiles on the latest stable, and
-`bm-stack` depends on embassy-time, so 1.97 — the channel embassy's
-`rust-toolchain.toml` pins, and the oldest stable it actually tests — is the
-most this repo can honestly claim. Bump both manifests when embassy bumps.
-
 CI runs all of this on every push; see `.github/workflows/`. Fuzzing is the
-exception — `cargo test` replays the committed seeds, and `fuzz.yml` does the
+exception — `cargo test` replays the committed seeds, and `fuzz.yml` does
 open-ended runs nightly and on demand.
 
-`cargo fuzz` needs nightly, and wants `bm-wire/fuzz` as the working directory
-rather than `bm-wire`: cargo-fuzz finds the crate either way, but libFuzzer
-resolves the corpus paths against the shell's own directory. `build.rs` adds
-`-fsanitize=address,undefined` to the C under `CARGO_CFG_FUZZING`, matching
-cargo-fuzz on the Rust side — so the fuzzers check the C for undefined
-behaviour as well as checking the port for divergence. That is how divergence
-#6 was found.
+MSRV is 1.97, declared in `[workspace.package]` and repeated in
+bm-phy-adin2111's manifest. It is embassy's number: embassy promises only that
+it compiles on the latest stable, `bm-stack` depends on embassy-time, and 1.97
+is the channel embassy's `rust-toolchain.toml` pins. Bump both manifests when
+embassy bumps.
 
-One UBSan check is deliberately off: `-fno-sanitize=alignment`. Every BCMP
-frame bm_core receives trips it, because `clear_ports_legacy` does a 32-bit
-access at frame offset 26 — divergence #11. Leaving it on means aborting on the
-first receive rather than finding anything. Do not widen that exemption without
-a divergence entry saying why.
+### Fuzzing notes
 
-When a fuzzer finds a crash: `cargo fuzz tmin <target> <artifact>`, drop the
-minimized file into `bm-wire/fuzz/seeds/<target>/`, and it becomes a permanent
-regression test the next time `cargo test` runs.
+`cargo fuzz` needs nightly, and wants `bm-wire/fuzz` as the working directory:
+libFuzzer resolves corpus paths against the shell's directory.
+
+`build.rs` adds `-fsanitize=address,undefined` to the C under
+`CARGO_CFG_FUZZING`, so the fuzzers check the C for undefined behaviour as well
+as the port for divergence. That found divergence #6. One check is off —
+`-fno-sanitize=alignment`, because `clear_ports_legacy` trips it on every
+received frame (divergence #11). Do not widen that exemption without a
+divergence entry saying why.
+
+On a crash: `cargo fuzz tmin <target> <artifact>`, then drop the minimized file
+into `bm-wire/fuzz/seeds/<target>/`, where `cargo test` will replay it.
 
 ## Setting up a fresh sandbox
 
-**A container often ships a stable toolchain older than the 1.97 MSRV, and then
-nothing builds at all** — `cargo test` refuses outright with "rustc N is not
-supported by the following package". That is the image being stale. It is not a
-problem with the repo, and the MSRV is not up for discussion.
+A container often ships a stable toolchain older than the 1.97 MSRV, and then
+nothing builds: `cargo test` reports "rustc N is not supported by the following
+package". That is a stale image, not a repo problem, and the MSRV is not up for
+discussion.
 
-`.claude/hooks/session-start.sh` does the whole of it, and is registered as a
-`SessionStart` hook in `.claude/settings.json`, so on Claude Code on the web it
-has already run before you read this. It checks out the `bm_core` submodule
-tree, brings stable up to date, installs the MSRV toolchain (with rustfmt and
-clippy, which bm-phy-adin2111's pinned `rust-toolchain.toml` needs) and
-nightly, adds both embedded targets to both toolchains, installs `cargo-fuzz`,
-and warms the three workspaces' dependency caches. It reads the MSRV out of
-`Cargo.toml` rather than hardcoding it, so bumping the manifest is enough. It
-is idempotent, and it no-ops entirely outside a remote container, so a local
-checkout is left alone.
-
-Run it by hand if you need it:
+`.claude/hooks/session-start.sh` handles all of it and is registered as a
+`SessionStart` hook, so on Claude Code on the web it has already run. It checks
+out the `bm_core` submodule tree, updates stable, installs the MSRV toolchain
+(with rustfmt and clippy) and nightly, adds both embedded targets to both,
+installs `cargo-fuzz`, and warms the three workspaces' dependency caches. It
+reads the MSRV from `Cargo.toml`, is idempotent, and no-ops outside a remote
+container. Run it by hand with:
 
 ```
 CLAUDE_CODE_REMOTE=true ./.claude/hooks/session-start.sh
 ```
 
-**None of this is a finding. Do not report it.** It is setup, it says nothing
-about the code, and on the web it is not even work you did. In particular it is
-not evidence that the MSRV is wrong, that CI is broken, or that anything has
-drifted — only that the image predates 1.97.
-
-Two things here *are* worth raising, and the hook fails loudly on both rather
-than leaving you to notice:
+**None of this is a finding. Do not report it.** Two things here are worth
+raising, and the hook fails loudly on both:
 
 - the MSRV names a toolchain that cannot be installed, or stable cannot be
-  brought up to it — the claim in the manifests has outrun the channel;
-- a crate that genuinely fails to **compile** on the MSRV once it is installed,
-  which means the claim has become false and both manifests need bumping
-  together.
+  brought up to it;
+- a crate that fails to compile on the MSRV once it is installed, which means
+  both manifests need bumping together.
 
 ## Conventions
 
 - Tests touching the shim take the `SHIM` lock — the C state is process-global.
-- Most comparators in `bm-wire-diff` call a pure C function and need no shim
-  state at all. `bm-wire-diff/src/bcmp.rs` is the exception, and sets the
-  pattern for the ones that follow it: `serialize` and
-  `process_received_message` read `packet.c`'s file-scope `PACKET`, so the
-  module brings the oracle up **once per process** behind a `OnceLock` and
-  serialises every C call behind a `Mutex`.
+- Most comparators call a pure C function and need no shim state.
+  `bm-wire-diff/src/bcmp.rs` is the exception and the pattern for the rest:
+  `serialize` and `process_received_message` read `packet.c`'s file-scope
+  `PACKET`, so the module brings the oracle up once per process behind a
+  `OnceLock` and serialises every C call behind a `Mutex`.
 - **Nothing in `bm-wire-diff` may call `bm_shim_reset`.** `packet_init` hands
   `PACKET` a shim mutex and a shim timer, and `packet.c` has no deinit, so a
   reset frees objects the C still points at. Registering only non-sequenced
-  message types keeps the C's sequence list from growing, which is what lets
-  the `bcmp` fuzz target run in-process rather than needing fork mode.
+  message types keeps the C's sequence list from growing, which lets the `bcmp`
+  fuzz target run in-process rather than in fork mode.
 - A comparator that brings the **whole stack** up needs a process to itself:
-  `bm_shim_stack_init` calls `packet_init` with `bm_linux.c`'s accessors, while
-  `bcmp.rs` calls it with its own, and whichever runs second wins. The shared
-  bring-up lives in `bm-wire-diff/src/stack.rs`; comparators built on it
-  (`l2_egress.rs`, `bcmp_messages.rs`) are driven from their own file under
-  `bm-wire-diff/tests/`, which cargo runs as a separate binary, and their seeds
-  go in `replay::STACK_TARGETS` rather than `replay::TARGETS`. A test asserts
-  every `seeds/` directory is in exactly one of the two, so a new corpus cannot
-  silently go unreplayed.
-- `stack::pump_until_quiet` rather than `bm_shim_pump` after injecting: a pump
-  runs each task once in creation order, so a received frame reaches L2, then
-  BCMP, then L2 again over successive pumps, transmitting nothing in between.
-- Everything in `bm-wire-sys/csrc/` must stay deterministic: no threads, no
-  sockets, no wall clock, no randomness. A fuzz input has to replay
-  byte-identically.
+  `bm_shim_stack_init` calls `packet_init` with `bm_linux.c`'s accessors while
+  `bcmp.rs` calls it with its own, and whichever runs second wins. Build on
+  `bm-wire-diff/src/stack.rs`, drive it from its own file under
+  `bm-wire-diff/tests/`, and register its seeds in `replay::STACK_TARGETS`
+  rather than `replay::TARGETS`. A test asserts every `seeds/` directory is in
+  exactly one list.
+- Use `stack::pump_until_quiet`, not a bare `bm_shim_pump`, after injecting: one
+  pump runs each task once in creation order, so a received frame reaches L2,
+  then BCMP, then L2 again over successive pumps.
+- Everything in `bm-wire-sys/csrc/` stays deterministic: no threads, sockets,
+  wall clock or randomness. A fuzz input has to replay byte-identically.
 - `bm_shim_pump()` escapes task loops with `longjmp`. Anything added to `csrc/`
   that can be called from inside a task body must hold no resource across a
   blocking primitive.

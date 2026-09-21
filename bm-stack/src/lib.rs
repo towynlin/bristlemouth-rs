@@ -1,27 +1,24 @@
 //! An async Bristlemouth node on embassy, built on [`bm_wire`].
 //!
-//! `bm-wire` is deliberately inert: pure codecs and sans-io state machines,
-//! no dependencies, no clock, no I/O. This crate is where those become a node
-//! that talks — it supplies the clock, the timer and the PHY, and nothing else.
+//! `bm-wire` is inert: pure codecs and sans-io state machines, no
+//! dependencies, no clock, no I/O. This crate supplies the clock, the timer
+//! and the PHY, and nothing else.
 //!
-//! The split is not decoration. Everything that decides what goes on the wire
-//! is in `bm-wire` and is compared byte for byte against the real C by
-//! `bm-wire-diff`. What is here is the part that cannot be compared that way:
-//! scheduling, and the driver.
+//! Everything deciding what goes on the wire stays in `bm-wire`, where
+//! `bm-wire-diff` compares it byte for byte against the real C. What is here
+//! is what cannot be compared that way: scheduling, and the driver.
 //!
 //! # Shape
 //!
 //! * [`port`] holds the seams an integrator fills — a port-aware PHY, the
-//!   node's identity and its real-time clock — as traits rather than as
+//!   node's identity and its real-time clock — as traits rather than
 //!   link-time symbols, so a test and the firmware can have different ones.
-//! * [`node::Node`] is the protocol. Its two entry points are synchronous and
-//!   take the current time, which is what makes them testable without an
+//! * [`node::Node`] is the protocol. Its three receive/timer entry points are
+//!   synchronous and take the current time, so they are testable without an
 //!   executor.
-//! * [`node::Node::run`] is the loop that joins the two, and is the only async
-//!   code here.
+//! * [`node::Node::run`] joins them, and is the only async code here.
 //! * [`mock`], behind the `mock` feature, is a PHY that replays a script and
-//!   records what was sent — enough to exercise the whole node before any
-//!   hardware exists.
+//!   records what was sent.
 
 #![no_std]
 #![forbid(unsafe_code)]

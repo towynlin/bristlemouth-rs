@@ -1,70 +1,58 @@
 //! The node: what to say, when to say it, and what to do with what arrives.
 //!
-//! The interesting half is synchronous. [`Node::on_frame`] and
-//! [`Node::on_tick`] take the current time, mutate the node's state, and hand
-//! back at most one frame to transmit — no futures, no PHY, no allocator. That
-//! is what makes the behaviour testable without an executor, and it is where
-//! all of the protocol lives.
-//!
-//! [`Node::run`] is the thin part on top: it waits on the PHY or the heartbeat
-//! ticker, calls one of the two, and transmits whatever came back.
+//! [`Node::on_frame`], [`Node::on_tick`] and [`Node::on_expiry`] are
+//! synchronous: they take the current time, mutate the node's state, and
+//! return at most one frame to transmit — no futures, no PHY, no allocator.
+//! All the protocol is there. [`Node::run`] is the thin async part on top: it
+//! waits on the PHY or the heartbeat ticker, calls one of the three, and
+//! transmits what came back.
 //!
 //! # Forwarding
 //!
-//! A frame that arrives is not always this node's business, and is not always
-//! only this node's business. [`Node::on_frame`] therefore runs bm_core's two
-//! receive stages in bm_core's order: L2's routing policy
-//! ([`bm_wire::l2_policy::rx_apply`]) decides which ports the frame is relayed
-//! to and whether it also travels up the local stack, and only then is it
-//! parsed as BCMP. Both answers come back together in [`Owed`], relay first,
-//! because that is the order `bm_l2_process_rx_evt` puts them on the wire in.
+//! [`Node::on_frame`] runs bm_core's two receive stages in bm_core's order:
+//! L2's routing policy ([`bm_wire::l2_policy::rx_apply`]) decides which ports
+//! the frame is relayed to and whether it also travels up the local stack, and
+//! only then is it parsed as BCMP. Both answers come back in [`Owed`], relay
+//! first, which is the order `bm_l2_process_rx_evt` puts them on the wire in.
 //!
-//! [`Node::forward_link_local`] is the other half — `bcmp_ll_forward`, which
-//! re-floods a link-local *message* as a fresh frame per port rather than
-//! relaying the received bytes. The system-time exchange is the first ported
-//! caller: a `0x10`, `0x11` or `0x12` naming another node comes back as
-//! [`Owed::forward`], which [`Node::reflood`] turns into one frame per other
-//! port. Config and DFU will join it.
+//! [`Node::forward_link_local`] is `bcmp_ll_forward`: it re-floods a
+//! link-local *message* as a fresh frame per port rather than relaying the
+//! received bytes. A `0x10`, `0x11` or `0x12` naming another node comes back
+//! as [`Owed::forward`], which [`Node::reflood`] turns into one frame per
+//! other port. Config and DFU will use the same path.
 //!
 //! # Requests and replies
 //!
-//! Everything the node puts on the wire goes through
+//! Everything the node sends goes through
 //! [`bm_wire::bcmp::registry::Registry`], which is `bcmp/packet.c`'s state:
 //! which message types exist, what sequence number an outgoing message
 //! carries, which outstanding requests a reply may answer, and when an
-//! unanswered one is given up on. [`Node::send`] is `bcmp_tx`, [`Node::request`]
-//! is `bcmp_tx` with no number to echo, and what comes back arrives as an
-//! [`Event`] — the three exits of `process_received_message` plus the
-//! `cb(NULL)` the expiry sweep takes.
+//! unanswered one is given up on. [`Node::send`] is `bcmp_tx`,
+//! [`Node::request`] is `bcmp_tx` with no number to echo, and what comes back
+//! arrives as an [`Event`] — the three exits of `process_received_message`
+//! plus the `cb(NULL)` the expiry sweep takes.
 //!
-//! A type nothing registers is not sent and not dispatched. That is the C's
-//! `BmENODEV`: `serialize` writes nothing into the caller's buffer, so
-//! `bcmp_tx` transmits nothing, and `process_received_message` returns before
-//! it looks at the body. [`Node::new`] registers what bm_core's `bcmp_init`
-//! registers for the modules that are ported — heartbeat, ping, system time,
-//! device info and the neighbour table — and [`Node::register`] is how a card
-//! adds its own.
+//! A type nothing registers is neither sent nor dispatched, which is the C's
+//! `BmENODEV`. [`Node::new`] registers what `bcmp_init` registers for the
+//! ported modules — heartbeat, ping, system time, device info and the
+//! neighbour table; [`Node::register`] adds more.
 //!
 //! # Ping is correlated outside the registry
 //!
 //! `bcmp/ping.c` registers both of its types unsequenced, so `packet.c` never
-//! matches an echo reply to an echo request: the module does it itself, from
-//! two file-scope statics that track exactly one outstanding ping. [`Node::ping`]
-//! is `bcmp_send_ping_request` and that single slot is on the node, because a
-//! second ping overwrites the first's expectations just as it does in the C.
-//! The verdict arrives as [`Event::EchoReply`], which is the one thing bm_core
-//! does not offer an application at all — there, a matched reply is a debug
-//! print and nothing more.
+//! matches an echo reply to an echo request; the module does it itself, from
+//! file-scope statics tracking exactly one outstanding ping. [`Node::ping`] is
+//! `bcmp_send_ping_request`, and that single slot is on the node, so a second
+//! ping overwrites the first's expectations as it does in the C. The verdict
+//! arrives as [`Event::EchoReply`], which bm_core reports to nobody.
 //!
 //! # Two timers, not one
 //!
-//! bm_core has both, and so does this: the 10-second heartbeat timer, which is
-//! [`Node::on_tick`], and `packet.c`'s 150 ms expiry sweep, which is
-//! [`Node::on_expiry`]. The sweep carries its own phase — see divergence #22 —
-//! so [`Node::on_expiry`] only has to be called at least every
-//! [`EXPIRY_PERIOD_MS`]; calling it more often costs nothing and calling it on
-//! a grid of one's own is what would make the port give up on requests at
-//! different moments from a C node.
+//! The 10-second heartbeat timer is [`Node::on_tick`]; `packet.c`'s 150 ms
+//! expiry sweep is [`Node::on_expiry`]. The sweep carries its own phase (see
+//! divergence #22), so [`Node::on_expiry`] only has to be called at least
+//! every [`EXPIRY_PERIOD_MS`]. Putting it on a grid of the port's own would
+//! make the port give up on requests at different moments from a C node.
 
 use bm_wire::addr;
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
@@ -119,18 +107,15 @@ pub const EXPIRY_PERIOD_MS: u32 = MESSAGE_TIMER_EXPIRY_PERIOD_MS;
 /// What a received message, or a request that gave up waiting, tells the
 /// application.
 ///
-/// The three variants are the three ways `process_received_message` can end
-/// for a message whose type is registered, plus the one the expiry sweep
-/// takes. The C reaches the application through function pointers — a
-/// `BcmpSequencedRequestCb` stored with the request, called with the reply's
-/// payload or with `NULL`, and a `cfg->process` per type — and the two are
-/// easy to confuse, because a caller that does not test for the null payload
-/// dereferences it. Here they cannot be confused: a timeout has no payload to
-/// read.
+/// The variants are the ways `process_received_message` can end for a
+/// registered type, plus the one the expiry sweep takes. The C reaches the
+/// application through function pointers — a `BcmpSequencedRequestCb` called
+/// with the reply's payload or with `NULL`, and a `cfg->process` per type —
+/// which a caller can confuse by not testing for the null payload. Here a
+/// timeout has no payload to read.
 ///
 /// The payload borrows the frame it arrived in and is gone when the handler
-/// returns, which is what keeps this allocation-free. Anything worth keeping
-/// has to be copied out.
+/// returns, which is what keeps this allocation-free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Event<'a> {
@@ -155,11 +140,10 @@ pub enum Event<'a> {
     },
     /// The expiry sweep gave up on a request. The C's `cb(NULL)`.
     ///
-    /// A reply that arrives after this is not dropped — it no longer matches
-    /// anything, so it is delivered again as [`Event::Message`]. The
-    /// application therefore hears about one exchange twice, once as a failure
-    /// and once as unsolicited traffic; that is divergence #22, and it is the
-    /// C's behaviour, not the port's invention.
+    /// A reply arriving after this no longer matches anything, so it is
+    /// delivered as [`Event::Message`]: the application hears about one
+    /// exchange twice, once as a failure and once as unsolicited traffic. See
+    /// divergence #22.
     Timeout {
         /// The request that went unanswered.
         request: PendingRequest,
@@ -182,15 +166,14 @@ pub enum Event<'a> {
     /// An echo reply answered the outstanding ping — `bcmp_process_ping_reply`
     /// reaching its `err = BmOK`.
     ///
-    /// This is reported **in addition to** [`Event::Message`] for the same
-    /// frame, and the split is bm_core's own: the `Message` is what
-    /// `process_received_message` dispatched, and this is what `ping.c` then
-    /// made of it. A reply that does not match produces only the `Message`.
+    /// Reported **in addition to** [`Event::Message`] for the same frame: the
+    /// `Message` is what `process_received_message` dispatched, this is what
+    /// `ping.c` made of it. A reply that does not match produces only the
+    /// `Message`.
     ///
     /// bm_core has nowhere to send this — `bcmp_send_ping_request` takes no
-    /// callback, and echo replies are registered unsequenced, so `packet.c`
-    /// has no callback to reach either. The round-trip result exists only as a
-    /// `bm_debug` line. See divergence #32.
+    /// callback and echo replies are unsequenced — so there the round-trip
+    /// result is only a `bm_debug` line. See divergence #32.
     EchoReply {
         /// Node id the reply came from, from the frame's source address.
         ///
@@ -201,11 +184,7 @@ pub enum Event<'a> {
         /// The reply as it arrived, payload included.
         reply: bm_wire::bcmp::ping::EchoReply<'a>,
         /// Milliseconds since [`Node::ping`] built the request, the value
-        /// bm_core prints as `time=`.
-        ///
-        /// Wrapping, like every other clock here. bm_core computes it in 64
-        /// bits from a 32-bit tick counter, so its version is wrong for one
-        /// reading after the counter wraps and this one is not.
+        /// bm_core prints as `time=`. Wrapping, like every other clock here.
         round_trip_ms: u32,
     },
 }
@@ -241,18 +220,17 @@ impl Outbound<'_> {
 
 /// What a received frame obliges the node to put back on the network.
 ///
-/// The two halves come from the two stages of `bm_l2_process_rx_evt`, and the
-/// field order is the transmit order: L2 queues the relay before it submits the
-/// frame up the stack, so a C node puts the relayed copy on the wire first.
-/// [`deliver`] does them in that order.
+/// Field order is transmit order: L2 queues the relay before it submits the
+/// frame up the stack, so a C node puts the relayed copy on the wire first, and
+/// [`deliver`] does the same.
 ///
 /// The lifetimes are separate because the two frames live in different buffers:
 /// `'f` is the caller's receive buffer, `'n` the node's transmit buffer.
 ///
-/// The third half, [`Owed::forward`], is not a frame at all but an instruction:
-/// `bcmp_ll_forward` builds one *new* frame per port and there is one transmit
-/// buffer, so the caller has to build and transmit them one at a time. See
-/// [`Node::reflood`], which is that loop.
+/// [`Owed::forward`] is an instruction rather than a frame: `bcmp_ll_forward`
+/// builds one new frame per port and there is one transmit buffer, so the
+/// caller builds and transmits them one at a time. [`Node::reflood`] is that
+/// loop.
 #[derive(Debug)]
 pub struct Owed<'f, 'n> {
     /// The received frame, already prepared as a forwarded copy, and the ports
@@ -278,17 +256,15 @@ impl Owed<'_, '_> {
 /// A received message `bcmp_ll_forward` is to re-flood, as a range within the
 /// frame it arrived in.
 ///
-/// The C hands `bcmp_ll_forward` `data.header`, `data.payload` and `data.size`,
-/// which together are the BCMP header and body exactly as they arrived, still
-/// inside the received frame. This is that same region, said as a range so that
-/// nothing is borrowed and nothing is copied — the caller already owns the
-/// frame, and the node's one transmit buffer is needed for the copies.
+/// The C hands `bcmp_ll_forward` `data.header`, `data.payload` and `data.size`
+/// — the BCMP header and body as they arrived, still inside the received
+/// frame. A range rather than a borrow, so nothing is copied and the node's one
+/// transmit buffer stays free for the copies.
 ///
-/// [`Self::ingress_port`] is the C's `data.ingress_port`, which is the nibble
-/// the *sender's* L2 stamped into the source address rather than the port the
-/// PHY reports. The two agree on a link where both ends stamp; a sender that
-/// stamped nothing yields 0, and the message is then re-flooded back out the
-/// port it came in on. That is the C's behaviour — see
+/// [`Self::ingress_port`] is the C's `data.ingress_port`: the nibble the
+/// *sender's* L2 stamped into the source address, not the port the PHY
+/// reports. A sender that stamped nothing yields 0, and the message is then
+/// re-flooded back out the port it came in on — see
 /// [`bm_wire::bcmp::forward::egress_ports`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reflood {
@@ -369,13 +345,13 @@ impl Snapshot {
 /// raises the parameter.
 pub const PING_PAYLOAD_BYTES: usize = 64;
 
-/// `bcmp/ping.c`'s four file-scope statics, which between them track exactly
-/// one outstanding ping.
+/// `bcmp/ping.c`'s four file-scope statics, which track exactly one
+/// outstanding ping.
 ///
 /// A second [`Node::ping`] overwrites the first's expectations, as
-/// `bcmp_send_ping_request` does by freeing `EXPECTED_PAYLOAD` and allocating
-/// another. Nothing ever clears them again — not a matched reply, not time —
-/// so the last ping's payload keeps answering for as long as the node runs.
+/// `bcmp_send_ping_request` does by freeing and reallocating
+/// `EXPECTED_PAYLOAD`. Nothing else ever clears them, so the last ping's
+/// payload keeps answering for as long as the node runs.
 #[derive(Debug)]
 struct PingState<const PAYLOAD: usize> {
     /// `BCMP_SEQ`. A `uint32_t` counter whose low sixteen bits are what
@@ -383,14 +359,12 @@ struct PingState<const PAYLOAD: usize> {
     /// `packet.c`'s `message_count`.
     seq: u32,
     /// `PING_REQUEST_TIMEOUT`, which despite the name times nothing out: it is
-    /// stamped after every request and read only to print a round-trip. A ping
-    /// that is never answered is simply never mentioned again — see
+    /// stamped after every request and read only to report a round-trip. See
     /// divergence #32.
     sent_at_ms: u32,
     /// `EXPECTED_PAYLOAD_LEN`, and `None` for the `EXPECTED_PAYLOAD == NULL`
-    /// the C starts in and returns to on a payload-free request. The two are
-    /// only ever set and cleared together, which is what lets one field hold
-    /// both.
+    /// the C starts in and returns to on a payload-free request. The C's two
+    /// statics are only ever set and cleared together, so one field holds both.
     expected_len: Option<u16>,
     /// `EXPECTED_PAYLOAD`'s bytes, as much of them as is worth keeping.
     expected: [u8; PAYLOAD],
@@ -429,20 +403,20 @@ impl<const PAYLOAD: usize> PingState<PAYLOAD> {
 
 /// A Bristlemouth node.
 ///
-/// `NEIGHBORS` is the neighbour-table capacity; it needs to be at least the
-/// PHY's port count, since bm_core keeps one neighbour per port. `PENDING` is
-/// how many requests may be waiting for a reply at once — bm_core's list is
-/// unbounded, and a `bm_malloc` failure there is discarded, so the port does
-/// what a full list does there: the request goes out untracked and its reply
-/// arrives as ordinary traffic. See
+/// `NEIGHBORS` is the neighbour-table capacity, and must be at least the PHY's
+/// port count, since bm_core keeps one neighbour per port.
+///
+/// `PENDING` is how many requests may await a reply at once. bm_core's list is
+/// unbounded and discards a `bm_malloc` failure, so a full list here does the
+/// same: the request goes out untracked and its reply arrives as ordinary
+/// traffic. See
 /// [`Outgoing::tracked`][bm_wire::bcmp::registry::Outgoing::tracked].
 ///
 /// `PING_PAYLOAD` is the longest ping payload the node can remember well
-/// enough to check a reply against, and so the longest one [`Node::ping`] will
+/// enough to check a reply against, and so the longest [`Node::ping`] will
 /// send. bm_core has no equivalent limit, only an unchecked `bm_malloc` whose
-/// failure it dereferences; refusing to send is the allocation-free node's
-/// version of that, and it is the one place ping's behaviour here is a choice
-/// rather than a port.
+/// failure it dereferences. This is the one place ping's behaviour here is a
+/// choice rather than a port.
 pub struct Node<
     I,
     R = NoRtc,
@@ -469,10 +443,9 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
 {
     /// A node with an empty neighbour table, at time zero.
     ///
-    /// The registry comes up registered for what bm_core's `bcmp_init`
-    /// registers for the modules that are ported, and with the expiry sweep
-    /// phased from zero — which is where [`Node::on_tick`]'s clock starts, since
-    /// it counts milliseconds of uptime.
+    /// The registry comes up holding what `bcmp_init` registers for the ported
+    /// modules, with the expiry sweep phased from zero — where
+    /// [`Node::on_tick`]'s uptime clock starts.
     pub fn new(identity: I, rtc: R, port_count: u8) -> Self {
         let mut registry = Registry::new();
         // heartbeat.c, ping.c, time.c, neighbors.c and info.c, in the order
@@ -528,8 +501,7 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
     /// does, reporting whether there was one.
     ///
     /// A node that unregisters a type it answers stops answering it: the
-    /// message is dropped before its body is looked at, which is what the C's
-    /// `BmENODEV` does.
+    /// message is dropped before its body is looked at, the C's `BmENODEV`.
     pub fn unregister(&mut self, message_type: MessageType) -> bool {
         self.registry.remove(message_type)
     }
@@ -572,8 +544,8 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
         &self.rtc
     }
 
-    /// The same, mutably — a firmware that sets its clock from somewhere other
-    /// than a `0x12` message needs this.
+    /// The same, mutably, for a firmware that sets its clock from somewhere
+    /// other than a `0x12` message.
     pub fn rtc_mut(&mut self) -> &mut R {
         &mut self.rtc
     }
@@ -616,16 +588,16 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
     ///
     /// `frame` is mutated in place, as bm_core mutates it. When a relay is owed
     /// the frame comes back as the C's forwarded copy — the whole ports byte
-    /// cleared, everything else as it arrived — and the returned [`Owed::relay`]
-    /// borrows it. Anything that does not validate as BCMP is dropped silently,
-    /// which is also what bm_core does; a dropped frame can still be relayed,
-    /// because the two decisions are made by different layers.
+    /// cleared, everything else as it arrived — and [`Owed::relay`] borrows it.
+    /// Anything that does not validate as BCMP is dropped silently, as in
+    /// bm_core; a dropped frame can still be relayed, since the two decisions
+    /// are made by different layers.
     ///
     /// bm_core's L2 also takes a link-local routing callback, consulted for
     /// link-local multicast that is not `FF02::1`. Nothing in bm_core registers
-    /// one — `bm_l2_register_link_local_routing_callback` has no callers — so
-    /// this passes `None`, which is what a C node does too: such a frame is
-    /// submitted locally and relayed nowhere.
+    /// one (`bm_l2_register_link_local_routing_callback` has no callers), so
+    /// this passes `None`: such a frame is submitted locally and relayed
+    /// nowhere.
     pub fn on_frame<'f>(
         &mut self,
         now_ms: u32,
@@ -637,11 +609,10 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
 
     /// The same, reporting every [`Event`] the frame produces.
     ///
-    /// The handler runs while the frame is still borrowed, which is what lets
-    /// a payload be passed without copying it. It is called before the node
-    /// acts on the message, so a reply the node builds is built after the
-    /// application has seen what prompted it — the same order the C has, where
-    /// `cfg->process` *is* the node's handling.
+    /// The handler runs while the frame is still borrowed, so a payload is
+    /// passed without copying. It runs before the node acts on the message, so
+    /// the application sees what prompted a reply before the reply is built —
+    /// the C's order, where `cfg->process` *is* the node's handling.
     pub fn on_frame_with<'f>(
         &mut self,
         now_ms: u32,
@@ -892,12 +863,12 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
     /// does — a fresh frame from this node, carrying the received BCMP header
     /// and body unchanged.
     ///
-    /// `bcmp` is the received message, header first, exactly as
-    /// [`bm_wire::bcmp::rx::accept`] found it; a caller has it as
-    /// `&frame[BCMP_HEADER_OFFSET..]` truncated to the IPv6 payload length.
-    /// Call it once per port from [`bm_wire::bcmp::forward::egress_ports`],
-    /// transmitting each frame before building the next — there is one transmit
-    /// buffer, exactly as bm_core allocates one forward buffer per port.
+    /// `bcmp` is the received message, header first, as
+    /// [`bm_wire::bcmp::rx::accept`] found it: `&frame[BCMP_HEADER_OFFSET..]`
+    /// truncated to the IPv6 payload length. Call it once per port from
+    /// [`bm_wire::bcmp::forward::egress_ports`], transmitting each frame before
+    /// building the next — there is one transmit buffer, as bm_core allocates
+    /// one forward buffer per port.
     ///
     /// Returns `None` if the message does not fit the transmit buffer or is
     /// shorter than a BCMP header, both of which bm_core reports as an error
@@ -942,13 +913,11 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
 
     /// The same, reporting every [`Event`] the tick produces.
     ///
-    /// This is bm_core's heartbeat timer, which does not sweep the outstanding
-    /// requests — `packet.c` has its own timer for that, and
-    /// [`Node::on_expiry`] is it. The sweep is run here as well because it
-    /// costs nothing between phases and a node driven only by this entry point
-    /// would otherwise never give up on a request at all; a node that also
-    /// calls [`Node::on_expiry`] on time is unaffected, because what decides
-    /// when a sweep happens is the phase, not the call.
+    /// This is bm_core's heartbeat timer, which does not itself sweep
+    /// outstanding requests — `packet.c` has [`Node::on_expiry`] for that. The
+    /// sweep runs here too, so a node driven only by this entry point still
+    /// gives up on requests. A node that also calls [`Node::on_expiry`] on time
+    /// is unaffected: the phase decides when a sweep happens, not the call.
     pub fn on_tick_with(
         &mut self,
         uptime_ms: u32,
@@ -965,13 +934,12 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
 
     /// Run `packet.c`'s expiry sweep, reporting every request that gave up.
     ///
-    /// Call it at least every [`EXPIRY_PERIOD_MS`]. It is `sequence_list_timer_callback`,
-    /// and the 150 ms grid it fires on — not the 24 ms a request is stamped
-    /// with — is what actually decides when a request dies, which is
-    /// divergence #22. The phase lives in the registry, so calling this early,
-    /// late or twice changes nothing: what matters is not leaving longer than
-    /// a period between calls, because a sweep that is skipped is a request
-    /// that outlives the one a C node would have given up on.
+    /// Call it at least every [`EXPIRY_PERIOD_MS`]. It is
+    /// `sequence_list_timer_callback`, and the 150 ms grid it fires on — not
+    /// the 24 ms a request is stamped with — decides when a request dies
+    /// (divergence #22). The phase lives in the registry, so calling this
+    /// early, late or twice changes nothing; only a skipped sweep does, and
+    /// that leaves a request alive that a C node would have given up on.
     pub fn on_expiry(&mut self, now_ms: u32, mut events: impl FnMut(Event<'_>)) {
         self.registry.on_tick(now_ms, |request| {
             events(Event::Timeout { request: *request });
@@ -987,15 +955,13 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
     /// `bcmp/config.c` is every type bm_core has — carries zero. Use
     /// [`Node::request`] when there is nothing to echo.
     ///
-    /// Returns `None` and sends nothing when the type is not registered, which
-    /// is the C's `BmENODEV`: `serialize` leaves the caller's buffer untouched
+    /// Returns `None` and sends nothing when the type is not registered — the
+    /// C's `BmENODEV`, where `serialize` leaves the caller's buffer untouched
     /// and `bcmp_tx` never reaches `bm_ip_tx_perform`. Also `None` when the
-    /// message does not fit the transmit buffer — checked before the registry
-    /// is asked, so an oversized request never becomes an outstanding one, as
-    /// in the C, where `bcmp_tx`'s size guard runs before `serialize`. The
-    /// ceiling here is the buffer, 1447 body bytes; the C's guard admits one
-    /// more and then builds a frame a byte over the MTU, which is divergence
-    /// #8.
+    /// message does not fit the transmit buffer, checked before the registry is
+    /// asked so an oversized request never becomes an outstanding one, as in
+    /// the C. The ceiling here is 1447 body bytes; the C's guard admits one
+    /// more and then builds a frame a byte over the MTU (divergence #8).
     pub fn send(
         &mut self,
         now_ms: u32,
@@ -1010,30 +976,22 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
         if end > MTU {
             return None;
         }
-        let outgoing = self
-            .registry
-            .on_serialize(now_ms, message_type, reply_seq_num)
-            .ok()?;
-
-        let all_ports = self.all_ports_mask();
+        let (seq_num, mask) = self.outgoing(now_ms, message_type, reply_seq_num)?;
         let Self { identity, tx, .. } = self;
-        let end = build_frame(
+        build_outbound(
             tx,
             identity.node_id(),
             dst,
             message_type,
-            outgoing.seq_num,
+            seq_num,
+            mask,
             |buf| {
                 buf.get_mut(..body.len())
                     .ok_or(BmWireError::Truncated)?
                     .copy_from_slice(body);
                 Ok(body.len())
             },
-        )?;
-        Some(Outbound {
-            frame: &mut tx[..end],
-            mask: all_ports,
-        })
+        )
     }
 
     /// Send a message that is not answering one — [`Node::send`] with no
@@ -1070,17 +1028,15 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
     /// takes the address as an argument, so this does too.
     ///
     /// Returns `None` without sending, and **without disturbing the ping
-    /// state**, when `payload` is longer than `PING_PAYLOAD` — or than the
-    /// `u16` length field, for a node given a `PING_PAYLOAD` larger than
-    /// that: there would be
-    /// nowhere to remember it, and a ping whose reply cannot be checked is
-    /// worse than no ping. That is the one thing here with no C counterpart —
-    /// bm_core `bm_malloc`s the copy and dereferences the result without
-    /// checking it. Also `None`, after the counter has advanced and the
-    /// payload has been stored, if the request does not fit the transmit
-    /// buffer or [`MessageType::ECHO_REQUEST`] has been unregistered; that is
-    /// the C's order too, where `BCMP_SEQ++` and the copy both happen before
-    /// `bcmp_tx` is called at all.
+    /// state**, when `payload` is longer than `PING_PAYLOAD` or than the `u16`
+    /// length field: there would be nowhere to remember it. That is the one
+    /// thing here with no C counterpart — bm_core `bm_malloc`s the copy and
+    /// dereferences the result unchecked.
+    ///
+    /// Also `None`, but *after* the counter has advanced and the payload has
+    /// been stored, if the request does not fit the transmit buffer or
+    /// [`MessageType::ECHO_REQUEST`] is unregistered. That is the C's order,
+    /// where `BCMP_SEQ++` and the copy both happen before `bcmp_tx` is called.
     pub fn ping(
         &mut self,
         now_ms: u32,
@@ -1110,25 +1066,17 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
             seq_num,
             payload,
         };
-        let header_seq = self
-            .registry
-            .on_serialize(now_ms, MessageType::ECHO_REQUEST, 0)
-            .ok()?
-            .seq_num;
-        let all_ports = self.all_ports_mask();
+        let (header_seq, mask) = self.outgoing(now_ms, MessageType::ECHO_REQUEST, 0)?;
         let Self { identity, tx, .. } = self;
-        let end = build_frame(
+        build_outbound(
             tx,
             identity.node_id(),
             dst,
             MessageType::ECHO_REQUEST,
             header_seq,
+            mask,
             |body| request.encode(body),
-        )?;
-        Some(Outbound {
-            frame: &mut tx[..end],
-            mask: all_ports,
-        })
+        )
     }
 
     /// `BCMP_SEQ`: the number the *next* ping will carry, before truncation.
@@ -1141,7 +1089,7 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
     /// compared against. `None` is the C's null pointer.
     ///
     /// Nothing clears this: bm_core keeps the last ping's payload for the life
-    /// of the process, and so a reply carrying it is accepted however long
+    /// of the process, so a reply carrying it is accepted however long
     /// afterwards it arrives.
     #[must_use]
     pub fn expected_ping_payload(&self) -> Option<&[u8]> {
@@ -1152,9 +1100,9 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
     ///
     /// Goes to `FF02::1`, so every node on the link sees it and exactly one
     /// answers. Passing zero asks **nobody**: the broadcast reaches every
-    /// node's switch and every node then drops it on the exact-match test.
-    /// That is divergence #27, reproduced here rather than corrected — a C
-    /// node on the other end would ignore it too.
+    /// node's switch and every node drops it on the exact-match test. That is
+    /// divergence #27, reproduced rather than corrected — a C node on the
+    /// other end would ignore it too.
     pub fn request_system_time(
         &mut self,
         now_ms: u32,
@@ -1209,30 +1157,42 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
         target_node_id == 0 || target_node_id == self.identity.node_id()
     }
 
-    fn build_heartbeat(&mut self, uptime_ms: u32) -> Option<Outbound<'_>> {
+    /// The sequence number `message_type` goes out with, and the port mask a
+    /// frame this node built is transmitted on.
+    ///
+    /// `None` for an unregistered type, which is the C's `BmENODEV`: the
+    /// registry is asked first, so a message whose type nothing registered is
+    /// never built.
+    fn outgoing(
+        &mut self,
+        now_ms: u32,
+        message_type: MessageType,
+        reply_seq_num: u32,
+    ) -> Option<(u32, u16)> {
         let seq_num = self
             .registry
-            .on_serialize(uptime_ms, MessageType::HEARTBEAT, 0)
+            .on_serialize(now_ms, message_type, reply_seq_num)
             .ok()?
             .seq_num;
-        let all_ports = self.all_ports_mask();
+        Some((seq_num, self.all_ports_mask()))
+    }
+
+    fn build_heartbeat(&mut self, uptime_ms: u32) -> Option<Outbound<'_>> {
+        let (seq_num, mask) = self.outgoing(uptime_ms, MessageType::HEARTBEAT, 0)?;
         let Self { identity, tx, .. } = self;
         let heartbeat = heartbeat_for(uptime_ms, HEARTBEAT_PERIOD_S);
-        let end = build_frame(
+        build_outbound(
             tx,
             identity.node_id(),
             &BmIpAddr::LINK_LOCAL_MULTICAST,
             MessageType::HEARTBEAT,
             seq_num,
+            mask,
             |body| {
                 heartbeat.encode(body)?;
                 Ok(Heartbeat::LEN)
             },
-        )?;
-        Some(Outbound {
-            frame: &mut tx[..end],
-            mask: all_ports,
-        })
+        )
     }
 
     fn build_device_info_request(
@@ -1258,12 +1218,8 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
         dst: &BmIpAddr,
         reply_seq_num: u32,
     ) -> Option<Outbound<'_>> {
-        let seq_num = self
-            .registry
-            .on_serialize(now_ms, MessageType::DEVICE_INFO_REPLY, reply_seq_num)
-            .ok()?
-            .seq_num;
-        let all_ports = self.all_ports_mask();
+        let (seq_num, mask) =
+            self.outgoing(now_ms, MessageType::DEVICE_INFO_REPLY, reply_seq_num)?;
         let Self { identity, tx, .. } = self;
         let node_id = identity.node_id();
         let mut info = identity.device_info();
@@ -1278,18 +1234,15 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
             version_string: &version[..version.len().min(DeviceInfoReply::MAX_STRING_LEN)],
             device_name: &name[..name.len().min(DeviceInfoReply::MAX_STRING_LEN)],
         };
-        let end = build_frame(
+        build_outbound(
             tx,
             node_id,
             dst,
             MessageType::DEVICE_INFO_REPLY,
             seq_num,
+            mask,
             |body| reply.encode(body),
-        )?;
-        Some(Outbound {
-            frame: &mut tx[..end],
-            mask: all_ports,
-        })
+        )
     }
 
     fn build_echo_reply(
@@ -1304,25 +1257,18 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
         // `sequenced_request`, so the header gets a zero. Passing it anyway
         // keeps the call the same shape as the C's; divergence #31 is what
         // becomes of it.
-        let seq_num = self
-            .registry
-            .on_serialize(now_ms, MessageType::ECHO_REPLY, u32::from(reply.seq_num))
-            .ok()?
-            .seq_num;
-        let all_ports = self.all_ports_mask();
+        let (seq_num, mask) =
+            self.outgoing(now_ms, MessageType::ECHO_REPLY, u32::from(reply.seq_num))?;
         let Self { identity, tx, .. } = self;
-        let end = build_frame(
+        build_outbound(
             tx,
             identity.node_id(),
             dst,
             MessageType::ECHO_REPLY,
             seq_num,
+            mask,
             |body| reply.encode(body),
-        )?;
-        Some(Outbound {
-            frame: &mut tx[..end],
-            mask: all_ports,
-        })
+        )
     }
 
     /// `bcmp_time_send_response`: a `0x11` to `FF02::1`, naming `target_node_id`
@@ -1333,12 +1279,7 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
         target_node_id: u64,
         utc_time_us: u64,
     ) -> Option<Outbound<'_>> {
-        let seq_num = self
-            .registry
-            .on_serialize(now_ms, MessageType::SYSTEM_TIME_RESPONSE, 0)
-            .ok()?
-            .seq_num;
-        let all_ports = self.all_ports_mask();
+        let (seq_num, mask) = self.outgoing(now_ms, MessageType::SYSTEM_TIME_RESPONSE, 0)?;
         let Self { identity, tx, .. } = self;
         let node_id = identity.node_id();
         let response = SystemTimeResponse {
@@ -1348,21 +1289,18 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
             },
             utc_time_us,
         };
-        let end = build_frame(
+        build_outbound(
             tx,
             node_id,
             &BmIpAddr::LINK_LOCAL_MULTICAST,
             MessageType::SYSTEM_TIME_RESPONSE,
             seq_num,
+            mask,
             |body| {
                 response.encode(body)?;
                 Ok(SystemTimeResponse::LEN)
             },
-        )?;
-        Some(Outbound {
-            frame: &mut tx[..end],
-            mask: all_ports,
-        })
+        )
     }
 
     fn build_neighbor_table_reply(
@@ -1371,12 +1309,8 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
         dst: &BmIpAddr,
         reply_seq_num: u32,
     ) -> Option<Outbound<'_>> {
-        let seq_num = self
-            .registry
-            .on_serialize(now_ms, MessageType::NEIGHBOR_TABLE_REPLY, reply_seq_num)
-            .ok()?
-            .seq_num;
-        let all_ports = self.all_ports_mask();
+        let (seq_num, mask) =
+            self.outgoing(now_ms, MessageType::NEIGHBOR_TABLE_REPLY, reply_seq_num)?;
         let Self {
             identity,
             neighbors,
@@ -1397,8 +1331,8 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
 
         let mut table = [bm_wire::bcmp::NeighborInfo::default(); NEIGHBORS];
         let mut count = 0;
-        for neighbor in neighbors.neighbors() {
-            table[count] = bm_wire::bcmp::NeighborInfo {
+        for (slot, neighbor) in table.iter_mut().zip(neighbors.neighbors()) {
+            *slot = bm_wire::bcmp::NeighborInfo {
                 node_id: neighbor.node_id,
                 port: neighbor.port,
                 online: u8::from(neighbor.online),
@@ -1406,18 +1340,15 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
             count += 1;
         }
 
-        let end = build_frame(
+        build_outbound(
             tx,
             node_id,
             dst,
             MessageType::NEIGHBOR_TABLE_REPLY,
             seq_num,
+            mask,
             |body| encode_neighbor_table_reply(body, node_id, ports, &table[..count]),
-        )?;
-        Some(Outbound {
-            frame: &mut tx[..end],
-            mask: all_ports,
-        })
+        )
     }
 }
 
@@ -1506,6 +1437,26 @@ where
     let end = MIN_FRAME_WITH_ADDRESSES + payload_len;
     tx::serialize_in_place(tx.get_mut(..end)?, message_type, seq_num, body_len).ok()?;
     Some(end)
+}
+
+/// [`build_frame`], handed back as the [`Outbound`] every `build_*` returns.
+fn build_outbound<'a, F>(
+    tx: &'a mut [u8],
+    node_id: u64,
+    dst: &BmIpAddr,
+    message_type: MessageType,
+    seq_num: u32,
+    mask: u16,
+    body: F,
+) -> Option<Outbound<'a>>
+where
+    F: FnOnce(&mut [u8]) -> Result<usize, BmWireError>,
+{
+    let end = build_frame(tx, node_id, dst, message_type, seq_num, body)?;
+    Some(Outbound {
+        frame: tx.get_mut(..end)?,
+        mask,
+    })
 }
 
 /// Transmit one frame, stamping the egress port into each copy that needs it.
