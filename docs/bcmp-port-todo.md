@@ -64,9 +64,11 @@ Without this, `bm-wire-sys` does not build and every differential test fails for
 the wrong reason.
 
 A sandbox whose stable toolchain predates the 1.97 MSRV will not build *at all*,
-which looks alarming and is not. `CLAUDE.md`'s "Setting up a fresh sandbox" has
-the full list of what to install. Install it, and do not write it up in the
-card's report — it is environment setup, not a finding about the code.
+which looks alarming and is not. `.claude/hooks/session-start.sh` handles both
+that and the submodules above, and runs before the session starts; `CLAUDE.md`'s
+"Setting up a fresh sandbox" says what it does and how to run it by hand. Either
+way, do not write it up in the card's report — it is environment setup, not a
+finding about the code.
 
 ### `bm-wire` rules
 

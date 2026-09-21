@@ -1,7 +1,8 @@
 # Working in this repo
 
-If the toolchain or the `bm_core` submodule is not set up yet, **"Setting up a
-fresh sandbox"** below is the whole of it — and is not worth reporting back.
+If the toolchain or the `bm_core` submodule looks wrong, read **"Setting up a
+fresh sandbox"** below before investigating. On the web a `SessionStart` hook
+has usually done it for you already, and none of it is worth reporting back.
 
 Read `bm-wire-sys/README.md` first — especially the shim contract and the note
 on state that outlives `bm_shim_reset`. Both describe real behavioural
@@ -186,29 +187,38 @@ regression test the next time `cargo test` runs.
 **A container often ships a stable toolchain older than the 1.97 MSRV, and then
 nothing builds at all** — `cargo test` refuses outright with "rustc N is not
 supported by the following package". That is the image being stale. It is not a
-problem with the repo, and the MSRV is not up for discussion. Install what is
-missing and carry on:
+problem with the repo, and the MSRV is not up for discussion.
+
+`.claude/hooks/session-start.sh` does the whole of it, and is registered as a
+`SessionStart` hook in `.claude/settings.json`, so on Claude Code on the web it
+has already run before you read this. It checks out the `bm_core` submodule
+tree, brings stable up to date, installs the MSRV toolchain (with rustfmt and
+clippy, which bm-phy-adin2111's pinned `rust-toolchain.toml` needs) and
+nightly, adds both embedded targets to both toolchains, installs `cargo-fuzz`,
+and warms the three workspaces' dependency caches. It reads the MSRV out of
+`Cargo.toml` rather than hardcoding it, so bumping the manifest is enough. It
+is idempotent, and it no-ops entirely outside a remote container, so a local
+checkout is left alone.
+
+Run it by hand if you need it:
 
 ```
-rustup update stable                                   # if stable < 1.97
-rustup toolchain install 1.97                          # for the MSRV check
-rustup toolchain install nightly --profile minimal     # for cargo fuzz
-rustup target add thumbv7em-none-eabihf thumbv8m.main-none-eabihf
-rustup target add --toolchain 1.97 thumbv7em-none-eabihf thumbv8m.main-none-eabihf
-rustup component add --toolchain 1.97 rustfmt clippy   # bm-phy-adin2111 pins 1.97
-cargo install cargo-fuzz --locked                      # if `cargo fuzz` is missing
-git submodule update --init --recursive                # the bm_core oracle
+CLAUDE_CODE_REMOTE=true ./.claude/hooks/session-start.sh
 ```
 
-**None of this is a finding. Do not report it.** It is setup, it costs a few
-minutes, and it says nothing about the code. In particular it is not evidence
-that the MSRV is wrong, that CI is broken, or that anything has drifted — only
-that the image predates 1.97. Every session that has hit this has reported it,
-and every report has been noise.
+**None of this is a finding. Do not report it.** It is setup, it says nothing
+about the code, and on the web it is not even work you did. In particular it is
+not evidence that the MSRV is wrong, that CI is broken, or that anything has
+drifted — only that the image predates 1.97.
 
-The one thing here worth raising is the opposite case: a crate that genuinely
-fails to **compile** on 1.97 once 1.97 is installed. That would mean the MSRV
-claim has become false, and both manifests need bumping together.
+Two things here *are* worth raising, and the hook fails loudly on both rather
+than leaving you to notice:
+
+- the MSRV names a toolchain that cannot be installed, or stable cannot be
+  brought up to it — the claim in the manifests has outrun the channel;
+- a crate that genuinely fails to **compile** on the MSRV once it is installed,
+  which means the claim has become false and both manifests need bumping
+  together.
 
 ## Conventions
 
