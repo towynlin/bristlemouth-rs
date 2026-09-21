@@ -60,9 +60,10 @@ A cargo workspace.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
 - `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
   SPI, on the per-port frame I/O of
-  [embassy-rs/embassy#7024](https://github.com/embassy-rs/embassy/pull/7024).
+  [embassy-rs/embassy#7024](https://github.com/embassy-rs/embassy/pull/7024),
+  merged to embassy `main` and awaiting an `embassy-net-adin1110` release.
   Each frame's port rides in `PacketMeta::id`. **Its own workspace**, because
-  it pins embassy to a git branch and `embassy-time-driver` carries
+  it pins embassy to git and `embassy-time-driver` carries
   `links = "embassy-time"`, so a git embassy and a crates.io embassy cannot
   share a dependency graph. Not built by the root `cargo test`. Its `Runner`
   must be spawned by the firmware — it owns the SPI bus, and until it runs no
@@ -85,9 +86,9 @@ A cargo workspace.
 - `docs/c-divergences.md` — the upstream defect list.
 - `docs/bcmp-port-todo.md` — what of BCMP is unported, as dependency-ordered
   task cards. Read its shared contract before starting a card.
-- `docs/embassy-port-tracking-prompt.md` — a brief for a separate agent working
-  in `embassy-rs/embassy`, to make `embassy-net-adin1110` report the ingress
-  port and take an egress port per frame. `bm-stack`'s `Phy` waits on it.
+- `docs/embassy-port-tracking-prompt.md` — the brief that produced
+  embassy#7024, which made `embassy-net-adin1110` report the ingress port and
+  take an egress port per frame. Merged; kept as the record of the design.
 
 ## Porting a function to bm-wire
 

@@ -1,6 +1,6 @@
 //! [`bm_stack::Phy`] for the ADIN2111, over OPEN Alliance TC6 SPI.
 //!
-//! Built on the per-port frame I/O proposed in
+//! Built on the per-port frame I/O added in
 //! [embassy-rs/embassy#7024](https://github.com/embassy-rs/embassy/pull/7024),
 //! which carries the port of each frame in `PacketMeta::id`: the driver sets it
 //! on receive, and reads it on transmit to pick an egress port.
