@@ -22,13 +22,13 @@ bm-wire = { path = "../bm-wire" }
 embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
 embedded-hal-async = "1.0"
 
-# TEMPORARY: per-port frame I/O is not in a released embassy-net-adin1110.
-# This is the head of embassy-rs/embassy#7024; move to a crates.io version
-# once it lands. Cargo.lock pins the exact commit, so `cargo update -p
-# embassy-net-adin1110` is what follows the PR as it is reviewed.
+# TEMPORARY: per-port frame I/O is merged (embassy-rs/embassy#7024) but not in
+# a released embassy-net-adin1110; move to a crates.io version once 0.5 ships.
+# Cargo.lock pins the exact commit, so `cargo update -p embassy-net-adin1110`
+# is what follows embassy main.
 [dependencies.embassy-net-adin1110]
-git = "https://github.com/towynlin/embassy"
-branch = "feat/adin2111-port-specific-txrx"
+git = "https://github.com/embassy-rs/embassy"
+branch = "main"
 default-features = false
 features = ["tc6", "packetmeta-id"]
 
@@ -36,15 +36,15 @@ features = ["tc6", "packetmeta-id"]
 # and rev the driver uses, or there would be two incompatible `PacketBuf`s.
 [dependencies.xarxa-driver]
 git = "https://github.com/embassy-rs/xarxa"
-rev = "d26bf86997757e5bdb635a0eb42abcf6d6340293"
+rev = "e5bc1b0408773f804f8d165257f34c3a11ae0181"
 features = ["async", "packetmeta-id"]
 
 # bm-stack depends on released embassy-time and embassy-futures; the driver
 # above brings the git ones. Only one crate may claim `links = "embassy-time"`,
 # so point everything at the git tree.
 [patch.crates-io]
-embassy-time = { git = "https://github.com/towynlin/embassy", branch = "feat/adin2111-port-specific-txrx" }
-embassy-futures = { git = "https://github.com/towynlin/embassy", branch = "feat/adin2111-port-specific-txrx" }
+embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 
 [dev-dependencies]
 # The three a board would otherwise supply; see bm-stack's Cargo.toml.

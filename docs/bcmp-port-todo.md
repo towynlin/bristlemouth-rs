@@ -458,8 +458,8 @@ reverse — completes an image transfer with identical frames at every step.
   doubly-linked cursor. A natural follow-on once M4 lands.
 - **`middleware/pubsub.c`, `bm_service*.c` and the built-in services** — above
   the wire.
-- **`bm-phy-adin2111` and embassy#7024** — tracked in
-  `docs/embassy-port-tracking-prompt.md`.
+- **`bm-phy-adin2111`** — embassy#7024 is merged; `docs/embassy-port-tracking-prompt.md`
+  keeps the design record.
 
 ---
 

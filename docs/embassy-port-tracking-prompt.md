@@ -1,5 +1,9 @@
 # Prompt: add per-port frame handling to `embassy-net-adin1110`
 
+**Status: done.** [embassy-rs/embassy#7024](https://github.com/embassy-rs/embassy/pull/7024)
+is merged to embassy `main`. `bm-phy-adin2111` pins that branch until
+`embassy-net-adin1110` 0.5 is released. Kept as the design record.
+
 Hand the section below to a Claude Code instance working in a clone of
 [`embassy-rs/embassy`](https://github.com/embassy-rs/embassy). It is
 self-contained and does not assume access to this repository.

@@ -3,7 +3,7 @@
 #
 # The PHY's embassy and xarxa dependencies are git-pinned deliberately (see
 # bm-phy-adin2111/Cargo.toml); dependabot leaves those alone, so following
-# embassy#7024 stays a manual `cargo update -p embassy-net-adin1110`.
+# embassy main stays a manual `cargo update -p embassy-net-adin1110`.
 version: 2
 updates:
   - package-ecosystem: cargo
