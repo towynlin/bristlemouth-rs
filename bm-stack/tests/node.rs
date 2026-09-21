@@ -1,12 +1,13 @@
 //! The node, driven with a mock PHY.
 
-use bm_stack::mock::{MockPhy, Script};
+use bm_stack::mock::{MockPhy, Script, Sent};
 use bm_stack::node::{EXPIRY_PERIOD_MS, HOP_LIMIT, LINK_LOCAL_PREFIX};
-use bm_stack::{Egress, Event, Identity, Node, deliver, transmit};
+use bm_stack::{Egress, Event, Identity, Node, Rtc, RtcTimeAndDate, SoftRtc, deliver, transmit};
 use bm_wire::addr;
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
 use bm_wire::bcmp::neighbors::{NeighborTableReply, NeighborTableRequest};
 use bm_wire::bcmp::registry::PacketCfg;
+use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
 use bm_wire::bcmp::{
     BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, DeviceInfo, Heartbeat, MessageType, rx, tx,
 };
@@ -49,8 +50,8 @@ impl Identity for TestIdentity {
     }
 }
 
-fn node() -> Node<TestIdentity, 4> {
-    Node::new(TestIdentity, PORTS)
+fn node() -> Node<TestIdentity, SoftRtc, 4> {
+    Node::new(TestIdentity, SoftRtc::new(), PORTS)
 }
 
 /// A BCMP frame from the peer, as the wire would deliver it.
@@ -391,7 +392,11 @@ fn the_run_loop_answers_and_heartbeats() {
 // ---------------------------------------------------------------------------
 
 /// The frames a node put on the wire for one received frame, in order.
-fn relay_through(node: &mut Node<TestIdentity, 4>, ingress_port: u8, frame: &mut [u8]) -> MockPhy {
+fn relay_through(
+    node: &mut Node<TestIdentity, SoftRtc, 4>,
+    ingress_port: u8,
+    frame: &mut [u8],
+) -> MockPhy {
     let mut phy = MockPhy::new(PORTS, Vec::new());
     let owed = node.on_frame(1000, ingress_port, frame);
     block_on(deliver(&mut phy, owed, PORTS)).unwrap();
@@ -548,7 +553,7 @@ fn a_chain_of_nodes_relays_a_global_multicast_message() {
     assert_eq!(phy.sent[0].egress, Egress::Port(2));
 
     // Far node: in on port 1 again, out on port 2 again, unchanged.
-    let mut far = Node::<TestIdentity, 4>::new(TestIdentity, PORTS);
+    let mut far = Node::<TestIdentity, SoftRtc, 4>::new(TestIdentity, SoftRtc::new(), PORTS);
     let mut hop = phy.sent[0].frame.clone();
     let phy = relay_through(&mut far, 1, &mut hop);
     assert_eq!(phy.sent.len(), 1);
@@ -688,7 +693,7 @@ const REPLY_TYPE: MessageType = MessageType::CONFIG_VALUE;
 
 /// A node that also knows the two config types, registered with the flags
 /// `bcmp_config_init` gives them.
-fn requesting_node() -> Node<TestIdentity, 4> {
+fn requesting_node() -> Node<TestIdentity, SoftRtc, 4> {
     let mut node = node();
     node.register(REQUEST_TYPE, PacketCfg::REQUEST).unwrap();
     node.register(REPLY_TYPE, PacketCfg::REPLY).unwrap();
@@ -1035,4 +1040,373 @@ fn the_run_loop_times_out_an_unanswered_request() {
         "the expiry ticker gave up on the request: {events:?}"
     );
     assert_eq!(node.registry().pending_len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// System time -- card M2.
+// ---------------------------------------------------------------------------
+
+/// 2026-09-21T12:34:56.789Z, a reading a human can check.
+const NOON_ISH: RtcTimeAndDate = RtcTimeAndDate {
+    year: 2026,
+    month: 9,
+    day: 21,
+    hour: 12,
+    minute: 34,
+    second: 56,
+    ms: 789,
+};
+
+/// A node whose clock already reads [`NOON_ISH`].
+fn node_with_a_clock() -> Node<TestIdentity, SoftRtc, 4> {
+    Node::new(TestIdentity, SoftRtc::at(NOON_ISH), PORTS)
+}
+
+fn time_frame(message_type: MessageType, target_node_id: u64, utc_time_us: u64) -> Vec<u8> {
+    let header = SystemTimeHeader {
+        target_node_id,
+        source_node_id: PEER_ID,
+    };
+    let body = match message_type {
+        MessageType::SYSTEM_TIME_REQUEST => {
+            let mut b = vec![0u8; SystemTimeRequest::LEN];
+            SystemTimeRequest { header }.encode(&mut b).unwrap();
+            b
+        }
+        MessageType::SYSTEM_TIME_RESPONSE => {
+            let mut b = vec![0u8; SystemTimeResponse::LEN];
+            SystemTimeResponse {
+                header,
+                utc_time_us,
+            }
+            .encode(&mut b)
+            .unwrap();
+            b
+        }
+        _ => {
+            let mut b = vec![0u8; SystemTimeSet::LEN];
+            SystemTimeSet {
+                header,
+                utc_time_us,
+            }
+            .encode(&mut b)
+            .unwrap();
+            b
+        }
+    };
+    peer_frame(message_type, &body, BmIpAddr::LINK_LOCAL_MULTICAST)
+}
+
+/// The body of whatever the node replied, parsed back as a `0x11`.
+fn response_body(
+    node: &mut Node<TestIdentity, SoftRtc, 4>,
+    frame: &mut [u8],
+) -> SystemTimeResponse {
+    let owed = node.on_frame(1000, 1, frame);
+    assert!(owed.forward.is_none(), "addressed to us, so not forwarded");
+    let mut reply = owed
+        .reply
+        .expect("this message calls for a response")
+        .frame()
+        .to_vec();
+    let received = rx::accept(&mut reply).expect("our own reply validates");
+    assert_eq!(
+        received.header.message_type,
+        MessageType::SYSTEM_TIME_RESPONSE
+    );
+    assert_eq!(
+        received.dst,
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+        "bcmp_time_send_response always passes multicast_ll_addr"
+    );
+    assert_eq!(
+        received.header.seq_num, 0,
+        "time.c registers it unsequenced"
+    );
+    SystemTimeResponse::decode(received.payload).expect("decodes")
+}
+
+#[test]
+fn a_time_request_for_us_is_answered_from_the_clock() {
+    let mut node = node_with_a_clock();
+    let mut frame = time_frame(MessageType::SYSTEM_TIME_REQUEST, NODE_ID, 0);
+    let response = response_body(&mut node, &mut frame);
+
+    assert_eq!(response.header.source_node_id, NODE_ID);
+    assert_eq!(
+        response.header.target_node_id, PEER_ID,
+        "the body's source_node_id is answered, not the frame's address"
+    );
+    assert_eq!(response.utc_time_us, NOON_ISH.to_utc_micros());
+}
+
+#[test]
+fn a_time_request_for_us_goes_unanswered_when_the_clock_is_unset() {
+    let mut node = node();
+    let mut frame = time_frame(MessageType::SYSTEM_TIME_REQUEST, NODE_ID, 0);
+    let owed = node.on_frame(1000, 1, &mut frame);
+    assert!(owed.is_empty(), "bm_rtc_get failing means silence");
+}
+
+/// Divergence #27: `target_node_id == 0` reaches the switch and is dropped by
+/// an inner exact-match test, so broadcasting a time request asks nobody.
+#[test]
+fn a_broadcast_time_request_is_silently_dropped() {
+    let mut node = node_with_a_clock();
+    let mut frame = time_frame(MessageType::SYSTEM_TIME_REQUEST, 0, 0);
+    let owed = node.on_frame(1000, 1, &mut frame);
+    assert!(owed.reply.is_none(), "nobody answers a broadcast 0x10");
+    assert!(owed.forward.is_none(), "and zero is not somebody else");
+
+    // The application still hears it, which is more than a C node offers.
+    let mut seen = 0;
+    let mut frame = time_frame(MessageType::SYSTEM_TIME_REQUEST, 0, 0);
+    node.on_frame_with(1000, 1, &mut frame, |event| {
+        if let Event::Message { message_type, .. } = event {
+            assert_eq!(message_type, MessageType::SYSTEM_TIME_REQUEST);
+            seen += 1;
+        }
+    });
+    assert_eq!(seen, 1);
+}
+
+/// And the other half of #27: a broadcast *set* is honoured by everybody.
+#[test]
+fn a_broadcast_time_set_is_honoured_and_answered() {
+    let utc_time_us = 1_789_948_800_250_999;
+    for target in [0, NODE_ID] {
+        let mut node = node_with_a_clock();
+        let mut frame = time_frame(MessageType::SYSTEM_TIME_SET, target, utc_time_us);
+        let response = response_body(&mut node, &mut frame);
+        assert_eq!(
+            response.utc_time_us, utc_time_us,
+            "target {target:#x}: the echo is the requested value, to the microsecond"
+        );
+        assert_eq!(
+            node.rtc().get().unwrap(),
+            RtcTimeAndDate::from_utc_micros(utc_time_us),
+            "target {target:#x}: and the clock moved"
+        );
+        assert_eq!(
+            node.rtc().get().unwrap().ms,
+            250,
+            "target {target:#x}: keeping only the millisecond"
+        );
+    }
+}
+
+/// A clock that refuses to be set leaves the node silent, as `bm_rtc_set`
+/// returning an error does in the C.
+#[test]
+fn a_set_that_the_clock_refuses_is_not_answered() {
+    let mut node =
+        Node::<TestIdentity, SoftRtc, 4>::new(TestIdentity, SoftRtc::read_only(NOON_ISH), PORTS);
+    let mut frame = time_frame(MessageType::SYSTEM_TIME_SET, NODE_ID, 1_000_000);
+    let owed = node.on_frame(1000, 1, &mut frame);
+    assert!(owed.reply.is_none());
+    assert_eq!(node.rtc().get(), Some(NOON_ISH), "and nothing moved");
+}
+
+/// A `0x11` addressed to us is logged by the C and nothing more. Here it
+/// reaches the application as an ordinary message and produces no frame.
+#[test]
+fn a_time_response_for_us_is_reported_and_not_answered() {
+    let mut node = node_with_a_clock();
+    let mut frame = time_frame(MessageType::SYSTEM_TIME_RESPONSE, NODE_ID, 42_000_000);
+    let mut seen = None;
+    let owed = node.on_frame_with(1000, 1, &mut frame, |event| {
+        if let Event::Message {
+            message_type,
+            payload,
+            ..
+        } = event
+        {
+            seen = Some((message_type, SystemTimeResponse::decode(payload).unwrap()));
+        }
+    });
+    assert!(owed.is_empty(), "a response provokes nothing");
+    let (message_type, response) = seen.expect("the application hears it");
+    assert_eq!(message_type, MessageType::SYSTEM_TIME_RESPONSE);
+    assert_eq!(response.utc_time_us, 42_000_000);
+    assert_eq!(
+        node.rtc().get(),
+        Some(NOON_ISH),
+        "and a C node does not adopt the time it was told"
+    );
+}
+
+/// A time message for a third node is re-flooded out every other port, as a
+/// fresh frame from this node — `bcmp_ll_forward`.
+#[test]
+fn a_time_message_for_another_node_is_re_flooded() {
+    const THIRD_ID: u64 = 0x0000_0000_0BAD_F00D;
+
+    for message_type in [
+        MessageType::SYSTEM_TIME_REQUEST,
+        MessageType::SYSTEM_TIME_RESPONSE,
+        MessageType::SYSTEM_TIME_SET,
+    ] {
+        let mut node = node_with_a_clock();
+        let mut frame = time_frame(message_type, THIRD_ID, 7_000_000);
+        let original = frame.clone();
+
+        let owed = node.on_frame(1000, 1, &mut frame);
+        assert!(owed.reply.is_none(), "{message_type:?}: not ours to answer");
+        assert!(
+            owed.relay.is_none(),
+            "{message_type:?}: FF02::1 is consumed by L2, not relayed"
+        );
+        let reflood = owed.forward.expect("{message_type:?}: must be re-flooded");
+
+        // The range is the BCMP header and body, exactly as they arrived.
+        assert_eq!(reflood.start, BCMP_HEADER_OFFSET);
+        assert_eq!(reflood.end, original.len());
+        assert_eq!(
+            reflood.ingress_port, 1,
+            "the nibble the sender's L2 stamped"
+        );
+
+        let mut phy = MockPhy::new(PORTS, Vec::new());
+        block_on(node.reflood(&mut phy, reflood, &frame)).unwrap();
+        assert_eq!(phy.sent.len(), 1, "{message_type:?}: one copy, on port 2");
+        assert_eq!(phy.sent[0].egress, Egress::Port(2));
+
+        let mut forwarded = phy.sent[0].frame.clone();
+        let received = rx::accept(&mut forwarded).expect("a peer accepts the re-flood");
+        assert_eq!(received.header.message_type, message_type);
+        assert_eq!(
+            received.src.to_node_id(),
+            NODE_ID,
+            "{message_type:?}: the forwarder claims it -- divergence #23"
+        );
+        let header = SystemTimeHeader::decode(received.payload).unwrap();
+        assert_eq!(header.target_node_id, THIRD_ID, "{message_type:?}");
+        assert_eq!(
+            header.source_node_id, PEER_ID,
+            "{message_type:?}: the originator survives only in the body"
+        );
+
+        assert_eq!(
+            node.rtc().get(),
+            Some(NOON_ISH),
+            "{message_type:?}: a forwarded set is not applied on the way past"
+        );
+    }
+}
+
+/// A body too short for the C to read without going out of bounds is refused
+/// here rather than guessed at. See divergence #14 for why that is a domain
+/// limit and not a behaviour to reproduce.
+#[test]
+fn a_time_message_shorter_than_its_header_is_dropped() {
+    for len in 0..SystemTimeHeader::LEN {
+        let mut frame = peer_frame(
+            MessageType::SYSTEM_TIME_REQUEST,
+            &vec![0u8; len],
+            BmIpAddr::LINK_LOCAL_MULTICAST,
+        );
+        let mut node = node_with_a_clock();
+        assert!(
+            node.on_frame(1000, 1, &mut frame).is_empty(),
+            "a {len}-byte body must not be acted on"
+        );
+    }
+    // A set needs the whole 24: the header alone gets it past the forwarding
+    // test and then falls short of `utc_time_us`.
+    for len in SystemTimeHeader::LEN..SystemTimeSet::LEN {
+        let mut body = vec![0u8; len];
+        body[..8].copy_from_slice(&NODE_ID.to_le_bytes());
+        let mut frame = peer_frame(
+            MessageType::SYSTEM_TIME_SET,
+            &body,
+            BmIpAddr::LINK_LOCAL_MULTICAST,
+        );
+        let mut node = node_with_a_clock();
+        assert!(
+            node.on_frame(1000, 1, &mut frame).is_empty(),
+            "a {len}-byte set must not be acted on"
+        );
+        assert_eq!(node.rtc().get(), Some(NOON_ISH));
+    }
+}
+
+/// The requester half, `bcmp_time_get_time` and `bcmp_time_set_time`: both go
+/// to `FF02::1` with a sequence number of zero.
+#[test]
+fn the_requests_we_issue_carry_what_the_c_puts_in_them() {
+    let mut node = node_with_a_clock();
+    let utc_time_us = 1_789_948_800_250_999;
+
+    let mut frame = node
+        .request_system_time(1000, PEER_ID)
+        .expect("a registered type is sent")
+        .frame()
+        .to_vec();
+    let received = rx::accept(&mut frame).expect("validates");
+    assert_eq!(
+        received.header.message_type,
+        MessageType::SYSTEM_TIME_REQUEST
+    );
+    assert_eq!(received.header.seq_num, 0);
+    assert_eq!(received.dst, BmIpAddr::LINK_LOCAL_MULTICAST);
+    assert_eq!(received.payload.len(), SystemTimeRequest::LEN);
+    let request = SystemTimeRequest::decode(received.payload).unwrap();
+    assert_eq!(request.header.target_node_id, PEER_ID);
+    assert_eq!(request.header.source_node_id, NODE_ID);
+
+    let mut frame = node
+        .set_system_time(1000, 0, utc_time_us)
+        .expect("a registered type is sent")
+        .frame()
+        .to_vec();
+    let received = rx::accept(&mut frame).expect("validates");
+    assert_eq!(received.header.message_type, MessageType::SYSTEM_TIME_SET);
+    assert_eq!(received.payload.len(), SystemTimeSet::LEN);
+    let set = SystemTimeSet::decode(received.payload).unwrap();
+    assert_eq!(
+        set.header.target_node_id, 0,
+        "a broadcast set is meaningful"
+    );
+    assert_eq!(set.header.source_node_id, NODE_ID);
+    assert_eq!(set.utc_time_us, utc_time_us);
+
+    // And our own clock is untouched by asking somebody else to change theirs.
+    assert_eq!(node.rtc().get(), Some(NOON_ISH));
+}
+
+/// The whole loop: a `0x10` arrives on the PHY and a `0x11` goes back out
+/// without anything synchronous being driven by hand.
+#[test]
+fn the_run_loop_answers_a_time_request() {
+    let request = time_frame(MessageType::SYSTEM_TIME_REQUEST, NODE_ID, 0);
+    let mut phy = MockPhy::new(
+        PORTS,
+        vec![Script::Receive {
+            port: 1,
+            frame: request,
+        }],
+    );
+    let mut node = node_with_a_clock();
+    block_on(node.run(&mut phy));
+
+    let responses: Vec<&Sent> = phy
+        .sent
+        .iter()
+        .filter(|sent| {
+            let mut copy = sent.frame.clone();
+            rx::accept(&mut copy)
+                .map(|r| r.header.message_type == MessageType::SYSTEM_TIME_RESPONSE)
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        responses.len(),
+        usize::from(PORTS),
+        "a link-local response is stamped once per port"
+    );
+
+    let mut copy = responses[0].frame.clone();
+    let received = rx::accept(&mut copy).unwrap();
+    let response = SystemTimeResponse::decode(received.payload).unwrap();
+    assert_eq!(response.utc_time_us, NOON_ISH.to_utc_micros());
 }

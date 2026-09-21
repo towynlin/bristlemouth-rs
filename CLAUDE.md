@@ -37,7 +37,10 @@ A cargo workspace.
   `mock` feature), and the only crate here that knows about time or I/O. It
   supplies what `bm-wire` deliberately lacks: a clock, a timer, and a PHY.
   - `src/port.rs` — the seams bm_core leaves to the integrator, as traits
-    rather than link-time symbols, so a test and the firmware can differ.
+    rather than link-time symbols, so a test and the firmware can differ. A
+    card that ports an exchange needing a new one adds it here: `Rtc` arrived
+    with system time, and configuration storage and the DFU flash slot are
+    still to come.
   - `src/node.rs` — `Node::on_frame`, `Node::on_tick` and `Node::on_expiry` are
     synchronous and take the current time; `Node::run` is the only async code.
     All the protocol is in the synchronous half. Each has a `_with` twin that

@@ -53,6 +53,7 @@ jobs:
           - neighbor
           - registry
           - strnlen
+          - time
           - time_remaining
           - wildcard
         include:
