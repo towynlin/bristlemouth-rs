@@ -2,25 +2,39 @@
 
 `bm-wire` reproduces bm_core's observable behaviour bit-for-bit, because
 interoperating with deployed C nodes is the requirement. Where the C does
-something surprising, wrong, or undefined, the port matches it anyway and the
-surprise is recorded here for upstream repair in
+something surprising, wrong, or undefined, the port matches it and the finding
+is recorded here for repair in
 [`bristlemouth/bm_core`](https://github.com/bristlemouth/bm_core).
 
-Nothing in this file is a licence to change `vendor/bm_core/` from this repo.
-Fixes go upstream; when they land, the submodule bump is what changes `bm-wire`.
+Fixes go upstream; a submodule bump is what changes `bm-wire`. Do not edit
+`vendor/bm_core/` from this repo.
 
 Status values:
 
-- **replicated** — `bm-wire` deliberately matches the C. Fixing the C is a
-  wire-visible change and needs coordination.
-- **domain-limited** — the C is undefined for these inputs, so there is nothing
-  to match. The differential harness constrains the input instead, and the
-  constraint is documented at the comparator.
-- **benign** — the C is technically undefined but every real toolchain produces
-  the intended value, and the port produces that value by construction.
-- **c-only** — a defect in state or an API that bm_core keeps and `bm-wire` has
-  no counterpart for. There is nothing to replicate; it is recorded because it
-  is worth fixing upstream.
+- **replicated** — `bm-wire` matches the C. Fixing the C is wire-visible and
+  needs coordination.
+- **domain-limited** — the C is undefined for these inputs. The differential
+  harness constrains the input instead, documented at the comparator.
+- **benign** — technically undefined, but every real toolchain produces the
+  intended value and the port produces it by construction.
+- **c-only** — a defect in state or an API `bm-wire` has no counterpart for.
+
+## Recommended upstream priority
+
+Three to fix first, in this order.
+
+| Rank | # | Why now |
+|---|---|---|
+| 1 | [#29](#29-bcmppingc-echoes-and-compares-an-unchecked-payload_len) | Remote memory disclosure. One unauthenticated frame from any node on the link makes a node transmit up to 1460 bytes of adjacent heap to a multicast address. No prior state needed. The fix is one comparison against `data.size`, already in the struct. |
+| 2 | [#12](#12-the-egress-port-checksum-patch-drops-the-end-around-carry) | Live frame loss on deployed hardware: ~1 BCMP frame in 40 000 leaves a two-port node with a checksum the far end rejects. Ports M1 and M2 raised the rate from theoretical to routine, and config/DFU bodies will raise it further. The fix is additive — a fixed node is strictly more interoperable. |
+| 3 | [#14](#14-device-info-and-neighbour-table-replies-are-parsed-with-unchecked-lengths) | Same class as #29 in two more parsers, reachable by any node on the link, and `topology.c`'s length also wraps in `uint16_t`. Not wire-visible to fix. |
+
+Runner-up: [#20](#20-ll_remove-leaves-lltail-pointing-at-a-freed-node) —
+`ll_remove` corrupts any list removed from out of insertion order, and
+`bcmp/config.c` already issues concurrent sequenced requests. Two lines to fix,
+but it needs a maintainer who can confirm the list invariants.
+
+## Index
 
 | # | Where | Status | Found by |
 |---|---|---|---|
@@ -29,82 +43,64 @@ Status values:
 | 3 | `ip_to_nodeid` returns 0 on big-endian | replicated | reading |
 | 4 | `__builtin_ffs` can yield a port number above 15 | replicated | reading |
 | 5 | `utc_from_date_time` reads `MONTH_DAYS` out of bounds | domain-limited | reading |
-| 6 | `uint8_to_uint32` shifts into the sign bit | benign | **UBSan, via `cargo fuzz run addr`** |
+| 6 | `uint8_to_uint32` shifts into the sign bit | benign | UBSan, via `cargo fuzz run addr` |
 | 7 | `bm_l2_policy_rx_apply` doc claims an egress-nibble clear that is not in the code | replicated | reading |
 | 8 | `bcmp_tx`'s size guard uses `sizeof(BcmpHeartbeat)` where it means `sizeof(BcmpHeader)` | replicated | reading |
-| 9 | `process_received_message` rewrites the source address before verifying the checksum, undocumented | replicated | reading |
+| 9 | `process_received_message` rewrites the source address before verifying the checksum | replicated | reading |
 | 10 | A rejected frame is left with its checksum field zeroed | replicated | reading |
-| 11 | `clear_ports_legacy` performs a misaligned 32-bit access on every received frame | benign | **UBSan** |
-| 12 | The egress-port checksum patch drops the one's-complement end-around carry | replicated | reading, then measured; **hit by `cargo fuzz run ping`** |
+| 11 | `clear_ports_legacy` does a misaligned 32-bit access on every received frame | benign | UBSan |
+| 12 | The egress-port checksum patch drops the end-around carry | replicated | reading, measured, hit by `cargo fuzz run ping` |
 | 13 | L2 silently drops any frame whose destination is not multicast | replicated | reading |
-| 14 | Device-info and neighbour-table replies are parsed with unchecked, attacker-supplied lengths | domain-limited | reading |
-| 15 | `bcmp_remove_neighbor_from_table` frees, and reports the free's result as the removal's | c-only | **a double free while writing the comparator** |
-| 16 | An advertised liveliness lease is doubled and scaled in 32-bit arithmetic, so it wraps | replicated | reading, confirmed differentially |
+| 14 | Device-info and neighbour-table replies are parsed with unchecked lengths | domain-limited | reading |
+| 15 | `bcmp_remove_neighbor_from_table` frees, and reports the free's result | c-only | a double free while writing the comparator |
+| 16 | An advertised liveliness lease wraps in 32-bit arithmetic | replicated | reading, confirmed differentially |
 | 17 | A new neighbour is announced to the application twice | replicated | reading, confirmed differentially |
-| 18 | A node id of zero is never recognised, so its node is rediscovered forever | replicated | reading, confirmed differentially |
+| 18 | A node id of zero is never recognised | replicated | reading, confirmed differentially |
 | 19 | `INFO_REQUEST_LIST` grows without de-duplication or expiry | c-only | reading |
 | 20 | `ll_remove` leaves `LL::tail` pointing at a freed node | domain-limited | reading, then modelled to stay out of it |
-| 21 | A sequenced reply is matched on its sequence number alone, never its type | replicated | reading, confirmed differentially |
+| 21 | A sequenced reply is matched on its sequence number alone | replicated | reading, confirmed differentially |
 | 22 | A sequenced request's timeout is the 150 ms sweep, not the 24 ms constant | replicated | reading, then measured |
 | 23 | `bcmp_ll_forward` replaces the originator's source address with the forwarder's | replicated | reading, confirmed differentially |
 | 24 | A forwarded frame's multicast MAC carries the egress port | replicated | reading, confirmed differentially |
-| 25 | `bcmp_ll_forward` writes its new checksum into the frame it was asked to forward | c-only | reading |
+| 25 | `bcmp_ll_forward` writes its new checksum into the frame it forwards | c-only | reading |
 | 26 | `bcmp_ll_forward` reports a forward with nowhere to go as `BmEINVAL` | replicated | reading |
-| 27 | A system-time `target_node_id` of zero is a broadcast for `0x12` and a dead letter for `0x10` and `0x11` | replicated | reading, confirmed differentially |
-| 28 | A global-multicast BCMP message that is forwarded is put on the wire twice, the second time link-local | replicated | reading, confirmed differentially |
-| 29 | `bcmp/ping.c` echoes and compares an unchecked, attacker-supplied `payload_len` | domain-limited | reading |
-| 30 | A ping reply is matched on sixteen bits of node id and the payload, and nothing else | replicated | reading |
-| 31 | `bcmp_send_ping_reply` echoes a `seq_num` that `serialize` then discards | replicated | reading, confirmed differentially |
+| 27 | A system-time `target_node_id` of zero is a broadcast for `0x12`, a dead letter for `0x10`/`0x11` | replicated | reading, confirmed differentially |
+| 28 | A forwarded global-multicast message goes out twice, the second time link-local | replicated | reading, confirmed differentially |
+| 29 | `bcmp/ping.c` echoes and compares an unchecked `payload_len` | domain-limited | reading |
+| 30 | A ping reply is matched on 16 bits of node id and the payload, nothing else | replicated | reading |
+| 31 | `bcmp_send_ping_reply` echoes a `seq_num` that `serialize` discards | replicated | reading, confirmed differentially |
 | 32 | `bcmp/ping.c` reports the result of a ping to nobody, and never forgets one | c-only | reading |
 
 ---
 
 ## 1. `bm_l2_policy_prepare_forwarded_copy` clears the egress nibble its doc promises to keep
 
-`network/l2_policy.h` documents the function as:
+`network/l2_policy.h` documents the function as clearing the ingress nibble and
+leaving the egress nibble intact. `network/l2_policy.c` calls both
+`clear_ingress_nibble(pb)` and `clear_egress_nibble(pb)`, so the whole ports
+byte at IPv6 source offset +2 goes to `0x00` on every forwarded copy.
 
-> - clears ingress nibble (on-wire ingress bits must be zero)
-> - **leaves egress nibble intact**
-
-`network/l2_policy.c` does the opposite:
-
-```c
-clear_ingress_nibble(pb);
-clear_egress_nibble(pb);
-```
-
-Both nibbles are zeroed, so the whole ports byte at IPv6 source offset +2 goes
-to `0x00` on every forwarded copy.
-
-**Ruling:** the code is authoritative — that is what deployed nodes put on the
-wire, and changing it would be an interop break. `bm-wire` zeroes both nibbles.
-**The doc comment is the bug to fix upstream.**
+**Ruling:** the code is authoritative — changing it is an interop break.
+`bm-wire` zeroes both nibbles. The doc comment is the bug to fix.
 
 ## 2. `check_endianness` swaps 32 bits over a 16-bit field
 
-`bcmp/packet.c`, in the `BcmpEchoRequestMessage` arm:
+`bcmp/packet.c`, `BcmpEchoRequestMessage` arm:
 
 ```c
-BcmpEchoRequest *request = (BcmpEchoRequest *)buf;
-swap_64bit(&request->target_node_id);
 swap_16bit(&request->id);
 swap_32bit(&request->seq_num);   /* seq_num is uint16_t */
 swap_16bit(&request->payload_len);
 ```
 
-`BcmpEchoRequest.seq_num` is declared `uint16_t` in `bcmp/messages.h`. The
-`swap_32bit` therefore reads and writes four bytes across a two-byte field,
-corrupting the adjacent `payload_len` — which is then itself swapped. The
-`BcmpEchoReplyMessage` arm gets this right with `swap_16bit`.
+The `swap_32bit` reads and writes four bytes across a two-byte field,
+corrupting `payload_len`, which is then swapped again. The
+`BcmpEchoReplyMessage` arm uses `swap_16bit` correctly.
 
-Only reachable on a big-endian host, since the whole function is guarded by
-`if (!is_little_endian())`. Every shipped Bristlemouth target is little-endian,
-so this is latent rather than active.
-
-**Not reachable from this harness.** The x86 oracle never enters the swap path,
-so no fuzz target can find or confirm this; it was found by reading. `bm-wire`
-sidesteps the issue entirely by using explicit little-endian codecs, which are
-endian-agnostic by construction.
+Only reachable on a big-endian host — the function is guarded by
+`if (!is_little_endian())` — so it is latent on every shipped target, and not
+reachable from this harness. `bm-wire` uses explicit little-endian codecs and
+is endian-agnostic by construction.
 
 ## 3. `ip_to_nodeid` returns 0 on big-endian
 
@@ -118,17 +114,13 @@ static inline uint64_t ip_to_nodeid(const BmIpAddr *ip) {
 }
 ```
 
-There is no `else`, so on a big-endian host every address maps to node id 0.
-There is already a `//TODO: make this endian agnostic and platform agnostic`
-directly above it.
+No `else`, so on a big-endian host every address maps to node id 0. A
+`//TODO: make this endian agnostic and platform agnostic` sits above it. The
+function also reads the 16-byte, 1-byte-aligned `BmIpAddr` through a
+`uint32_t *` — a strict-aliasing violation and a possibly misaligned load.
 
-The function also reads the 16-byte, 1-byte-aligned `BmIpAddr` through a
-`uint32_t *`, which is both a strict-aliasing violation and a potentially
-misaligned load.
-
-`bm-wire`'s `BmIpAddr::to_node_id` always performs the little-endian-host
-behaviour — a big-endian read of the low 8 bytes — which is what the C does on
-every real target.
+`BmIpAddr::to_node_id` always performs the little-endian-host behaviour, which
+is what the C does on every real target.
 
 ## 4. `bm_l2_policy_rx_apply` can report a port number above its documented range
 
@@ -139,15 +131,15 @@ every real target.
 const uint8_t ingress_port_num = (uint8_t)__builtin_ffs((unsigned)ingress_port_mask);
 ```
 
-An `ingress_port_mask` of `0x8000` yields 16. `set_ingress_nibble` then masks
-with `0x0F`, writing a **zero** ingress nibble into the frame, while the
-returned struct still reports 16. So the frame and the result disagree.
+A mask of `0x8000` yields 16. `set_ingress_nibble` then masks with `0x0F`,
+writing a zero ingress nibble into the frame while the returned struct still
+reports 16, so the frame and the result disagree.
 
-Not reachable in practice today: the shim exposes 2 ports and the L2 layer never
-builds a mask with a bit above 15 set. `bm-wire` replicates the C exactly.
+Not reachable today: the shim exposes 2 ports and L2 never builds a mask with a
+bit above 15 set. `bm-wire` replicates it.
 
-**Open question for a maintainer:** should a mask above bit 15 be rejected
-outright, or should the nibble and the reported number be made consistent?
+**Open question:** reject a mask above bit 15, or make the nibble and the
+reported number consistent?
 
 ## 5. `utc_from_date_time` reads `MONTH_DAYS` out of bounds for `month > 12`
 
@@ -157,24 +149,16 @@ outright, or should the nibble and the reported number be made consistent?
 static const uint8_t MONTH_DAYS[] = { 31, 28, /* ... */ 31 };  /* 12 entries */
 
 for (i = 1; i < month; i++) {
-  /* ... */
   seconds += secs_per_day * MONTH_DAYS[i - 1];
 }
 ```
 
-`month` is a `uint8_t` and is not validated. For `month` in 13..=255 the loop
-indexes past the end of a 12-element array — an out-of-bounds read, and
-undefined behaviour.
+`month` is an unvalidated `uint8_t`. For 13..=255 the loop indexes past the
+array. An attacker-influenced or corrupted RTC value reaches this.
 
-The RTC shim (`bm_rtc_get` → `bm_shim_generic_reset`'s zeroed `RtcTimeAndDate`)
-can produce `month == 0`, which is harmless here, but a corrupted or
-attacker-influenced RTC value above 12 reaches this loop.
-
-**Status: domain-limited.** There is no defined C behaviour to match, so
-`bm-wire-diff`'s `DateTimeInput` constrains `month` to 1..=12 and says so at the
-type. `bm-wire::util::utc_from_date_time` stops at the end of the table rather
-than reading out of bounds. Fixing this upstream — validating `month`, or
-returning an error — would not be wire-visible.
+**domain-limited.** `bm-wire-diff`'s `DateTimeInput` constrains `month` to
+1..=12 and says so at the type; `bm_wire::util::utc_from_date_time` stops at
+the end of the table. Validating `month` upstream is not wire-visible.
 
 ## 6. `uint8_to_uint32` shifts into the sign bit
 
@@ -186,62 +170,39 @@ static inline uint32_t uint8_to_uint32(uint8_t *buf) {
 }
 ```
 
-`buf[0]` is a `uint8_t`, which integer-promotes to `int`. When `buf[0] >= 0x80`,
-`buf[0] << 24` shifts a set bit into the sign bit of a 32-bit `int`, which is
-undefined behaviour.
-
-Reported by UndefinedBehaviorSanitizer during `cargo fuzz run addr`:
+`buf[0]` promotes to `int`, so `buf[0] << 24` shifts a set bit into the sign
+bit when `buf[0] >= 0x80`. Reported by UBSan during `cargo fuzz run addr`:
 
 ```
 util.h:124:66: runtime error: left shift of 255 by 24 places
 cannot be represented in type 'int'
 ```
 
-This is reachable on every host and is hit by any big-endian read of a buffer
-whose first byte has the high bit set — including `ethernet_get_type` on a frame
-and the BCMP header parse path.
+Reachable on every host, including `ethernet_get_type` and the BCMP header
+parse path.
 
-**Status: benign in practice.** Every mainstream compiler produces the intended
-value, and the differential comparison shows no mismatch: `bm-wire`'s
-`u32::from_be_bytes` agrees with the C on all 2^32 inputs the fuzzer reached.
-The fix upstream is a one-line cast:
-
-```c
-return ((uint32_t)buf[3]) | ((uint32_t)buf[2] << 8)
-     | ((uint32_t)buf[1] << 16) | ((uint32_t)buf[0] << 24);
-```
-
-`uint8_to_uint16` is not affected — `0xFF << 8` fits in an `int`.
+**benign.** Every mainstream compiler produces the intended value and the
+differential comparison shows no mismatch. The fix is a cast on each operand.
+`uint8_to_uint16` is unaffected — `0xFF << 8` fits in an `int`.
 
 ## 7. `bm_l2_policy_rx_apply` documents an egress-nibble clear it never performs
 
-`network/l2_policy.h` describes the function as:
-
-> - if routing_cb is used, **clears the egress nibble in the src addr after
->   callback**
-
-`network/l2_policy.c` does no such thing. After the callback returns it only
-records the mask:
+`network/l2_policy.h` says the function "clears the egress nibble in the src
+addr after callback". `network/l2_policy.c` only records the mask:
 
 ```c
 policy_result.should_submit = routing_cb(ingress_port_num, &egress, src_ip, dst_ip);
 policy_result.egress_mask = egress;
 ```
 
-Whatever the callback wrote into the source address — including the egress
-nibble — stays in the frame and is submitted up the stack that way.
+Whatever the callback wrote into the source address stays in the frame and is
+submitted up the stack that way. Same class as #1, in the same header, and the
+two interact: the RX buffer keeps what the callback left, and the forwarded
+copy has *both* nibbles zeroed.
 
-This is the same class of defect as divergence #1, in the same header, and the
-two interact: a caller reading the header would expect the ports byte to be
-clean after `rx_apply` and fully cleared only on the forwarded copy, whereas the
-code leaves the RX buffer as the callback left it and zeroes *both* nibbles on
-the copy.
-
-`bm-wire` matches the code, and the differential harness covers it: the
-`cb_src_write` field of `L2PolicyInput` makes the fake callback write the ports
-byte, and both implementations must end up with the same frame.
-
-**Both doc comments in `l2_policy.h` need correcting upstream.**
+`bm-wire` matches the code. `L2PolicyInput::cb_src_write` makes the fake
+callback write the ports byte, and both implementations must end up with the
+same frame. Both doc comments need correcting.
 
 ## 8. `bcmp_tx`'s size guard uses the wrong `sizeof`
 
@@ -252,32 +213,21 @@ if (dst && (uint32_t)size + sizeof(BcmpHeartbeat) <= max_payload_len) {
   buf = bm_ip_tx_new(dst, size + sizeof(BcmpHeader));
 ```
 
-The guard is meant to check that the message fits inside `max_payload_len`
-(1460 = a 1500-byte MTU less the 40-byte IPv6 header). What actually gets sent
-is `size + sizeof(BcmpHeader)`, which is what the very next line allocates —
-but the guard adds `sizeof(BcmpHeartbeat)` instead.
+The guard checks against `sizeof(BcmpHeartbeat)` (12) while the allocation uses
+`sizeof(BcmpHeader)` (13), so a `size` of 1448 passes the guard and builds a
+1461-byte IPv6 payload, one byte over `max_payload_len` (1460).
 
-`BcmpHeartbeat` is 12 bytes; `BcmpHeader` is 13. So a `size` of 1448 passes the
-guard and then builds a 1461-byte IPv6 payload: one byte over the budget. The
-`BcmpHeartbeat` in the expression is a leftover — heartbeat is simply the
-message this ceiling was first written for.
+**replicated**, in that `bm-wire` imposes no ceiling of its own:
+`bcmp::tx::serialize` takes a caller-sized frame and fails cleanly if it is too
+small. The fix is a one-word change, and is not wire-visible.
 
-**Status: replicated**, in the sense that `bm-wire` imposes no ceiling of its
-own — `bcmp::tx::serialize` takes a caller-sized frame and fails cleanly if it
-is too small, so the off-by-one has nowhere to land. The fix upstream is a
-one-word change to `sizeof(BcmpHeader)`, and it is not wire-visible: no
-conforming sender emits a message in the one-byte window.
-
-`bm_stack::Node::send` is where a ceiling does exist, because a node has one
-transmit buffer: `MTU` is 1514, so a body of 1447 is the largest that fits and
-1448 — the one the C's guard lets through — is refused rather than sent as a
-1515-byte frame. Nothing reaches that size today; the largest body any ported
-exchange builds is a neighbour-table reply, and only `bcmp/config.c` has a
-message that could grow near it.
+`bm_stack::Node::send` does have a ceiling, because a node has one transmit
+buffer: `MTU` is 1514, so a body of 1447 is the largest that fits and 1448 is
+refused. Nothing reaches that size today.
 
 ## 9. `process_received_message` rewrites the source address before verifying the checksum
 
-`bcmp/packet.c`, with the two macros it uses from the top of the same file:
+`bcmp/packet.c`:
 
 ```c
 #define clear_ports_legacy(x) (x[1] &= (~(0xFFFFU)))
@@ -292,102 +242,71 @@ data.header->checksum = 0;
 checksum_calc = PACKET.cb.checksum(payload, size + sizeof(BcmpHeader));
 ```
 
-Three bytes of the source address — bytes 2, 4 and 5, or frame offsets 24, 26
-and 27 — are rewritten **before** the checksum is computed, and the checksum
-covers the source address. So the value a receiver computes is the checksum of
-an address that never appeared on the wire.
+Source-address bytes 2, 4 and 5 — frame offsets 24, 26 and 27 — are rewritten
+*before* the checksum is computed, and the checksum covers the source address.
+The receiver therefore checksums an address that never appeared on the wire.
 
-This is load-bearing and it is documented nowhere. It is what lets a receiving node
-stamp the ingress port into the source address on arrival (per spec 5.4.4.1/2)
-without invalidating the sender's checksum: the clear undoes the stamp. An
-implementation that verifies the checksum over the address as received rejects
-every frame a real Bristlemouth node sends.
+This is load-bearing and undocumented: it is what lets a receiver stamp the
+ingress port into the source address on arrival (spec 5.4.4.1/2) without
+invalidating the sender's checksum. An implementation that verifies over the
+address as received rejects every frame a real node sends.
 
-`clear_ports_legacy` is explicitly marked as backwards compatibility for
-bm_core < v0.13.0 and is expected to disappear once resource-based routing
-lands — which will be a wire-visible change and needs coordinating.
+`clear_ports_legacy` is marked as backwards compatibility for bm_core < v0.13.0
+and is expected to disappear once resource-based routing lands, which will be
+wire-visible.
 
-**`bm-wire` reproduces the rewrite exactly**, in `bcmp::rx::accept`, and the
-differential harness covers it: the
-`ingress_stamp` and `legacy_ports` fields of `BcmpInput` stamp both after the
-frame is built, and both implementations must agree on the verdict and on the
-resulting buffer. **The upstream fix is a comment, not a code change.**
+`bm-wire` reproduces the rewrite in `bcmp::rx::accept`; `BcmpInput`'s
+`ingress_stamp` and `legacy_ports` fields stamp both after the frame is built.
+**The upstream fix is a comment, not a code change.**
 
-One detail of the comment is worth getting right, because it is easy to state
-too simply. "A frame carrying the legacy port bytes fails its checksum" is
-false for two values of them. Frame bytes 26 and 27 are one aligned 16-bit word
-of the one's-complement sum, so clearing it changes the sum by that word's
-value — and both `0x0000` and `0xFFFF` are zero in one's-complement arithmetic.
-A frame whose legacy bytes are `FF FF` therefore survives the clear with a
-valid checksum and is processed normally. `cargo fuzz run forward` found this
-while card M2 was being written, against a comparator predicate that had said
-`legacy == [0, 0]`;
+One detail to state precisely: "a frame carrying the legacy port bytes fails
+its checksum" is false for two values. Frame bytes 26–27 are one aligned 16-bit
+word of the one's-complement sum, and both `0x0000` and `0xFFFF` are zero in
+one's-complement arithmetic, so a frame whose legacy bytes are `FF FF` survives
+the clear with a valid checksum. `cargo fuzz run forward` found this against a
+comparator predicate that said `legacy == [0, 0]`. See
 `legacy_port_bytes_of_all_ones_leave_the_checksum_valid` in
-`bm-wire-diff/tests/forward.rs` records it, and
-`bm-wire/fuzz/seeds/forward/system-time-for-another-legacy-ones` is the input.
+`bm-wire-diff/tests/forward.rs` and the seed
+`bm-wire/fuzz/seeds/forward/system-time-for-another-legacy-ones`.
 
 ## 10. A rejected frame is left with its checksum field zeroed
-
-Continuing the same function:
 
 ```c
 checksum_read = data.header->checksum;
 data.header->checksum = 0;
 checksum_calc = PACKET.cb.checksum(payload, size + sizeof(BcmpHeader));
 if (checksum_calc != checksum_read) {
-  bm_debug(...);
   err = BmEBADMSG;
-  return err;              /* <-- checksum field still zero */
+  return err;              /* checksum field still zero */
 }
 data.header->checksum = checksum_read;
 ```
 
-The field is zeroed to compute the checksum over it and restored afterwards —
-but the early return on mismatch skips the restore. A caller that inspects,
-logs, or forwards a rejected frame sees a header whose checksum reads `0x0000`
-rather than the value that arrived, so the one piece of evidence needed to
-diagnose the rejection has been destroyed by the code doing the rejecting.
-
-Nothing in bm_core reads the buffer after a rejection today, which is why this
-has gone unnoticed. It is still observable state, so `bm-wire` matches it and
-says so at `bcmp::rx::RxError::BadChecksum`. The fix upstream is to restore
-the field before returning, and it is not wire-visible.
+The early return skips the restore, so a caller that inspects, logs or forwards
+a rejected frame sees `0x0000` rather than what arrived. Nothing in bm_core
+reads the buffer after a rejection today. It is still observable state, so
+`bm-wire` matches it and says so at `bcmp::rx::RxError::BadChecksum`. Restoring
+the field before returning is not wire-visible.
 
 ## 11. `clear_ports_legacy` performs a misaligned 32-bit access
-
-The same macro as in #9:
 
 ```c
 #define clear_ports_legacy(x) (x[1] &= (~(0xFFFFU)))
 clear_ports_legacy(((uint32_t *)data.src));
 ```
 
-`data.src` points at the IPv6 source address, frame offset 22. `x[1]` is
-therefore a `uint32_t` read-modify-write at frame offset **26**, which is
-`2 mod 4` no matter how the frame itself is aligned — bm_linux's buffers come
-from `malloc`, so the frame is at least 8-aligned and offset 26 is never
-4-aligned. It is also a strict-aliasing violation, the same one already noted
-against `ip_to_nodeid` in divergence #3.
+`data.src` is frame offset 22, so `x[1]` is a `uint32_t` read-modify-write at
+offset 26 — `2 mod 4` however the frame is aligned. Also a strict-aliasing
+violation, as in #3. UBSan reports both the load and the store.
 
-UndefinedBehaviorSanitizer reports both halves:
+This is on the path of **every BCMP frame bm_core receives**, so it fires on
+the first receive of any fuzz run. `bm-wire-sys/build.rs` therefore passes
+`-fno-sanitize=alignment` under `CARGO_CFG_FUZZING` and nothing else;
+`shift-base` (which found #6), the rest of UBSan and ASan stay on.
 
-```
-runtime error: load of misaligned address 0x... for type 'uint32_t',
-which requires 4 byte alignment
-runtime error: store to misaligned address 0x... for type 'uint32_t',
-which requires 4 byte alignment
-```
-
-This is on the path of **every BCMP frame bm_core receives**, so the alignment
-check fires on the first receive of any fuzz run. `bm-wire-sys/build.rs`
-therefore passes `-fno-sanitize=alignment` under `CARGO_CFG_FUZZING` and
-nothing else: `shift-base`, which found divergence #6, and every other UBSan
-check stay on, as does AddressSanitizer.
-
-**Status: benign in practice.** Both shipped targets — x86-64 and Cortex-M33 —
-permit unaligned word access, and `bm-wire` sidesteps it entirely by clearing
-the two bytes directly. The fix upstream is to write the macro in terms of
-`uint8_t`, which is what it means:
+**benign.** Both shipped targets permit unaligned word access, and `bm-wire`
+clears the two bytes directly. The fix is to write the macro in `uint8_t`
+terms:
 
 ```c
 #define clear_ports_legacy(x) (((uint8_t *)(x))[4] = 0, ((uint8_t *)(x))[5] = 0)
@@ -396,8 +315,8 @@ the two bytes directly. The fix upstream is to write the macro in terms of
 ## 12. The egress-port checksum patch drops the end-around carry
 
 `network/l2.c` stamps the egress port into the IPv6 source address on the way
-out, which changes a byte the upper-layer checksum covers. Rather than
-recompute the checksum it patches it, in `network_add_egress_port`:
+out, changing a byte the upper-layer checksum covers. `network_add_egress_port`
+patches the checksum rather than recomputing it:
 
 ```c
 add_egress_port(payload, port_num);   /* payload[24] |= port_num */
@@ -414,90 +333,62 @@ if (ipv6_get_next_header(payload) == ip_proto_udp) {
 }
 ```
 
-The idea is sound. Frame offset 24 is the high byte of a 16-bit word in the
-one's-complement sum, so stamping it raises the sum by `port_num << 8`, and
-the checksum's high byte can be adjusted by `port_num` to match. The patch is
-also *necessary*, not merely an optimisation: `process_received_message`
-clears only the ingress nibble (`src[2] &= 0xF`), so the egress nibble the
-sender stamped is still there when the receiver checksums the frame.
-
-**What is missed is the carry.** A one's-complement sum wraps its carry around
-into the low end. Neither branch does that correctly, and they fail
-differently, because the two lvalues are different types:
+The approach is sound and necessary — `process_received_message` clears only
+the ingress nibble, so the sender's egress nibble is still present when the
+receiver checksums. What is missed is the one's-complement end-around carry,
+and the two branches fail differently because the lvalues have different types:
 
 - **UDP.** `payload[udp_checksum_offset]` is a `uint8_t`. `^= 0xFFFF`
-  truncates to `^= 0xFF` — the constant says the author believed this was a
-  16-bit lvalue — and `+= port_num` is 8-bit, so a carry out of the high byte
-  is simply lost. Exhaustively over all 65536 sums and all 15 port numbers,
-  the result differs from a correct one's-complement patch in **30720 of
-  983040 cases (3.12%)**.
+  truncates to `^= 0xFF` and `+= port_num` is 8-bit, so a carry out of the high
+  byte is lost. Exhaustively: wrong in **30720 of 983040 cases (3.12%)**.
 - **BCMP.** `header->checksum` is a `uint16_t`, so the carry propagates one
   place — and because the stored value is byte-swapped relative to the wire,
-  that propagation lands exactly where the end-around carry belongs. It is
-  right except when the carry itself carries, which needs the sum's low byte
-  to be `0xFF` as well: **120 of 983040 cases (0.0122%)**.
+  that lands where the end-around carry belongs. Wrong only when the carry
+  itself carries: **120 of 983040 cases (0.0122%)**.
 
-The severity is the other way round from the rates. `bm_l2_process_tx_evt`
-only stamps **link-local multicast**, and bm_core's UDP traffic — pub/sub via
-`bm_pubsub_init` — goes to `multicast_global_addr`, which takes the unstamped
-branch. So the 3.12% path is latent, reachable only by an integrator who
-registers a middleware application on a link-local destination. BCMP, on the
-other hand, sends heartbeats, pings and info to `multicast_ll_addr` and is
-stamped on every transmission, so the 0.0122% path is **live on deployed
-hardware**: roughly one BCMP frame in 40 000 leaves a two-port node with a
-checksum the node at the other end will reject and silently drop.
+Severity runs the other way from the rates. `bm_l2_process_tx_evt` stamps only
+**link-local multicast**, and bm_core's UDP traffic goes to
+`multicast_global_addr`, so the 3.12% path is latent. BCMP sends heartbeats,
+pings and info to `multicast_ll_addr` and is stamped on every transmission, so
+the 0.0122% path is **live on deployed hardware**: roughly one BCMP frame in
+40 000 leaves a two-port node with a checksum the far end rejects and drops.
 
-`bm-wire` reproduces both branches exactly, in `l2::add_egress_port`, and
-`bm-wire-diff/tests/l2_egress.rs` pins them down from both directions: the
-comparator asserts the port emits the same bytes as bm_core through the TX
-capture ring, and two further tests assert those bytes are *wrong* — that a
-carrying UDP frame's checksum does not match the frame, and that a
-double-carrying BCMP frame is rejected by `bcmp::rx::accept`. Both carry a
-note to say that if they start passing, the C has been fixed and the port must
-follow.
+Since ping and system time were ported, that rate is real rather than
+theoretical. Before them, every BCMP body came from a fixed `DeviceCfg` or a
+slow-moving uptime counter, so a node either hit the case constantly or never.
+Both new exchanges put caller-chosen bytes on the wire — a free-running 64-bit
+timestamp, an echoed payload — and the first run of each fuzz target produced
+an unverifiable frame within minutes. Config and DFU will be worse.
 
-**Addendum, from cards M1 and M2.** One frame in 40 000 is a rate over *body
-content*, not over time, and until ping and system time were ported every BCMP
-body a node emitted came from a fixed `DeviceCfg` or a slow-moving uptime
-counter — so in practice a given node either hit the case constantly or never.
-Both new exchanges make the rate real, because both put bytes on the wire that
-somebody else chose: a system-time response carries a free-running 64-bit
-timestamp, and an echo reply carries whatever payload the requester sent. The
-first run of each fuzz target produced an unverifiable frame within minutes.
+Pinned from both directions in `bm-wire-diff/tests/l2_egress.rs`: the
+comparator asserts `l2::add_egress_port` emits the same bytes as bm_core, and
+two further tests assert those bytes are *wrong*. Seeds
 `bm-wire/fuzz/seeds/time/stamped-checksum-carries-twice` and
-`bm-wire/fuzz/seeds/ping/reply-checksum-double-carry` keep the two inputs, and
-`a_response_whose_stamped_checksum_carries_twice_is_unverifiable` in
-`bm-wire-diff/tests/time.rs` and
-`a_reply_whose_stamped_checksum_double_carries_is_wrong_on_both_sides` in
-`bm-wire-diff/tests/ping.rs` each assert bm_core and the port build the same
-unverifiable bytes. Config and DFU, whose bodies are arbitrary payloads, will
-be worse again. This raises the priority of the upstream fix from "latent" to
-"one dropped frame per node per few tens of thousands of link-local
-transmissions, and rising".
+`bm-wire/fuzz/seeds/ping/reply-checksum-double-carry`, with
+`a_response_whose_stamped_checksum_carries_twice_is_unverifiable`
+(`tests/time.rs`) and
+`a_reply_whose_stamped_checksum_double_carries_is_wrong_on_both_sides`
+(`tests/ping.rs`). If those start passing, the C has been fixed and the port
+must follow.
 
-Ping's came with a lesson for the harness rather than the port: it first showed
-up as `bm-wire-diff/src/ping.rs` *failing*, because it was classifying captured
-frames with `rx::accept`. The C was right and the assertion was wrong. A
-comparator that reads a frame bm_core stamped must not require it to validate,
-because some of them correctly do not — every one of those is a ping a node
-answered and nobody heard.
+A comparator that reads a frame bm_core stamped must not require it to
+validate: some of them correctly do not. `bm-wire-diff/src/ping.rs` first
+failed for exactly that reason, classifying captured frames with `rx::accept`.
 
-The fix upstream is to fold the carry back in, in both branches. For BCMP:
+Fix, for BCMP:
 
 ```c
 uint32_t sum = (uint32_t)(uint16_t)(header->checksum ^ 0xFFFF) + port_num;
 header->checksum = (uint16_t)(((sum & 0xFFFF) + (sum >> 16)) ^ 0xFFFF);
 ```
 
-and for UDP the same, on a properly-read 16-bit field rather than a byte.
-`network_revert_checksum` needs the mirrored change. **This is wire-visible in
-the sense that it fixes frames that are currently discarded**; a node running
-the fix is strictly more interoperable, not less, so it does not need to be
-rolled out in lockstep.
+and the same for UDP on a properly-read 16-bit field.
+`network_revert_checksum` needs the mirrored change. Wire-visible only in that
+it fixes frames currently discarded, so it needs no lockstep rollout.
 
 ## 13. L2 silently drops any frame whose destination is not multicast
 
-`bm_l2_process_tx_evt` dispatches on the destination address:
+`bm_l2_process_tx_evt`:
 
 ```c
 if (is_global_multicast(dst_ip)) {
@@ -509,26 +400,24 @@ if (is_global_multicast(dst_ip)) {
 bm_l2_free(tx_evt->buf);
 ```
 
-There is no `else`. A frame addressed to a unicast address — including the
-`FD00::/8` addresses `bm_ip_init` derives for every node — is accepted by
-`bm_l2_link_output`, queued, dequeued, and then freed without ever reaching
-the network device. No error is returned and nothing is logged: the caller
-sees `BmOK` from `bm_l2_link_output` and the frame simply never arrives.
+No `else`. A unicast-addressed frame — including the `FD00::/8` addresses
+`bm_ip_init` derives for every node — is accepted by `bm_l2_link_output`,
+queued, dequeued and freed without reaching the network device. `BmOK` is
+returned and nothing is logged.
 
-This is consistent with the protocol as it stands, where everything is
-multicast and the `//TODO: Add functionality for resource based routing`
-in `pubsub.c` marks unicast as future work. It is still a trap for an
-integrator, and it is the reason `bm-wire`'s `l2::tx_kind` names the case
-`TxKind::Dropped` explicitly rather than folding it into a default. The fix
-upstream is a `bm_debug` line and a returned error, and it is not wire-visible.
+Consistent with the protocol as it stands, where everything is multicast and
+`pubsub.c`'s `//TODO: Add functionality for resource based routing` marks
+unicast as future work. `bm-wire`'s `l2::tx_kind` names the case
+`TxKind::Dropped` rather than folding it into a default. A `bm_debug` line and
+a returned error would fix it, and are not wire-visible.
 
 ## 14. Device-info and neighbour-table replies are parsed with unchecked lengths
 
 Both variable-length BCMP replies declare their own sizes, and bm_core copies
-according to those declarations without ever comparing them to how many bytes
-arrived. `BcmpProcessData` carries a `size` field; neither parser reads it.
+per those declarations without comparing them to how many bytes arrived.
+`BcmpProcessData` carries a `size` field; neither parser reads it.
 
-**`bcmp/info.c`**, in `populate_neighbor_info`:
+`bcmp/info.c`, `populate_neighbor_info`:
 
 ```c
 neighbor->version_str = (char *)bm_malloc(dev_info->ver_str_len + 1);
@@ -539,13 +428,12 @@ memcpy(neighbor->device_name, &dev_info->strings[dev_info->ver_str_len],
        dev_info->dev_name_len);
 ```
 
-`ver_str_len` and `dev_name_len` are `uint8_t` fields taken straight off the
-wire, so a reply carrying only its 38-byte fixed part but declaring 255 and 255
-copies **510 bytes past the end of the received frame** into two heap buffers.
-Those buffers are then held in the neighbour table and printed by
-`bcmp_print_neighbor_info`.
+Both lengths are `uint8_t` off the wire, so a reply carrying only its 38-byte
+fixed part but declaring 255 and 255 copies 510 bytes past the end of the
+frame into two heap buffers, which are then held in the neighbour table and
+printed by `bcmp_print_neighbor_info`.
 
-**`integrations/topology.c`**, in `neighbor_request_cb`, is worse:
+`integrations/topology.c`, `neighbor_request_cb`, is worse:
 
 ```c
 uint16_t neighbor_table_len =
@@ -558,43 +446,32 @@ neighbor_entry->neighbor_table_reply =
 memcpy(neighbor_entry->neighbor_table_reply, reply, neighbor_table_len);
 ```
 
-`port_len` is a `uint8_t` and `neighbor_len` a `uint16_t`, both off the wire.
-Saturated, they ask for `11 + 255*2 + 65535*10` = 655 871 bytes, copied out of
-a frame that may have carried eleven. Note also that the sum is accumulated in
-a `uint16_t`, so it wraps: the `bm_malloc` and the `memcpy` agree with each
-other but not with reality, and large declarations produce a small allocation
-and a large copy in some combinations and the reverse in others.
+Saturated, the declarations ask for 655 871 bytes out of a frame that may have
+carried eleven. The sum is also accumulated in a `uint16_t`, so it wraps: the
+`bm_malloc` and the `memcpy` agree with each other but not with reality.
 
 **Reachability.** Neither is gated on anything an attacker cannot arrange.
 
-- The info path requires an entry in `INFO_REQUEST_LIST` for the sender's node
-  id. `bcmp_process_heartbeat` calls `bcmp_request_info` whenever a neighbour's
-  `time_since_boot_us` goes backwards, which the neighbour itself chooses. So a
-  node on the link sends a heartbeat, sends a second with a lower uptime, and
-  is then asked for its info — at which point its reply is parsed this way.
-- The topology path requires `SENT_REQUEST` and a matching `TARGET_NODE_ID`,
-  which is the node being asked. Node ids are in every heartbeat.
+- The info path needs an `INFO_REQUEST_LIST` entry for the sender.
+  `bcmp_process_heartbeat` calls `bcmp_request_info` whenever a neighbour's
+  `time_since_boot_us` goes backwards, which the neighbour chooses. Send a
+  heartbeat, send a second with a lower uptime, and the node asks for info.
+- The topology path needs `SENT_REQUEST` and a matching `TARGET_NODE_ID`, which
+  is the node being asked. Node ids are in every heartbeat.
 
-Both need only link access, which is the threat model Bristlemouth already
-assumes for a physical bus, but neither should be a memory-safety boundary.
+Both need only link access. That is the threat model Bristlemouth assumes for a
+physical bus, but neither should be a memory-safety boundary.
 
-**Status: domain-limited.** There is no defined C behaviour to reproduce, so
-`bm-wire` does not reproduce it: `DeviceInfoReply::decode` and
-`NeighborTableReply::decode` validate every declared length against the buffer
-and return `BmWireError::Truncated` otherwise, and the decoded message borrows
-the frame rather than copying out of it, so the bounds are checked once and the
-iterators cannot walk past them.
+**domain-limited.** `DeviceInfoReply::decode` and `NeighborTableReply::decode`
+validate every declared length against the buffer and return
+`BmWireError::Truncated` otherwise, and the decoded message borrows the frame
+rather than copying out of it. `BcmpMessagesInput` only ever hands bm_core
+well-formed requests; its `decode_probe` bytes go to the Rust decoders and
+never to the C.
 
-The differential harness constrains its input to match: `BcmpMessagesInput`
-only ever hands bm_core **well-formed requests**, and its `decode_probe` bytes
-— which is where a fuzzer's malformed replies go — are fed to the Rust decoders
-and never to the C. Injecting a malformed reply into the oracle would be
-exercising undefined behaviour, not comparing against it.
-
-The fix upstream is to check `data.size` before trusting any declared length,
-in both parsers, and to accumulate the neighbour-table length in a `uint32_t`.
-It is not wire-visible: no conforming sender emits a reply whose declared
-lengths exceed the message.
+The fix is to check `data.size` before trusting any declared length in both
+parsers, and to accumulate the neighbour-table length in a `uint32_t`. Not
+wire-visible.
 
 ## 15. `bcmp_remove_neighbor_from_table` frees, and reports the wrong result
 
@@ -605,10 +482,9 @@ bool bcmp_remove_neighbor_from_table(BcmpNeighbor *neighbor);
 bool bcmp_free_neighbor(BcmpNeighbor *neighbor);
 ```
 
-and `bcmp_free_neighbor`'s own doc comment says, in capitals, *"NOTE: this does
-NOT remove neighbor from table"* — which reads as an instruction to call the
-other one too. Doing so is a **double free**: `bcmp_remove_neighbor_from_table`
-ends with
+and `bcmp_free_neighbor`'s doc comment says "NOTE: this does NOT remove
+neighbor from table", which reads as an instruction to call both. Doing so is a
+double free:
 
 ```c
     if (!rval) {
@@ -621,24 +497,21 @@ ends with
   return rval;
 ```
 
-Two problems in those four lines:
+Two problems:
 
-* It frees unconditionally, **including when it did not find the node in the
-  list**. A caller passing a stale or foreign pointer gets it freed anyway,
-  with whatever still points at it left dangling.
-* `rval` is overwritten by `bcmp_free_neighbor`'s result, so the function
-  returns "did the free succeed" while its doc comment promises "true if
-  successful" at removing. It returns `true` for a node that was never in the
-  list.
+- It frees unconditionally, including when the node was not found in the list,
+  so a stale or foreign pointer is freed anyway.
+- `rval` is overwritten by the free's result, so the function returns "did the
+  free succeed" while its doc promises "true if successful" at removing. It
+  returns `true` for a node that was never in the list.
 
-**Found the hard way.** `bm-wire-diff/src/neighbor.rs` clears the oracle's table
-between runs, and the first version called both functions, as the header reads.
-It aborted on the second test; valgrind put the first free inside
-`bcmp_remove_neighbor_from_table`. The comparator now calls only that one.
+Found by `bm-wire-diff/src/neighbor.rs` aborting on its second test, with
+valgrind putting the first free inside `bcmp_remove_neighbor_from_table`; the
+comparator now calls only that one.
 
-**Status: c-only.** The port has no such API — `NeighborTable` owns its storage
-and removal is an array shift. The fix upstream is to rename the function to
-say that it frees, or to split it honestly and fix the return value.
+**c-only.** `NeighborTable` owns its storage and removal is an array shift. Fix
+upstream by renaming the function to say that it frees, or splitting it
+honestly and fixing the return value.
 
 ## 16. An advertised liveliness lease wraps in 32-bit arithmetic
 
@@ -650,28 +523,20 @@ if (neighbor->online &&
                     bm_ms_to_ticks(2 * neighbor->heartbeat_period_s * 1000))) {
 ```
 
-`heartbeat_period_s` is a `uint32_t` taken straight from the heartbeat's
-`liveliness_lease_dur_s`, so `2 * period * 1000` is evaluated in 32-bit
-unsigned arithmetic and wraps at 2^32. A neighbour advertising 2 147 483 648
-seconds — nominally 68 years, "effectively forever" — produces a lease of
-**zero milliseconds**, and is marked offline by the very next check.
+`heartbeat_period_s` is a `uint32_t` from the heartbeat's
+`liveliness_lease_dur_s`, so `2 * period * 1000` wraps at 2^32. A neighbour
+advertising 2 147 483 648 seconds gets a lease of **zero milliseconds** and is
+marked offline by the next check. The wrap starts at 2 147 484 seconds, well
+below the field's range. bm_core itself always sends 10, so this is reachable
+only from a peer's advertised value.
 
-The wrap starts at 2 147 484 seconds, which is far below the field's range, so
-a well-meaning integrator asking for a long lease gets a short one. bm_core
-itself always sends `bcmp_heartbeat_s` = 10, so this is only reachable from a
-peer's advertised value.
-
-`bm-wire` reproduces it with `wrapping_mul` in `Neighbor::lease_ms`, and the
-differential harness sweeps the boundary: `advertised_leases_across_the_range`
-in `bm-wire-diff/tests/neighbor.rs` covers 0, 1, 10, 2 147 483, 2 147 484,
-2 147 483 648 and `u32::MAX`, and replacing the wrapping multiply with a
-saturating one makes the tables diverge. The fix upstream is to widen the
-expression to 64-bit and clamp.
+`Neighbor::lease_ms` reproduces it with `wrapping_mul`, and
+`advertised_leases_across_the_range` in `bm-wire-diff/tests/neighbor.rs` sweeps
+the boundary. Fix by widening to 64-bit and clamping.
 
 ## 17. A new neighbour is announced to the application twice
 
-`bcmp_update_neighbor` invokes the discovery callback as soon as the entry
-exists:
+`bcmp_update_neighbor` invokes the discovery callback on insert:
 
 ```c
 neighbor = bcmp_add_neighbor(node_id, port);
@@ -681,7 +546,7 @@ if (neighbor) {
 }
 ```
 
-and `bcmp_process_heartbeat`, having just called it, then invokes it again:
+and `bcmp_process_heartbeat`, having just called it, invokes it again:
 
 ```c
 if (!neighbor->online || neighbor_reset) {
@@ -689,19 +554,14 @@ if (!neighbor->online || neighbor_reset) {
 }
 ```
 
-`bcmp_add_neighbor` zeroes the entry, so `online` is still false at that
-second test and the condition holds. **Every newly discovered neighbour is
-therefore reported to the application twice**, on the same heartbeat, with the
-same pointer. An application that counts discoveries, or that does work per
-discovery, does it twice.
+`bcmp_add_neighbor` zeroes the entry, so `online` is still false at the second
+test. Every newly discovered neighbour is reported twice, on the same
+heartbeat, with the same pointer.
 
-Confirmed differentially rather than assumed: the comparator registers a real
-`NeighborDiscoveryCallback` and compares call counts, and reducing the port to
-a single announcement makes it fail with `left: appeared: 2, right: appeared: 1`.
-
-`bm-wire` matches it: `HeartbeatOutcome::discovery_callbacks` is 2 for a new
-neighbour. The fix upstream is to drop the call in `bcmp_update_neighbor`,
-whose caller already covers the case.
+Confirmed differentially: the comparator registers a real
+`NeighborDiscoveryCallback` and compares call counts.
+`HeartbeatOutcome::discovery_callbacks` is 2 for a new neighbour. Fix by
+dropping the call in `bcmp_update_neighbor`, whose caller already covers it.
 
 ## 18. A node id of zero is never recognised
 
@@ -716,26 +576,19 @@ while (neighbor != NULL) {
 }
 ```
 
-The `node_id &&` guard means a lookup for zero always fails, even when a
-zero-id neighbour is sitting in the table. Node ids come from
-`ip_to_nodeid(data.src)`, the low 8 bytes of the source address, so a node
-whose link-local address is exactly `fe80::` has one.
+The `node_id &&` guard means a lookup for zero always fails, even with a
+zero-id neighbour in the table. Node ids come from `ip_to_nodeid(data.src)`, so
+a node whose link-local address is exactly `fe80::` has one.
 
-Every heartbeat from such a node is therefore treated as a first sighting:
-`bcmp_update_neighbor` adds it again, which evicts the previous copy of itself
-from the port, fires the discovery callback (twice, per #17) and sends another
-`bcmp_request_info`. The table does not grow — eviction by port sees to that —
-but the node is permanently "new", its uptime history is reset on every
-heartbeat so a genuine restart can never be detected, and each heartbeat costs
-an info request on the wire and an `INFO_REQUEST_LIST` entry that is never
-reclaimed (#19).
+Every heartbeat from such a node is a first sighting: it is added again (which
+evicts the previous copy of itself from the port), fires the discovery callback
+twice (#17) and sends another `bcmp_request_info`. The table does not grow, but
+the node is permanently "new", a genuine restart can never be detected, and
+each heartbeat leaks an `INFO_REQUEST_LIST` entry (#19).
 
-`bm-wire`'s `NeighborTable::find` reproduces the guard, and the harness covers
-it: `a_zero_node_id_is_rediscovered_on_every_heartbeat`. Letting zero match
-makes the discovery counts diverge immediately.
-
-The fix upstream is to drop the `node_id &&` guard and reject a zero id where
-it is *received* instead, which is where the real question lies.
+`NeighborTable::find` reproduces the guard;
+`a_zero_node_id_is_rediscovered_on_every_heartbeat` covers it. Fix by dropping
+the guard and rejecting a zero id where it is *received* instead.
 
 ## 19. `INFO_REQUEST_LIST` grows without de-duplication or expiry
 
@@ -747,33 +600,25 @@ if (item) {
   err = ll_item_add(&INFO_REQUEST_LIST, item);
 ```
 
-`ll_item_add` in `common/ll.c` appends unconditionally — it does not look at
-the id — so requesting information about the same node twice leaves two
-entries. The only removal is in `bcmp_process_info_reply`, which removes one
-entry when a reply arrives. A node that is asked and never answers leaves its
-entry behind for the life of the process, and `ll_get_item` walks the list
-linearly, so the cost of every subsequent reply grows with it.
+`ll_item_add` appends unconditionally, so requesting the same node twice leaves
+two entries. The only removal is in `bcmp_process_info_reply`, one entry per
+reply. A node that is asked and never answers leaves its entry for the life of
+the process, and `ll_get_item` walks the list linearly.
 
-Ordinary operation is bounded by how often neighbours appear. Combined with
-#18 it is not: a node sending heartbeats from `fe80::` is "new" every time, so
-each heartbeat appends an entry that will never be removed.
+Ordinary operation is bounded by how often neighbours appear. Combined with #18
+it is not: a node heartbeating from `fe80::` appends an entry per heartbeat.
+`bcmp/packet.c` solves the same problem with a 150 ms sweep that expires
+entries and fires their callbacks with `NULL`; `INFO_REQUEST_LIST` has no
+equivalent.
 
-Contrast `bcmp/packet.c`, which has exactly this problem solved — its
-`sequence_list` has a 150 ms sweep that expires entries and fires their
-callbacks with `NULL`. `INFO_REQUEST_LIST` has no equivalent.
-
-**Status: c-only.** `bm-wire` is sans-io and keeps no such list;
-`HeartbeatOutcome::request_info` tells the runtime a request is owed and the
-runtime owns any bookkeeping. The fix upstream is to de-duplicate on the id in
-`bcmp_request_info`, and to expire entries the way `packet.c` does.
-
-This is also why the `neighbor` fuzz target needs `-fork=1`: the growth is
-bounded per iteration but not across a run.
+**c-only.** `bm-wire` is sans-io; `HeartbeatOutcome::request_info` tells the
+runtime a request is owed. This is why the `neighbor` fuzz target needs
+`-fork=1`. Fix by de-duplicating on the id and expiring entries as `packet.c`
+does.
 
 ## 20. `ll_remove` leaves `LL::tail` pointing at a freed node
 
-`common/ll.c` keeps `LL` doubly linked, but only `next` is maintained on
-removal. `ll_remove`:
+`common/ll.c` keeps `LL` doubly linked but maintains only `next` on removal:
 
 ```c
     if (current) {
@@ -793,15 +638,15 @@ removal. `ll_remove`:
     }
 ```
 
-Two omissions, one of which bites:
+Two omissions:
 
-* removing the head does not clear the new head's `previous`, which is
-  harmless — the only read of `previous` is in the tail branch, and a node that
-  is the head takes the head branch first;
-* removing a node from the **middle** does not fix up the `previous` of the
-  node that follows it. That node's `previous` now points at freed memory, and
-  if it is later removed as the tail, `ll->tail = current->previous` stores the
-  freed pointer into the list itself.
+- removing the head does not clear the new head's `previous` — harmless, since
+  the only read of `previous` is in the tail branch and a head takes the head
+  branch first;
+- removing a node from the **middle** does not fix up the following node's
+  `previous`, which now points at freed memory. If that node is later removed
+  as the tail, `ll->tail = current->previous` stores the freed pointer into the
+  list.
 
 The next `ll_item_add` dereferences it:
 
@@ -811,121 +656,81 @@ The next `ll_item_add` dereferences it:
       ll->tail->next = node;      // write through a freed pointer
 ```
 
-Four operations reach it. In `bcmp/packet.c`'s `sequence_list`, which removes
-by sequence number in whatever order replies arrive, they are all ordinary:
+Four ordinary operations on `packet.c`'s `sequence_list` reach it:
 
-1. three sequenced requests are outstanding — `[A, B, C]`;
-2. the reply to `B` arrives, so `B` is unlinked from the middle and freed;
-   `C->previous` now dangles;
-3. the reply to `C` arrives; `C` is the tail and not the head, so
+1. three sequenced requests outstanding — `[A, B, C]`;
+2. `B`'s reply arrives, `B` is unlinked from the middle and freed;
+   `C->previous` dangles;
+3. `C`'s reply arrives; `C` is the tail and not the head, so
    `ll->tail = C->previous`, the freed `B`;
-4. a fourth request is sent, and `ll_item_add` writes `node` into the freed
-   block.
+4. a fourth request is sent, and `ll_item_add` writes into the freed block.
 
-The write is what a sanitizer reports. What a deployed node sees is quieter and
-worse: `ll->head` still points at `A`, whose `next` was set to `NULL` in step 3,
-so **the request added in step 4 is not reachable from the head at all**.
-`ll_get_item` never finds it, so its reply is treated as unsolicited;
-`ll_traverse` never visits it, so the expiry sweep never fires its callback —
-not with a payload, and not with `NULL` either. The caller waits forever for a
-callback that cannot come, and every subsequent append extends an unreachable
-chain hanging off `ll->tail`.
+The write is what a sanitizer reports. What a deployed node sees is quieter:
+`ll->head` still points at `A`, whose `next` was set to `NULL` in step 3, so the
+request added in step 4 is **not reachable from the head**. `ll_get_item` never
+finds it, so its reply is treated as unsolicited; `ll_traverse` never visits it,
+so the expiry sweep never fires its callback — not with a payload, and not with
+`NULL`. The caller waits forever.
 
-`ll_remove` is shared by every list in bm_core — `packet_list`,
-`INFO_REQUEST_LIST`, the resource-discovery lists — so anything that removes
-out of insertion order is exposed. `bcmp/config.c` is the module that will hit
-it first: it is the only one that issues sequenced requests, and it issues
-several concurrently.
+`ll_remove` is shared by every list in bm_core, so anything removing out of
+insertion order is exposed. `bcmp/config.c` will hit it first: it is the only
+module issuing sequenced requests, and it issues several concurrently.
 
-**Status: domain-limited.** There is nothing to replicate — the port's
-`Registry` keeps a fixed array and closes the gap on removal — and comparing
-against a freed-pointer write would be comparing against nothing. So
-`bm-wire-diff/src/registry.rs` carries a `LinkModel` that tracks exactly which
-of the C's `previous` pointers are stale, and declines to perform the fourth
-step above. Every step it does perform is compared in full; the seed
-`bm-wire/fuzz/seeds/registry/dangling-tail` drives the shape right up to the
-edge. The fix upstream is two lines: clear the new head's `previous` and set
+**domain-limited.** `bm-wire-diff/src/registry.rs` carries a `LinkModel` that
+tracks which of the C's `previous` pointers are stale and declines step 4; the
+seed `bm-wire/fuzz/seeds/registry/dangling-tail` drives the shape to the edge.
+The fix is two lines: clear the new head's `previous`, and set
 `current->next->previous = current->previous` before freeing.
 
 ## 21. A sequenced reply is matched on its sequence number alone
 
-`new_sequence_list_item` records what was asked:
-
-```c
-  BcmpRequestElement element;
-  element.type = type;
-```
-
-and nothing ever reads that field again. `process_received_message` looks the
-entry up by number:
+`new_sequence_list_item` records `element.type = type`, and nothing ever reads
+it again. `process_received_message` looks the entry up by number:
 
 ```c
       if (cfg->sequenced_reply && !cfg->sequenced_request) {
         request_message = sequence_list_find_message(data.header->seq_num);
 ```
 
-`sequence_list_find_message` is `ll_get_item(&PACKET.sequence_list, seq_num,
-...)`, an id lookup. So **any** reply type whose sequence number happens to
-match an outstanding request consumes that request and invokes its callback
-with a payload of an entirely different shape. A `BcmpConfigValue` reply
-answers a `BcmpNeighborProtoRequest`; the neighbour-proto callback is then
-handed config bytes and parses them as its own.
+`sequence_list_find_message` is an id lookup, so any reply type whose sequence
+number matches an outstanding request consumes it and invokes its callback with
+a payload of a different shape — a `BcmpConfigValue` can answer a
+`BcmpNeighborProtoRequest`.
 
-The numbers are not hard to line up. They come from a single global counter
-that starts at zero on boot and increments by one per request, and the request
-carries the number in its header on the wire — so anything that can see a
-request can answer it with a message of any registered reply type, and be
-believed. Since `config.c` is the only module issuing sequenced requests today,
-the everyday case is milder: one config exchange's reply credited to another's,
-because both draw from the same counter.
+The numbers are not hard to line up: a single global counter starting at zero
+on boot, incrementing by one per request, carried in the request's header on
+the wire. Anything that can see a request can answer it with any registered
+reply type and be believed. Since `config.c` is the only module issuing
+sequenced requests today, the everyday case is one config exchange's reply
+credited to another's.
 
-Confirmed differentially rather than assumed:
 `a_reply_of_the_wrong_type_answers_the_request_anyway` in
-`bm-wire-diff/tests/registry.rs` sends a `NEIGHBOR_PROTO_REQUEST` and answers
-it with a `CONFIG_VALUE`, and adding a type comparison to
-`Registry::on_received` makes the C and the port diverge immediately:
+`bm-wire-diff/tests/registry.rs` sends a `NEIGHBOR_PROTO_REQUEST` and answers it
+with a `CONFIG_VALUE`; adding a type comparison to `Registry::on_received` makes
+the C and the port diverge. `PendingRequest::message_type` is carried for the
+caller as the C carries it, without taking part in the match.
 
-```
-left:  [Reply { slot: 0, payload: [...] }]
-right: [Process { message_type: ConfigValue, seq_num: 0, payload: [...] }]
-```
+`bm_stack::Node` inherits it —
+`a_reply_of_the_wrong_type_answers_the_request_anyway` in
+`bm-stack/tests/node.rs` — so `Event::Reply` carries both the request's and the
+reply's type and says at the type that they need not agree.
 
-`bm-wire` matches the C — `Registry::on_received` compares `seq_num` and
-nothing else — and `PendingRequest::message_type` is carried for the caller's
-benefit, as the C carries it, without taking part in the match. The fix
-upstream is to compare `element->type` against the type the reply is a reply
-to, which needs the registry to say which request type each reply type answers.
-
-`bm_stack::Node` inherits it, because the registry is what routes a reply there
-too: `a_reply_of_the_wrong_type_answers_the_request_anyway` in
-`bm-stack/tests/node.rs` answers a config get with a neighbour-proto reply and
-the node reports it as the answer. `Event::Reply` therefore carries both the
-request and the reply's own type, and says at the type that they need not
-agree — an application that cares has to compare them itself, which is the
-check the C leaves to nobody.
+Fix by comparing `element->type` against the type the reply answers, which
+needs the registry to record which request type each reply type answers.
 
 ## 22. A sequenced request's timeout is the sweep period, not the timeout
 
-`bcmp/packet.c` opens with two constants:
+`bcmp/packet.c`:
 
 ```c
 #define default_message_timeout_ms 24
 #define message_timer_expiry_period_ms 150
 ```
 
-Every sequenced request is stamped with the first:
-`new_sequence_list_item(header->type, default_message_timeout_ms, ...)`. But
-nothing consults it except `timer_traverse_cb`, which only runs from
-`sequence_list_timer_callback`, which only runs when the 150 ms auto-reload
-timer fires. **The 24 ms is a threshold applied on a 150 ms grid**, so what a
-request actually gets is neither number.
-
-Measured rather than inferred. `the_effective_timeout_across_the_whole_phase`
-in `bm-wire-diff/tests/registry.rs` walks the clock a millisecond at a time for
-every offset in the sweep's phase, against the real timer in the shim rather
-than against the constant, and
-`the_effective_timeout_ranges_from_25_to_174_milliseconds` in `bm-wire`'s own
-unit tests asserts the resulting shape:
+Every sequenced request is stamped with the first. Nothing consults it except
+`timer_traverse_cb`, which runs only from `sequence_list_timer_callback`, which
+runs only when the 150 ms auto-reload timer fires. The 24 ms is a threshold
+applied on a 150 ms grid, so a request gets neither number:
 
 | Sent at | Expired at | Lived for |
 |---|---|---|
@@ -933,86 +738,72 @@ unit tests asserts the resulting shape:
 | 0 ms (on a sweep) | 150 ms | 150 ms |
 | 126 ms (24 before a sweep) | 300 ms | **174 ms** |
 
-One millisecond earlier or later in the phase is the difference between 25 ms
-and 174 ms — a factor of seven, for identical traffic, decided by nothing the
-caller can see or control. The nominal 24 ms is the one value a request can
-never get, because the comparison is strict: a request exactly 24 ms old when
-the sweep reaches it survives to the next one.
+One millisecond of phase is the difference between 25 ms and 174 ms, for
+identical traffic. The nominal 24 ms is the one value a request can never get,
+because the comparison is strict.
 
-Whether that window is long enough for a real reply is a question about a real
-link, and this harness cannot answer it — the shim's clock only moves when the
-test says so. What it can say is that the answer differs by 7× depending on
-scheduling jitter of a single millisecond, which is not a property a timeout
-should have. Card C3 is where it will matter: `bcmp/config.c` is the only
-module that issues sequenced requests, and a config get whose reply arrives in
-the wrong part of the phase is reported to the application as a failure
-(`cb(NULL)`) and then delivered again as an unsolicited `BcmpConfigValue` a
-moment later.
+Measured rather than inferred: `the_effective_timeout_across_the_whole_phase`
+in `bm-wire-diff/tests/registry.rs` walks the clock a millisecond at a time
+against the real timer in the shim, and
+`the_effective_timeout_ranges_from_25_to_174_milliseconds` in `bm-wire`'s unit
+tests asserts the shape.
 
-`bm-wire` reproduces the grid, not just the threshold: `Registry::on_tick`
-carries the sweep's phase and only sweeps when one comes due, so the port times
-out the same requests at the same instants a C node does. Deleting the phase
-check — sweeping on every tick, which is what a reasonable reading of the
-constants would suggest — makes six of the comparator's tests fail. The fix
-upstream is to make the sweep period the timeout, or to drive the expiry from
-the entry's own deadline rather than from a fixed tick.
+Card C3 is where it matters: `bcmp/config.c` is the only module issuing
+sequenced requests, and a config get whose reply arrives in the wrong part of
+the phase is reported to the application as a failure (`cb(NULL)`) and then
+delivered again as an unsolicited `BcmpConfigValue`.
 
-`bm_stack::Node` carries the grid rather than a grid of its own: `Node::on_expiry`
-is `sequence_list_timer_callback` and `Node::run` drives it from a ticker of
-`EXPIRY_PERIOD_MS`, separate from the ten-second heartbeat ticker, exactly as
-bm_core has two timers.
-`an_unanswered_request_dies_on_the_sweep_rather_than_on_its_timeout` in
-`bm-stack/tests/node.rs` walks a request to 149 ms and finds it alive, and
-`a_reply_that_arrives_after_the_timeout_is_reported_twice` shows the other
-half at the node level: one exchange reaches the application twice, first as a
-failed request and then as unsolicited traffic, because after the sweep there
-is nothing left for the reply to match.
+`Registry::on_tick` carries the sweep's phase and only sweeps when one is due,
+so the port times out the same requests at the same instants. Sweeping on every
+tick instead fails six of the comparator's tests. `bm_stack::Node::on_expiry`
+is `sequence_list_timer_callback`, driven from a ticker of `EXPIRY_PERIOD_MS`
+separate from the heartbeat ticker; see
+`an_unanswered_request_dies_on_the_sweep_rather_than_on_its_timeout` and
+`a_reply_that_arrives_after_the_timeout_is_reported_twice` in
+`bm-stack/tests/node.rs`.
+
+Fix by making the sweep period the timeout, or by driving expiry from each
+entry's own deadline.
 
 ## 23. `bcmp_ll_forward` replaces the originator's source address with the forwarder's
 
-`bcmp/bcmp.c`'s doc comment says only this:
-
-> Forward the payload to all ports other than the ingress port.
-
-What the code does is build a **new datagram**:
+`bcmp/bcmp.c`'s doc comment says only "Forward the payload to all ports other
+than the ingress port." What the code does is build a new datagram:
 
 ```c
 void *forward = bm_ip_tx_new(&multicast_ll_addr, size + sizeof(BcmpHeader));
 ```
 
-`bm_ip_tx_new` fills in the source address itself, and it has only one to give:
+`bm_ip_tx_new` fills in the source address itself, and has only one to give:
 
 ```c
 uint8_t *ip = (uint8_t *)bm_l2_get_payload(buf) + ETH_HDR_LEN;
 memcpy(ip + 8, &CTX.ll_addr, 16);   /* this node's link-local address */
 ```
 
-So the frame that leaves the far port claims the **forwarder** as its IPv6
-source. The originator is not relayed; it survives only in whatever the message
-body carries, and the checksum is recomputed because the address changed.
+So the frame leaving the far port claims the forwarder as its IPv6 source. The
+originator survives only in whatever the message body carries, and the checksum
+is recomputed. The hop limit is reset to 64, so hop count is not recoverable
+either.
 
-For the three exchanges that forward today this happens to be harmless: the
-system-time, config and DFU messages all carry a `source_node_id` in their own
-body headers, and their processors read that rather than the IPv6 source. But
+Harmless for the three exchanges that forward today — system time, config and
+DFU all carry a `source_node_id` in their own body headers. But
 `process_received_message` hands every processor `data.src`, and
-`ip_to_nodeid(data.src)` is how several of them identify a peer — so anything
-that grows a reliance on it will silently see the last hop instead of the
-sender, and only on multi-hop networks. The hop count is not recoverable either:
-the hop limit is reset to 64 along with everything else in the header.
+`ip_to_nodeid(data.src)` is how several of them identify a peer, so anything
+that grows a reliance on it will silently see the last hop, and only on
+multi-hop networks.
 
-`bm-wire` reproduces it. `bcmp::forward::serialize_forwarded` checksums against
-whatever source address the caller wrote, and `bm_stack::Node::forward_link_local`
-writes this node's own — `the_c_puts_its_own_address_on_a_forwarded_message` in
-`bm-wire-diff/tests/forward.rs` asserts the C does the same, so if upstream
-changes it the comparator fails first. The fix upstream is either to document
-the rewrite or to carry the originator's address over, and the second is
+`bcmp::forward::serialize_forwarded` checksums against whatever source address
+the caller wrote, and `bm_stack::Node::forward_link_local` writes this node's
+own. `the_c_puts_its_own_address_on_a_forwarded_message` in
+`bm-wire-diff/tests/forward.rs` asserts the C does the same. Fix by documenting
+the rewrite, or by carrying the originator's address over — the second is
 wire-visible.
 
 ## 24. A forwarded frame's multicast MAC carries the egress port
 
-bm_core has no per-port transmit call. To get one copy of a forwarded message
-onto one port, `bcmp_ll_forward` encodes the port into the IPv6 destination
-address and lets L2 read it back out:
+bm_core has no per-port transmit call, so `bcmp_ll_forward` encodes the port
+into the IPv6 destination and lets L2 read it back out:
 
 ```c
 uint8_t port_specific_dst[sizeof(multicast_ll_addr)];
@@ -1022,9 +813,9 @@ memcpy(port_specific_dst, &multicast_ll_addr, sizeof(multicast_ll_addr));
 BmErr tx_err = bm_ip_tx_perform(forward, (BmIpAddr *)port_specific_dst);
 ```
 
-`bm_l2_link_output` then reads destination byte 13, sets the port mask from it,
-and clears the byte — so the address on the wire is a clean `FF02::1`. The C's
-own comment says as much, and it is careful to checksum before the byte goes on.
+`bm_l2_link_output` reads destination byte 13, sets the port mask from it, and
+clears the byte, so the address on the wire is a clean `FF02::1`. The C
+checksums before the byte goes on.
 
 The Ethernet header is not so lucky. `bm_ip_tx_perform` derives the destination
 MAC from the address it was handed, **before** L2 clears anything:
@@ -1035,35 +826,26 @@ if (is_multicast(effective_dst)) {
 }
 ```
 
-`multicast_mac_from_ipv6` copies destination bytes 12..16, which at that moment
-are `00 <port> 00 01`. So a forwarded frame leaves port 2 addressed to
-`33:33:00:02:00:01` while its IPv6 destination says `FF02::1`, whose correct
-mapped MAC is `33:33:00:00:00:01`. The MAC and the address disagree, and the MAC
-is the one that reaches the wire.
+Those bytes are `00 <port> 00 01` at that moment, so a forwarded frame leaves
+port 2 addressed to `33:33:00:02:00:01` while its IPv6 destination says
+`FF02::1`, whose correct mapped MAC is `33:33:00:00:00:01`.
 
-Whether that matters depends on what is between the two nodes. On a
-point-to-point Bristlemouth link there is nothing to filter on a multicast MAC
-group address, which is presumably why it has never been noticed. Anything that
-does filter — a switch, a host NIC that is not promiscuous, a capture matched on
-the mapped multicast MAC — sees a frame addressed to a group nobody joined. The
-two nibbles the protocol already borrows from the source address are documented;
-this one is not, and it is in the field the protocol has no claim on.
+On a point-to-point Bristlemouth link there is nothing filtering on a multicast
+MAC group address. Anything that does filter — a switch, a non-promiscuous host
+NIC, a capture matched on the mapped MAC — sees a frame addressed to a group
+nobody joined.
 
-`bm-wire` reproduces it. `bcmp::forward::apply_port_specific_destination` writes
-the address and re-derives the MAC from it in one step, in the order
-`bm_ip_tx_perform` does, and `the_egress_port_survives_in_the_multicast_mac` in
-`bm-wire-diff/tests/forward.rs` pins the resulting byte against the C. Deriving
-the MAC from the plain `FF02::1` instead — the reading a careful implementer
-would arrive at from the spec — makes the comparator diverge at Ethernet byte 3.
-The fix upstream is to build the MAC from `multicast_ll_addr` and pass the port
-to L2 some other way; it is wire-visible, but only to a receiver that was
-dropping these frames already.
+`bcmp::forward::apply_port_specific_destination` writes the address and
+re-derives the MAC from it in `bm_ip_tx_perform`'s order, and
+`the_egress_port_survives_in_the_multicast_mac` in
+`bm-wire-diff/tests/forward.rs` pins the byte. Fix by building the MAC from
+`multicast_ll_addr` and passing the port to L2 some other way; wire-visible,
+but only to a receiver that was dropping these frames already.
 
 ## 25. `bcmp_ll_forward` writes its new checksum into the frame it was asked to forward
 
 `header` points into the received frame — `process_received_message` sets
-`data.header = (BcmpHeader *)buf` where `buf` is the RX buffer — and
-`bcmp_ll_forward` uses it as scratch space:
+`data.header = (BcmpHeader *)buf` — and `bcmp_ll_forward` uses it as scratch:
 
 ```c
 header->checksum = 0;
@@ -1074,18 +856,15 @@ bm_ip_tx_copy(forward, header, sizeof(BcmpHeader), 0);
 ```
 
 Two bytes of the caller's received frame are overwritten with a checksum
-computed for a *different* frame — one with a different source address. It is
-invisible today: the only readers of the RX buffer after a processor returns are
-`bm_ip_rx_cleanup` and the `free` under it, and the loop re-zeroes the field
-before each port, so every forwarded copy is still identical. A processor that
-forwarded a message and then went on to re-examine its own header would find the
-wrong checksum there, and nothing in the signature warns it.
+computed for a different frame. Invisible today: the only readers of the RX
+buffer after a processor returns are `bm_ip_rx_cleanup` and the `free` under
+it, and the loop re-zeroes the field before each port. A processor that
+forwarded a message and then re-examined its own header would find the wrong
+checksum, and nothing in the signature warns it.
 
-`bm-wire` has no counterpart: `bcmp::forward::serialize_forwarded` takes the
-received message as `&[u8]` and cannot write to it, and
-`bm_stack::Node::forward_link_local` builds the copy in the node's own transmit
-buffer. The fix upstream is a local `BcmpHeader` copy, which costs thirteen
-bytes of stack and nothing on the wire.
+`bcmp::forward::serialize_forwarded` takes the received message as `&[u8]` and
+cannot write to it. Fix with a local `BcmpHeader` copy — thirteen bytes of
+stack, nothing on the wire.
 
 ## 26. `bcmp_ll_forward` reports a forward with nowhere to go as `BmEINVAL`
 
@@ -1101,33 +880,29 @@ for (uint8_t egress_port = 1; egress_port <= num_ports; egress_port++) {
 return err;
 ```
 
-The error starts as "bad argument" and is only cleared by a transmit that
-succeeded. On a one-port device — or on any device where `ingress_port` is the
-only port — the loop body never runs, and the caller is told its arguments were
-invalid for a forward that was correctly a no-op. `bcmp_time_process_time_message`,
-`bcmp_process_config_message` and `dfu_copy_and_process_message` all return that
+On a one-port device — or wherever `ingress_port` is the only port — the loop
+body never runs and the caller is told its arguments were invalid for a forward
+that was correctly a no-op. `bcmp_time_process_time_message`,
+`bcmp_process_config_message` and `dfu_copy_and_process_message` return that
 value as their own, so a single-port node reports every forwarded message as a
 failure.
 
-An `ingress_port` of zero has the opposite effect. `process_received_message`
-reads it out of the source address, so zero means the sender encoded no port,
-and then no port matches the `continue` — the message is forwarded straight back
-out the interface it arrived on. On a two-port node that is a duplicate on one
-port and a loop on the other.
+An `ingress_port` of zero has the opposite effect: zero means the sender encoded
+no port, no port matches the `continue`, and the message is forwarded back out
+the interface it arrived on. On a two-port node that is a duplicate on one port
+and a loop on the other.
 
-`bm-wire` names both cases rather than hiding them:
 `bcmp::forward::egress_ports` skips nothing for an ingress port of zero, and
-`bcmp::forward::ll_forward_is_a_no_op` is the predicate for the `BmEINVAL`. The
-fix upstream is to return `BmOK` when there was nothing to do, and to refuse an
-ingress port of zero.
+`bcmp::forward::ll_forward_is_a_no_op` is the predicate for the `BmEINVAL`. Fix
+by returning `BmOK` when there was nothing to do, and refusing an ingress port
+of zero.
 
 ## 27. A system-time `target_node_id` of zero is a broadcast for one message type and a dead letter for the other two
 
 `bcmp_time_process_time_message` tests `target_node_id` twice, and the two tests
-do not agree about what zero means:
+disagree about what zero means:
 
 ```c
-BcmpSystemTimeHeader *msg_header = (BcmpSystemTimeHeader *)data.payload;
 if (msg_header->target_node_id != node_id() &&
     msg_header->target_node_id != 0) {
   should_forward = true;                      /* zero is "for everyone" */
@@ -1138,28 +913,18 @@ case BcmpSystemTimeRequestMessage: {
   if (msg_header->target_node_id != node_id()) {
     break;                                    /* zero is "for nobody" */
   }
-  bcmp_time_process_time_request_msg(...);
-  err = BmOK;
-  break;
+  /* ... */
 }
 case BcmpSystemTimeResponseMessage: {
   if (msg_header->target_node_id != node_id()) {
     break;                                    /* zero is "for nobody" */
   }
-  /* ... bm_debug only ... */
+  /* ... */
 }
 case BcmpSystemTimeSetMessage: {
   bcmp_time_process_time_set_msg(...);        /* no second test at all */
-  err = BmOK;
-  break;
 }
 ```
-
-The outer test treats zero the way every other addressed BCMP message does — not
-mine, not nobody's, so do not forward it. The `0x10` and `0x11` arms then
-re-test for an exact match, which zero fails. The `0x12` arm makes no such test.
-
-So the three types behave as:
 
 | Message | `target == node_id()` | `target == 0` | `target == somebody else` |
 |---|---|---|---|
@@ -1167,16 +932,14 @@ So the three types behave as:
 | `0x11` system time response | logged | **silently dropped** | forwarded |
 | `0x12` system time set | applied, answered | applied, answered | forwarded |
 
-`bcmp_time_get_time(0)` therefore builds a message, transmits it, and every node
-on the link throws it away — the one obvious way to ask "does anybody here know
-what time it is" is the one that cannot work. `bcmp_time_set_time(0)` is the
-mirror image and does work: one frame sets the clock of every node on the link,
-and every one of them answers, which is a small broadcast storm but an intended
-one. The asymmetry is not documented anywhere; `bcmp_time_get_time`'s doc
-comment says only "Gets the system time from a target node."
+So `bcmp_time_get_time(0)` builds a message, transmits it, and every node
+discards it — the obvious way to ask "does anybody here know what time it is"
+cannot work. `bcmp_time_set_time(0)` is the mirror image and does work: one
+frame sets every node's clock and every one answers. Undocumented;
+`bcmp_time_get_time`'s doc comment says only "Gets the system time from a
+target node."
 
-bm_core's own `time_test.cpp` pins all three rows, so the behaviour is
-deliberate at least in the sense that somebody wrote a test for it:
+bm_core's `time_test.cpp` pins all three rows:
 
 ```cpp
 // Test request process with target id of 0
@@ -1185,95 +948,78 @@ ASSERT_EQ(packet_process_invoke(BcmpSystemTimeRequestMessage, data), BmEINVAL);
 ASSERT_EQ(bcmp_tx_fake.call_count, 0);
 ```
 
-`bm-wire` reproduces it, and names it rather than burying it in a comparison:
-`bcmp::time::SystemTimeRequest::is_for` and `SystemTimeResponse::is_for` are the
-exact-match test, `SystemTimeSet::is_for` is the broadcast one, and
-`SystemTimeHeader::is_local` is the forwarding test all three share.
-`zero_is_a_broadcast_for_a_set_and_a_dead_letter_for_the_other_two` in
-`bm-wire/src/bcmp/time.rs` is the table above as an assertion, and
-`a_broadcast_is_honoured_only_by_the_set_message` in `bm-wire-diff/tests/time.rs`
-pins each row against the C, so an upstream fix fails the comparator first.
+`SystemTimeRequest::is_for` and `SystemTimeResponse::is_for` are the exact-match
+test, `SystemTimeSet::is_for` the broadcast one, and `SystemTimeHeader::is_local`
+the forwarding test all three share. The table is asserted in
+`zero_is_a_broadcast_for_a_set_and_a_dead_letter_for_the_other_two`
+(`bm-wire/src/bcmp/time.rs`) and pinned against the C in
+`a_broadcast_is_honoured_only_by_the_set_message` (`bm-wire-diff/tests/time.rs`).
 
-The fix upstream is to drop the two inner tests, which makes `0x10` and `0x11`
-agree with `0x12` and with every other addressed message in BCMP. It is
-wire-visible in the useful direction: a node that starts answering broadcast time
-requests is answering messages that nobody can currently be relying on being
-ignored, since nothing has ever answered them.
+Fix by dropping the two inner tests, which makes `0x10` and `0x11` agree with
+`0x12` and with every other addressed BCMP message. Wire-visible in the useful
+direction: nothing can currently be relying on these being ignored, since
+nothing has ever answered them.
 
 ## 28. A global-multicast message that is forwarded is put on the wire twice, the second time link-local
 
-Two independent layers can decide to move a received frame onward, and nothing
-tells either about the other.
+Two layers can move a received frame onward, and neither knows about the other.
 
-L2 goes first. `bm_l2_process_rx_evt` applies the routing policy, and for an
+L2 goes first: `bm_l2_process_rx_evt` applies the routing policy, and for an
 `FF03::1` destination the policy asks for egress on every port but the ingress
-one **and** for local submission. The frame is copied, both port nibbles are
-cleared, and the copy is queued for transmission.
+one *and* for local submission. The frame is copied, both port nibbles are
+cleared, and the copy is queued.
 
 The local copy then reaches BCMP, and if it is a system-time message for a third
-node, `bcmp_time_process_time_message` sets `should_forward` and hands it to
-`bcmp_ll_forward` — which knows nothing of destinations and always builds its
-copies for `multicast_ll_addr`:
-
-```c
-BmErr bcmp_ll_forward(BcmpHeader *header, void *payload, uint32_t size,
-                      uint8_t ingress_port) {
-  /* ... */
-  void *forward = bm_ip_tx_new(&multicast_ll_addr, size + sizeof(BcmpHeader));
-```
+node, `bcmp_time_process_time_message` hands it to `bcmp_ll_forward` — which
+knows nothing of destinations and always builds for `multicast_ll_addr`.
 
 So one `FF03::1` system-time message arriving on port 1 of a two-port node
 leaves port 2 twice:
 
 1. the relayed copy, still `FF03::1`, still from the originator;
-2. a re-flood, `FF02::1`, from the forwarder (divergence #23).
+2. a re-flood, `FF02::1`, from the forwarder (#23).
 
 The second copy is the damaging one. `FF03::1` is Bristlemouth's *global*
-multicast — the address that is meant to cross the whole network — and the
-re-flood demotes it to link-local. A node one further hop away sees the
-link-local copy, is not the target, and forwards it link-local again, so the
-message does keep travelling; but its destination no longer says what it is, and
-anything routing on the destination address rather than on BCMP's own
-`target_node_id` sees a global message that stopped being global at the first
-node that did not own it. Meanwhile every hop carries two copies of the same
-message instead of one.
+multicast, and the re-flood demotes it to link-local. A node one hop further on
+sees the link-local copy and forwards it link-local again, so the message keeps
+travelling, but its destination no longer says what it is, and anything routing
+on the destination rather than on `target_node_id` sees a global message that
+stopped being global at the first node that did not own it. Every hop carries
+two copies.
 
-The same applies to `bcmp/config.c` and `bcmp/dfu_core.c`, which forward the
-same way; system time is only the first one ported.
+`bcmp/config.c` and `bcmp/dfu_core.c` forward the same way.
 
-`bm-wire` reproduces both transmissions and their order.
-`bm_stack::Owed` carries the L2 relay and the re-flood as separate fields
-because they are separate decisions, `bm_stack::Node::reflood` performs the
-second, and `a_global_multicast_for_a_third_node_is_forwarded_twice` in
-`bm-wire-diff/tests/time.rs` asserts the C emits exactly the same two frames on
-exactly the same port, in the same order.
+`bm_stack::Owed` carries the L2 relay and the re-flood as separate fields,
+`bm_stack::Node::reflood` performs the second, and
+`a_global_multicast_for_a_third_node_is_forwarded_twice` in
+`bm-wire-diff/tests/time.rs` asserts the C emits the same two frames on the same
+port in the same order.
 
-The fix upstream is for `bcmp_ll_forward` to take the received destination, or
-for the processors to skip the forward when L2 has already relayed the frame.
-Either is wire-visible — one copy stops arriving — but the copy that stops
-arriving is a duplicate.
+Fix by having `bcmp_ll_forward` take the received destination, or by having the
+processors skip the forward when L2 has already relayed. Either is wire-visible,
+but the copy that stops arriving is a duplicate.
 
-## 29. `bcmp/ping.c` echoes and compares an unchecked, attacker-supplied `payload_len`
+## 29. `bcmp/ping.c` echoes and compares an unchecked `payload_len`
 
-The same shape as divergence #14, in a second module. `BcmpProcessData` carries
-`size` — how many body bytes actually arrived — and both of ping's processors
-ignore it in favour of a length read out of the frame.
+Same shape as #14, in a second module. `BcmpProcessData` carries `size` — how
+many body bytes arrived — and both of ping's processors ignore it in favour of
+a length read out of the frame.
 
-`bcmp_process_ping_request` answers with
+`bcmp_process_ping_request` answers with:
 
 ```c
 return bcmp_tx(addr, BcmpEchoReplyMessage, (uint8_t *)echo_reply,
                sizeof(*echo_reply) + echo_reply->payload_len, seq_num, NULL);
 ```
 
-so a fourteen-byte request declaring `payload_len = 0xFFFF` makes the node
+A fourteen-byte request declaring `payload_len = 0xFFFF` makes the node
 transmit 65 549 bytes starting at the received frame — up to 64 KiB of whatever
-the allocator had next — to a multicast address. It is a remote memory
-disclosure reachable by any node on the link, needing one frame and no prior
-state. `bcmp_tx`'s `max_payload_len` guard rejects the largest of these, but
-everything up to 1460 bytes goes out.
+the allocator had next — to a multicast address. `bcmp_tx`'s `max_payload_len`
+guard rejects the largest of these, but everything up to 1460 bytes goes out.
+Remote memory disclosure reachable by any node on the link, needing one frame
+and no prior state.
 
-`bcmp_process_ping_reply` has the read half of it:
+`bcmp_process_ping_reply` has the read half:
 
 ```c
 if (EXPECTED_PAYLOAD_LEN == echo_reply->payload_len && ...) {
@@ -1281,47 +1027,42 @@ if (EXPECTED_PAYLOAD_LEN == echo_reply->payload_len && ...) {
     if (memcmp(EXPECTED_PAYLOAD, echo_reply->payload, echo_reply->payload_len) != 0) {
 ```
 
-Here the declared length has to equal what this node last pinged with, so the
-read is bounded by the node's own choice rather than the sender's — but it is
-still a read of `payload_len` bytes from a frame that may carry none of them.
+Here the declared length must equal what this node last pinged with, so the read
+is bounded by the node's own choice — but it is still a read of `payload_len`
+bytes from a frame that may carry none of them.
 
-**Ruling: domain-limited.** There is no defined behaviour to reproduce.
-`bm_wire::bcmp::ping`'s decoders validate the declared length against the
-buffer and return `BmWireError::Truncated` instead, and
+**domain-limited.** `bm_wire::bcmp::ping`'s decoders validate the declared
+length against the buffer and return `BmWireError::Truncated`;
 `bm-wire-diff/src/ping.rs` never injects a request whose `payload_len` is not
-what it carries; the `decode_probe` bytes exercise the Rust decoders with
-arbitrary input, and never reach the C. The fix upstream is one comparison
-against `data.size`, which is already in the struct.
+what it carries, and its `decode_probe` bytes never reach the C.
+
+The fix is one comparison against `data.size`, which is already in the struct.
 
 ## 30. A ping reply is matched on sixteen bits of node id and the payload, and nothing else
 
-`bcmp_process_ping_reply` accepts a reply when three things hold: the declared
-`payload_len` equals `EXPECTED_PAYLOAD_LEN`, `(uint16_t)node_id()` equals the
-reply's `id`, and — only if `EXPECTED_PAYLOAD` is non-null — the payload bytes
-compare equal.
+`bcmp_process_ping_reply` accepts a reply when the declared `payload_len` equals
+`EXPECTED_PAYLOAD_LEN`, `(uint16_t)node_id()` equals the reply's `id`, and — only
+if `EXPECTED_PAYLOAD` is non-null — the payload bytes compare equal.
 
-What it never looks at is as interesting:
+What it never looks at:
 
 - **`echo_reply->seq_num`.** `bcmp_send_ping_request` increments `BCMP_SEQ` per
-  request and the reply faithfully echoes it, and then nothing compares it. A
-  reply to a ping sent an hour ago answers today's, as long as the payload is
-  the same.
+  request and the reply echoes it faithfully; nothing compares it. A reply to a
+  ping sent an hour ago answers today's, as long as the payload is the same.
 - **`echo_reply->node_id`,** and the source address it arrived from. A ping
-  aimed at one node is answered by whichever node replies first — or by a node
-  that was never pinged at all.
-- **Whether a ping is outstanding.** The statics are never cleared: not by a
-  matched reply, not by a timer. A node that has pinged once accepts that
-  reply's shape for the rest of its uptime.
+  aimed at one node is answered by whichever node replies first, or by one that
+  was never pinged.
+- **Whether a ping is outstanding.** The statics are never cleared, so a node
+  that has pinged once accepts that reply's shape for the rest of its uptime.
 
-The `id` is the only correlation there is, and `ping.c:42` makes it
-`(uint16_t)node_id()` with a `TODO` saying it should be random. Two nodes whose
-ids share their low sixteen bits — the same nibble-packed serial range, say —
-cannot tell each other's ping traffic apart.
+The `id` is the only correlation, and `ping.c:42` makes it `(uint16_t)node_id()`
+with a `TODO` saying it should be random. Two nodes sharing the low sixteen bits
+of their ids cannot tell each other's ping traffic apart.
 
-**Ruling: replicated.** `bm_wire::bcmp::ping::EchoReply::answers` is that rule,
-comment for comment, and `bm_stack::Node` keeps the single slot it reads from.
-The fix upstream is a random `id` per request and a comparison of `seq_num`;
-both are wire-compatible, since the fields already exist and are already echoed.
+**replicated.** `bm_wire::bcmp::ping::EchoReply::answers` is that rule and
+`bm_stack::Node` keeps the single slot it reads from. Fix with a random `id` per
+request and a `seq_num` comparison; both are wire-compatible, since the fields
+already exist and are already echoed.
 
 ## 31. `bcmp_send_ping_reply` echoes a `seq_num` that `serialize` then discards
 
@@ -1335,72 +1076,56 @@ static BmErr bcmp_send_ping_reply(BcmpEchoReply *echo_reply, void *addr,
 
 called as `bcmp_send_ping_reply((BcmpEchoReply *)echo_req, data.dst, echo_req->seq_num)`
 — the request's *body* sequence number, passed down to be written into the
-*header*. It never gets there. `ping_init` registers both echo types as
+*header*. It never gets there: `ping_init` registers both echo types as
 `{false, false}`, and `serialize` writes the caller's number only for a
-`sequenced_reply`:
-
-```c
-if (cfg->sequenced_reply) {
-  header->seq_num = seq_num;
-} else if (cfg->sequenced_request) {
-  /* ... */
-} else {
-  header->seq_num = 0;
-}
-```
+`sequenced_reply`, zero otherwise.
 
 So every echo reply on the wire carries a header sequence number of zero, and
-the parameter, the argument and the three casts that carry it exist to be
-thrown away. The correlation the author reached for is in the body, where the
-in-place reuse of the request buffer had already preserved it.
+the parameter and its three casts exist to be thrown away. The correlation the
+author reached for is in the body, where the in-place reuse of the request
+buffer had already preserved it.
 
-Worth noting alongside divergence #2, which is the other thing that happens to
-`BcmpEchoRequest::seq_num`: `check_endianness` swaps it with `swap_32bit`
-although it is a `uint16_t`, so on a big-endian host the swap runs over the
-adjacent `payload_len` as well — and `payload_len` is then swapped again by the
-next line. The `BcmpEchoReplyMessage` arm gets the same field right with
-`swap_16bit`. Neither is reachable on a little-endian target.
-
-**Ruling: replicated,** and measured: `bm-wire-diff/tests/ping.rs` compares the
-reply frame the oracle builds against the one `bm_stack::Node` builds, header
+**replicated**, and measured: `bm-wire-diff/tests/ping.rs` compares the reply
+frame the oracle builds against the one `bm_stack::Node` builds, header
 included, and both carry zero. `Node::build_echo_reply` passes the body's
-`seq_num` to the registry anyway, so the call has the same shape as the C's and
-the discarding happens in the same place. The fix upstream is to delete the
-parameter — or, better, to register the reply as `sequenced_reply` and start
-using it, which would be a wire-visible change and needs coordination.
+`seq_num` to the registry anyway, so the discarding happens in the same place.
+
+Fix by deleting the parameter, or by registering the reply as `sequenced_reply`
+and using it — the second is wire-visible.
+
+See also #2, the other thing that happens to `BcmpEchoRequest::seq_num`.
 
 ## 32. `bcmp/ping.c` reports the result of a ping to nobody, and never forgets one
 
 `bcmp_send_ping_request` takes no callback, and `BcmpEchoReplyMessage` is
-registered unsequenced, so `packet.c`'s sequenced-reply machinery — the one
-path that reaches an application with `cb(data.payload)` — is never involved.
-When `bcmp_process_ping_reply` decides a reply matches, all that happens is a
-`bm_debug` line and a `BmOK` returned to `process_received_message`, which
-discards it. There is no way for anything above BCMP to learn that a ping
-succeeded, and no way at all for it to learn that one failed.
+registered unsequenced, so `packet.c`'s sequenced-reply machinery — the one path
+that reaches an application with `cb(data.payload)` — is never involved. When
+`bcmp_process_ping_reply` decides a reply matches, all that happens is a
+`bm_debug` line and a `BmOK` that `process_received_message` discards. Nothing
+above BCMP can learn that a ping succeeded, and nothing at all can learn that
+one failed.
 
 Three smaller things travel with it:
 
 - **`PING_REQUEST_TIMEOUT` times nothing out.** It is stamped after every
-  `bcmp_tx` and read once, to print `time=%llu ms`. An unanswered ping is
-  simply never mentioned again.
+  `bcmp_tx` and read once, to print `time=%llu ms`.
 - **`EXPECTED_PAYLOAD` is kept forever.** Nothing frees it but the next
-  `bcmp_send_ping_request`, which is what makes divergence #30's "accepts that
-  reply's shape for the rest of its uptime" true.
+  `bcmp_send_ping_request`, which is what makes #30's "for the rest of its
+  uptime" true.
 - **Its `bm_malloc` is not checked.** `EXPECTED_PAYLOAD = bm_malloc(payload_len)`
-  is followed immediately by `memcpy(EXPECTED_PAYLOAD, payload, payload_len)`,
-  so an allocation failure is a null-pointer write rather than a refused ping.
+  is followed immediately by a `memcpy`, so an allocation failure is a
+  null-pointer write rather than a refused ping.
 
-**Ruling: c-only** for the reporting, which `bm-wire` has no counterpart to
-reproduce: `bm_stack::Event::EchoReply` is the verdict bm_core keeps to itself,
-reported alongside the `Event::Message` that `process_received_message`
-dispatched. It is also why the acceptance rule has no oracle —
-`bcmp_process_ping_reply` is `static`, transmits nothing and reports nothing, so
-`bm-wire-diff/src/ping.rs` compares the two frames on the wire and
+**c-only** for the reporting: `bm_stack::Event::EchoReply` is the verdict
+bm_core keeps to itself, reported alongside the `Event::Message` that
+`process_received_message` dispatched. The acceptance rule has no oracle —
+`bcmp_process_ping_reply` is `static`, transmits nothing and reports nothing —
+so `bm-wire-diff/src/ping.rs` compares the two frames on the wire and
 `bm_wire::bcmp::ping`'s unit tests assert the rule from the reading.
 
-The allocation is the one place `bm-stack` diverges deliberately rather than
-matching: it keeps a fixed slot, `Node`'s `PING_PAYLOAD`, and
-[`Node::ping`] refuses a payload that will not fit rather than sending a ping
-whose reply it could not check. The fix upstream is a callback argument on
-`bcmp_send_ping_request`, a null check, and a real timeout.
+The allocation is the one place `bm-stack` diverges deliberately: it keeps a
+fixed slot, `Node`'s `PING_PAYLOAD`, and `Node::ping` refuses a payload that
+will not fit rather than sending a ping whose reply it could not check.
+
+Fix with a callback argument on `bcmp_send_ping_request`, a null check, and a
+real timeout.
