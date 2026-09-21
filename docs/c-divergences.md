@@ -50,6 +50,8 @@ Status values:
 | 24 | A forwarded frame's multicast MAC carries the egress port | replicated | reading, confirmed differentially |
 | 25 | `bcmp_ll_forward` writes its new checksum into the frame it was asked to forward | c-only | reading |
 | 26 | `bcmp_ll_forward` reports a forward with nowhere to go as `BmEINVAL` | replicated | reading |
+| 27 | A system-time `target_node_id` of zero is a broadcast for `0x12` and a dead letter for `0x10` and `0x11` | replicated | reading, confirmed differentially |
+| 28 | A global-multicast BCMP message that is forwarded is put on the wire twice, the second time link-local | replicated | reading, confirmed differentially |
 
 ---
 
@@ -307,6 +309,19 @@ differential harness covers it: the
 frame is built, and both implementations must agree on the verdict and on the
 resulting buffer. **The upstream fix is a comment, not a code change.**
 
+One detail of the comment is worth getting right, because it is easy to state
+too simply. "A frame carrying the legacy port bytes fails its checksum" is
+false for two values of them. Frame bytes 26 and 27 are one aligned 16-bit word
+of the one's-complement sum, so clearing it changes the sum by that word's
+value — and both `0x0000` and `0xFFFF` are zero in one's-complement arithmetic.
+A frame whose legacy bytes are `FF FF` therefore survives the clear with a
+valid checksum and is processed normally. `cargo fuzz run forward` found this
+while card M2 was being written, against a comparator predicate that had said
+`legacy == [0, 0]`;
+`legacy_port_bytes_of_all_ones_leave_the_checksum_valid` in
+`bm-wire-diff/tests/forward.rs` records it, and
+`bm-wire/fuzz/seeds/forward/system-time-for-another-legacy-ones` is the input.
+
 ## 10. A rejected frame is left with its checksum field zeroed
 
 Continuing the same function:
@@ -436,6 +451,20 @@ carrying UDP frame's checksum does not match the frame, and that a
 double-carrying BCMP frame is rejected by `bcmp::rx::accept`. Both carry a
 note to say that if they start passing, the C has been fixed and the port must
 follow.
+
+**Addendum, from card M2.** One frame in 40 000 is a rate over *body content*,
+not over time, and until system time was ported every BCMP body a node emitted
+came from a fixed `DeviceCfg` or a slow-moving uptime counter — so in practice
+a given node either hit the case constantly or never. A system-time response
+carries a free-running 64-bit timestamp, which makes the rate real: the first
+run of `cargo fuzz run time` produced an unverifiable frame in under a minute.
+`bm-wire/fuzz/seeds/time/stamped-checksum-carries-twice` keeps that input, and
+`a_response_whose_stamped_checksum_carries_twice_is_unverifiable` in
+`bm-wire-diff/tests/time.rs` asserts bm_core builds the same unverifiable
+bytes. Config and DFU, whose bodies are arbitrary payloads, will be worse
+again. This raises the priority of the upstream fix from "latent" to "one
+dropped frame per node per few tens of thousands of link-local transmissions,
+and rising".
 
 The fix upstream is to fold the carry back in, in both branches. For BCMP:
 
@@ -1075,3 +1104,135 @@ port and a loop on the other.
 `bcmp::forward::ll_forward_is_a_no_op` is the predicate for the `BmEINVAL`. The
 fix upstream is to return `BmOK` when there was nothing to do, and to refuse an
 ingress port of zero.
+
+## 27. A system-time `target_node_id` of zero is a broadcast for one message type and a dead letter for the other two
+
+`bcmp_time_process_time_message` tests `target_node_id` twice, and the two tests
+do not agree about what zero means:
+
+```c
+BcmpSystemTimeHeader *msg_header = (BcmpSystemTimeHeader *)data.payload;
+if (msg_header->target_node_id != node_id() &&
+    msg_header->target_node_id != 0) {
+  should_forward = true;                      /* zero is "for everyone" */
+  break;
+}
+switch (time_msg_type) {
+case BcmpSystemTimeRequestMessage: {
+  if (msg_header->target_node_id != node_id()) {
+    break;                                    /* zero is "for nobody" */
+  }
+  bcmp_time_process_time_request_msg(...);
+  err = BmOK;
+  break;
+}
+case BcmpSystemTimeResponseMessage: {
+  if (msg_header->target_node_id != node_id()) {
+    break;                                    /* zero is "for nobody" */
+  }
+  /* ... bm_debug only ... */
+}
+case BcmpSystemTimeSetMessage: {
+  bcmp_time_process_time_set_msg(...);        /* no second test at all */
+  err = BmOK;
+  break;
+}
+```
+
+The outer test treats zero the way every other addressed BCMP message does — not
+mine, not nobody's, so do not forward it. The `0x10` and `0x11` arms then
+re-test for an exact match, which zero fails. The `0x12` arm makes no such test.
+
+So the three types behave as:
+
+| Message | `target == node_id()` | `target == 0` | `target == somebody else` |
+|---|---|---|---|
+| `0x10` system time request | answered | **silently dropped** | forwarded |
+| `0x11` system time response | logged | **silently dropped** | forwarded |
+| `0x12` system time set | applied, answered | applied, answered | forwarded |
+
+`bcmp_time_get_time(0)` therefore builds a message, transmits it, and every node
+on the link throws it away — the one obvious way to ask "does anybody here know
+what time it is" is the one that cannot work. `bcmp_time_set_time(0)` is the
+mirror image and does work: one frame sets the clock of every node on the link,
+and every one of them answers, which is a small broadcast storm but an intended
+one. The asymmetry is not documented anywhere; `bcmp_time_get_time`'s doc
+comment says only "Gets the system time from a target node."
+
+bm_core's own `time_test.cpp` pins all three rows, so the behaviour is
+deliberate at least in the sense that somebody wrote a test for it:
+
+```cpp
+// Test request process with target id of 0
+req_msg.header.target_node_id = 0;
+ASSERT_EQ(packet_process_invoke(BcmpSystemTimeRequestMessage, data), BmEINVAL);
+ASSERT_EQ(bcmp_tx_fake.call_count, 0);
+```
+
+`bm-wire` reproduces it, and names it rather than burying it in a comparison:
+`bcmp::time::SystemTimeRequest::is_for` and `SystemTimeResponse::is_for` are the
+exact-match test, `SystemTimeSet::is_for` is the broadcast one, and
+`SystemTimeHeader::is_local` is the forwarding test all three share.
+`zero_is_a_broadcast_for_a_set_and_a_dead_letter_for_the_other_two` in
+`bm-wire/src/bcmp/time.rs` is the table above as an assertion, and
+`a_broadcast_is_honoured_only_by_the_set_message` in `bm-wire-diff/tests/time.rs`
+pins each row against the C, so an upstream fix fails the comparator first.
+
+The fix upstream is to drop the two inner tests, which makes `0x10` and `0x11`
+agree with `0x12` and with every other addressed message in BCMP. It is
+wire-visible in the useful direction: a node that starts answering broadcast time
+requests is answering messages that nobody can currently be relying on being
+ignored, since nothing has ever answered them.
+
+## 28. A global-multicast message that is forwarded is put on the wire twice, the second time link-local
+
+Two independent layers can decide to move a received frame onward, and nothing
+tells either about the other.
+
+L2 goes first. `bm_l2_process_rx_evt` applies the routing policy, and for an
+`FF03::1` destination the policy asks for egress on every port but the ingress
+one **and** for local submission. The frame is copied, both port nibbles are
+cleared, and the copy is queued for transmission.
+
+The local copy then reaches BCMP, and if it is a system-time message for a third
+node, `bcmp_time_process_time_message` sets `should_forward` and hands it to
+`bcmp_ll_forward` — which knows nothing of destinations and always builds its
+copies for `multicast_ll_addr`:
+
+```c
+BmErr bcmp_ll_forward(BcmpHeader *header, void *payload, uint32_t size,
+                      uint8_t ingress_port) {
+  /* ... */
+  void *forward = bm_ip_tx_new(&multicast_ll_addr, size + sizeof(BcmpHeader));
+```
+
+So one `FF03::1` system-time message arriving on port 1 of a two-port node
+leaves port 2 twice:
+
+1. the relayed copy, still `FF03::1`, still from the originator;
+2. a re-flood, `FF02::1`, from the forwarder (divergence #23).
+
+The second copy is the damaging one. `FF03::1` is Bristlemouth's *global*
+multicast — the address that is meant to cross the whole network — and the
+re-flood demotes it to link-local. A node one further hop away sees the
+link-local copy, is not the target, and forwards it link-local again, so the
+message does keep travelling; but its destination no longer says what it is, and
+anything routing on the destination address rather than on BCMP's own
+`target_node_id` sees a global message that stopped being global at the first
+node that did not own it. Meanwhile every hop carries two copies of the same
+message instead of one.
+
+The same applies to `bcmp/config.c` and `bcmp/dfu_core.c`, which forward the
+same way; system time is only the first one ported.
+
+`bm-wire` reproduces both transmissions and their order.
+`bm_stack::Owed` carries the L2 relay and the re-flood as separate fields
+because they are separate decisions, `bm_stack::Node::reflood` performs the
+second, and `a_global_multicast_for_a_third_node_is_forwarded_twice` in
+`bm-wire-diff/tests/time.rs` asserts the C emits exactly the same two frames on
+exactly the same port, in the same order.
+
+The fix upstream is for `bcmp_ll_forward` to take the received destination, or
+for the processors to skip the forward when L2 has already relayed the frame.
+Either is wire-visible — one copy stops arriving — but the copy that stops
+arriving is a duplicate.

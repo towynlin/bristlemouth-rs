@@ -3,28 +3,31 @@
 What of BCMP is still unported, in dependency order, as task cards sized for one
 agent each.
 
-`bm-wire` currently carries three of BCMP's exchanges — heartbeat (`0x01`),
-device info (`0x04`/`0x05`, responder only) and neighbour table (`0x08`/`0x09`,
-responder only) — plus the wire engine under them (`bcmp::tx::serialize`,
-`bcmp::rx::accept`, L2 egress stamping, the link-local RX policy, the two
-forwarding paths in `bcmp::forward`) and two state machines,
-`bm-wire/src/neighbor.rs` and `bm-wire/src/bcmp/registry.rs`. `MessageType` in
-`bm-wire/src/bcmp/header.rs` already names all 45 of bm_core's constants, but
-only five body structs have a codec.
+`bm-wire` currently carries four of BCMP's exchanges — heartbeat (`0x01`),
+device info (`0x04`/`0x05`, responder only), neighbour table (`0x08`/`0x09`,
+responder only) and system time (`0x10`–`0x12`, both halves) — plus the wire
+engine under them (`bcmp::tx::serialize`, `bcmp::rx::accept`, L2 egress
+stamping, the link-local RX policy, the two forwarding paths in
+`bcmp::forward`) and two state machines, `bm-wire/src/neighbor.rs` and
+`bm-wire/src/bcmp/registry.rs`. `MessageType` in `bm-wire/src/bcmp/header.rs`
+already names all 45 of bm_core's constants, but only nine body structs have a
+codec.
 
 `bm_stack::Node` drives that registry: `Node::register` is `packet_add`,
 `Node::request` is `bcmp_tx`, and `bm_stack::Event` is where a reply, a timeout
 or an unsolicited message arrives. A card that adds an exchange has somewhere to
 put its requester half.
 
-Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
+Everything below is absent from Rust — no files, no stubs, no `TODO` markers
+— except the struck-through cards, which have landed and are kept for what
+they record.
 
 ## Status at a glance
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
 | Echo / ping `0x02`,`0x03` | `bcmp/ping.c` | 176 | M1 |
-| System time `0x10`–`0x12` | `bcmp/time.c` | 195 | M2 |
+| ~~System time `0x10`–`0x12`~~ | ~~`bcmp/time.c`~~ | 195 | **M2 — landed** |
 | Device-info reply consumption `0x05` | `bcmp/info.c` | 264 | M3 |
 | Neighbour-table reply consumption `0x09` | `bcmp/neighbors.c` | 489 | M4 |
 | Resource discovery `0x0A`,`0x0B` | `bcmp/resource_discovery.c` | 444 | M5 |
@@ -36,9 +39,10 @@ Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-Dependency order: M1, M2, M3, M4, M5, C1 and D1 are all unblocked and may run
-in parallel. C2 needs C1. C3 needs C1 and C2. D2 needs D1; D3 and D4 each need
-D2.
+Dependency order: M1, M3, M4, M5, C1 and D1 are all unblocked and may run in
+parallel. C2 needs C1. C3 needs C1 and C2. D2 needs D1; D3 and D4 each need D2.
+M2 has landed; its card is kept below, struck through, because what it says
+about the forwarding decision is what C3 and D2 will need.
 
 ---
 
@@ -58,6 +62,13 @@ git submodule update --init --recursive
 
 Without this, `bm-wire-sys` does not build and every differential test fails for
 the wrong reason.
+
+A sandbox whose stable toolchain predates the 1.97 MSRV will not build *at all*,
+which looks alarming and is not. `.claude/hooks/session-start.sh` handles both
+that and the submodules above, and runs before the session starts; `CLAUDE.md`'s
+"Setting up a fresh sandbox" says what it does and how to run it by hand. Either
+way, do not write it up in the card's report — it is environment setup, not a
+finding about the code.
 
 ### `bm-wire` rules
 
@@ -233,37 +244,71 @@ matrix.
 answering. It is also the smallest complete request/reply in BCMP, which makes
 it the right card to prove I3 on.
 
-## M2 — system time, `0x10`, `0x11`, `0x12`
+## ~~M2 — system time, `0x10`, `0x11`, `0x12`~~ — **landed**
 
-**Blocked by:** nothing — I2 landed. `bm_wire::bcmp::forward::egress_ports` and
-`bm_stack::Node::forward_link_local` are the re-flood this card needs; call the
-second once per port of the first, transmitting each frame before building the
-next, because there is one transmit buffer.
+**What landed.** `bm-wire/src/bcmp/time.rs` carries all three codecs;
+`bm_stack::port::Rtc`, `RtcTimeAndDate`, `NoRtc` and `SoftRtc` are the new
+seam; `bm_stack::Node` registers the three types, answers `0x10` and `0x12`
+from the clock, and issues both through `Node::request_system_time` and
+`Node::set_system_time`. `bm-wire-diff/src/time.rs` is the comparator, `time`
+the fuzz target, `bm-wire/fuzz/seeds/time/` its corpus, and
+`bm-wire-diff/tests/time.rs` its binary.
 
-**C source.** `bcmp/time.c` (195 LoC), one handler
-(`bcmp_time_process_time_message`) for all three types. No module state; it
-leans on `bm_rtc_get`/`bm_rtc_set` and `date_time_from_utc` in `common/util.c`,
-both of which `bm-wire/src/util.rs` already ports.
+**What the next forwarding card inherits.** `bcmp/config.c` and
+`bcmp/dfu_core.c` forward exactly as `bcmp/time.c` does, so C3 and D2 get the
+machinery rather than having to build it:
 
-**New port seam.** An `Rtc` trait in `bm-stack/src/port.rs`. That file's header
-comment already anticipates it: "Configuration storage, the RTC and the DFU
-flash slot are seams too, and they will arrive with the code that uses them."
-This is that code. Follow the existing `Phy`/`Identity` shape.
+- `bm_stack::Owed::forward` is the decision, as a `Reflood` — a byte range
+  within the received frame plus the ingress port, not a frame, because
+  `bcmp_ll_forward` builds one *new* frame per port and a node has one transmit
+  buffer. `bm_stack::Node::reflood` is the loop; `Node::run` drives it after
+  `deliver`, and a caller driving the synchronous half by hand reads
+  `owed.forward` out before handing the rest to `deliver`, because `deliver`
+  takes the frame.
+- The forwarding test is `SystemTimeHeader::is_local`, and it is **not** the
+  same test as the one deciding whether to act on the message. Divergence #27
+  is what happens when those two are assumed to agree.
+- `bm-wire-diff::forward::Message::SystemTimeForAnother` is the input that makes
+  `check_relay` compare the whole receive path, forwarding decision included. A
+  card adding another forwarding exchange wants the same shape.
 
-**Quirks to reproduce.** A message whose `target_node_id` is neither ours nor 0
-is re-flooded via `bcmp_ll_forward`, which is already ported — note divergences
-#23, #24 and #26, which the forward carries with it. A *request* with
-`target_node_id == 0` reaches the switch and is then dropped by an inner
-exact-match check, so broadcast time requests are silently ignored: probably a
-divergence. All transmits go to `multicast_ll_addr` with `seq_num` 0.
+**Divergences found.** #27 (`target_node_id == 0` is a broadcast for `0x12` and
+a dead letter for `0x10` and `0x11`) and #28 (a global-multicast message that is
+forwarded is transmitted twice, the second time demoted to link-local). Both are
+pinned against the C in `bm-wire-diff/tests/time.rs`. The fuzzer also found the
+first *frequent* instance of the existing divergence #12: a system-time body
+carries a free-running 64-bit timestamp, which is enough entropy to reach the
+double-carry case in the egress-port checksum patch within a minute. #12 now
+carries an addendum saying so, and a card whose message bodies are arbitrary
+payloads — C3, D2 — should expect to meet it constantly and must not "fix" it
+on the Rust side. It also sharpened divergence #9: legacy port bytes of `FF FF`
+do *not* break the checksum, because that is one's-complement negative zero, so
+"a frame carrying the legacy bytes is rejected" is true of 65 534 values out of
+65 536 and not of all of them.
 
-**Done when.** The three codecs round-trip against the oracle, and a `Node` with
-a mock RTC answers a time request byte-identically to the C — add the case to
-`bm-wire-diff/tests/node_frames.rs`. The forward path is already compared per
-port by `bm-wire-diff/tests/forward.rs`, which calls `bcmp_ll_forward` directly;
-what M2 adds is the *decision* to forward, so extend `check_relay` there with a
-system-time message whose target is another node, and it will compare the C's
-whole receive path against `Node::on_frame`.
+**What the fuzzer was actually good for.** Both of the above came from a
+comparator assertion that modelled *why* the C does something, next to the
+byte-for-byte comparison that says *what* it does. The model was wrong twice,
+the fuzzer said so within minutes each time, and the repairs are now written
+down in `docs/c-divergences.md`. A card that only compares bytes gets the
+compatibility guarantee and learns nothing; one extra assertion saying what the
+comparator believes is cheap and pays.
+
+**On step 4.** As the shared contract predicts, there were no gold vectors to
+lift: `time_test.cpp` builds randomized C structs and asserts on
+`bcmp_tx_fake.call_count`. What it *does* pin is the divergence-#27 table, and
+those three rows are asserted as literals in `bm-wire/src/bcmp/time.rs`'s
+`zero_is_a_broadcast_for_a_set_and_a_dead_letter_for_the_other_two`. Ground
+truth for the encoding came from running the oracle.
+
+**On the RTC.** `bm_rtc_get`, `bm_rtc_set` and `bm_rtc_get_micro_seconds` are
+declared in `bcmp/bm_rtc.h` and defined nowhere in bm_core — they are integrator
+hooks, and the only implementation in this repository is ours, in
+`bm-wire-sys/csrc/bm_generic_shim.c`. So the *reading* is not a divergence
+surface: `RtcTimeAndDate::to_utc_micros` matches the shim by construction and
+`stack::set_both_clocks` makes it a shared input rather than a comparison.
+Everything downstream of the reading is compared. A card that adds another
+integrator-hook seam should say the same thing at the same volume.
 
 ## M3 — device-info reply consumption, `0x05` receive side
 

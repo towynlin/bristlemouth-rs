@@ -1,5 +1,9 @@
 # Working in this repo
 
+If the toolchain or the `bm_core` submodule looks wrong, read **"Setting up a
+fresh sandbox"** below before investigating. On the web a `SessionStart` hook
+has usually done it for you already, and none of it is worth reporting back.
+
 Read `bm-wire-sys/README.md` first — especially the shim contract and the note
 on state that outlives `bm_shim_reset`. Both describe real behavioural
 divergence from the firmware, and both are easy to trip over.
@@ -37,7 +41,10 @@ A cargo workspace.
   `mock` feature), and the only crate here that knows about time or I/O. It
   supplies what `bm-wire` deliberately lacks: a clock, a timer, and a PHY.
   - `src/port.rs` — the seams bm_core leaves to the integrator, as traits
-    rather than link-time symbols, so a test and the firmware can differ.
+    rather than link-time symbols, so a test and the firmware can differ. A
+    card that ports an exchange needing a new one adds it here: `Rtc` arrived
+    with system time, and configuration storage and the DFU flash slot are
+    still to come.
   - `src/node.rs` — `Node::on_frame`, `Node::on_tick` and `Node::on_expiry` are
     synchronous and take the current time; `Node::run` is the only async code.
     All the protocol is in the synchronous half. Each has a `_with` twin that
@@ -174,6 +181,44 @@ a divergence entry saying why.
 When a fuzzer finds a crash: `cargo fuzz tmin <target> <artifact>`, drop the
 minimized file into `bm-wire/fuzz/seeds/<target>/`, and it becomes a permanent
 regression test the next time `cargo test` runs.
+
+## Setting up a fresh sandbox
+
+**A container often ships a stable toolchain older than the 1.97 MSRV, and then
+nothing builds at all** — `cargo test` refuses outright with "rustc N is not
+supported by the following package". That is the image being stale. It is not a
+problem with the repo, and the MSRV is not up for discussion.
+
+`.claude/hooks/session-start.sh` does the whole of it, and is registered as a
+`SessionStart` hook in `.claude/settings.json`, so on Claude Code on the web it
+has already run before you read this. It checks out the `bm_core` submodule
+tree, brings stable up to date, installs the MSRV toolchain (with rustfmt and
+clippy, which bm-phy-adin2111's pinned `rust-toolchain.toml` needs) and
+nightly, adds both embedded targets to both toolchains, installs `cargo-fuzz`,
+and warms the three workspaces' dependency caches. It reads the MSRV out of
+`Cargo.toml` rather than hardcoding it, so bumping the manifest is enough. It
+is idempotent, and it no-ops entirely outside a remote container, so a local
+checkout is left alone.
+
+Run it by hand if you need it:
+
+```
+CLAUDE_CODE_REMOTE=true ./.claude/hooks/session-start.sh
+```
+
+**None of this is a finding. Do not report it.** It is setup, it says nothing
+about the code, and on the web it is not even work you did. In particular it is
+not evidence that the MSRV is wrong, that CI is broken, or that anything has
+drifted — only that the image predates 1.97.
+
+Two things here *are* worth raising, and the hook fails loudly on both rather
+than leaving you to notice:
+
+- the MSRV names a toolchain that cannot be installed, or stable cannot be
+  brought up to it — the claim in the manifests has outrun the channel;
+- a crate that genuinely fails to **compile** on the MSRV once it is installed,
+  which means the claim has become false and both manifests need bumping
+  together.
 
 ## Conventions
 

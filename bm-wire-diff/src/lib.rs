@@ -30,6 +30,7 @@ pub mod neighbor;
 pub mod registry;
 pub mod replay;
 pub mod stack;
+pub mod time;
 pub mod util;
 
 /// Inputs restricted to a domain where the C has defined behaviour.

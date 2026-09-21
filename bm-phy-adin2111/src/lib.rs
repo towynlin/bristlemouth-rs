@@ -266,8 +266,8 @@ impl Phy for Adin2111Phy<'_> {
 /// on a host ever will — that needs a real SPI bus — so this stands in. It is
 /// never called; type-checking it is the whole point.
 #[allow(dead_code)]
-async fn assert_drives_a_node<I: bm_stack::Identity, const N: usize>(
-    node: &mut bm_stack::Node<I, N>,
+async fn assert_drives_a_node<I: bm_stack::Identity, R: bm_stack::Rtc, const N: usize>(
+    node: &mut bm_stack::Node<I, R, N>,
     phy: &mut Adin2111Phy<'_>,
 ) -> PhyError {
     node.run(phy).await

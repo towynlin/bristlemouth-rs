@@ -12,7 +12,8 @@
 //! Its own binary because it brings the stack up; see `bm_wire_diff::stack`.
 
 use bm_stack::node::LINK_LOCAL_PREFIX;
-use bm_stack::{Identity, Node};
+use bm_stack::port::RtcTimeAndDate;
+use bm_stack::{Identity, Node, SoftRtc};
 use bm_wire::bcmp::info::DeviceInfoRequest;
 use bm_wire::bcmp::registry::PacketCfg;
 use bm_wire::bcmp::{DeviceInfo, MessageType, rx};
@@ -21,6 +22,7 @@ use bm_wire::l2;
 use bm_wire::util::BmIpAddr;
 use bm_wire_diff::bcmp_messages::{BcmpMessagesInput, Request, Target, build_request};
 use bm_wire_diff::stack::{self, NUM_PORTS, drain, inject, oracle, pump_until_quiet};
+use bm_wire_diff::time::{self, TimeInput, TimeMessage};
 
 /// The same identity the oracle's stack was brought up with, so the two nodes
 /// have nothing to differ about but their code.
@@ -56,8 +58,8 @@ impl Identity for OracleIdentity {
 
 /// A node with the same link state the oracle has: `stack::oracle` brings both
 /// ports up before any comparison, and a neighbour-table reply carries that.
-fn node() -> Node<OracleIdentity, 4> {
-    let mut node = Node::new(OracleIdentity, NUM_PORTS);
+fn node() -> Node<OracleIdentity, SoftRtc, 4> {
+    let mut node = Node::new(OracleIdentity, SoftRtc::new(), NUM_PORTS);
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }
@@ -224,6 +226,113 @@ fn our_global_multicast_reply_is_byte_identical_to_the_c() {
         &replies[0].1,
         &ours,
     );
+}
+
+// ---------------------------------------------------------------------------
+// System time -- card M2.
+// ---------------------------------------------------------------------------
+
+/// A reading a human can check: 2026-09-21T12:34:56.789Z.
+const NOON_ISH: RtcTimeAndDate = RtcTimeAndDate {
+    year: 2026,
+    month: 9,
+    day: 21,
+    hour: 12,
+    minute: 34,
+    second: 56,
+    ms: 789,
+};
+
+/// Card M2's "done when": a node with a clock answers a `0x10` with the frame
+/// bm_core would have sent, byte for byte.
+///
+/// `bm_wire_diff::time` compares this for every message, target and port; this
+/// is the one case spelled out, in the file where node-against-node lives.
+#[test]
+fn our_system_time_response_is_byte_identical_to_the_c() {
+    let _guard = oracle();
+    drain();
+
+    // The same reading on both clocks. `bm_rtc_*` are integrator hooks rather
+    // than bm_core code -- see `bm_wire_diff::stack::set_both_clocks` -- so the
+    // reading is a shared input here, not something to compare.
+    let rtc = stack::set_both_clocks(NOON_ISH);
+
+    let request = time::build_frame(&TimeInput {
+        message: TimeMessage::Request,
+        target: time::Target::ThisNode,
+        ingress_port: 1,
+        global_multicast: false,
+        clock_us: NOON_ISH.to_utc_micros(),
+        utc_time_us: 0,
+        trailing: Vec::new(),
+        decode_probe: Vec::new(),
+    });
+    inject(1, &request);
+    let captured = drain();
+    assert!(!captured.is_empty(), "the oracle answered nothing");
+
+    let mut node: Node<OracleIdentity, SoftRtc, 4> = Node::new(OracleIdentity, rtc, NUM_PORTS);
+    for port in 1..=NUM_PORTS {
+        node.set_link_up(port, true);
+    }
+    let mut frame = request.clone();
+    let ours = node
+        .on_frame(0, 1, &mut frame)
+        .reply
+        .expect("a system-time request must be answered")
+        .frame()
+        .to_vec();
+
+    compare_stamped("system time response", &captured, ours);
+}
+
+/// The requester half: `bcmp_time_get_time` and `bcmp_time_set_time`.
+///
+/// Neither is sequenced -- `time_init` registers all three types
+/// `{false, false}` -- so this does not disturb the `message_count` the
+/// sequenced-request test below relies on being untouched.
+#[test]
+fn our_system_time_requests_are_byte_identical_to_the_c() {
+    let _guard = oracle();
+    drain();
+
+    let mut node = node();
+
+    let now_ms = unsafe { bm_wire_sys::bm_shim_tick_count() };
+    unsafe {
+        assert_eq!(
+            bm_wire_sys::bcmp_time_get_time(PEER_ID),
+            bm_wire_sys::BmErr_BmOK
+        );
+    }
+    pump_until_quiet();
+    let captured = drain();
+    assert!(!captured.is_empty(), "the oracle sent nothing");
+    let ours = node
+        .request_system_time(now_ms, PEER_ID)
+        .expect("a registered type is sent")
+        .frame()
+        .to_vec();
+    compare_stamped("system time request", &captured, ours);
+
+    let now_ms = unsafe { bm_wire_sys::bm_shim_tick_count() };
+    let utc_time_us = NOON_ISH.to_utc_micros();
+    unsafe {
+        assert_eq!(
+            bm_wire_sys::bcmp_time_set_time(PEER_ID, utc_time_us),
+            bm_wire_sys::BmErr_BmOK
+        );
+    }
+    pump_until_quiet();
+    let captured = drain();
+    assert!(!captured.is_empty(), "the oracle sent nothing");
+    let ours = node
+        .set_system_time(now_ms, PEER_ID, utc_time_us)
+        .expect("a registered type is sent")
+        .frame()
+        .to_vec();
+    compare_stamped("system time set", &captured, ours);
 }
 
 /// Our link-local address and MAC are derived the way bm_core derives them.

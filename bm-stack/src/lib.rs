@@ -11,9 +11,9 @@
 //!
 //! # Shape
 //!
-//! * [`port`] holds the seams an integrator fills — a port-aware PHY and the
-//!   node's identity — as traits rather than as link-time symbols, so a test
-//!   and the firmware can have different ones.
+//! * [`port`] holds the seams an integrator fills — a port-aware PHY, the
+//!   node's identity and its real-time clock — as traits rather than as
+//!   link-time symbols, so a test and the firmware can have different ones.
 //! * [`node::Node`] is the protocol. Its two entry points are synchronous and
 //!   take the current time, which is what makes them testable without an
 //!   executor.
@@ -32,5 +32,5 @@ pub mod mock;
 pub mod node;
 pub mod port;
 
-pub use node::{Event, MTU, Node, Outbound, Owed, deliver, transmit};
-pub use port::{Egress, Identity, Phy};
+pub use node::{Event, MTU, Node, Outbound, Owed, Reflood, deliver, transmit};
+pub use port::{Egress, Identity, NoRtc, Phy, Rtc, RtcTimeAndDate, SoftRtc};
