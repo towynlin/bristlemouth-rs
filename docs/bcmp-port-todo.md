@@ -8,9 +8,14 @@ device info (`0x04`/`0x05`, responder only) and neighbour table (`0x08`/`0x09`,
 responder only) — plus the wire engine under them (`bcmp::tx::serialize`,
 `bcmp::rx::accept`, L2 egress stamping, the link-local RX policy, the two
 forwarding paths in `bcmp::forward`) and two state machines,
-`bm-wire/src/neighbor.rs` and `bm-wire/src/bcmp/registry.rs`.
-`MessageType` in `bm-wire/src/bcmp/header.rs` already names all 45 of bm_core's
-constants, but only five body structs have a codec.
+`bm-wire/src/neighbor.rs` and `bm-wire/src/bcmp/registry.rs`. `MessageType` in
+`bm-wire/src/bcmp/header.rs` already names all 45 of bm_core's constants, but
+only five body structs have a codec.
+
+`bm_stack::Node` drives that registry: `Node::register` is `packet_add`,
+`Node::request` is `bcmp_tx`, and `bm_stack::Event` is where a reply, a timeout
+or an unsolicited message arrives. A card that adds an exchange has somewhere to
+put its requester half.
 
 Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
 
@@ -18,7 +23,6 @@ Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| Reply routing in `Node` | — (Rust-side plumbing) | — | I3 |
 | Echo / ping `0x02`,`0x03` | `bcmp/ping.c` | 176 | M1 |
 | System time `0x10`–`0x12` | `bcmp/time.c` | 195 | M2 |
 | Device-info reply consumption `0x05` | `bcmp/info.c` | 264 | M3 |
@@ -32,9 +36,9 @@ Everything below is absent from Rust: no files, no stubs, no `TODO` markers.
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-Dependency order: I3 and C1 and D1 are unblocked and may run in parallel.
-M1/M3/M4 need I3. M5 needs I3. C2 needs C1. C3 needs C1 and C2. D2 needs D1;
-D3 and D4 each need D2.
+Dependency order: M1, M2, M3, M4, M5, C1 and D1 are all unblocked and may run
+in parallel. C2 needs C1. C3 needs C1 and C2. D2 needs D1; D3 and D4 each need
+D2.
 
 ---
 
@@ -146,6 +150,15 @@ are `sequenced_reply`; commit is neither.
 **Registering any of them in `bcmp.rs` would break the in-process property.**
 Card C3 must live in a stack-target binary of its own.
 
+One sequenced request already exists outside it:
+`our_sequenced_request_carries_the_number_the_c_would_have_given_it` in
+`bm-wire-diff/tests/node_frames.rs` sends three `BcmpConfigGetMessage`s through
+`bcmp_tx` to pin the sequence number a request carries. `message_count` is a
+function-level `static` with nothing that resets it, so that test assumes it is
+the only sequenced sender in its binary. A card adding another to
+`node_frames.rs` has to say where the counter had got to — or put its
+comparison in a binary of its own, which is what C3 is doing anyway.
+
 ### Verifying
 
 Per `CLAUDE.md`. At minimum, before claiming a card done:
@@ -176,42 +189,15 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 
 ---
 
-# Infrastructure
-
-## I3 — request/reply routing in `Node`
-
-**Blocked by:** nothing — I1 landed, and `bm_wire::bcmp::registry::Registry`
-is the table this card puts inside `Node`.
-
-**The gap.** `bm-stack/src/node.rs` handles requests and drops replies: a
-received `DEVICE_INFO_REPLY` falls through the `_ => None` arm of `on_frame`.
-There is nowhere for a reply to land, so M1, M3, M4 and M5 have no home.
-
-**Rust to create.** On top of I1's `Registry`, reply routing in `on_frame` and
-the expiry sweep in `on_tick`. Fixed capacity, no alloc, generic over the
-node's neighbour count as `Node` already is. `Registry::on_tick` carries the
-C's 150 ms sweep phase itself, so `Node::on_tick` only has to call it at least
-that often — it must not schedule the expiry on a grid of its own, or the port
-will give up on requests at different moments from a C node. See divergence
-#22.
-
-**Done when.** `Node` can issue a request, match its reply, and time it out;
-`bm-stack/tests/node.rs` covers all three paths against the mock PHY and mock
-clock.
-
-Note the two shapes I1's comparator found, because `Node` inherits both: a
-reply is matched on its sequence number alone, so a reply of the wrong type
-answers the request (divergence #21), and a request whose reply arrives after
-the sweep is reported to the application twice — once as a timeout with no
-payload, then again as an unsolicited message (divergence #22).
-
----
-
 # Messages bm_core implements
 
 ## M1 — echo / ping, `0x02` and `0x03`
 
-**Blocked by:** I3 (requester side; the responder side is independent).
+**Blocked by:** nothing — I3 landed. `Node::request` sends the echo request and
+`Node::Event::Reply` is where the echo reply arrives; ping's own single-slot
+state (`EXPECTED_PAYLOAD`, `BCMP_SEQ`) is what this card adds on top, because
+`0x02`/`0x03` are registered unsequenced and so are matched by `ping.c` rather
+than by `packet.c`.
 
 **C source.** `bcmp/ping.c` (176 LoC). Four file-scope statics at
 `ping.c:10-13` — `PING_REQUEST_TIMEOUT`, `BCMP_SEQ`, `EXPECTED_PAYLOAD` (a heap
@@ -281,7 +267,9 @@ whole receive path against `Node::on_frame`.
 
 ## M3 — device-info reply consumption, `0x05` receive side
 
-**Blocked by:** I3.
+**Blocked by:** nothing — I3 landed. `0x05` is registered unsequenced, so the
+reply arrives as `Node::Event::Message` and reaches `Node::submit`'s match on
+message type; the cache this card adds hangs off that arm.
 
 **The gap.** `bm-wire/src/bcmp/info.rs` already decodes `DeviceInfoReply`, and
 `Node` already emits a request when it discovers a neighbour. Nothing consumes
@@ -303,7 +291,9 @@ and the cache contents match what the C's callback reports for the same frames.
 
 ## M4 — neighbour-table reply consumption, `0x09` receive side
 
-**Blocked by:** I3.
+**Blocked by:** nothing — I3 landed, on the same terms as M3: `0x09` is
+unsequenced, so the reply comes through `Node::submit`'s match rather than
+through the registry.
 
 **The gap.** Same shape as M3: `NeighborTableReply` decodes,
 `build_neighbor_table_reply` answers, but no requester side exists and received
@@ -328,7 +318,8 @@ case.
 
 ## M5 — resource discovery, `0x0A` and `0x0B`
 
-**Blocked by:** I3.
+**Blocked by:** nothing — I3 landed. As with M3 and M4, both types are
+unsequenced, so the requester half is `Node::request` plus a match arm.
 
 **C source.** `bcmp/resource_discovery.c` (444 LoC). Two `BcmpResourceList`s —
 `PUB_LIST` and `SUB_LIST` — each a singly-linked list with its own semaphore
@@ -361,7 +352,7 @@ table's add/find behaviour matches the C under a scripted comparator.
 
 ## C1 — a `no_std`, alloc-free CBOR codec
 
-**Blocked by:** nothing. Schedulable in parallel with I2 and I3.
+**Blocked by:** nothing.
 
 **Why this card exists at all.** Config values are CBOR-encoded, and `bm-wire`
 may not take a dependency. There is no way to port C3 without first having a

@@ -23,10 +23,41 @@
 //! re-floods a link-local *message* as a fresh frame per port rather than
 //! relaying the received bytes. Nothing calls it yet; the system-time, config
 //! and DFU exchanges that do are still unported.
+//!
+//! # Requests and replies
+//!
+//! Everything the node puts on the wire goes through
+//! [`bm_wire::bcmp::registry::Registry`], which is `bcmp/packet.c`'s state:
+//! which message types exist, what sequence number an outgoing message
+//! carries, which outstanding requests a reply may answer, and when an
+//! unanswered one is given up on. [`Node::send`] is `bcmp_tx`, [`Node::request`]
+//! is `bcmp_tx` with no number to echo, and what comes back arrives as an
+//! [`Event`] — the three exits of `process_received_message` plus the
+//! `cb(NULL)` the expiry sweep takes.
+//!
+//! A type nothing registers is not sent and not dispatched. That is the C's
+//! `BmENODEV`: `serialize` writes nothing into the caller's buffer, so
+//! `bcmp_tx` transmits nothing, and `process_received_message` returns before
+//! it looks at the body. [`Node::new`] registers what bm_core's `bcmp_init`
+//! registers for the modules that are ported — heartbeat, device info and the
+//! neighbour table — and [`Node::register`] is how a card adds its own.
+//!
+//! # Two timers, not one
+//!
+//! bm_core has both, and so does this: the 10-second heartbeat timer, which is
+//! [`Node::on_tick`], and `packet.c`'s 150 ms expiry sweep, which is
+//! [`Node::on_expiry`]. The sweep carries its own phase — see divergence #22 —
+//! so [`Node::on_expiry`] only has to be called at least every
+//! [`EXPIRY_PERIOD_MS`]; calling it more often costs nothing and calling it on
+//! a grid of one's own is what would make the port give up on requests at
+//! different moments from a C node.
 
 use bm_wire::addr;
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
 use bm_wire::bcmp::neighbors::{NeighborTableRequest, PortInfo, encode_neighbor_table_reply};
+use bm_wire::bcmp::registry::{
+    Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, PacketCfg, PendingRequest, Registry, RegistryError,
+};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, Heartbeat, MessageType, forward, rx, tx};
 use bm_wire::frame::{
     ETHERNET_DESTINATION_OFFSET, ETHERNET_SRC_OFFSET, ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET,
@@ -54,6 +85,85 @@ pub const LINK_LOCAL_PREFIX: u32 = 0xFE80_0000;
 
 /// The hop limit bm_core sets on everything it transmits.
 pub const HOP_LIMIT: u8 = 64;
+
+/// How many message types a node's registry holds.
+///
+/// bm_core registers thirty across the eight modules `bcmp_init` brings up,
+/// each calling `packet_add` once per type it handles. This is that with room
+/// to spare; [`Node::register`] reports [`RegistryError::Full`] past it.
+/// bm_core has no such ceiling — its registry is a `bm_malloc`'d list.
+pub const MESSAGE_TYPES: usize = 32;
+
+/// How often [`Node::on_expiry`] must be called, `message_timer_expiry_period_ms`.
+///
+/// Not a deadline the node schedules against: the sweep's phase lives in the
+/// registry, so this is only the *longest* a caller may leave between calls.
+pub const EXPIRY_PERIOD_MS: u32 = MESSAGE_TIMER_EXPIRY_PERIOD_MS;
+
+/// What a received message, or a request that gave up waiting, tells the
+/// application.
+///
+/// The three variants are the three ways `process_received_message` can end
+/// for a message whose type is registered, plus the one the expiry sweep
+/// takes. The C reaches the application through function pointers — a
+/// `BcmpSequencedRequestCb` stored with the request, called with the reply's
+/// payload or with `NULL`, and a `cfg->process` per type — and the two are
+/// easy to confuse, because a caller that does not test for the null payload
+/// dereferences it. Here they cannot be confused: a timeout has no payload to
+/// read.
+///
+/// The payload borrows the frame it arrived in and is gone when the handler
+/// returns, which is what keeps this allocation-free. Anything worth keeping
+/// has to be copied out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Event<'a> {
+    /// A reply answered an outstanding request, which is no longer
+    /// outstanding. The C's `cb(data.payload)`.
+    ///
+    /// **`request.message_type` is not what was matched.** The C looks the
+    /// outstanding request up by sequence number alone and never compares the
+    /// type it recorded, so a reply of one type answers a request of another
+    /// whenever the numbers line up. The port reproduces that; divergence #21
+    /// has the measurement. A handler that cares has to compare
+    /// `message_type` against `request.message_type` itself.
+    Reply {
+        /// The request this answered, as it was recorded when it was sent.
+        request: PendingRequest,
+        /// The type of the *reply*, which may be nothing like the request's.
+        message_type: MessageType,
+        /// Node id the reply came from.
+        source: u64,
+        /// The reply's body, after the BCMP header.
+        payload: &'a [u8],
+    },
+    /// The expiry sweep gave up on a request. The C's `cb(NULL)`.
+    ///
+    /// A reply that arrives after this is not dropped — it no longer matches
+    /// anything, so it is delivered again as [`Event::Message`]. The
+    /// application therefore hears about one exchange twice, once as a failure
+    /// and once as unsolicited traffic; that is divergence #22, and it is the
+    /// C's behaviour, not the port's invention.
+    Timeout {
+        /// The request that went unanswered.
+        request: PendingRequest,
+    },
+    /// The message was handed to its type's own processor, the C's
+    /// `cfg->process`. Ordinary inbound traffic: a heartbeat, a request
+    /// addressed to this node or to any node, or a reply that matched no
+    /// outstanding request.
+    Message {
+        /// The message type, which is registered — an unregistered type is
+        /// dropped without an event.
+        message_type: MessageType,
+        /// The sequence number in the header, zero for anything unsequenced.
+        seq_num: u32,
+        /// Node id the message came from.
+        source: u64,
+        /// The body, after the BCMP header.
+        payload: &'a [u8],
+    },
+}
 
 /// A frame the node wants transmitted, and the ports it goes out on.
 ///
@@ -161,10 +271,16 @@ impl Snapshot {
 /// A Bristlemouth node.
 ///
 /// `NEIGHBORS` is the neighbour-table capacity; it needs to be at least the
-/// PHY's port count, since bm_core keeps one neighbour per port.
-pub struct Node<I, const NEIGHBORS: usize = 4> {
+/// PHY's port count, since bm_core keeps one neighbour per port. `PENDING` is
+/// how many requests may be waiting for a reply at once — bm_core's list is
+/// unbounded, and a `bm_malloc` failure there is discarded, so the port does
+/// what a full list does there: the request goes out untracked and its reply
+/// arrives as ordinary traffic. See
+/// [`Outgoing::tracked`][bm_wire::bcmp::registry::Outgoing::tracked].
+pub struct Node<I, const NEIGHBORS: usize = 4, const PENDING: usize = 4> {
     identity: I,
     neighbors: NeighborTable<NEIGHBORS>,
+    registry: Registry<MESSAGE_TYPES, PENDING>,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -174,16 +290,70 @@ pub struct Node<I, const NEIGHBORS: usize = 4> {
     tx: [u8; MTU],
 }
 
-impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
-    /// A node with an empty neighbour table.
+impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize> Node<I, NEIGHBORS, PENDING> {
+    /// A node with an empty neighbour table, at time zero.
+    ///
+    /// The registry comes up registered for what bm_core's `bcmp_init`
+    /// registers for the modules that are ported, and with the expiry sweep
+    /// phased from zero — which is where [`Node::on_tick`]'s clock starts, since
+    /// it counts milliseconds of uptime.
     pub fn new(identity: I, port_count: u8) -> Self {
+        let mut registry = Registry::new();
+        // heartbeat.c, info.c and neighbors.c, in the order `bcmp_init` calls
+        // their inits. Every one of them is `{false, false}`: outside
+        // `bcmp/config.c`, nothing in bm_core is sequenced at all, so all of
+        // this rides on the wire with a sequence number of zero.
+        for message_type in [
+            MessageType::HEARTBEAT,
+            MessageType::DEVICE_INFO_REQUEST,
+            MessageType::DEVICE_INFO_REPLY,
+            MessageType::NEIGHBOR_TABLE_REQUEST,
+            MessageType::NEIGHBOR_TABLE_REPLY,
+        ] {
+            // Cannot fail: MESSAGE_TYPES is far larger than this list.
+            let _ = registry.add(message_type, PacketCfg::UNSEQUENCED);
+        }
         Self {
             identity,
             neighbors: NeighborTable::new(),
+            registry,
             port_count,
             link_mask: 0,
             tx: [0u8; MTU],
         }
+    }
+
+    /// Register a message type, as each module's init does with `packet_add`.
+    ///
+    /// A card that ports a new exchange registers its types here, with the
+    /// flags its C module uses. Until a type is registered the node will
+    /// neither send it nor dispatch it.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::Full`] once [`MESSAGE_TYPES`] types are registered.
+    pub fn register(
+        &mut self,
+        message_type: MessageType,
+        cfg: PacketCfg,
+    ) -> Result<(), RegistryError> {
+        self.registry.add(message_type, cfg)
+    }
+
+    /// Remove the first registration for `message_type`, as `packet_remove`
+    /// does, reporting whether there was one.
+    ///
+    /// A node that unregisters a type it answers stops answering it: the
+    /// message is dropped before its body is looked at, which is what the C's
+    /// `BmENODEV` does.
+    pub fn unregister(&mut self, message_type: MessageType) -> bool {
+        self.registry.remove(message_type)
+    }
+
+    /// The packet registry: what is registered, and what is still waiting for
+    /// a reply.
+    pub fn registry(&self) -> &Registry<MESSAGE_TYPES, PENDING> {
+        &self.registry
     }
 
     /// Record that `port` came up or went down. Ports are 1-based.
@@ -258,6 +428,23 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
         ingress_port: u8,
         frame: &'f mut [u8],
     ) -> Owed<'f, '_> {
+        self.on_frame_with(now_ms, ingress_port, frame, |_| {})
+    }
+
+    /// The same, reporting every [`Event`] the frame produces.
+    ///
+    /// The handler runs while the frame is still borrowed, which is what lets
+    /// a payload be passed without copying it. It is called before the node
+    /// acts on the message, so a reply the node builds is built after the
+    /// application has seen what prompted it — the same order the C has, where
+    /// `cfg->process` *is* the node's handling.
+    pub fn on_frame_with<'f>(
+        &mut self,
+        now_ms: u32,
+        ingress_port: u8,
+        frame: &'f mut [u8],
+        mut events: impl FnMut(Event<'_>),
+    ) -> Owed<'f, '_> {
         let ingress_mask = port_mask(ingress_port);
         let policy = l2_policy::rx_apply(frame, ingress_mask, self.all_ports_mask(), None);
 
@@ -266,7 +453,7 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
         let snapshot = Snapshot::take(frame);
 
         let reply = if policy.should_submit {
-            self.submit(now_ms, ingress_port, frame)
+            self.submit(now_ms, ingress_port, frame, &mut events)
         } else {
             None
         };
@@ -296,11 +483,36 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
         now_ms: u32,
         ingress_port: u8,
         frame: &mut [u8],
+        events: &mut impl FnMut(Event<'_>),
     ) -> Option<Outbound<'s>> {
         let received = rx::accept(frame).ok()?;
         let message_type = received.header.message_type;
+        let seq_num = received.header.seq_num;
         let source = received.src.to_node_id();
         let reply_to = received.dst;
+
+        // `process_received_message`'s dispatch, in its order: an unregistered
+        // type is dropped before its body is looked at, a reply that answers
+        // an outstanding request goes to that request's callback *instead of*
+        // the type's processor, and everything else is processed.
+        match self.registry.on_received(message_type, seq_num) {
+            Delivery::Unregistered => return None,
+            Delivery::SequencedReply(request) => {
+                events(Event::Reply {
+                    request,
+                    message_type,
+                    source,
+                    payload: received.payload,
+                });
+                return None;
+            }
+            Delivery::Process => events(Event::Message {
+                message_type,
+                seq_num,
+                source,
+                payload: received.payload,
+            }),
+        }
 
         // Everything the reply needs is copied out of the frame here, so the
         // borrow `accept` took ends before a reply is built.
@@ -315,21 +527,21 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
                 }
                 // bm_core asks on the link-local multicast address rather than
                 // the one the heartbeat arrived on.
-                self.build_device_info_request(source)
+                self.build_device_info_request(now_ms, source)
             }
             MessageType::DEVICE_INFO_REQUEST => {
                 let request = DeviceInfoRequest::decode(received.payload).ok()?;
                 if !self.addressed_to_us(request.target_node_id) {
                     return None;
                 }
-                self.build_device_info_reply(&reply_to)
+                self.build_device_info_reply(now_ms, &reply_to, seq_num)
             }
             MessageType::NEIGHBOR_TABLE_REQUEST => {
                 let request = NeighborTableRequest::decode(received.payload).ok()?;
                 if !self.addressed_to_us(request.target_node_id) {
                     return None;
                 }
-                self.build_neighbor_table_reply(&reply_to)
+                self.build_neighbor_table_reply(now_ms, &reply_to, seq_num)
             }
             _ => None,
         }
@@ -384,10 +596,124 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
     /// `uptime_ms` is milliseconds since this node started, which is also the
     /// clock [`Self::on_frame`] is given.
     pub fn on_tick(&mut self, uptime_ms: u32) -> Option<Outbound<'_>> {
+        self.on_tick_with(uptime_ms, |_| {})
+    }
+
+    /// The same, reporting every [`Event`] the tick produces.
+    ///
+    /// This is bm_core's heartbeat timer, which does not sweep the outstanding
+    /// requests — `packet.c` has its own timer for that, and
+    /// [`Node::on_expiry`] is it. The sweep is run here as well because it
+    /// costs nothing between phases and a node driven only by this entry point
+    /// would otherwise never give up on a request at all; a node that also
+    /// calls [`Node::on_expiry`] on time is unaffected, because what decides
+    /// when a sweep happens is the phase, not the call.
+    pub fn on_tick_with(
+        &mut self,
+        uptime_ms: u32,
+        mut events: impl FnMut(Event<'_>),
+    ) -> Option<Outbound<'_>> {
         // bm_core checks neighbours and sends a heartbeat on the same timer,
         // in that order.
         self.neighbors.check(uptime_ms, |_| {});
+        self.registry.on_tick(uptime_ms, |request| {
+            events(Event::Timeout { request: *request });
+        });
         self.build_heartbeat(uptime_ms)
+    }
+
+    /// Run `packet.c`'s expiry sweep, reporting every request that gave up.
+    ///
+    /// Call it at least every [`EXPIRY_PERIOD_MS`]. It is `sequence_list_timer_callback`,
+    /// and the 150 ms grid it fires on — not the 24 ms a request is stamped
+    /// with — is what actually decides when a request dies, which is
+    /// divergence #22. The phase lives in the registry, so calling this early,
+    /// late or twice changes nothing: what matters is not leaving longer than
+    /// a period between calls, because a sweep that is skipped is a request
+    /// that outlives the one a C node would have given up on.
+    pub fn on_expiry(&mut self, now_ms: u32, mut events: impl FnMut(Event<'_>)) {
+        self.registry.on_tick(now_ms, |request| {
+            events(Event::Timeout { request: *request });
+        });
+    }
+
+    /// Serialize a BCMP message and hand it back ready to transmit — `bcmp_tx`.
+    ///
+    /// `reply_seq_num` is the number being echoed. The registry decides
+    /// whether it is used: a [`PacketCfg::sequenced_reply`] type carries it, a
+    /// [`PacketCfg::sequenced_request`] type ignores it and takes the next
+    /// number from the node's counter, and anything else — which outside
+    /// `bcmp/config.c` is every type bm_core has — carries zero. Use
+    /// [`Node::request`] when there is nothing to echo.
+    ///
+    /// Returns `None` and sends nothing when the type is not registered, which
+    /// is the C's `BmENODEV`: `serialize` leaves the caller's buffer untouched
+    /// and `bcmp_tx` never reaches `bm_ip_tx_perform`. Also `None` when the
+    /// message does not fit the transmit buffer — checked before the registry
+    /// is asked, so an oversized request never becomes an outstanding one, as
+    /// in the C, where `bcmp_tx`'s size guard runs before `serialize`. The
+    /// ceiling here is the buffer, 1447 body bytes; the C's guard admits one
+    /// more and then builds a frame a byte over the MTU, which is divergence
+    /// #8.
+    pub fn send(
+        &mut self,
+        now_ms: u32,
+        dst: &BmIpAddr,
+        message_type: MessageType,
+        body: &[u8],
+        reply_seq_num: u32,
+    ) -> Option<Outbound<'_>> {
+        let end = MIN_FRAME_WITH_ADDRESSES
+            .checked_add(BCMP_HEADER_LEN)?
+            .checked_add(body.len())?;
+        if end > MTU {
+            return None;
+        }
+        let outgoing = self
+            .registry
+            .on_serialize(now_ms, message_type, reply_seq_num)
+            .ok()?;
+
+        let all_ports = self.all_ports_mask();
+        let Self { identity, tx, .. } = self;
+        let end = build_frame(
+            tx,
+            identity.node_id(),
+            dst,
+            message_type,
+            outgoing.seq_num,
+            |buf| {
+                buf.get_mut(..body.len())
+                    .ok_or(BmWireError::Truncated)?
+                    .copy_from_slice(body);
+                Ok(body.len())
+            },
+        )?;
+        Some(Outbound {
+            frame: &mut tx[..end],
+            mask: all_ports,
+        })
+    }
+
+    /// Send a message that is not answering one — [`Node::send`] with no
+    /// sequence number to echo, which is what every one of bm_core's own
+    /// request sites passes.
+    ///
+    /// If `message_type` is registered as a
+    /// [`PacketCfg::sequenced_request`], the message carries the node's next
+    /// sequence number and is recorded as outstanding: a reply carrying that
+    /// number comes back as [`Event::Reply`], and silence comes back as
+    /// [`Event::Timeout`] from the first [`Node::on_expiry`] sweep more than
+    /// [`DEFAULT_MESSAGE_TIMEOUT_MS`][bm_wire::bcmp::registry::DEFAULT_MESSAGE_TIMEOUT_MS]
+    /// later.
+    pub fn request(
+        &mut self,
+        now_ms: u32,
+        dst: &BmIpAddr,
+        message_type: MessageType,
+        body: &[u8],
+    ) -> Option<Outbound<'_>> {
+        self.send(now_ms, dst, message_type, body, 0)
     }
 
     fn addressed_to_us(&self, target_node_id: u64) -> bool {
@@ -395,6 +721,11 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
     }
 
     fn build_heartbeat(&mut self, uptime_ms: u32) -> Option<Outbound<'_>> {
+        let seq_num = self
+            .registry
+            .on_serialize(uptime_ms, MessageType::HEARTBEAT, 0)
+            .ok()?
+            .seq_num;
         let all_ports = self.all_ports_mask();
         let Self { identity, tx, .. } = self;
         let heartbeat = heartbeat_for(uptime_ms, HEARTBEAT_PERIOD_S);
@@ -403,6 +734,7 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
             identity.node_id(),
             &BmIpAddr::LINK_LOCAL_MULTICAST,
             MessageType::HEARTBEAT,
+            seq_num,
             |body| {
                 heartbeat.encode(body)?;
                 Ok(Heartbeat::LEN)
@@ -414,26 +746,34 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
         })
     }
 
-    fn build_device_info_request(&mut self, target_node_id: u64) -> Option<Outbound<'_>> {
-        let all_ports = self.all_ports_mask();
-        let Self { identity, tx, .. } = self;
-        let end = build_frame(
-            tx,
-            identity.node_id(),
+    fn build_device_info_request(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+    ) -> Option<Outbound<'_>> {
+        let mut body = [0u8; DeviceInfoRequest::LEN];
+        DeviceInfoRequest { target_node_id }
+            .encode(&mut body)
+            .ok()?;
+        self.request(
+            now_ms,
             &BmIpAddr::LINK_LOCAL_MULTICAST,
             MessageType::DEVICE_INFO_REQUEST,
-            |body| {
-                DeviceInfoRequest { target_node_id }.encode(body)?;
-                Ok(DeviceInfoRequest::LEN)
-            },
-        )?;
-        Some(Outbound {
-            frame: &mut tx[..end],
-            mask: all_ports,
-        })
+            &body,
+        )
     }
 
-    fn build_device_info_reply(&mut self, dst: &BmIpAddr) -> Option<Outbound<'_>> {
+    fn build_device_info_reply(
+        &mut self,
+        now_ms: u32,
+        dst: &BmIpAddr,
+        reply_seq_num: u32,
+    ) -> Option<Outbound<'_>> {
+        let seq_num = self
+            .registry
+            .on_serialize(now_ms, MessageType::DEVICE_INFO_REPLY, reply_seq_num)
+            .ok()?
+            .seq_num;
         let all_ports = self.all_ports_mask();
         let Self { identity, tx, .. } = self;
         let node_id = identity.node_id();
@@ -449,16 +789,31 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
             version_string: &version[..version.len().min(DeviceInfoReply::MAX_STRING_LEN)],
             device_name: &name[..name.len().min(DeviceInfoReply::MAX_STRING_LEN)],
         };
-        let end = build_frame(tx, node_id, dst, MessageType::DEVICE_INFO_REPLY, |body| {
-            reply.encode(body)
-        })?;
+        let end = build_frame(
+            tx,
+            node_id,
+            dst,
+            MessageType::DEVICE_INFO_REPLY,
+            seq_num,
+            |body| reply.encode(body),
+        )?;
         Some(Outbound {
             frame: &mut tx[..end],
             mask: all_ports,
         })
     }
 
-    fn build_neighbor_table_reply(&mut self, dst: &BmIpAddr) -> Option<Outbound<'_>> {
+    fn build_neighbor_table_reply(
+        &mut self,
+        now_ms: u32,
+        dst: &BmIpAddr,
+        reply_seq_num: u32,
+    ) -> Option<Outbound<'_>> {
+        let seq_num = self
+            .registry
+            .on_serialize(now_ms, MessageType::NEIGHBOR_TABLE_REPLY, reply_seq_num)
+            .ok()?
+            .seq_num;
         let all_ports = self.all_ports_mask();
         let Self {
             identity,
@@ -466,6 +821,7 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
             port_count,
             link_mask,
             tx,
+            ..
         } = self;
         let node_id = identity.node_id();
 
@@ -493,6 +849,7 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
             node_id,
             dst,
             MessageType::NEIGHBOR_TABLE_REPLY,
+            seq_num,
             |body| encode_neighbor_table_reply(body, node_id, ports, &table[..count]),
         )?;
         Some(Outbound {
@@ -573,6 +930,7 @@ fn build_frame<F>(
     node_id: u64,
     dst: &BmIpAddr,
     message_type: MessageType,
+    seq_num: u32,
     body: F,
 ) -> Option<usize>
 where
@@ -584,7 +942,7 @@ where
     write_frame_headers(tx, node_id, dst, payload_len)?;
 
     let end = MIN_FRAME_WITH_ADDRESSES + payload_len;
-    tx::serialize_in_place(tx.get_mut(..end)?, message_type, 0, body_len).ok()?;
+    tx::serialize_in_place(tx.get_mut(..end)?, message_type, seq_num, body_len).ok()?;
     Some(end)
 }
 
@@ -660,13 +1018,27 @@ pub async fn deliver<P: Phy>(
 // The async loop
 // ---------------------------------------------------------------------------
 
-impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
-    /// Run the node until the PHY fails.
+impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize> Node<I, NEIGHBORS, PENDING> {
+    /// Run the node until the PHY fails, discarding every [`Event`].
     ///
-    /// Waits on whichever comes first, a frame or the heartbeat tick, handles
-    /// it, and transmits anything owed. The heartbeat interval is bm_core's
-    /// `bcmp_heartbeat_s`, and the tick also ages the neighbour table, in that
-    /// order, as bm_core does on the same timer.
+    /// See [`Node::run_with`], which is the same loop with somewhere for the
+    /// replies and timeouts to go.
+    ///
+    /// # Errors
+    ///
+    /// The first error the PHY reports, from either direction.
+    pub async fn run<P: Phy>(&mut self, phy: &mut P) -> P::Error {
+        self.run_with(phy, |_| {}).await
+    }
+
+    /// Run the node until the PHY fails, reporting every [`Event`].
+    ///
+    /// Waits on whichever comes first — a frame, the heartbeat tick or the
+    /// expiry sweep — handles it, and transmits anything owed. Both timers are
+    /// bm_core's: `bcmp_heartbeat_s`, which also ages the neighbour table in
+    /// that order, and `packet.c`'s [`EXPIRY_PERIOD_MS`] sweep. Keeping them
+    /// apart is what lets a request time out on the C's grid while heartbeats
+    /// stay ten seconds apart.
     ///
     /// Returns rather than panicking when the PHY errors, so the caller can
     /// decide whether that is fatal. It has no other exit.
@@ -674,12 +1046,17 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
     /// # Errors
     ///
     /// The first error the PHY reports, from either direction.
-    pub async fn run<P: Phy>(&mut self, phy: &mut P) -> P::Error {
-        use embassy_futures::select::{Either, select};
+    pub async fn run_with<P: Phy>(
+        &mut self,
+        phy: &mut P,
+        mut events: impl FnMut(Event<'_>),
+    ) -> P::Error {
+        use embassy_futures::select::{Either3, select3};
         use embassy_time::{Duration, Instant, Ticker};
 
         let started = Instant::now();
         let mut ticker = Ticker::every(Duration::from_secs(u64::from(HEARTBEAT_PERIOD_S)));
+        let mut expiry = Ticker::every(Duration::from_millis(u64::from(EXPIRY_PERIOD_MS)));
         let mut rx = [0u8; MTU];
         let port_count = self.port_count;
 
@@ -697,22 +1074,26 @@ impl<I: Identity, const NEIGHBORS: usize> Node<I, NEIGHBORS> {
                 started.elapsed().as_millis() as u32
             };
 
-            match select(phy.receive(&mut rx), ticker.next()).await {
-                Either::First(Ok((port, len))) => {
+            match select3(phy.receive(&mut rx), ticker.next(), expiry.next()).await {
+                Either3::First(Ok((port, len))) => {
                     let now = uptime_ms(());
-                    let owed = self.on_frame(now, port, &mut rx[..len]);
+                    let owed = self.on_frame_with(now, port, &mut rx[..len], &mut events);
                     if let Err(error) = deliver(phy, owed, port_count).await {
                         return error;
                     }
                 }
-                Either::First(Err(error)) => return error,
-                Either::Second(()) => {
+                Either3::First(Err(error)) => return error,
+                Either3::Second(()) => {
                     let now = uptime_ms(());
-                    if let Some(outbound) = self.on_tick(now)
+                    if let Some(outbound) = self.on_tick_with(now, &mut events)
                         && let Err(error) = transmit(phy, outbound, port_count).await
                     {
                         return error;
                     }
+                }
+                Either3::Third(()) => {
+                    let now = uptime_ms(());
+                    self.on_expiry(now, &mut events);
                 }
             }
         }

@@ -38,9 +38,13 @@ A cargo workspace.
   supplies what `bm-wire` deliberately lacks: a clock, a timer, and a PHY.
   - `src/port.rs` — the seams bm_core leaves to the integrator, as traits
     rather than link-time symbols, so a test and the firmware can differ.
-  - `src/node.rs` — `Node::on_frame` and `Node::on_tick` are synchronous and
-    take the current time; `Node::run` is the only async code. All the protocol
-    is in the synchronous half.
+  - `src/node.rs` — `Node::on_frame`, `Node::on_tick` and `Node::on_expiry` are
+    synchronous and take the current time; `Node::run` is the only async code.
+    All the protocol is in the synchronous half. Each has a `_with` twin that
+    reports `Event`s — a reply, a timeout, an unsolicited message — which is
+    where a ported exchange's requester half hangs. The two timers are
+    bm_core's two: the ten-second heartbeat and `packet.c`'s 150 ms expiry
+    sweep, which must not be put on a grid of the port's own (divergence #22).
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock, so
     the real `run` loop can be tested with no hardware.
 - `bm-phy-adin2111/` — [`bm_stack::Phy`] for the ADIN2111 over OPEN Alliance
