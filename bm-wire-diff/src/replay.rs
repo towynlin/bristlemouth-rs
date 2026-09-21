@@ -183,6 +183,21 @@ mod tests {
         }
     }
 
+    /// The other direction: a target named in a list whose directory is gone
+    /// replays nothing, and `replay_target` reports that as zero rather than
+    /// as an error.
+    #[test]
+    fn every_listed_target_has_a_seeds_directory() {
+        let found = seed_directories();
+        for target in TARGETS.iter().chain(STACK_TARGETS) {
+            assert!(
+                found.iter().any(|dir| dir == target),
+                "{target} is listed as a fuzz target, but {} does not exist",
+                seeds_dir().join(target).display()
+            );
+        }
+    }
+
     /// Each stack target needs its own process, so each has its own test
     /// binary that replays it. A target without one would never be replayed.
     #[test]
@@ -199,17 +214,20 @@ mod tests {
         }
     }
 
+    /// Per target, not in aggregate: one empty or missing corpus among several
+    /// full ones would otherwise leave the total non-zero and go unnoticed.
     #[test]
     fn every_committed_seed_still_agrees_with_the_c() {
         let mut total = 0;
         for target in TARGETS {
-            total += replay_target(target);
+            let replayed = replay_target(target);
+            assert!(
+                replayed > 0,
+                "no seeds replayed for {target} -- expected files under {}",
+                seeds_dir().join(target).display()
+            );
+            total += replayed;
         }
-        assert!(
-            total > 0,
-            "no seeds replayed -- expected files under {}",
-            seeds_dir().display()
-        );
         eprintln!("replayed {total} seeds across {} targets", TARGETS.len());
     }
 }

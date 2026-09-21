@@ -1,22 +1,19 @@
 //! `BcmpEchoRequest` and `BcmpEchoReply`, ported from `bcmp/messages.h` and
 //! `bcmp/ping.c`.
 //!
-//! Ping is the smallest complete exchange BCMP has: a node asks, a node
-//! answers with the same bytes back. Both message types are registered
-//! `{false, false}` by `ping_init`, so neither carries a header sequence
-//! number and neither is matched by `packet.c`'s outstanding-request list —
-//! whatever correlation there is, `bcmp/ping.c` does itself, out of the two
-//! statics it keeps.
+//! A node asks, a node answers with the same bytes back. `ping_init`
+//! registers both types `{false, false}`, so neither carries a header sequence
+//! number and neither is matched by `packet.c`'s outstanding-request list:
+//! `bcmp/ping.c` does its own correlation, from two file-scope statics.
 //!
 //! # The two structs are one struct
 //!
 //! `BcmpEchoRequest` and `BcmpEchoReply` are byte-for-byte identical: a 64-bit
 //! node id, three 16-bit fields, then the payload. Only the first field's
-//! *meaning* differs — the request names who should answer, the reply names
-//! who did. `bcmp_process_ping_request` exploits that directly: it overwrites
-//! `target_node_id` with this node's id and casts the request buffer to a
-//! `BcmpEchoReply` in place. [`EchoRequest::into_reply`] is that cast, with
-//! the substitution written down rather than implied by a pointer.
+//! meaning differs — the request names who should answer, the reply names who
+//! did. `bcmp_process_ping_request` overwrites `target_node_id` with this
+//! node's id and casts the request buffer to a `BcmpEchoReply` in place;
+//! [`EchoRequest::into_reply`] is that cast, with the substitution explicit.
 //!
 //! # Lengths are checked here and nowhere in the C
 //!
@@ -25,9 +22,8 @@
 //! `payload_len` of them, in both cases taking the length from the frame and
 //! never comparing it against `BcmpProcessData.size`, which is right there.
 //! [`EchoRequest::decode`] and [`EchoReply::decode`] validate it against the
-//! buffer instead. See divergence #29: this is a domain limit, not a
-//! behaviour the port reproduces, because there is no defined C behaviour to
-//! reproduce.
+//! buffer instead. See divergence #29: a domain limit, not a reproduced
+//! behaviour, because there is no defined C behaviour to reproduce.
 
 use crate::BmWireError;
 

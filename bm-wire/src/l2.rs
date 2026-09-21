@@ -9,17 +9,16 @@
 //!
 //! bm_core does not recompute the checksum. It *patches* it: the ports byte is
 //! the high half of a 16-bit word in the one's-complement sum, so adding the
-//! port number to the high byte of the checksum is enough. That is
-//! `network_add_egress_port`, and [`add_egress_port`] reproduces it — including
-//! the place where the patch is wrong, which is divergence #12.
+//! port number to the checksum's high byte is enough. That is
+//! `network_add_egress_port`, and [`add_egress_port`] reproduces it, including
+//! divergence #12, where the patch is wrong.
 //!
 //! # Order matters
 //!
 //! A frame going out several ports is stamped, sent, cleared and un-patched
-//! once per port, in that order, reusing one buffer. Getting the order wrong
-//! leaves the next port's frame with a checksum for the previous port, which
-//! the receiving node silently drops. [`with_egress_port`] exists so that
-//! sequence lives in one place instead of at every call site.
+//! once per port, in that order, reusing one buffer. Out of order, the next
+//! port's frame carries a checksum for the previous port and the receiver
+//! silently drops it. [`with_egress_port`] keeps that sequence in one place.
 
 use crate::BmWireError;
 use crate::bcmp::header::{BCMP_HEADER_OFFSET, CHECKSUM_FIELD_OFFSET};

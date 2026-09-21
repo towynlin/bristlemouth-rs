@@ -3,8 +3,8 @@
 //!
 //! A node that receives a link-local message addressed to somebody else puts it
 //! back on every port except the one it arrived on, so a chain of nodes relays
-//! it hop by hop. `bcmp/time.c`, `bcmp/config.c` and `bcmp/dfu_core.c` all do
-//! this, and all of them do it through the one function ported here.
+//! it hop by hop. `bcmp/time.c`, `bcmp/config.c` and `bcmp/dfu_core.c` all go
+//! through the one function ported here.
 //!
 //! # It is a new datagram, not a relay
 //!
@@ -36,7 +36,7 @@
 //!
 //! 1. write the frame headers with the **plain** `FF02::1` destination, then
 //!    [`serialize_forwarded`] — `bm_ip_tx_new` and the copy-checksum-copy
-//!    dance in `bcmp_ll_forward`;
+//!    sequence in `bcmp_ll_forward`;
 //! 2. [`apply_port_specific_destination`] — `bm_ip_tx_perform(forward, dst)`;
 //! 3. [`l2::take_requested_egress_port`] — `bm_l2_link_output`.
 //!

@@ -24,17 +24,16 @@
 //!
 //! # Callbacks become return values
 //!
-//! The C stores a `BcmpSequencedRequestCb` per request and invokes it in two
-//! places: with the reply's payload when one arrives, and — this is the part
-//! that is easy to miss — **with `NULL` when the request times out**. A caller
-//! that does not test for the null payload dereferences it.
+//! The C stores a `BcmpSequencedRequestCb` per request and invokes it twice
+//! over: with the reply's payload when one arrives, and **with `NULL` when the
+//! request times out**. A caller that does not test for the null payload
+//! dereferences it.
 //!
 //! The port has no callback to store. A matched reply comes back as
 //! [`Delivery::SequencedReply`] and an expiry as a call to `on_tick`'s
-//! `timed_out`, so the two cases cannot be confused for one another. Where the
-//! C falls back to `cfg->process` because the stored callback was null, the
-//! port's caller does the same by choosing not to handle the entry it was
-//! handed.
+//! `timed_out`, so the two cannot be confused. Where the C falls back to
+//! `cfg->process` because the stored callback was null, the port's caller does
+//! the same by not handling the entry it was handed.
 //!
 //! # Time
 //!

@@ -16,8 +16,8 @@
 //! `bcmp/dfu_core.c` all do for anything not addressed to this node.
 //!
 //! The message bodies each have a module of their own — [`heartbeat`],
-//! [`info`], [`neighbors`], [`ping`] — and are codecs and nothing else. What
-//! a node *does* with one is `bm-stack`'s business.
+//! [`info`], [`neighbors`], [`ping`] — and are codecs only. What a node *does*
+//! with one is `bm-stack`'s business.
 
 pub mod forward;
 pub mod header;

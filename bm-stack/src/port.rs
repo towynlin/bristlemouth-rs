@@ -1,15 +1,13 @@
 //! The seams bm_core leaves to the integrator, as traits.
 //!
 //! bm_core declares `bm_os.h`, `bm_ip.h`, `network_device.h` and friends and
-//! expects the integrator to supply definitions at link time. That works, but
-//! it means a program can only have one of each, and a test cannot have a
-//! different one from the firmware. These are the same seams expressed as
-//! traits, so a node is generic over them and a mock is just another
+//! expects definitions at link time, so a program can only have one of each
+//! and a test cannot differ from the firmware. These are the same seams as
+//! traits, so a node is generic over them and a mock is another
 //! implementation.
 //!
-//! Only the seams the ported exchanges actually need are here. Configuration
-//! storage and the DFU flash slot are seams too, and they will arrive with the
-//! code that uses them rather than ahead of it.
+//! Only the seams the ported exchanges need are here. Configuration storage
+//! and the DFU flash slot arrive with the code that uses them.
 
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::util::{date_time_from_utc, utc_from_date_time};
@@ -26,12 +24,11 @@ pub enum Egress {
 
 /// A port-aware Ethernet PHY.
 ///
-/// The port number is the whole reason this is not just a byte pipe.
 /// Bristlemouth encodes the ingress port into the source address of every
 /// frame it receives and picks an egress port per copy on transmit, so a
 /// driver that hides which port a frame came from cannot carry the protocol.
-/// `embassy-net-adin1110` currently does hide it — fixing that upstream is
-/// what this trait is waiting for.
+/// `embassy-net-adin1110` currently hides it; see
+/// `docs/embassy-port-tracking-prompt.md`.
 #[allow(async_fn_in_trait)]
 pub trait Phy {
     /// Why a transfer failed.
@@ -44,8 +41,8 @@ pub trait Phy {
     /// serviced the PHY. Ports are 1-based; a port the device does not have
     /// reports `false`.
     ///
-    /// A neighbour-table reply carries this for every port, which is the one
-    /// place bm_core reads `bm_l2_get_port_state`.
+    /// A neighbour-table reply carries this for every port — the one place
+    /// bm_core reads `bm_l2_get_port_state`.
     fn link_up(&self, port: u8) -> bool;
 
     /// Transmit one frame.
@@ -81,12 +78,9 @@ pub trait Identity {
 
 /// A wall-clock reading, `RtcTimeAndDate` from `bcmp/bm_rtc.h`.
 ///
-/// Nothing in bm_core builds one of these from the wire: the field order here
-/// is the C struct's, but the struct never leaves the device, so this is a
-/// plain value type rather than a codec. The wire carries
-/// [`bm_wire::bcmp::SystemTimeResponse::utc_time_us`] instead, and the two
-/// conversions between them are [`Self::to_utc_micros`] and
-/// [`Self::from_utc_micros`].
+/// A plain value type, not a codec: the struct never leaves the device. The
+/// wire carries [`bm_wire::bcmp::SystemTimeResponse::utc_time_us`], and
+/// [`Self::to_utc_micros`] and [`Self::from_utc_micros`] convert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RtcTimeAndDate {
     /// Full year, e.g. 2026.
@@ -110,14 +104,14 @@ impl RtcTimeAndDate {
     /// Microseconds since the Unix epoch — `bm_rtc_get_micro_seconds`.
     ///
     /// **bm_core does not define this.** It is declared in `bcmp/bm_rtc.h` and
-    /// left to the integrator, so unlike everything else in this repository
-    /// there is no authoritative C to match: `bm-wire-sys/csrc/bm_generic_shim.c`
-    /// implements it as `utc_from_date_time(...) * 1_000_000 + ms * 1_000`, and
-    /// this is the same arithmetic so that the differential harness compares a
-    /// node against a node rather than against a different clock.
+    /// left to the integrator, so there is no authoritative C to match.
+    /// `bm-wire-sys/csrc/bm_generic_shim.c` implements it as
+    /// `utc_from_date_time(...) * 1_000_000 + ms * 1_000`; this is the same
+    /// arithmetic, so the harness compares a node against a node rather than
+    /// against a different clock.
     ///
-    /// [`utc_from_date_time`] returns a `u32`, which is bm_core's own choice
-    /// and runs out in 2106; the multiply is done in 64 bits afterwards, as the
+    /// [`utc_from_date_time`] returns a `u32` — bm_core's choice, which runs
+    /// out in 2106 — and the multiply is done in 64 bits afterwards, as the
     /// shim does it.
     #[must_use]
     pub fn to_utc_micros(&self) -> u64 {
@@ -138,8 +132,8 @@ impl RtcTimeAndDate {
     /// This half *is* bm_core's: `date_time_from_utc` followed by the
     /// field-by-field copy at `time.c:103-110`, including `usec / 1000`, which
     /// discards the sub-millisecond part. Setting a node's clock and reading it
-    /// back therefore does not round-trip, and the response the C sends echoes
-    /// the *requested* microseconds rather than what the RTC kept.
+    /// back does not round-trip, and the C's response echoes the *requested*
+    /// microseconds rather than what the RTC kept.
     #[must_use]
     pub fn from_utc_micros(utc_us: u64) -> Self {
         let datetime = date_time_from_utc(utc_us);
@@ -161,14 +155,13 @@ impl RtcTimeAndDate {
 /// The node's real-time clock, `bcmp/bm_rtc.h`.
 ///
 /// bm_core declares `bm_rtc_get`, `bm_rtc_set` and `bm_rtc_get_micro_seconds`
-/// and defines none of them; a firmware links its own. Here it is a trait, so
-/// a node without a clock ([`NoRtc`]) and a node with one are different types
-/// rather than different link lines.
+/// and defines none of them. As a trait, a node without a clock ([`NoRtc`])
+/// and a node with one are different types rather than different link lines.
 ///
-/// This is what the system-time exchange stands on: `0x10` is answered from
-/// [`Self::get`], `0x12` is applied through [`Self::set`], and a node whose
-/// clock refuses either says nothing at all — which is exactly what a C node
-/// does when its `bm_rtc_get` returns anything but `BmOK`.
+/// The system-time exchange stands on this: `0x10` is answered from
+/// [`Self::get`], `0x12` applied through [`Self::set`], and a node whose clock
+/// refuses either says nothing — what a C node does when `bm_rtc_get` returns
+/// anything but `BmOK`.
 pub trait Rtc {
     /// Read the clock — `bm_rtc_get`.
     ///
@@ -185,10 +178,9 @@ pub trait Rtc {
 
 /// A node with no real-time clock.
 ///
-/// Both operations fail, which is a state a C node can be in too — an
-/// integrator that links stubs returning an error, or a board whose RTC has
-/// never been set. Such a node stays silent when asked for the time, and
-/// re-floods and drops time messages exactly as it would otherwise.
+/// Both operations fail, a state a C node can be in too: stubs that return an
+/// error, or a board whose RTC has never been set. Such a node stays silent
+/// when asked the time, and re-floods and drops time messages as usual.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoRtc;
 
@@ -204,16 +196,15 @@ impl Rtc for NoRtc {
 
 /// A clock kept in RAM, with no hardware behind it.
 ///
-/// Exactly what `bm_rtc_set` and `bm_rtc_get` do in
+/// What `bm_rtc_set` and `bm_rtc_get` do in
 /// `bm-wire-sys/csrc/bm_generic_shim.c`: remember what was set, refuse to be
-/// read until something has set it. Two uses, and both are real —
-/// a test that needs a node whose clock answers, and a board with no RTC
-/// part, whose time comes from a `0x12` message and is lost on reset.
+/// read until something sets it. Two uses — a test needing a node whose clock
+/// answers, and a board with no RTC part, whose time comes from a `0x12`
+/// message and is lost on reset.
 ///
-/// It is not gated behind the `mock` feature because there is nothing to mock:
-/// no clock advances on its own here, and a node built on this one reports the
-/// same time until it is set again. A firmware wanting a clock that *runs*
-/// implements [`Rtc`] over its own peripheral.
+/// Not behind the `mock` feature, because nothing here is mocked: it does not
+/// advance, so it reports the same time until set again. A firmware wanting a
+/// clock that *runs* implements [`Rtc`] over its own peripheral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SoftRtc {
     reading: Option<RtcTimeAndDate>,
@@ -276,7 +267,7 @@ mod tests {
     use super::*;
 
     /// The conversion the shim performs, checked against a date a human can
-    /// verify: 2026-09-21T00:00:00Z is 1 758 412 800 seconds after the epoch.
+    /// verify: 2026-09-21T00:00:00Z is 1 789 948 800 seconds after the epoch.
     #[test]
     fn a_reading_converts_to_the_microseconds_the_shim_would_report() {
         let reading = RtcTimeAndDate {
