@@ -41,8 +41,20 @@
 //! `BmENODEV`: `serialize` writes nothing into the caller's buffer, so
 //! `bcmp_tx` transmits nothing, and `process_received_message` returns before
 //! it looks at the body. [`Node::new`] registers what bm_core's `bcmp_init`
-//! registers for the modules that are ported — heartbeat, device info and the
-//! neighbour table — and [`Node::register`] is how a card adds its own.
+//! registers for the modules that are ported — heartbeat, ping, system time,
+//! device info and the neighbour table — and [`Node::register`] is how a card
+//! adds its own.
+//!
+//! # Ping is correlated outside the registry
+//!
+//! `bcmp/ping.c` registers both of its types unsequenced, so `packet.c` never
+//! matches an echo reply to an echo request: the module does it itself, from
+//! two file-scope statics that track exactly one outstanding ping. [`Node::ping`]
+//! is `bcmp_send_ping_request` and that single slot is on the node, because a
+//! second ping overwrites the first's expectations just as it does in the C.
+//! The verdict arrives as [`Event::EchoReply`], which is the one thing bm_core
+//! does not offer an application at all — there, a matched reply is a debug
+//! print and nothing more.
 //!
 //! # Two timers, not one
 //!
@@ -57,6 +69,7 @@
 use bm_wire::addr;
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
 use bm_wire::bcmp::neighbors::{NeighborTableRequest, PortInfo, encode_neighbor_table_reply};
+use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::{
     Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, PacketCfg, PendingRequest, Registry, RegistryError,
 };
@@ -165,6 +178,35 @@ pub enum Event<'a> {
         source: u64,
         /// The body, after the BCMP header.
         payload: &'a [u8],
+    },
+    /// An echo reply answered the outstanding ping — `bcmp_process_ping_reply`
+    /// reaching its `err = BmOK`.
+    ///
+    /// This is reported **in addition to** [`Event::Message`] for the same
+    /// frame, and the split is bm_core's own: the `Message` is what
+    /// `process_received_message` dispatched, and this is what `ping.c` then
+    /// made of it. A reply that does not match produces only the `Message`.
+    ///
+    /// bm_core has nowhere to send this — `bcmp_send_ping_request` takes no
+    /// callback, and echo replies are registered unsequenced, so `packet.c`
+    /// has no callback to reach either. The round-trip result exists only as a
+    /// `bm_debug` line. See divergence #32.
+    EchoReply {
+        /// Node id the reply came from, from the frame's source address.
+        ///
+        /// Not what was matched on, and not necessarily
+        /// [`bm_wire::bcmp::ping::EchoReply::node_id`] either: the C compares
+        /// neither.
+        source: u64,
+        /// The reply as it arrived, payload included.
+        reply: bm_wire::bcmp::ping::EchoReply<'a>,
+        /// Milliseconds since [`Node::ping`] built the request, the value
+        /// bm_core prints as `time=`.
+        ///
+        /// Wrapping, like every other clock here. bm_core computes it in 64
+        /// bits from a 32-bit tick counter, so its version is wrong for one
+        /// reading after the counter wraps and this one is not.
+        round_trip_ms: u32,
     },
 }
 
@@ -319,6 +361,72 @@ impl Snapshot {
     }
 }
 
+/// Default size of a node's expected-ping-payload buffer, [`Node`]'s
+/// `PING_PAYLOAD`.
+///
+/// bm_core keeps this on the heap, reallocated per request, so it has no
+/// ceiling but `bcmp_tx`'s. A node that wants to ping with more than this
+/// raises the parameter.
+pub const PING_PAYLOAD_BYTES: usize = 64;
+
+/// `bcmp/ping.c`'s four file-scope statics, which between them track exactly
+/// one outstanding ping.
+///
+/// A second [`Node::ping`] overwrites the first's expectations, as
+/// `bcmp_send_ping_request` does by freeing `EXPECTED_PAYLOAD` and allocating
+/// another. Nothing ever clears them again — not a matched reply, not time —
+/// so the last ping's payload keeps answering for as long as the node runs.
+#[derive(Debug)]
+struct PingState<const PAYLOAD: usize> {
+    /// `BCMP_SEQ`. A `uint32_t` counter whose low sixteen bits are what
+    /// reaches the wire, and a sequence space entirely separate from
+    /// `packet.c`'s `message_count`.
+    seq: u32,
+    /// `PING_REQUEST_TIMEOUT`, which despite the name times nothing out: it is
+    /// stamped after every request and read only to print a round-trip. A ping
+    /// that is never answered is simply never mentioned again — see
+    /// divergence #32.
+    sent_at_ms: u32,
+    /// `EXPECTED_PAYLOAD_LEN`, and `None` for the `EXPECTED_PAYLOAD == NULL`
+    /// the C starts in and returns to on a payload-free request. The two are
+    /// only ever set and cleared together, which is what lets one field hold
+    /// both.
+    expected_len: Option<u16>,
+    /// `EXPECTED_PAYLOAD`'s bytes, as much of them as is worth keeping.
+    expected: [u8; PAYLOAD],
+}
+
+impl<const PAYLOAD: usize> Default for PingState<PAYLOAD> {
+    fn default() -> Self {
+        Self {
+            seq: 0,
+            sent_at_ms: 0,
+            expected_len: None,
+            expected: [0u8; PAYLOAD],
+        }
+    }
+}
+
+impl<const PAYLOAD: usize> PingState<PAYLOAD> {
+    /// What `bcmp_process_ping_reply` compares against, or `None` for the C's
+    /// null pointer.
+    fn expected_payload(&self) -> Option<&[u8]> {
+        self.expected_len
+            .map(|len| &self.expected[..usize::from(len)])
+    }
+
+    /// `bcmp_send_ping_request`'s clear-then-copy: the old expectation goes
+    /// whether or not a new one replaces it, and an empty payload leaves the
+    /// pointer null.
+    fn remember(&mut self, payload: &[u8]) {
+        self.expected_len = None;
+        if !payload.is_empty() {
+            self.expected[..payload.len()].copy_from_slice(payload);
+            self.expected_len = Some(payload.len() as u16);
+        }
+    }
+}
+
 /// A Bristlemouth node.
 ///
 /// `NEIGHBORS` is the neighbour-table capacity; it needs to be at least the
@@ -328,11 +436,25 @@ impl Snapshot {
 /// what a full list does there: the request goes out untracked and its reply
 /// arrives as ordinary traffic. See
 /// [`Outgoing::tracked`][bm_wire::bcmp::registry::Outgoing::tracked].
-pub struct Node<I, R = NoRtc, const NEIGHBORS: usize = 4, const PENDING: usize = 4> {
+///
+/// `PING_PAYLOAD` is the longest ping payload the node can remember well
+/// enough to check a reply against, and so the longest one [`Node::ping`] will
+/// send. bm_core has no equivalent limit, only an unchecked `bm_malloc` whose
+/// failure it dereferences; refusing to send is the allocation-free node's
+/// version of that, and it is the one place ping's behaviour here is a choice
+/// rather than a port.
+pub struct Node<
+    I,
+    R = NoRtc,
+    const NEIGHBORS: usize = 4,
+    const PENDING: usize = 4,
+    const PING_PAYLOAD: usize = PING_PAYLOAD_BYTES,
+> {
     identity: I,
     rtc: R,
     neighbors: NeighborTable<NEIGHBORS>,
     registry: Registry<MESSAGE_TYPES, PENDING>,
+    ping: PingState<PING_PAYLOAD>,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -342,8 +464,8 @@ pub struct Node<I, R = NoRtc, const NEIGHBORS: usize = 4, const PENDING: usize =
     tx: [u8; MTU],
 }
 
-impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize>
-    Node<I, R, NEIGHBORS, PENDING>
+impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLOAD: usize>
+    Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD>
 {
     /// A node with an empty neighbour table, at time zero.
     ///
@@ -353,19 +475,22 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize>
     /// it counts milliseconds of uptime.
     pub fn new(identity: I, rtc: R, port_count: u8) -> Self {
         let mut registry = Registry::new();
-        // heartbeat.c, time.c, info.c and neighbors.c, in the order `bcmp_init`
-        // calls their inits. Every one of them is `{false, false}`: outside
-        // `bcmp/config.c`, nothing in bm_core is sequenced at all, so all of
-        // this rides on the wire with a sequence number of zero.
+        // heartbeat.c, ping.c, time.c, neighbors.c and info.c, in the order
+        // `bcmp_init` calls their inits. Every one of them is
+        // `{false, false}`: outside `bcmp/config.c`, nothing in bm_core is
+        // sequenced at all, so all of this rides on the wire with a sequence
+        // number of zero.
         for message_type in [
             MessageType::HEARTBEAT,
+            MessageType::ECHO_REQUEST,
+            MessageType::ECHO_REPLY,
             MessageType::SYSTEM_TIME_REQUEST,
             MessageType::SYSTEM_TIME_RESPONSE,
             MessageType::SYSTEM_TIME_SET,
-            MessageType::DEVICE_INFO_REQUEST,
-            MessageType::DEVICE_INFO_REPLY,
             MessageType::NEIGHBOR_TABLE_REQUEST,
             MessageType::NEIGHBOR_TABLE_REPLY,
+            MessageType::DEVICE_INFO_REQUEST,
+            MessageType::DEVICE_INFO_REPLY,
         ] {
             // Cannot fail: MESSAGE_TYPES is far larger than this list.
             let _ = registry.add(message_type, PacketCfg::UNSEQUENCED);
@@ -375,6 +500,7 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize>
             rtc,
             neighbors: NeighborTable::new(),
             registry,
+            ping: PingState::default(),
             port_count,
             link_mask: 0,
             tx: [0u8; MTU],
@@ -638,6 +764,39 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize>
                 }
                 self.build_neighbor_table_reply(now_ms, &reply_to, seq_num)
             }
+            MessageType::ECHO_REQUEST => {
+                let Ok(request) = EchoRequest::decode(received.payload) else {
+                    return (None, None);
+                };
+                if !self.addressed_to_us(request.target_node_id) {
+                    return (None, None);
+                }
+                // `bcmp_process_ping_request` overwrites `target_node_id` in
+                // the received buffer and casts it to a reply. Nothing else
+                // changes, so the payload goes back out exactly as it came in
+                // -- and the frame itself is left alone here, which matters
+                // because the relayed copy of a global-multicast echo request
+                // is the same bytes.
+                let reply = request.into_reply(self.identity.node_id());
+                self.build_echo_reply(now_ms, &reply_to, &reply)
+            }
+            MessageType::ECHO_REPLY => {
+                let Ok(reply) = EchoReply::decode(received.payload) else {
+                    return (None, None);
+                };
+                // `bcmp_process_ping_reply`, which transmits nothing: it
+                // either recognises the reply as the answer to the one ping it
+                // is tracking, or ignores it.
+                let our_id = self.identity.node_id() as u16;
+                if reply.answers(our_id, self.ping.expected_payload()) {
+                    events(Event::EchoReply {
+                        source,
+                        reply,
+                        round_trip_ms: now_ms.wrapping_sub(self.ping.sent_at_ms),
+                    });
+                }
+                None
+            }
             MessageType::SYSTEM_TIME_REQUEST
             | MessageType::SYSTEM_TIME_RESPONSE
             | MessageType::SYSTEM_TIME_SET => {
@@ -898,6 +1057,97 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize>
         self.send(now_ms, dst, message_type, body, 0)
     }
 
+    /// Ping `target_node_id`, or every node if it is zero — the whole of
+    /// `bcmp_send_ping_request`.
+    ///
+    /// The request carries this node's id truncated to sixteen bits as its
+    /// `id`, and `ping.c`'s own counter — not `packet.c`'s — as its `seq_num`,
+    /// also truncated. `payload` is copied into the node's single expectation
+    /// slot, replacing whatever the last ping left there; a reply matching it
+    /// arrives as [`Event::EchoReply`].
+    ///
+    /// bm_core sends to `multicast_ll_addr` from every call site it has, but
+    /// takes the address as an argument, so this does too.
+    ///
+    /// Returns `None` without sending, and **without disturbing the ping
+    /// state**, when `payload` is longer than `PING_PAYLOAD` — or than the
+    /// `u16` length field, for a node given a `PING_PAYLOAD` larger than
+    /// that: there would be
+    /// nowhere to remember it, and a ping whose reply cannot be checked is
+    /// worse than no ping. That is the one thing here with no C counterpart —
+    /// bm_core `bm_malloc`s the copy and dereferences the result without
+    /// checking it. Also `None`, after the counter has advanced and the
+    /// payload has been stored, if the request does not fit the transmit
+    /// buffer or [`MessageType::ECHO_REQUEST`] has been unregistered; that is
+    /// the C's order too, where `BCMP_SEQ++` and the copy both happen before
+    /// `bcmp_tx` is called at all.
+    pub fn ping(
+        &mut self,
+        now_ms: u32,
+        dst: &BmIpAddr,
+        target_node_id: u64,
+        payload: &[u8],
+    ) -> Option<Outbound<'_>> {
+        if payload.len() > PING_PAYLOAD || payload.len() > EchoRequest::MAX_PAYLOAD_LEN {
+            return None;
+        }
+
+        // `echo_req->seq_num = BCMP_SEQ++`: the frame carries the value from
+        // before the increment, sixteen bits of a thirty-two bit counter.
+        let seq_num = self.ping.seq as u16;
+        self.ping.seq = self.ping.seq.wrapping_add(1);
+        // An empty slice stands in for both of the C's ways of asking for a
+        // payload-free ping, a null pointer and a zero length -- it folds them
+        // together at the top of `bcmp_send_ping_request` itself.
+        self.ping.remember(payload);
+        // The C stamps this after `bcmp_tx` returns rather than before. No
+        // clock moves in between, so the order is not observable.
+        self.ping.sent_at_ms = now_ms;
+
+        let request = EchoRequest {
+            target_node_id,
+            id: self.identity.node_id() as u16,
+            seq_num,
+            payload,
+        };
+        let header_seq = self
+            .registry
+            .on_serialize(now_ms, MessageType::ECHO_REQUEST, 0)
+            .ok()?
+            .seq_num;
+        let all_ports = self.all_ports_mask();
+        let Self { identity, tx, .. } = self;
+        let end = build_frame(
+            tx,
+            identity.node_id(),
+            dst,
+            MessageType::ECHO_REQUEST,
+            header_seq,
+            |body| request.encode(body),
+        )?;
+        Some(Outbound {
+            frame: &mut tx[..end],
+            mask: all_ports,
+        })
+    }
+
+    /// `BCMP_SEQ`: the number the *next* ping will carry, before truncation.
+    #[must_use]
+    pub fn ping_sequence(&self) -> u32 {
+        self.ping.seq
+    }
+
+    /// `EXPECTED_PAYLOAD` and `EXPECTED_PAYLOAD_LEN`, which an echo reply is
+    /// compared against. `None` is the C's null pointer.
+    ///
+    /// Nothing clears this: bm_core keeps the last ping's payload for the life
+    /// of the process, and so a reply carrying it is accepted however long
+    /// afterwards it arrives.
+    #[must_use]
+    pub fn expected_ping_payload(&self) -> Option<&[u8]> {
+        self.ping.expected_payload()
+    }
+
     /// Ask `target_node_id` what time it is — `bcmp_time_get_time`.
     ///
     /// Goes to `FF02::1`, so every node on the link sees it and exactly one
@@ -1033,6 +1283,39 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize>
             node_id,
             dst,
             MessageType::DEVICE_INFO_REPLY,
+            seq_num,
+            |body| reply.encode(body),
+        )?;
+        Some(Outbound {
+            frame: &mut tx[..end],
+            mask: all_ports,
+        })
+    }
+
+    fn build_echo_reply(
+        &mut self,
+        now_ms: u32,
+        dst: &BmIpAddr,
+        reply: &EchoReply<'_>,
+    ) -> Option<Outbound<'_>> {
+        // `bcmp_send_ping_reply` hands `bcmp_tx` the request's *body*
+        // `seq_num` to echo into the header -- and `serialize` throws it away,
+        // because ping is registered neither `sequenced_reply` nor
+        // `sequenced_request`, so the header gets a zero. Passing it anyway
+        // keeps the call the same shape as the C's; divergence #31 is what
+        // becomes of it.
+        let seq_num = self
+            .registry
+            .on_serialize(now_ms, MessageType::ECHO_REPLY, u32::from(reply.seq_num))
+            .ok()?
+            .seq_num;
+        let all_ports = self.all_ports_mask();
+        let Self { identity, tx, .. } = self;
+        let end = build_frame(
+            tx,
+            identity.node_id(),
+            dst,
+            MessageType::ECHO_REPLY,
             seq_num,
             |body| reply.encode(body),
         )?;
@@ -1302,8 +1585,8 @@ pub async fn deliver<P: Phy>(
 // The async loop
 // ---------------------------------------------------------------------------
 
-impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize>
-    Node<I, R, NEIGHBORS, PENDING>
+impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLOAD: usize>
+    Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD>
 {
     /// Run the node until the PHY fails, discarding every [`Event`].
     ///

@@ -51,6 +51,7 @@ jobs:
           - l2_egress
           - l2_policy
           - neighbor
+          - ping
           - registry
           - strnlen
           - time

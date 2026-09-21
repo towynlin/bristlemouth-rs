@@ -78,6 +78,9 @@ pub fn replay_target(target: &str) -> usize {
             "neighbor" => replay_one::<crate::neighbor::NeighborInput, _>(&bytes, |i| {
                 crate::neighbor::check(i);
             }),
+            "ping" => replay_one::<crate::ping::PingInput, _>(&bytes, |i| {
+                crate::ping::check(i);
+            }),
             "l2_egress" => replay_one::<crate::l2_egress::L2EgressInput, _>(&bytes, |i| {
                 crate::l2_egress::check(i);
             }),
@@ -142,6 +145,7 @@ pub const STACK_TARGETS: &[&str] = &[
     "forward",
     "l2_egress",
     "neighbor",
+    "ping",
     "registry",
     "time",
 ];

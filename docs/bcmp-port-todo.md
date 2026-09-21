@@ -3,15 +3,15 @@
 What of BCMP is still unported, in dependency order, as task cards sized for one
 agent each.
 
-`bm-wire` currently carries four of BCMP's exchanges — heartbeat (`0x01`),
-device info (`0x04`/`0x05`, responder only), neighbour table (`0x08`/`0x09`,
-responder only) and system time (`0x10`–`0x12`, both halves) — plus the wire
-engine under them (`bcmp::tx::serialize`, `bcmp::rx::accept`, L2 egress
-stamping, the link-local RX policy, the two forwarding paths in
-`bcmp::forward`) and two state machines, `bm-wire/src/neighbor.rs` and
-`bm-wire/src/bcmp/registry.rs`. `MessageType` in `bm-wire/src/bcmp/header.rs`
-already names all 45 of bm_core's constants, but only nine body structs have a
-codec.
+`bm-wire` currently carries five of BCMP's exchanges — heartbeat (`0x01`),
+echo (`0x02`/`0x03`, both halves), device info (`0x04`/`0x05`, responder only),
+neighbour table (`0x08`/`0x09`, responder only) and system time (`0x10`–`0x12`,
+both halves) — plus the wire engine under them (`bcmp::tx::serialize`,
+`bcmp::rx::accept`, L2 egress stamping, the link-local RX policy, the two
+forwarding paths in `bcmp::forward`) and two state machines,
+`bm-wire/src/neighbor.rs` and `bm-wire/src/bcmp/registry.rs`. `MessageType` in
+`bm-wire/src/bcmp/header.rs` already names all 45 of bm_core's constants, but
+only eleven body structs have a codec.
 
 `bm_stack::Node` drives that registry: `Node::register` is `packet_add`,
 `Node::request` is `bcmp_tx`, and `bm_stack::Event` is where a reply, a timeout
@@ -26,7 +26,7 @@ they record.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| Echo / ping `0x02`,`0x03` | `bcmp/ping.c` | 176 | M1 |
+| ~~Echo / ping `0x02`,`0x03`~~ | ~~`bcmp/ping.c`~~ | 176 | **M1 — landed** |
 | ~~System time `0x10`–`0x12`~~ | ~~`bcmp/time.c`~~ | 195 | **M2 — landed** |
 | Device-info reply consumption `0x05` | `bcmp/info.c` | 264 | M3 |
 | Neighbour-table reply consumption `0x09` | `bcmp/neighbors.c` | 489 | M4 |
@@ -39,10 +39,11 @@ they record.
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-Dependency order: M1, M3, M4, M5, C1 and D1 are all unblocked and may run in
+Dependency order: M3, M4, M5, C1 and D1 are all unblocked and may run in
 parallel. C2 needs C1. C3 needs C1 and C2. D2 needs D1; D3 and D4 each need D2.
-M2 has landed; its card is kept below, struck through, because what it says
-about the forwarding decision is what C3 and D2 will need.
+M1 and M2 have landed; their cards are kept below, struck through, because what
+they say about the forwarding decision and about the comparator's limits is
+what C3 and D2 will need.
 
 ---
 
@@ -202,7 +203,53 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 
 # Messages bm_core implements
 
-## M1 — echo / ping, `0x02` and `0x03`
+## ~~M1 — echo / ping, `0x02` and `0x03`~~ — **landed**
+
+**What landed.** `bm-wire/src/bcmp/ping.rs` (the two codecs, plus
+`EchoRequest::into_reply` for the C's in-place cast and `EchoReply::answers`
+for its acceptance rule), `Node::ping` and the single-slot state on
+`bm_stack::Node` behind a new `PING_PAYLOAD` const generic,
+`Node::Event::EchoReply`, the comparator in `bm-wire-diff/src/ping.rs` driven
+from `bm-wire-diff/tests/ping.rs`, twelve seeds, and divergences #29 to #32.
+
+It also reached divergence #12's live case, independently of M2 and for the
+same underlying reason: an echo reply carries whatever payload the requester
+chose, which is enough entropy to land on the 0.0122% of stamped BCMP checksums
+the C's egress patch gets wrong, and `cargo fuzz run ping` found one in two
+minutes. It arrived as the *comparator* failing rather than the port —
+classifying captured frames with `rx::accept` was the wrong tool, because some
+of the C's frames correctly do not validate. A later card that reads frames
+bm_core stamped should read the type out of the BCMP header instead.
+`seeds/ping/reply-checksum-double-carry` keeps the input, and #12's addendum
+now records both cards' encounters with it.
+
+Three corrections to the card as it was written, all found by doing it:
+
+- **It is a stack target, not a `bcmp.rs` one.** The card says registering
+  `0x02`/`0x03` in `bm-wire-diff/src/bcmp.rs` keeps `ping` in
+  `replay::TARGETS`, and registering them there would indeed be safe — but it
+  would not help. The only public encoder in `bcmp/ping.c` is
+  `bcmp_send_ping_request`, which goes through `bcmp_tx` → `bm_ip_tx_new`, and
+  the `packet.c`-only oracle has no IP layer under it. Anything reachable from
+  that oracle is `serialize`, which the `bcmp` target already covers. So `ping`
+  brings the whole stack up, lives in `replay::STACK_TARGETS`, and has its own
+  test binary. It needs no `-fork=1`: nothing accumulates.
+- **The reply does *not* carry the request's `seq_num` in the header.**
+  `bcmp_send_ping_reply` passes it to `bcmp_tx`, and `serialize` discards it,
+  because `ping_init` registers the type as neither `sequenced_reply` nor
+  `sequenced_request` — so the header's number is zero. The echo survives in
+  the *body*, where the in-place buffer reuse preserved it. Divergence #31.
+- **The reply does not arrive as `Event::Reply`** either, for the reason the
+  card's own next paragraph gives: `0x03` is unsequenced, so it comes through
+  `Node::submit`'s dispatch as `Event::Message`. `Event::EchoReply` follows it
+  when `ping.c`'s rule accepts it, and is new.
+
+Step 4 of the recipe was unavailable, as the shared contract predicted:
+`bm_core` has no gold vectors for `0x02`/`0x03`, and no `ping_test.cpp` at all.
+Ground truth for the encoding is the compiled oracle. One further thing has no
+oracle either — `bcmp_process_ping_reply` is `static`, transmits nothing and
+reports to nobody, so the acceptance rule is ported by reading and asserted in
+`bm_wire::bcmp::ping`'s and `bm-stack`'s unit tests. That is divergence #32.
 
 **Blocked by:** nothing — I3 landed. `Node::request` sends the echo request and
 `Node::Event::Reply` is where the echo reply arrives; ping's own single-slot
