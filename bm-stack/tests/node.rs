@@ -1,11 +1,12 @@
 //! The node, driven with a mock PHY.
 
 use bm_stack::mock::{MockPhy, Script};
-use bm_stack::node::{HOP_LIMIT, LINK_LOCAL_PREFIX};
-use bm_stack::{Egress, Identity, Node, deliver, transmit};
+use bm_stack::node::{EXPIRY_PERIOD_MS, HOP_LIMIT, LINK_LOCAL_PREFIX};
+use bm_stack::{Egress, Event, Identity, Node, deliver, transmit};
 use bm_wire::addr;
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
 use bm_wire::bcmp::neighbors::{NeighborTableReply, NeighborTableRequest};
+use bm_wire::bcmp::registry::PacketCfg;
 use bm_wire::bcmp::{
     BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, DeviceInfo, Heartbeat, MessageType, rx, tx,
 };
@@ -54,6 +55,12 @@ fn node() -> Node<TestIdentity, 4> {
 
 /// A BCMP frame from the peer, as the wire would deliver it.
 fn peer_frame(message_type: MessageType, body: &[u8], dst: BmIpAddr) -> Vec<u8> {
+    peer_frame_seq(message_type, body, dst, 0)
+}
+
+/// The same, carrying a sequence number — what a reply to one of our requests
+/// looks like.
+fn peer_frame_seq(message_type: MessageType, body: &[u8], dst: BmIpAddr, seq_num: u32) -> Vec<u8> {
     let payload_len = BCMP_HEADER_LEN + body.len();
     let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
     frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
@@ -65,7 +72,7 @@ fn peer_frame(message_type: MessageType, body: &[u8], dst: BmIpAddr) -> Vec<u8> 
         .copy_from_slice(&addr::nodeid_to_ip(LINK_LOCAL_PREFIX, PEER_ID).0);
     frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
         .copy_from_slice(&dst.0);
-    tx::serialize(&mut frame, message_type, 0, body).unwrap();
+    tx::serialize(&mut frame, message_type, seq_num, body).unwrap();
     frame
 }
 
@@ -609,4 +616,423 @@ fn a_link_local_message_is_re_flooded_as_a_fresh_frame_per_port() {
         ports.push(port);
     }
     assert_eq!(ports, vec![2], "port 1 is where it came from");
+}
+
+// ---------------------------------------------------------------------------
+// Requests, replies and timeouts -- card I3.
+// ---------------------------------------------------------------------------
+
+/// An [`Event`], with the payload copied out so a test can keep it.
+///
+/// The real thing borrows the frame it arrived in, which is what makes the
+/// node allocation-free and what makes a collected event need a shape of its
+/// own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Seen {
+    Reply {
+        /// What we asked, which the C does not compare against what answered.
+        request_type: MessageType,
+        /// What answered.
+        message_type: MessageType,
+        source: u64,
+        payload: Vec<u8>,
+    },
+    Timeout {
+        request_type: MessageType,
+        seq_num: u32,
+    },
+    Message {
+        message_type: MessageType,
+        seq_num: u32,
+        source: u64,
+    },
+}
+
+fn seen(event: Event<'_>) -> Seen {
+    match event {
+        Event::Reply {
+            request,
+            message_type,
+            source,
+            payload,
+        } => Seen::Reply {
+            request_type: request.message_type,
+            message_type,
+            source,
+            payload: payload.to_vec(),
+        },
+        Event::Timeout { request } => Seen::Timeout {
+            request_type: request.message_type,
+            seq_num: request.seq_num,
+        },
+        Event::Message {
+            message_type,
+            seq_num,
+            source,
+            ..
+        } => Seen::Message {
+            message_type,
+            seq_num,
+            source,
+        },
+        _ => unreachable!("Event is non_exhaustive; this test knows all of it"),
+    }
+}
+
+/// `bcmp/config.c` is the only module in bm_core that issues sequenced
+/// requests, so its types are the ones a test has to borrow to exercise the
+/// machinery at all. Nothing here parses a config body: what is under test is
+/// the sequence number and the routing, not the payload.
+const REQUEST_TYPE: MessageType = MessageType::CONFIG_GET;
+const REPLY_TYPE: MessageType = MessageType::CONFIG_VALUE;
+
+/// A node that also knows the two config types, registered with the flags
+/// `bcmp_config_init` gives them.
+fn requesting_node() -> Node<TestIdentity, 4> {
+    let mut node = node();
+    node.register(REQUEST_TYPE, PacketCfg::REQUEST).unwrap();
+    node.register(REPLY_TYPE, PacketCfg::REPLY).unwrap();
+    node
+}
+
+/// The frame a node built, parsed back.
+fn sent_header(outbound: &bm_stack::Outbound<'_>) -> bm_wire::bcmp::BcmpHeader {
+    let mut frame = outbound.frame().to_vec();
+    rx::accept(&mut frame)
+        .expect("everything we send must validate")
+        .header
+}
+
+#[test]
+fn a_message_of_an_unregistered_type_is_never_sent() {
+    let mut node = node();
+    assert!(
+        node.request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[1, 2, 3])
+            .is_none(),
+        "serialize returns BmENODEV and bcmp_tx transmits nothing"
+    );
+    assert_eq!(node.registry().pending_len(), 0);
+}
+
+#[test]
+fn a_sequenced_request_takes_the_next_number_and_waits_for_its_reply() {
+    let mut node = requesting_node();
+    for expected in 0..3u32 {
+        let outbound = node
+            .request(100, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
+            .expect("a registered type is sent");
+        assert_eq!(sent_header(&outbound).seq_num, expected);
+    }
+    assert_eq!(
+        node.registry().pending_len(),
+        3,
+        "all three are outstanding"
+    );
+    let first = node.registry().pending().next().copied().expect("one");
+    assert_eq!(first.message_type, REQUEST_TYPE);
+    assert_eq!(first.timestamp_ms, 100);
+}
+
+/// Outside `bcmp/config.c` nothing in bm_core is sequenced, so everything a
+/// node says today goes out with a sequence number of zero and is never waited
+/// on. If this ever stops being true, every `node_frames` comparison moves.
+#[test]
+fn everything_else_goes_out_unsequenced_and_untracked() {
+    let mut node = node();
+    let heartbeat = node.on_tick(1000).expect("a tick emits a heartbeat");
+    assert_eq!(sent_header(&heartbeat).seq_num, 0);
+
+    let info_request = node
+        .on_frame(1000, 1, &mut heartbeat_frame(1_000_000))
+        .reply
+        .expect("a new neighbour is asked for its info");
+    assert_eq!(sent_header(&info_request).seq_num, 0);
+    assert_eq!(node.registry().pending_len(), 0);
+}
+
+/// A reply the node was waiting for is reported once, with its payload, and
+/// the request is no longer outstanding.
+#[test]
+fn a_reply_answers_the_request_it_matches() {
+    let mut node = requesting_node();
+    node.request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
+        .expect("sent");
+
+    let mut frame = peer_frame_seq(
+        REPLY_TYPE,
+        &[0xDE, 0xAD, 0xBE, 0xEF],
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+        0,
+    );
+    let mut events = Vec::new();
+    let owed = node.on_frame_with(10, 1, &mut frame, |e| events.push(seen(e)));
+
+    assert!(
+        owed.is_empty(),
+        "a reply to our own request needs no answer"
+    );
+    assert_eq!(
+        events,
+        vec![Seen::Reply {
+            request_type: REQUEST_TYPE,
+            message_type: REPLY_TYPE,
+            source: PEER_ID,
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        }]
+    );
+    assert_eq!(node.registry().pending_len(), 0, "the request is answered");
+}
+
+/// Divergence #21: the C matches a reply on its sequence number alone. It
+/// records the request's type and never compares it, so a reply of an
+/// unrelated type answers the request and the requester is handed a body of a
+/// shape it never asked for.
+#[test]
+fn a_reply_of_the_wrong_type_answers_the_request_anyway() {
+    let mut node = requesting_node();
+    node.register(MessageType::NEIGHBOR_PROTO_REPLY, PacketCfg::REPLY)
+        .unwrap();
+    node.request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
+        .expect("sent");
+
+    let mut frame = peer_frame_seq(
+        MessageType::NEIGHBOR_PROTO_REPLY,
+        &[0x11, 0x22],
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+        0,
+    );
+    let mut events = Vec::new();
+    node.on_frame_with(10, 1, &mut frame, |e| events.push(seen(e)));
+
+    assert_eq!(
+        events,
+        vec![Seen::Reply {
+            request_type: REQUEST_TYPE,
+            message_type: MessageType::NEIGHBOR_PROTO_REPLY,
+            source: PEER_ID,
+            payload: vec![0x11, 0x22],
+        }],
+        "a config get is answered by a neighbour-proto reply, because the \
+         numbers line up"
+    );
+}
+
+/// A reply that answers nothing is not dropped: it goes to its type's own
+/// processor, which is where an unsolicited message has always gone.
+#[test]
+fn a_reply_with_no_outstanding_request_is_delivered_as_a_message() {
+    let mut node = requesting_node();
+    let mut frame = peer_frame_seq(REPLY_TYPE, &[0x01], BmIpAddr::LINK_LOCAL_MULTICAST, 7);
+    let mut events = Vec::new();
+    node.on_frame_with(10, 1, &mut frame, |e| events.push(seen(e)));
+
+    assert_eq!(
+        events,
+        vec![Seen::Message {
+            message_type: REPLY_TYPE,
+            seq_num: 7,
+            source: PEER_ID,
+        }]
+    );
+}
+
+/// An unregistered type is dropped before its body is looked at, with no event
+/// at all -- the C's `BmENODEV`, returned before `cfg->process` is reached.
+/// Unregistering a type the node answers is therefore enough to stop it
+/// answering.
+#[test]
+fn an_unregistered_type_is_dropped_without_an_event() {
+    let mut node = node();
+    let mut frame = peer_frame(MessageType(0xFFFF), &[0x01], BmIpAddr::LINK_LOCAL_MULTICAST);
+    let mut events = Vec::new();
+    let owed = node.on_frame_with(10, 1, &mut frame, |e| events.push(seen(e)));
+    assert!(owed.is_empty());
+    assert!(events.is_empty());
+
+    assert!(node.unregister(MessageType::DEVICE_INFO_REQUEST));
+    let mut frame = peer_frame(
+        MessageType::DEVICE_INFO_REQUEST,
+        &NODE_ID.to_le_bytes(),
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    );
+    let owed = node.on_frame_with(10, 1, &mut frame, |e| events.push(seen(e)));
+    assert!(owed.is_empty(), "nothing is registered to answer it now");
+    assert!(events.is_empty());
+}
+
+/// `process_received_message` runs the request's callback *instead of* the
+/// type's processor, never both. There is one processor to observe that with
+/// -- the one that answers a device-info request -- so this registers that
+/// type as a reply and lets it match an outstanding request: the request is
+/// answered, and the device-info processor never runs.
+#[test]
+fn a_matched_reply_replaces_the_processing_its_type_would_have_had() {
+    let mut node = requesting_node();
+    assert!(node.unregister(MessageType::DEVICE_INFO_REQUEST));
+    node.register(MessageType::DEVICE_INFO_REQUEST, PacketCfg::REPLY)
+        .unwrap();
+    node.request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
+        .expect("sent");
+
+    let mut frame = peer_frame_seq(
+        MessageType::DEVICE_INFO_REQUEST,
+        &NODE_ID.to_le_bytes(),
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+        0,
+    );
+    let mut events = Vec::new();
+    let owed = node.on_frame_with(10, 1, &mut frame, |e| events.push(seen(e)));
+
+    assert!(
+        owed.is_empty(),
+        "the request's callback ran, so the device-info processor did not"
+    );
+    assert_eq!(
+        events,
+        vec![Seen::Reply {
+            request_type: REQUEST_TYPE,
+            message_type: MessageType::DEVICE_INFO_REQUEST,
+            source: PEER_ID,
+            payload: NODE_ID.to_le_bytes().to_vec(),
+        }]
+    );
+}
+
+/// Divergence #22: the request is stamped with a 24 ms timeout and nothing
+/// applies it except a 150 ms sweep, so this one — sent on the sweep's phase —
+/// lives for 150 ms, not 24.
+#[test]
+fn an_unanswered_request_dies_on_the_sweep_rather_than_on_its_timeout() {
+    let mut node = requesting_node();
+    node.request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
+        .expect("sent");
+
+    let mut events = Vec::new();
+    for now in 0..EXPIRY_PERIOD_MS {
+        node.on_expiry(now, |e| events.push(seen(e)));
+    }
+    assert!(
+        events.is_empty(),
+        "still outstanding at {} ms, well past its 24 ms timeout",
+        EXPIRY_PERIOD_MS - 1
+    );
+    assert_eq!(node.registry().pending_len(), 1);
+
+    node.on_expiry(EXPIRY_PERIOD_MS, |e| events.push(seen(e)));
+    assert_eq!(
+        events,
+        vec![Seen::Timeout {
+            request_type: REQUEST_TYPE,
+            seq_num: 0,
+        }]
+    );
+    assert_eq!(node.registry().pending_len(), 0);
+}
+
+/// The other half of divergence #22: a reply that arrives after the sweep has
+/// given up is reported to the application a second time, now as unsolicited
+/// traffic. One exchange, two notifications, and the first of them says it
+/// failed.
+#[test]
+fn a_reply_that_arrives_after_the_timeout_is_reported_twice() {
+    let mut node = requesting_node();
+    node.request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
+        .expect("sent");
+
+    let mut events = Vec::new();
+    node.on_expiry(EXPIRY_PERIOD_MS, |e| events.push(seen(e)));
+
+    let mut frame = peer_frame_seq(REPLY_TYPE, &[0x42], BmIpAddr::LINK_LOCAL_MULTICAST, 0);
+    node.on_frame_with(EXPIRY_PERIOD_MS + 1, 1, &mut frame, |e| {
+        events.push(seen(e))
+    });
+
+    assert_eq!(
+        events,
+        vec![
+            Seen::Timeout {
+                request_type: REQUEST_TYPE,
+                seq_num: 0,
+            },
+            Seen::Message {
+                message_type: REPLY_TYPE,
+                seq_num: 0,
+                source: PEER_ID,
+            },
+        ]
+    );
+}
+
+/// `bcmp_tx` checks the size before `serialize` runs, so a message too large to
+/// send never becomes an outstanding request -- and does not consume a
+/// sequence number either.
+///
+/// The ceiling is the transmit buffer: 1514 less the 54 bytes of Ethernet and
+/// IPv6 headers and the 13-byte BCMP header. The C's guard admits one byte
+/// more and then builds a frame a byte over the MTU, which is divergence #8.
+#[test]
+fn an_oversized_request_is_refused_before_it_is_recorded() {
+    let largest = bm_stack::MTU - MIN_FRAME_WITH_ADDRESSES - BCMP_HEADER_LEN;
+    assert_eq!(largest, 1447);
+
+    let mut node = requesting_node();
+    assert!(
+        node.request(
+            0,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            REQUEST_TYPE,
+            &vec![0u8; largest + 1]
+        )
+        .is_none()
+    );
+    assert_eq!(node.registry().pending_len(), 0);
+    assert_eq!(
+        node.request(
+            0,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            REQUEST_TYPE,
+            &vec![0u8; largest]
+        )
+        .map(|o| (o.frame().len(), sent_header(&o).seq_num)),
+        Some((bm_stack::MTU, 0)),
+        "the largest that fits goes out, and takes the first sequence number"
+    );
+}
+
+/// The whole loop, on the mock clock: a request goes out, nothing answers it,
+/// and the expiry ticker reports it. `packet.c`'s sweep is a timer of its own,
+/// so this must not have to wait for the ten-second heartbeat.
+#[test]
+fn the_run_loop_times_out_an_unanswered_request() {
+    let mut node = requesting_node();
+    let mut phy = MockPhy::new(
+        PORTS,
+        // Comfortably past one sweep, in steps too small to reach a heartbeat.
+        vec![
+            Script::Idle { ms: 60 },
+            Script::Idle { ms: 60 },
+            Script::Idle { ms: 60 },
+            Script::Idle { ms: 60 },
+            Script::Idle { ms: 60 },
+        ],
+    );
+
+    let outbound = node
+        .request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
+        .expect("sent");
+    block_on(transmit(&mut phy, outbound, PORTS)).unwrap();
+    assert_eq!(phy.sent.len(), usize::from(PORTS), "once per port");
+
+    let mut events = Vec::new();
+    let error = block_on(node.run_with(&mut phy, |e| events.push(seen(e))));
+    assert_eq!(error, bm_stack::mock::MockError::ScriptFinished);
+
+    assert!(
+        events.contains(&Seen::Timeout {
+            request_type: REQUEST_TYPE,
+            seq_num: 0,
+        }),
+        "the expiry ticker gave up on the request: {events:?}"
+    );
+    assert_eq!(node.registry().pending_len(), 0);
 }

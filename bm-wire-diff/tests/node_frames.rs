@@ -13,9 +13,12 @@
 
 use bm_stack::node::LINK_LOCAL_PREFIX;
 use bm_stack::{Identity, Node};
+use bm_wire::bcmp::info::DeviceInfoRequest;
+use bm_wire::bcmp::registry::PacketCfg;
 use bm_wire::bcmp::{DeviceInfo, MessageType, rx};
 use bm_wire::frame::IPV6_INGRESS_EGRESS_PORTS_OFFSET;
 use bm_wire::l2;
+use bm_wire::util::BmIpAddr;
 use bm_wire_diff::bcmp_messages::{BcmpMessagesInput, Request, Target, build_request};
 use bm_wire_diff::stack::{self, NUM_PORTS, drain, inject, oracle, pump_until_quiet};
 
@@ -240,4 +243,132 @@ fn our_addresses_match_the_oracles() {
     }
     assert_eq!(node.link_local().0, c_ip.addr);
     assert_eq!(bm_wire::addr::mac_from_nodeid(stack::NODE_ID), c_mac);
+}
+
+// ---------------------------------------------------------------------------
+// The requests a node issues -- card I3.
+// ---------------------------------------------------------------------------
+
+/// Some other node, the one a request is aimed at.
+const PEER_ID: u64 = 0x0000_0000_55AA_0011;
+
+/// `bcmp_request_info` is what a C node sends on discovering a neighbour, and
+/// `Node::request` is the path ours sends it on.
+#[test]
+fn our_device_info_request_is_byte_identical_to_the_c() {
+    let _guard = oracle();
+    drain();
+
+    let now_ms = unsafe { bm_wire_sys::bm_shim_tick_count() };
+    unsafe {
+        assert_eq!(
+            bm_wire_sys::bcmp_request_info(
+                PEER_ID,
+                (&raw const bm_wire_sys::multicast_ll_addr).cast(),
+                None,
+            ),
+            bm_wire_sys::BmErr_BmOK
+        );
+    }
+    pump_until_quiet();
+    let captured = drain();
+    assert!(!captured.is_empty(), "the oracle sent nothing");
+
+    let mut body = [0u8; DeviceInfoRequest::LEN];
+    DeviceInfoRequest {
+        target_node_id: PEER_ID,
+    }
+    .encode(&mut body)
+    .unwrap();
+
+    let mut node = node();
+    let ours = node
+        .request(
+            now_ms,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            MessageType::DEVICE_INFO_REQUEST,
+            &body,
+        )
+        .expect("a registered type is sent")
+        .frame()
+        .to_vec();
+
+    compare_stamped("device info request", &captured, ours);
+}
+
+/// The sequenced path, which nothing ported issues yet: `bcmp/config.c` is the
+/// only module in bm_core that registers a `sequenced_request`, so its
+/// `BcmpConfigGetMessage` is what proves a request carries the number the C
+/// would have given it — in the header, and in the checksum over it.
+///
+/// Both counters start at zero here because this is the **only** test in this
+/// binary that issues a sequenced request: `message_count` is a function-level
+/// `static` inside `serialize` with nothing that resets it, so a second such
+/// test would have to say where the C had got to. Card C3, which ports config,
+/// is where that will matter.
+#[test]
+fn our_sequenced_request_carries_the_number_the_c_would_have_given_it() {
+    let _guard = oracle();
+    drain();
+
+    let mut node = node();
+    node.register(MessageType::CONFIG_GET, PacketCfg::REQUEST)
+        .expect("room for one more type");
+
+    // A `BmConfigGet`: the 16-byte config header, a partition, a key length
+    // and the key. Its contents do not matter to either side -- `serialize`
+    // copies the body verbatim on a little-endian host -- but a plausible one
+    // keeps the length honest.
+    let mut body = Vec::new();
+    body.extend_from_slice(&stack::NODE_ID.to_le_bytes());
+    body.extend_from_slice(&PEER_ID.to_le_bytes());
+    body.push(0);
+    body.push(3);
+    body.extend_from_slice(b"key");
+
+    for expected_seq in 0..3u32 {
+        let now_ms = unsafe { bm_wire_sys::bm_shim_tick_count() };
+        unsafe {
+            assert_eq!(
+                bm_wire_sys::bcmp_tx(
+                    &raw const bm_wire_sys::multicast_ll_addr,
+                    bm_wire_sys::BcmpMessageType_BcmpConfigGetMessage,
+                    body.as_mut_ptr(),
+                    body.len() as u16,
+                    0,
+                    None,
+                ),
+                bm_wire_sys::BmErr_BmOK
+            );
+        }
+        pump_until_quiet();
+        let captured = drain();
+        assert!(!captured.is_empty(), "the oracle sent nothing");
+
+        let ours = node
+            .request(
+                now_ms,
+                &BmIpAddr::LINK_LOCAL_MULTICAST,
+                MessageType::CONFIG_GET,
+                &body,
+            )
+            .expect("a registered type is sent");
+        let frame = ours.frame().to_vec();
+        let mut parsed = frame.clone();
+        assert_eq!(
+            rx::accept(&mut parsed)
+                .expect("our own request validates")
+                .header
+                .seq_num,
+            expected_seq,
+            "the nth sequenced request carries n, as packet_test.cpp asserts"
+        );
+        compare_stamped("config get", &captured, frame);
+    }
+
+    assert_eq!(
+        node.registry().pending_len(),
+        3,
+        "and all three are waiting for a reply, as the C's sequence list is"
+    );
 }

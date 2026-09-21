@@ -262,6 +262,13 @@ is too small, so the off-by-one has nowhere to land. The fix upstream is a
 one-word change to `sizeof(BcmpHeader)`, and it is not wire-visible: no
 conforming sender emits a message in the one-byte window.
 
+`bm_stack::Node::send` is where a ceiling does exist, because a node has one
+transmit buffer: `MTU` is 1514, so a body of 1447 is the largest that fits and
+1448 — the one the C's guard lets through — is refused rather than sent as a
+1515-byte frame. Nothing reaches that size today; the largest body any ported
+exchange builds is a neighbour-table reply, and only `bcmp/config.c` has a
+message that could grow near it.
+
 ## 9. `process_received_message` rewrites the source address before verifying the checksum
 
 `bcmp/packet.c`, with the two macros it uses from the top of the same file:
@@ -844,6 +851,14 @@ benefit, as the C carries it, without taking part in the match. The fix
 upstream is to compare `element->type` against the type the reply is a reply
 to, which needs the registry to say which request type each reply type answers.
 
+`bm_stack::Node` inherits it, because the registry is what routes a reply there
+too: `a_reply_of_the_wrong_type_answers_the_request_anyway` in
+`bm-stack/tests/node.rs` answers a config get with a neighbour-proto reply and
+the node reports it as the answer. `Event::Reply` therefore carries both the
+request and the reply's own type, and says at the type that they need not
+agree — an application that cares has to compare them itself, which is the
+check the C leaves to nobody.
+
 ## 22. A sequenced request's timeout is the sweep period, not the timeout
 
 `bcmp/packet.c` opens with two constants:
@@ -896,6 +911,17 @@ check — sweeping on every tick, which is what a reasonable reading of the
 constants would suggest — makes six of the comparator's tests fail. The fix
 upstream is to make the sweep period the timeout, or to drive the expiry from
 the entry's own deadline rather than from a fixed tick.
+
+`bm_stack::Node` carries the grid rather than a grid of its own: `Node::on_expiry`
+is `sequence_list_timer_callback` and `Node::run` drives it from a ticker of
+`EXPIRY_PERIOD_MS`, separate from the ten-second heartbeat ticker, exactly as
+bm_core has two timers.
+`an_unanswered_request_dies_on_the_sweep_rather_than_on_its_timeout` in
+`bm-stack/tests/node.rs` walks a request to 149 ms and finds it alive, and
+`a_reply_that_arrives_after_the_timeout_is_reported_twice` shows the other
+half at the node level: one exchange reaches the application twice, first as a
+failed request and then as unsolicited traffic, because after the sweep there
+is nothing left for the reply to match.
 
 ## 23. `bcmp_ll_forward` replaces the originator's source address with the forwarder's
 
