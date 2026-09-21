@@ -21,8 +21,10 @@
 //!
 //! [`Node::forward_link_local`] is the other half — `bcmp_ll_forward`, which
 //! re-floods a link-local *message* as a fresh frame per port rather than
-//! relaying the received bytes. Nothing calls it yet; the system-time, config
-//! and DFU exchanges that do are still unported.
+//! relaying the received bytes. The system-time exchange is the first ported
+//! caller: a `0x10`, `0x11` or `0x12` naming another node comes back as
+//! [`Owed::forward`], which [`Node::reflood`] turns into one frame per other
+//! port. Config and DFU will join it.
 //!
 //! # Requests and replies
 //!
@@ -39,8 +41,9 @@
 //! `BmENODEV`: `serialize` writes nothing into the caller's buffer, so
 //! `bcmp_tx` transmits nothing, and `process_received_message` returns before
 //! it looks at the body. [`Node::new`] registers what bm_core's `bcmp_init`
-//! registers for the modules that are ported — heartbeat, ping, device info
-//! and the neighbour table — and [`Node::register`] is how a card adds its own.
+//! registers for the modules that are ported — heartbeat, ping, system time,
+//! device info and the neighbour table — and [`Node::register`] is how a card
+//! adds its own.
 //!
 //! # Ping is correlated outside the registry
 //!
@@ -70,6 +73,7 @@ use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::{
     Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, PacketCfg, PendingRequest, Registry, RegistryError,
 };
+use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, Heartbeat, MessageType, forward, rx, tx};
 use bm_wire::frame::{
     ETHERNET_DESTINATION_OFFSET, ETHERNET_SRC_OFFSET, ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET,
@@ -84,7 +88,7 @@ use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::util::BmIpAddr;
 use bm_wire::{BmWireError, addr::MAC_LEN};
 
-use crate::port::{Egress, Identity, Phy};
+use crate::port::{Egress, Identity, NoRtc, Phy, Rtc, RtcTimeAndDate};
 
 /// Largest frame the node will build or accept.
 ///
@@ -186,7 +190,7 @@ pub enum Event<'a> {
     /// bm_core has nowhere to send this — `bcmp_send_ping_request` takes no
     /// callback, and echo replies are registered unsequenced, so `packet.c`
     /// has no callback to reach either. The round-trip result exists only as a
-    /// `bm_debug` line. See divergence #30.
+    /// `bm_debug` line. See divergence #32.
     EchoReply {
         /// Node id the reply came from, from the frame's source address.
         ///
@@ -244,6 +248,11 @@ impl Outbound<'_> {
 ///
 /// The lifetimes are separate because the two frames live in different buffers:
 /// `'f` is the caller's receive buffer, `'n` the node's transmit buffer.
+///
+/// The third half, [`Owed::forward`], is not a frame at all but an instruction:
+/// `bcmp_ll_forward` builds one *new* frame per port and there is one transmit
+/// buffer, so the caller has to build and transmit them one at a time. See
+/// [`Node::reflood`], which is that loop.
 #[derive(Debug)]
 pub struct Owed<'f, 'n> {
     /// The received frame, already prepared as a forwarded copy, and the ports
@@ -251,13 +260,56 @@ pub struct Owed<'f, 'n> {
     pub relay: Option<Outbound<'f>>,
     /// A frame the node built in answer, or `None` if it owes nothing.
     pub reply: Option<Outbound<'n>>,
+    /// A message to re-flood out every other port, or `None`.
+    ///
+    /// Plain data rather than a frame, so it survives the [`Owed`] being
+    /// consumed: read it out before handing the rest to [`deliver`].
+    pub forward: Option<Reflood>,
 }
 
 impl Owed<'_, '_> {
     /// Whether there is nothing to transmit.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.relay.is_none() && self.reply.is_none()
+        self.relay.is_none() && self.reply.is_none() && self.forward.is_none()
+    }
+}
+
+/// A received message `bcmp_ll_forward` is to re-flood, as a range within the
+/// frame it arrived in.
+///
+/// The C hands `bcmp_ll_forward` `data.header`, `data.payload` and `data.size`,
+/// which together are the BCMP header and body exactly as they arrived, still
+/// inside the received frame. This is that same region, said as a range so that
+/// nothing is borrowed and nothing is copied — the caller already owns the
+/// frame, and the node's one transmit buffer is needed for the copies.
+///
+/// [`Self::ingress_port`] is the C's `data.ingress_port`, which is the nibble
+/// the *sender's* L2 stamped into the source address rather than the port the
+/// PHY reports. The two agree on a link where both ends stamp; a sender that
+/// stamped nothing yields 0, and the message is then re-flooded back out the
+/// port it came in on. That is the C's behaviour — see
+/// [`bm_wire::bcmp::forward::egress_ports`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reflood {
+    /// Offset of the first byte of the BCMP header within the received frame.
+    pub start: usize,
+    /// One past the last body byte, taken from the IPv6 payload length.
+    pub end: usize,
+    /// The one port the message is *not* re-flooded to.
+    pub ingress_port: u8,
+}
+
+impl Reflood {
+    /// The bytes to re-flood, out of the frame they arrived in.
+    ///
+    /// # Panics
+    ///
+    /// Never, for the frame this [`Reflood`] came from: the range was taken
+    /// from that frame's own contents.
+    #[must_use]
+    pub fn bcmp<'f>(&self, frame: &'f [u8]) -> &'f [u8] {
+        &frame[self.start..self.end]
     }
 }
 
@@ -333,7 +385,7 @@ struct PingState<const PAYLOAD: usize> {
     /// `PING_REQUEST_TIMEOUT`, which despite the name times nothing out: it is
     /// stamped after every request and read only to print a round-trip. A ping
     /// that is never answered is simply never mentioned again — see
-    /// divergence #30.
+    /// divergence #32.
     sent_at_ms: u32,
     /// `EXPECTED_PAYLOAD_LEN`, and `None` for the `EXPECTED_PAYLOAD == NULL`
     /// the C starts in and returns to on a payload-free request. The two are
@@ -393,11 +445,13 @@ impl<const PAYLOAD: usize> PingState<PAYLOAD> {
 /// rather than a port.
 pub struct Node<
     I,
+    R = NoRtc,
     const NEIGHBORS: usize = 4,
     const PENDING: usize = 4,
     const PING_PAYLOAD: usize = PING_PAYLOAD_BYTES,
 > {
     identity: I,
+    rtc: R,
     neighbors: NeighborTable<NEIGHBORS>,
     registry: Registry<MESSAGE_TYPES, PENDING>,
     ping: PingState<PING_PAYLOAD>,
@@ -410,8 +464,8 @@ pub struct Node<
     tx: [u8; MTU],
 }
 
-impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLOAD: usize>
-    Node<I, NEIGHBORS, PENDING, PING_PAYLOAD>
+impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLOAD: usize>
+    Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD>
 {
     /// A node with an empty neighbour table, at time zero.
     ///
@@ -419,9 +473,9 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
     /// registers for the modules that are ported, and with the expiry sweep
     /// phased from zero — which is where [`Node::on_tick`]'s clock starts, since
     /// it counts milliseconds of uptime.
-    pub fn new(identity: I, port_count: u8) -> Self {
+    pub fn new(identity: I, rtc: R, port_count: u8) -> Self {
         let mut registry = Registry::new();
-        // heartbeat.c, ping.c, info.c and neighbors.c, in the order
+        // heartbeat.c, ping.c, time.c, neighbors.c and info.c, in the order
         // `bcmp_init` calls their inits. Every one of them is
         // `{false, false}`: outside `bcmp/config.c`, nothing in bm_core is
         // sequenced at all, so all of this rides on the wire with a sequence
@@ -430,6 +484,9 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
             MessageType::HEARTBEAT,
             MessageType::ECHO_REQUEST,
             MessageType::ECHO_REPLY,
+            MessageType::SYSTEM_TIME_REQUEST,
+            MessageType::SYSTEM_TIME_RESPONSE,
+            MessageType::SYSTEM_TIME_SET,
             MessageType::NEIGHBOR_TABLE_REQUEST,
             MessageType::NEIGHBOR_TABLE_REPLY,
             MessageType::DEVICE_INFO_REQUEST,
@@ -440,6 +497,7 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
         }
         Self {
             identity,
+            rtc,
             neighbors: NeighborTable::new(),
             registry,
             ping: PingState::default(),
@@ -507,6 +565,26 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
     /// This node's identity.
     pub fn identity(&self) -> &I {
         &self.identity
+    }
+
+    /// This node's real-time clock, the seam a `0x10` request is answered from.
+    pub fn rtc(&self) -> &R {
+        &self.rtc
+    }
+
+    /// The same, mutably — a firmware that sets its clock from somewhere other
+    /// than a `0x12` message needs this.
+    pub fn rtc_mut(&mut self) -> &mut R {
+        &mut self.rtc
+    }
+
+    /// How many ports this node has. Ports are numbered 1..=`port_count`.
+    ///
+    /// [`bm_wire::bcmp::forward::egress_ports`] takes it, which is what a
+    /// caller driving [`Owed::forward`] by hand needs.
+    #[must_use]
+    pub fn port_count(&self) -> u8 {
+        self.port_count
     }
 
     /// The neighbours seen so far.
@@ -578,10 +656,10 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
         // receive path rewrites any of it.
         let snapshot = Snapshot::take(frame);
 
-        let reply = if policy.should_submit {
+        let (reply, forward) = if policy.should_submit {
             self.submit(now_ms, ingress_port, frame, &mut events)
         } else {
-            None
+            (None, None)
         };
 
         let relay = if policy.egress_mask != 0 {
@@ -597,21 +675,32 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
             None
         };
 
-        Owed { relay, reply }
+        Owed {
+            relay,
+            reply,
+            forward,
+        }
     }
 
     /// Validate a frame as BCMP and answer it — `bm_l2_submit` and the BCMP
     /// task, minus the queue between them.
     ///
     /// Borrows `frame` only for the call, so the caller can still relay it.
+    ///
+    /// The second half of the return is the C's `should_forward`: a message
+    /// this node is not the target of, which `bcmp_ll_forward` puts back on
+    /// every other port. It is a range rather than a frame because that
+    /// re-flood is one *new* frame per port and there is one transmit buffer.
     fn submit<'s>(
         &'s mut self,
         now_ms: u32,
         ingress_port: u8,
         frame: &mut [u8],
         events: &mut impl FnMut(Event<'_>),
-    ) -> Option<Outbound<'s>> {
-        let received = rx::accept(frame).ok()?;
+    ) -> (Option<Outbound<'s>>, Option<Reflood>) {
+        let Ok(received) = rx::accept(frame) else {
+            return (None, None);
+        };
         let message_type = received.header.message_type;
         let seq_num = received.header.seq_num;
         let source = received.src.to_node_id();
@@ -622,7 +711,7 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
         // an outstanding request goes to that request's callback *instead of*
         // the type's processor, and everything else is processed.
         match self.registry.on_received(message_type, seq_num) {
-            Delivery::Unregistered => return None,
+            Delivery::Unregistered => return (None, None),
             Delivery::SequencedReply(request) => {
                 events(Event::Reply {
                     request,
@@ -630,7 +719,7 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
                     source,
                     payload: received.payload,
                 });
-                return None;
+                return (None, None);
             }
             Delivery::Process => events(Event::Message {
                 message_type,
@@ -642,37 +731,45 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
 
         // Everything the reply needs is copied out of the frame here, so the
         // borrow `accept` took ends before a reply is built.
-        match message_type {
+        let reply = match message_type {
             MessageType::HEARTBEAT => {
-                let heartbeat = Heartbeat::decode(received.payload).ok()?;
+                let Ok(heartbeat) = Heartbeat::decode(received.payload) else {
+                    return (None, None);
+                };
                 let outcome = self
                     .neighbors
                     .on_heartbeat(now_ms, source, ingress_port, &heartbeat);
                 if !outcome.request_info {
-                    return None;
+                    return (None, None);
                 }
                 // bm_core asks on the link-local multicast address rather than
                 // the one the heartbeat arrived on.
                 self.build_device_info_request(now_ms, source)
             }
             MessageType::DEVICE_INFO_REQUEST => {
-                let request = DeviceInfoRequest::decode(received.payload).ok()?;
+                let Ok(request) = DeviceInfoRequest::decode(received.payload) else {
+                    return (None, None);
+                };
                 if !self.addressed_to_us(request.target_node_id) {
-                    return None;
+                    return (None, None);
                 }
                 self.build_device_info_reply(now_ms, &reply_to, seq_num)
             }
             MessageType::NEIGHBOR_TABLE_REQUEST => {
-                let request = NeighborTableRequest::decode(received.payload).ok()?;
+                let Ok(request) = NeighborTableRequest::decode(received.payload) else {
+                    return (None, None);
+                };
                 if !self.addressed_to_us(request.target_node_id) {
-                    return None;
+                    return (None, None);
                 }
                 self.build_neighbor_table_reply(now_ms, &reply_to, seq_num)
             }
             MessageType::ECHO_REQUEST => {
-                let request = EchoRequest::decode(received.payload).ok()?;
+                let Ok(request) = EchoRequest::decode(received.payload) else {
+                    return (None, None);
+                };
                 if !self.addressed_to_us(request.target_node_id) {
-                    return None;
+                    return (None, None);
                 }
                 // `bcmp_process_ping_request` overwrites `target_node_id` in
                 // the received buffer and casts it to a reply. Nothing else
@@ -684,7 +781,9 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
                 self.build_echo_reply(now_ms, &reply_to, &reply)
             }
             MessageType::ECHO_REPLY => {
-                let reply = EchoReply::decode(received.payload).ok()?;
+                let Ok(reply) = EchoReply::decode(received.payload) else {
+                    return (None, None);
+                };
                 // `bcmp_process_ping_reply`, which transmits nothing: it
                 // either recognises the reply as the answer to the one ping it
                 // is tracking, or ignores it.
@@ -697,6 +796,93 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
                     });
                 }
                 None
+            }
+            MessageType::SYSTEM_TIME_REQUEST
+            | MessageType::SYSTEM_TIME_RESPONSE
+            | MessageType::SYSTEM_TIME_SET => {
+                // `bcmp_time_process_time_message` reads the 16-byte header out
+                // of the body before it looks at the type, and reads it without
+                // consulting `data.size` -- divergence #14's shape, so a body
+                // too short to hold one is refused here rather than guessed at.
+                let Ok(header) = SystemTimeHeader::decode(received.payload) else {
+                    return (None, None);
+                };
+                if !header.is_local(self.identity.node_id()) {
+                    // The C's `should_forward`, which skips the switch
+                    // entirely. `data.size` is the body length, so the region
+                    // handed to `bcmp_ll_forward` is the header and body as
+                    // they arrived.
+                    return (
+                        None,
+                        Some(Reflood {
+                            start: BCMP_HEADER_OFFSET,
+                            end: BCMP_HEADER_OFFSET + BCMP_HEADER_LEN + received.payload.len(),
+                            ingress_port: received.ingress_port,
+                        }),
+                    );
+                }
+                let time_reply = self.process_system_time(now_ms, message_type, received.payload);
+                return (time_reply, None);
+            }
+            _ => None,
+        };
+        (reply, None)
+    }
+
+    /// The `switch` in `bcmp_time_process_time_message`, for a message this
+    /// node is not forwarding.
+    ///
+    /// Three arms, and they do not agree with each other about what
+    /// `target_node_id == 0` means: see [`bm_wire::bcmp::time`] and divergence
+    /// #27. All three answers go to `FF02::1` rather than back to the address
+    /// the message arrived from, because `bcmp_time_send_response` always
+    /// passes `multicast_ll_addr`.
+    fn process_system_time<'s>(
+        &'s mut self,
+        now_ms: u32,
+        message_type: MessageType,
+        payload: &[u8],
+    ) -> Option<Outbound<'s>> {
+        let our_node_id = self.identity.node_id();
+        match message_type {
+            MessageType::SYSTEM_TIME_REQUEST => {
+                let request = SystemTimeRequest::decode(payload).ok()?;
+                if !request.is_for(our_node_id) {
+                    // A broadcast request reached the switch and dies here.
+                    return None;
+                }
+                // `bm_rtc_get` failing means no answer at all, not an empty one.
+                let utc_time_us = self.rtc.get()?.to_utc_micros();
+                self.build_system_time_response(now_ms, request.header.source_node_id, utc_time_us)
+            }
+            MessageType::SYSTEM_TIME_RESPONSE => {
+                // `bm_debug` and nothing else. The application already has it
+                // as `Event::Message`, which is more than a C node offers.
+                None
+            }
+            MessageType::SYSTEM_TIME_SET => {
+                // The C reads `utc_time_us` past the header without checking
+                // the size, as above.
+                let set = SystemTimeSet::decode(payload).ok()?;
+                // The C's `0x12` arm makes no test of its own -- this is the
+                // outer one restated, so the function is right when read
+                // alone. That absence is the divergence: zero got past the
+                // outer test by being a broadcast, and nothing here takes it
+                // back, so a broadcast set is honoured where a broadcast
+                // request is not.
+                if !set.is_for(our_node_id) {
+                    return None;
+                }
+                if !self
+                    .rtc
+                    .set(&RtcTimeAndDate::from_utc_micros(set.utc_time_us))
+                {
+                    return None;
+                }
+                // The response echoes the microseconds that were *asked for*,
+                // not what the RTC kept -- which differ, because the RTC has
+                // only millisecond resolution.
+                self.build_system_time_response(now_ms, set.header.source_node_id, set.utc_time_us)
             }
             _ => None,
         }
@@ -962,6 +1148,63 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
         self.ping.expected_payload()
     }
 
+    /// Ask `target_node_id` what time it is — `bcmp_time_get_time`.
+    ///
+    /// Goes to `FF02::1`, so every node on the link sees it and exactly one
+    /// answers. Passing zero asks **nobody**: the broadcast reaches every
+    /// node's switch and every node then drops it on the exact-match test.
+    /// That is divergence #27, reproduced here rather than corrected — a C
+    /// node on the other end would ignore it too.
+    pub fn request_system_time(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+    ) -> Option<Outbound<'_>> {
+        let mut body = [0u8; SystemTimeRequest::LEN];
+        SystemTimeRequest {
+            header: SystemTimeHeader {
+                target_node_id,
+                source_node_id: self.identity.node_id(),
+            },
+        }
+        .encode(&mut body)
+        .ok()?;
+        self.request(
+            now_ms,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            MessageType::SYSTEM_TIME_REQUEST,
+            &body,
+        )
+    }
+
+    /// Tell `target_node_id` what time it is — `bcmp_time_set_time`.
+    ///
+    /// Zero here *is* a broadcast, unlike [`Node::request_system_time`]: every
+    /// node on the link adopts `utc_time_us` and every one of them answers.
+    pub fn set_system_time(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        utc_time_us: u64,
+    ) -> Option<Outbound<'_>> {
+        let mut body = [0u8; SystemTimeSet::LEN];
+        SystemTimeSet {
+            header: SystemTimeHeader {
+                target_node_id,
+                source_node_id: self.identity.node_id(),
+            },
+            utc_time_us,
+        }
+        .encode(&mut body)
+        .ok()?;
+        self.request(
+            now_ms,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            MessageType::SYSTEM_TIME_SET,
+            &body,
+        )
+    }
+
     fn addressed_to_us(&self, target_node_id: u64) -> bool {
         target_node_id == 0 || target_node_id == self.identity.node_id()
     }
@@ -1059,7 +1302,7 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
         // `seq_num` to echo into the header -- and `serialize` throws it away,
         // because ping is registered neither `sequenced_reply` nor
         // `sequenced_request`, so the header gets a zero. Passing it anyway
-        // keeps the call the same shape as the C's; divergence #29 is what
+        // keeps the call the same shape as the C's; divergence #31 is what
         // becomes of it.
         let seq_num = self
             .registry
@@ -1075,6 +1318,46 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
             MessageType::ECHO_REPLY,
             seq_num,
             |body| reply.encode(body),
+        )?;
+        Some(Outbound {
+            frame: &mut tx[..end],
+            mask: all_ports,
+        })
+    }
+
+    /// `bcmp_time_send_response`: a `0x11` to `FF02::1`, naming `target_node_id`
+    /// in the body and this node as its source.
+    fn build_system_time_response(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        utc_time_us: u64,
+    ) -> Option<Outbound<'_>> {
+        let seq_num = self
+            .registry
+            .on_serialize(now_ms, MessageType::SYSTEM_TIME_RESPONSE, 0)
+            .ok()?
+            .seq_num;
+        let all_ports = self.all_ports_mask();
+        let Self { identity, tx, .. } = self;
+        let node_id = identity.node_id();
+        let response = SystemTimeResponse {
+            header: SystemTimeHeader {
+                target_node_id,
+                source_node_id: node_id,
+            },
+            utc_time_us,
+        };
+        let end = build_frame(
+            tx,
+            node_id,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            MessageType::SYSTEM_TIME_RESPONSE,
+            seq_num,
+            |body| {
+                response.encode(body)?;
+                Ok(SystemTimeResponse::LEN)
+            },
         )?;
         Some(Outbound {
             frame: &mut tx[..end],
@@ -1276,6 +1559,11 @@ pub async fn transmit<P: Phy>(
 /// Transmit everything a received frame owed, in bm_core's order: the relayed
 /// copy first, then the node's own reply.
 ///
+/// [`Owed::forward`] is **not** covered, because a re-flood needs the node's
+/// transmit buffer once per port and this has already given it away. Read the
+/// field out before calling this and hand it to [`Node::reflood`] afterwards,
+/// which is what [`Node::run`] does.
+///
 /// # Errors
 ///
 /// Whatever the PHY returns. A failure abandons whatever is left.
@@ -1297,8 +1585,8 @@ pub async fn deliver<P: Phy>(
 // The async loop
 // ---------------------------------------------------------------------------
 
-impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLOAD: usize>
-    Node<I, NEIGHBORS, PENDING, PING_PAYLOAD>
+impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLOAD: usize>
+    Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD>
 {
     /// Run the node until the PHY fails, discarding every [`Event`].
     ///
@@ -1310,6 +1598,38 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
     /// The first error the PHY reports, from either direction.
     pub async fn run<P: Phy>(&mut self, phy: &mut P) -> P::Error {
         self.run_with(phy, |_| {}).await
+    }
+
+    /// Re-flood a received message out every port but the one it arrived on —
+    /// the loop `bcmp_ll_forward` runs internally.
+    ///
+    /// `frame` is the frame the [`Reflood`] came from, which the caller gets
+    /// back once the [`Owed`] it was carried in has been delivered. Each copy
+    /// is built into the node's one transmit buffer and put on the wire before
+    /// the next is built, because there is only one of it — the same
+    /// constraint the C has, allocating one forward buffer per port in turn.
+    ///
+    /// A copy that does not fit the transmit buffer is skipped rather than
+    /// abandoning the rest, which is what the C does too: its per-port loop
+    /// records the error and carries on.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the PHY returns. A failure abandons the remaining ports.
+    pub async fn reflood<P: Phy>(
+        &mut self,
+        phy: &mut P,
+        reflood: Reflood,
+        frame: &[u8],
+    ) -> Result<(), P::Error> {
+        let port_count = self.port_count;
+        for egress_port in forward::egress_ports(port_count, reflood.ingress_port) {
+            let Some(outbound) = self.forward_link_local(egress_port, reflood.bcmp(frame)) else {
+                continue;
+            };
+            transmit(phy, outbound, port_count).await?;
+        }
+        Ok(())
     }
 
     /// Run the node until the PHY fails, reporting every [`Event`].
@@ -1359,7 +1679,15 @@ impl<I: Identity, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLO
                 Either3::First(Ok((port, len))) => {
                     let now = uptime_ms(());
                     let owed = self.on_frame_with(now, port, &mut rx[..len], &mut events);
+                    // Copied out before `owed` is consumed: the re-flood needs
+                    // the frame back, and `deliver` is holding it.
+                    let forward = owed.forward;
                     if let Err(error) = deliver(phy, owed, port_count).await {
+                        return error;
+                    }
+                    if let Some(reflood) = forward
+                        && let Err(error) = self.reflood(phy, reflood, &rx[..len]).await
+                    {
                         return error;
                     }
                 }

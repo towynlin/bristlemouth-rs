@@ -111,6 +111,18 @@ test = false
 doc = false
 bench = false
 
+# Stack-backed as well, same rule. The system-time exchange is the first thing
+# ported that makes bm_core forward a message rather than answer it, so this
+# target exercises both outcomes plus `bm_rtc_set` moving the clock underneath
+# them. Nothing accumulates: time.c has no module state, and the RTC is set
+# afresh from the input before every injection -- see bm-wire-diff/src/time.rs.
+[[bin]]
+name = "time"
+path = "fuzz_targets/time.rs"
+test = false
+doc = false
+bench = false
+
 # Also stack-backed, and subject to the same rule: it must not share a process
 # with `bcmp`. It only ever hands bm_core well-formed requests -- see
 # divergence #14 for why a malformed reply must not be injected -- and drives

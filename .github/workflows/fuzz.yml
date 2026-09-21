@@ -54,6 +54,7 @@ jobs:
           - ping
           - registry
           - strnlen
+          - time
           - time_remaining
           - wildcard
         include:

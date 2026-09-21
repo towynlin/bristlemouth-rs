@@ -27,6 +27,7 @@ pub mod neighbors;
 pub mod ping;
 pub mod registry;
 pub mod rx;
+pub mod time;
 pub mod tx;
 
 pub use forward::{
@@ -49,4 +50,5 @@ pub use registry::{
     PendingRequest, Registry, RegistryError,
 };
 pub use rx::{Received, RxError, accept};
+pub use time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
 pub use tx::serialize;

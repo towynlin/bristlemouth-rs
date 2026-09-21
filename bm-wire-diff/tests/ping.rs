@@ -208,7 +208,7 @@ fn the_decoders_survive_arbitrary_bytes() {
 
 /// A saturated `payload_len` on a header-only body is the shape that would have
 /// `bcmp_process_ping_request` echo 64 KiB of whatever follows the frame —
-/// divergence #27. The port refuses it; nothing is handed to the C.
+/// divergence #29. The port refuses it; nothing is handed to the C.
 #[test]
 fn a_saturated_payload_length_is_refused_rather_than_trusted() {
     let mut body = vec![0u8; EchoRequest::HEADER_LEN];

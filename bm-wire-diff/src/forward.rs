@@ -16,9 +16,9 @@
 //! # `bcmp_ll_forward`
 //!
 //! The other path is a message-level re-flood: a fresh frame per port, from
-//! this node, carrying the received BCMP header and body unchanged. Its C
-//! callers are `bcmp/time.c`, `bcmp/config.c` and `bcmp/dfu_core.c`, none of
-//! which is ported yet — so [`check_ll_forward`] calls `bcmp_ll_forward`
+//! this node, carrying the received BCMP header and body unchanged. Of its
+//! three C callers — `bcmp/time.c`, `bcmp/config.c` and `bcmp/dfu_core.c` —
+//! only the first is ported, so [`check_ll_forward`] calls `bcmp_ll_forward`
 //! directly rather than provoking it, and compares against
 //! [`bm_stack::Node::forward_link_local`] once per port.
 //!
@@ -26,6 +26,10 @@
 //! every message type and body length rather than only for the three exchanges
 //! that happen to use it, and it does not depend on a caller that does not
 //! exist yet.
+//!
+//! Since card M2 there *is* one caller, and [`Message::SystemTimeForAnother`]
+//! is it: [`check_relay`] then compares the whole receive path, the decision to
+//! forward included, rather than the forward alone.
 //!
 //! # Input domain
 //!
@@ -35,6 +39,14 @@
 //! against a freshly constructed Rust node that never saw it. Every other
 //! message type is fair game, including types nothing registers: the relay
 //! decision is L2's and does not depend on the payload at all.
+//!
+//! **Nothing here may set the oracle's RTC.** It is process-global and has no
+//! un-set, and [`stack::node`] hands the Rust side a clock that has never been
+//! set, so the two agree only while the oracle's has not been either — which is
+//! what makes a system-time request addressed to this node produce silence on
+//! both sides. Setting a clock is [`crate::time`]'s business, and it lives in
+//! its own binary. That is also why a `0x12` is not in the input domain here:
+//! it would move the oracle's clock and leave it moved.
 //!
 //! This module brings the stack up and so must not share a process with
 //! [`crate::bcmp`] — see [`crate::stack`].
@@ -50,10 +62,16 @@ use bm_wire::frame::{
 use bm_wire::util::BmIpAddr;
 
 use crate::Domain;
-use crate::stack::{self, NUM_PORTS, capture, drain, inject, node, oracle, pump_until_quiet};
+use crate::stack::{
+    self, NUM_PORTS, capture, capture_reflood, drain, inject, node, oracle, pump_until_quiet,
+};
 
 /// Node id the injected frame appears to come from. Anything but the oracle's.
 pub const PEER_NODE_ID: u64 = 0x0000_0000_55AA_0011;
+
+/// A third node, so a system-time message can be addressed to somebody who is
+/// neither end of the link and so gets forwarded.
+pub const THIRD_NODE_ID: u64 = 0x0000_0000_0BAD_F00D;
 
 /// Largest body the comparator will build.
 ///
@@ -76,11 +94,15 @@ pub enum Message {
     DeviceInfoForAnother,
     /// A neighbour-table request for this node, which it answers.
     NeighborTableForUs,
-    /// A system-time request. `time.c` registers it and would forward it, but
-    /// the body here is arbitrary rather than a well-formed
-    /// `BcmpSystemTimeHeader`, so this is only ever injected with a body long
-    /// enough for the C to read one.
+    /// A system-time request addressed to this node, which `time.c` answers
+    /// from the RTC — and, since nothing here sets the RTC, does not answer at
+    /// all. The relay is then the only thing on the wire, exactly as for an
+    /// unregistered type, but by a different route.
     SystemTime,
+    /// A system-time request addressed to a third node, which `time.c` hands to
+    /// `bcmp_ll_forward`. The one input here that provokes a real re-flood
+    /// rather than calling for one.
+    SystemTimeForAnother,
 }
 
 impl Message {
@@ -91,24 +113,35 @@ impl Message {
             Self::Unregistered => MessageType(0xFFFE),
             Self::DeviceInfoForUs | Self::DeviceInfoForAnother => MessageType::DEVICE_INFO_REQUEST,
             Self::NeighborTableForUs => MessageType::NEIGHBOR_TABLE_REQUEST,
-            Self::SystemTime => MessageType::SYSTEM_TIME_REQUEST,
+            Self::SystemTime | Self::SystemTimeForAnother => MessageType::SYSTEM_TIME_REQUEST,
         }
+    }
+
+    /// Whether the C hands this message to `bcmp_ll_forward`.
+    fn is_forwarded(self) -> bool {
+        matches!(self, Self::SystemTimeForAnother)
     }
 
     /// The prefix the C's processor reads out of the body, if it reads one.
     ///
-    /// Both request types start with a target node id, and `time.c` reads a
-    /// `BcmpSystemTimeHeader` whose first field is one too. A body shorter than
-    /// that is an out-of-bounds read in the C, so the body always carries it.
-    fn body_prefix(self) -> Option<[u8; 8]> {
+    /// Both request types start with a target node id. `time.c` reads a whole
+    /// 16-byte `BcmpSystemTimeHeader`, and `bcmp_time_process_time_request_msg`
+    /// then reads its `source_node_id`, so a system-time body is never shorter
+    /// than that. Anything shorter is an out-of-bounds read in the C, with
+    /// nothing to compare against -- divergence #14's shape.
+    fn body_prefix(self) -> Option<Vec<u8>> {
+        let target = |id: u64| Some(id.to_le_bytes().to_vec());
+        let time_header = |target: u64| {
+            let mut prefix = target.to_le_bytes().to_vec();
+            prefix.extend_from_slice(&PEER_NODE_ID.to_le_bytes());
+            Some(prefix)
+        };
         match self {
             Self::Unregistered => None,
-            Self::DeviceInfoForUs | Self::NeighborTableForUs => Some(stack::NODE_ID.to_le_bytes()),
-            Self::DeviceInfoForAnother => Some(PEER_NODE_ID.to_le_bytes()),
-            // Addressed to us, so the C handles it rather than forwarding it --
-            // the forward path gets its own comparison, which does not need a
-            // caller.
-            Self::SystemTime => Some(stack::NODE_ID.to_le_bytes()),
+            Self::DeviceInfoForUs | Self::NeighborTableForUs => target(stack::NODE_ID),
+            Self::DeviceInfoForAnother => target(PEER_NODE_ID),
+            Self::SystemTime => time_header(stack::NODE_ID),
+            Self::SystemTimeForAnother => time_header(THIRD_NODE_ID),
         }
     }
 }
@@ -163,6 +196,36 @@ pub struct ForwardInput {
     pub body: Vec<u8>,
 }
 
+impl ForwardInput {
+    /// Whether bm_core's BCMP layer ever sees this message.
+    ///
+    /// `process_received_message` clears the legacy port bytes and *then*
+    /// verifies the checksum, which was computed with them in place — so a
+    /// frame carrying them is normally rejected before its type is looked at,
+    /// and `time.c` never runs. That is divergence #9. L2 relays the frame
+    /// anyway, because the relay is a different layer's decision, which is what
+    /// `a_frame_that_fails_its_checksum_is_still_relayed_with_its_legacy_bytes`
+    /// pins.
+    ///
+    /// **Normally, but not always.** Frame bytes 26 and 27 are one aligned
+    /// 16-bit word of the checksum's one's-complement sum. Removing a term of
+    /// `0x0000` changes nothing — and neither does removing `0xFFFF`, which is
+    /// one's-complement *negative zero*. So legacy bytes of `FF FF` survive the
+    /// clear with the checksum still valid and the message reaches `time.c`
+    /// after all. `cargo fuzz run forward` found that within seven minutes of
+    /// this predicate being written as `== [0, 0]`;
+    /// `bm-wire/fuzz/seeds/forward/system-time-for-another-legacy-ones` keeps
+    /// the input.
+    ///
+    /// The egress nibble is not in the same position: `clear_ingress_port`
+    /// touches only the high nibble, so the low one survives into the checksum
+    /// exactly as the sender computed it.
+    #[must_use]
+    pub fn reaches_bcmp(&self) -> bool {
+        matches!(u16::from_be_bytes(self.legacy_ports), 0x0000 | 0xFFFF)
+    }
+}
+
 impl<'a> Arbitrary<'a> for ForwardInput {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
         let mut input = Self::scalars(u)?;
@@ -200,12 +263,15 @@ impl Domain for ForwardInput {
 
 impl ForwardInput {
     fn scalars(u: &mut Unstructured<'_>) -> Result<Self> {
-        let message = match u.arbitrary::<u8>()? % 5 {
+        // Six now, not five. Every committed seed picks its message with a
+        // byte below 5, so `% 6` leaves all of them meaning what they did.
+        let message = match u.arbitrary::<u8>()? % 6 {
             0 => Message::Unregistered,
             1 => Message::DeviceInfoForUs,
             2 => Message::DeviceInfoForAnother,
             3 => Message::NeighborTableForUs,
-            _ => Message::SystemTime,
+            4 => Message::SystemTime,
+            _ => Message::SystemTimeForAnother,
         };
         let destination = match u.arbitrary::<u8>()? % 3 {
             0 => Destination::GlobalMulticast,
@@ -321,6 +387,8 @@ pub fn check_relay(input: &ForwardInput) {
     let mut node = node();
     let mut ours = frame.clone();
     let owed = node.on_frame(0, input.ingress_port, &mut ours);
+    // Read out before `owed` is consumed: a re-flood needs the frame back.
+    let forward = owed.forward;
     let mut rs = Vec::new();
     if let Some(relay) = owed.relay {
         rs.extend(capture(relay));
@@ -328,7 +396,15 @@ pub fn check_relay(input: &ForwardInput) {
     if let Some(reply) = owed.reply {
         rs.extend(capture(reply));
     }
+    if let Some(reflood) = forward {
+        rs.extend(capture_reflood(&mut node, reflood, &ours));
+    }
 
+    assert_eq!(
+        forward.is_some(),
+        input.message.is_forwarded() && input.reaches_bcmp(),
+        "the port disagreed with the C about whether this message is forwarded ({input:?})"
+    );
     assert_same_frames("relay", &input, &c, &rs);
 }
 

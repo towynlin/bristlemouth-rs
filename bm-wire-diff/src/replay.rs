@@ -90,6 +90,9 @@ pub fn replay_target(target: &str) -> usize {
             "registry" => replay_one::<crate::registry::RegistryInput, _>(&bytes, |i| {
                 crate::registry::check(i);
             }),
+            "time" => replay_one::<crate::time::TimeInput, _>(&bytes, |i| {
+                crate::time::check(i);
+            }),
             "checksum" => replay_one::<crate::checksum::ChecksumInput, _>(&bytes, |i| {
                 crate::checksum::check(i);
             }),
@@ -144,6 +147,7 @@ pub const STACK_TARGETS: &[&str] = &[
     "neighbor",
     "ping",
     "registry",
+    "time",
 ];
 
 /// Every seeds directory on disk, so a new one cannot be added without being

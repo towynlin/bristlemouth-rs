@@ -26,7 +26,7 @@
 //! reaches nobody: `bcmp_send_ping_request` takes no callback, and
 //! `BcmpEchoReplyMessage` is registered unsequenced so `packet.c` has no
 //! callback to reach either. A matched reply produces a `bm_debug` line and an
-//! ignored return code. That is divergence #30.
+//! ignored return code. That is divergence #32.
 //!
 //! So the acceptance rule — [`EchoReply::answers`] — has no oracle, and this
 //! comparator does not pretend otherwise. It is ported by reading and asserted
@@ -40,7 +40,7 @@
 //! `payload_len` bytes out of the received frame without ever comparing it
 //! against `BcmpProcessData.size`, which is right there in the same struct, so
 //! a request declaring more payload than it carries makes the C read — and
-//! transmit — past the frame. That is divergence #27, and it has no defined
+//! transmit — past the frame. That is divergence #29, and it has no defined
 //! behaviour to compare against. Every injected request declares exactly what
 //! it carries; the [`PingInput::decode_probe`] bytes exercise the Rust
 //! decoders with arbitrary input instead, and never reach the C.
@@ -52,7 +52,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 
-use bm_stack::Node;
+use bm_stack::{Node, SoftRtc};
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, BcmpHeader, MessageType, tx};
 use bm_wire::frame::{
@@ -78,7 +78,7 @@ pub const PEER_NODE_ID: u64 = 0x0000_0000_55AA_0011;
 pub const MAX_PING_PAYLOAD: usize = 256;
 
 /// A `bm-stack` node whose ping slot is as large as this comparator's domain.
-pub type PingNode = Node<OracleIdentity, 4, 4, MAX_PING_PAYLOAD>;
+pub type PingNode = Node<OracleIdentity, SoftRtc, 4, 4, MAX_PING_PAYLOAD>;
 
 /// The Rust node, kept for the life of the process alongside the C stack.
 ///
@@ -94,7 +94,7 @@ fn pair() -> (MutexGuard<'static, ()>, MutexGuard<'static, PingNode>) {
     let guard = oracle();
     let node = NODE
         .get_or_init(|| {
-            let mut node = PingNode::new(OracleIdentity, NUM_PORTS);
+            let mut node = PingNode::new(OracleIdentity, SoftRtc::new(), NUM_PORTS);
             // `stack::oracle` brings both of the capture device's ports up
             // before any comparison; a node that disagreed about that would
             // disagree about more than ping.
@@ -465,7 +465,7 @@ pub fn check_reply(input: &PingInput) {
 
 /// Feed arbitrary bytes to both ping decoders.
 ///
-/// There is no C counterpart to compare against — that is divergence #27 — so
+/// There is no C counterpart to compare against — that is divergence #29 — so
 /// the property checked is the port's own: a decoder either refuses the bytes
 /// or produces something that re-encodes to a prefix of them, and it never
 /// panics.

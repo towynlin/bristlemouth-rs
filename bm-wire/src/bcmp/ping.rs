@@ -25,7 +25,7 @@
 //! `payload_len` of them, in both cases taking the length from the frame and
 //! never comparing it against `BcmpProcessData.size`, which is right there.
 //! [`EchoRequest::decode`] and [`EchoReply::decode`] validate it against the
-//! buffer instead. See divergence #27: this is a domain limit, not a
+//! buffer instead. See divergence #29: this is a domain limit, not a
 //! behaviour the port reproduces, because there is no defined C behaviour to
 //! reproduce.
 
@@ -89,7 +89,7 @@ pub struct EchoRequest<'a> {
     /// truncated to sixteen bits — and the comment at `ping.c:42` says it
     /// should be a random number instead. It is what the requester matches a
     /// reply on, so two nodes sharing the low sixteen bits of their ids share
-    /// this. See divergence #28.
+    /// this. See divergence #30.
     pub id: u16,
     /// Counter within that stream, from `ping.c`'s own `BCMP_SEQ`.
     ///
@@ -182,7 +182,7 @@ pub struct EchoReply<'a> {
     ///
     /// **Not checked by the requester.** `bcmp_process_ping_reply` never looks
     /// at it, so a reply from any node answers a ping aimed at one particular
-    /// node — divergence #28.
+    /// node — divergence #30.
     pub node_id: u64,
     /// The request's [`EchoRequest::id`], echoed.
     pub id: u16,
@@ -244,7 +244,7 @@ impl<'a> EchoReply<'a> {
     ///
     /// The three things the C compares are the payload length, the id, and the
     /// payload bytes. The three it does not are the reply's `seq_num`, its
-    /// `node_id`, and the address it arrived from; see divergence #28 for what
+    /// `node_id`, and the address it arrived from; see divergence #30 for what
     /// that admits.
     #[must_use]
     pub fn answers(&self, our_id: u16, expected_payload: Option<&[u8]>) -> bool {
@@ -448,7 +448,7 @@ mod tests {
         assert!(reply(0x5678, b"").answers(0x5678, Some(b"")));
     }
 
-    /// Divergence #28: the reply's own `seq_num` and `node_id` are never
+    /// Divergence #30: the reply's own `seq_num` and `node_id` are never
     /// compared, so a reply from the wrong node, carrying the wrong counter,
     /// still answers.
     #[test]

@@ -24,8 +24,8 @@
 
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use bm_stack::port::{Egress, Identity, Phy};
-use bm_stack::{Node, Outbound};
+use bm_stack::port::{Egress, Identity, Phy, RtcTimeAndDate, SoftRtc};
+use bm_stack::{Node, Outbound, Reflood};
 use bm_wire::bcmp::DeviceInfo;
 
 /// Ports the capture device reports, from `SHIM_NUM_PORTS` in
@@ -227,18 +227,85 @@ impl Identity for OracleIdentity {
     }
 }
 
-/// A `bm-stack` node with the oracle's identity, port count and link state.
+/// A `bm-stack` node with the oracle's identity, port count, link state and
+/// clock.
 ///
 /// [`oracle`] brings both of the capture device's ports up before any
 /// comparison, and a neighbour-table reply carries that, so the port sets have
-/// to match too.
+/// to match too. The clock starts **unset**, which is the state
+/// `bm-wire-sys/csrc/bm_generic_shim.c` brings the C's RTC up in: `bm_rtc_get`
+/// returns `BmENODATA` until something sets it, and a node in that state
+/// answers no system-time request. A comparator that wants the two clocks to
+/// agree calls [`set_both_clocks`].
 #[must_use]
-pub fn node() -> Node<OracleIdentity, 4> {
-    let mut node = Node::new(OracleIdentity, NUM_PORTS);
+pub fn node() -> Node<OracleIdentity, SoftRtc, 4> {
+    node_with_clock(SoftRtc::new())
+}
+
+/// The same, with a clock of the caller's choosing.
+#[must_use]
+pub fn node_with_clock(rtc: SoftRtc) -> Node<OracleIdentity, SoftRtc, 4> {
+    let mut node = Node::new(OracleIdentity, rtc, NUM_PORTS);
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }
     node
+}
+
+/// Set the oracle's RTC, and hand back a [`SoftRtc`] reading the same thing.
+///
+/// `bm_rtc_set` and `bm_rtc_get` are integrator hooks: bm_core declares them
+/// and defines neither, so there is no authoritative C behaviour to compare
+/// against — only `csrc/bm_generic_shim.c`'s, which is ours. What *is*
+/// bm_core's, and what the comparators check, is everything downstream of the
+/// reading: which messages provoke an answer, and what goes in it.
+///
+/// Like everything else the oracle owns, this is process-global and survives
+/// every seed, so a comparator that cares must set it rather than assume it.
+///
+/// # Panics
+///
+/// If the C refuses the value, which it does only for a null pointer.
+pub fn set_both_clocks(reading: RtcTimeAndDate) -> SoftRtc {
+    let c_reading = bm_wire_sys::RtcTimeAndDate {
+        year: reading.year,
+        month: reading.month,
+        day: reading.day,
+        hour: reading.hour,
+        minute: reading.minute,
+        second: reading.second,
+        ms: reading.ms,
+    };
+    unsafe {
+        assert_eq!(
+            bm_wire_sys::bm_rtc_set(&c_reading),
+            bm_wire_sys::BmErr_BmOK,
+            "the shim's RTC accepts any reading"
+        );
+    }
+    SoftRtc::at(reading)
+}
+
+/// What `bm_rtc_get_micro_seconds` makes of the oracle's current reading.
+///
+/// Reads it back out of the C rather than recomputing it, so a
+/// [`RtcTimeAndDate::to_utc_micros`] that drifted from the shim's arithmetic
+/// fails a comparison instead of hiding inside both sides.
+///
+/// # Panics
+///
+/// If the oracle's clock has not been set.
+#[must_use]
+pub fn oracle_clock_micros() -> u64 {
+    let mut reading = bm_wire_sys::RtcTimeAndDate::default();
+    unsafe {
+        assert_eq!(
+            bm_wire_sys::bm_rtc_get(&mut reading),
+            bm_wire_sys::BmErr_BmOK,
+            "the oracle's clock has not been set"
+        );
+        bm_wire_sys::bm_rtc_get_micro_seconds(&mut reading)
+    }
 }
 
 /// A PHY that records what it is given and never receives anything.
@@ -293,6 +360,27 @@ impl Phy for CapturePhy {
 pub fn capture(outbound: Outbound<'_>) -> Vec<(u8, Vec<u8>)> {
     let mut phy = CapturePhy::default();
     embassy_futures::block_on(bm_stack::transmit(&mut phy, outbound, NUM_PORTS))
+        .expect("CapturePhy cannot fail");
+    phy.sent
+}
+
+/// Run a node's re-flood through a fresh [`CapturePhy`] and return what it saw.
+///
+/// `frame` is the frame the [`Reflood`] was produced from. One frame per port
+/// that is not the ingress one, built and transmitted in turn, which is the
+/// order `bcmp_ll_forward` puts them on the wire in.
+///
+/// # Panics
+///
+/// Never: [`CapturePhy`] cannot fail.
+#[must_use]
+pub fn capture_reflood<R: bm_stack::Rtc>(
+    node: &mut Node<OracleIdentity, R, 4>,
+    reflood: Reflood,
+    frame: &[u8],
+) -> Vec<(u8, Vec<u8>)> {
+    let mut phy = CapturePhy::default();
+    embassy_futures::block_on(node.reflood(&mut phy, reflood, frame))
         .expect("CapturePhy cannot fail");
     phy.sent
 }

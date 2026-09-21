@@ -87,6 +87,7 @@ fn every_destination_and_message_on_every_port() {
         Message::DeviceInfoForAnother,
         Message::NeighborTableForUs,
         Message::SystemTime,
+        Message::SystemTimeForAnother,
     ] {
         for destination in [
             Destination::GlobalMulticast,
@@ -173,6 +174,110 @@ fn a_frame_that_fails_its_checksum_is_still_relayed_with_its_legacy_bytes() {
     drain();
     inject(1, &build_frame(&clean));
     assert_eq!(drain().len(), 2, "relayed and answered");
+}
+
+/// And the same for a message BCMP would have *forwarded*: the frame is
+/// relayed by L2 and never re-flooded, because the checksum failure stops it
+/// one layer below `time.c`.
+///
+/// `bm-wire/fuzz/seeds/forward/system-time-for-another-with-legacy-bytes` is
+/// the input, found by `cargo fuzz run forward`.
+#[test]
+fn a_forwarded_message_that_fails_its_checksum_is_relayed_and_not_re_flooded() {
+    let mut i = input(
+        Message::SystemTimeForAnother,
+        Destination::GlobalMulticast,
+        2,
+        24,
+    );
+    i.sender_egress_nibble = 0;
+    i.legacy_ports = [0, 2];
+    assert!(!i.reaches_bcmp());
+
+    // The same input without the legacy bytes does reach time.c, so the
+    // assertions below are about the checksum and not about the message.
+    let mut clean = i.clone();
+    clean.legacy_ports = [0, 0];
+    assert!(clean.reaches_bcmp());
+
+    // Both comparisons before the guard: `check_relay` takes it itself, and the
+    // lock is not reentrant.
+    check_relay(&i);
+    check_relay(&clean);
+
+    let frame = build_frame(&i);
+    let _guard = oracle();
+    drain();
+    inject(2, &frame);
+    let c = drain();
+    assert_eq!(c.len(), 1, "relayed only -- no re-flood behind it");
+    assert_eq!(c[0].0, 1, "onto the other port");
+
+    let mut node = node();
+    let mut ours = frame.clone();
+    let owed = node.on_frame(0, 2, &mut ours);
+    assert!(
+        owed.forward.is_none(),
+        "a frame BCMP rejected is not BCMP's to forward"
+    );
+
+    drain();
+    inject(2, &build_frame(&clean));
+    assert_eq!(drain().len(), 2, "relayed and re-flooded -- divergence #28");
+}
+
+/// Legacy port bytes of `FF FF` do **not** break the checksum, because that is
+/// one's-complement negative zero and the clear at frame bytes 26-27 removes a
+/// term worth nothing. So the frame reaches `time.c` and is re-flooded, exactly
+/// as a frame with no legacy bytes at all.
+///
+/// This is a refinement of divergence #9 rather than a new one, and
+/// `cargo fuzz run forward` is what noticed: the predicate in
+/// `ForwardInput::reaches_bcmp` said `== [0, 0]` and the fuzzer disagreed
+/// inside seven minutes. `bm-wire/fuzz/seeds/forward/system-time-for-another-legacy-ones`
+/// is the input it produced.
+#[test]
+fn legacy_port_bytes_of_all_ones_leave_the_checksum_valid() {
+    let mut i = input(
+        Message::SystemTimeForAnother,
+        Destination::LinkLocalNeighbor,
+        2,
+        24,
+    );
+    i.sender_egress_nibble = 4;
+    i.legacy_ports = [0xFF, 0xFF];
+    assert!(
+        i.reaches_bcmp(),
+        "0xFFFF is one's-complement zero, so the clear costs nothing"
+    );
+    check_relay(&i);
+
+    let frame = build_frame(&i);
+    let _guard = oracle();
+    drain();
+    inject(2, &frame);
+    let c = drain();
+    assert_eq!(
+        c.len(),
+        1,
+        "FF02::1 is consumed by L2, so the re-flood is the only frame"
+    );
+    assert_eq!(c[0].0, 1);
+
+    let mut node = node();
+    let mut ours = frame.clone();
+    assert!(
+        node.on_frame(0, 2, &mut ours).forward.is_some(),
+        "the message got through to time.c"
+    );
+
+    // Every other value of that word does break it, which is the ordinary
+    // divergence-#9 case. 0x0001 is the nearest one.
+    let mut breaks = i.clone();
+    breaks.legacy_ports = [0x00, 0x01];
+    assert!(!breaks.reaches_bcmp());
+    let mut ours = build_frame(&breaks);
+    assert!(node.on_frame(0, 2, &mut ours).forward.is_none());
 }
 
 // ---------------------------------------------------------------------------
