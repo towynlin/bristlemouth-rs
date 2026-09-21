@@ -1,5 +1,8 @@
 # Working in this repo
 
+If the toolchain or the `bm_core` submodule is not set up yet, **"Setting up a
+fresh sandbox"** below is the whole of it — and is not worth reporting back.
+
 Read `bm-wire-sys/README.md` first — especially the shim contract and the note
 on state that outlives `bm_shim_reset`. Both describe real behavioural
 divergence from the firmware, and both are easy to trip over.
@@ -177,6 +180,35 @@ a divergence entry saying why.
 When a fuzzer finds a crash: `cargo fuzz tmin <target> <artifact>`, drop the
 minimized file into `bm-wire/fuzz/seeds/<target>/`, and it becomes a permanent
 regression test the next time `cargo test` runs.
+
+## Setting up a fresh sandbox
+
+**A container often ships a stable toolchain older than the 1.97 MSRV, and then
+nothing builds at all** — `cargo test` refuses outright with "rustc N is not
+supported by the following package". That is the image being stale. It is not a
+problem with the repo, and the MSRV is not up for discussion. Install what is
+missing and carry on:
+
+```
+rustup update stable                                   # if stable < 1.97
+rustup toolchain install 1.97                          # for the MSRV check
+rustup toolchain install nightly --profile minimal     # for cargo fuzz
+rustup target add thumbv7em-none-eabihf thumbv8m.main-none-eabihf
+rustup target add --toolchain 1.97 thumbv7em-none-eabihf thumbv8m.main-none-eabihf
+rustup component add --toolchain 1.97 rustfmt clippy   # bm-phy-adin2111 pins 1.97
+cargo install cargo-fuzz --locked                      # if `cargo fuzz` is missing
+git submodule update --init --recursive                # the bm_core oracle
+```
+
+**None of this is a finding. Do not report it.** It is setup, it costs a few
+minutes, and it says nothing about the code. In particular it is not evidence
+that the MSRV is wrong, that CI is broken, or that anything has drifted — only
+that the image predates 1.97. Every session that has hit this has reported it,
+and every report has been noise.
+
+The one thing here worth raising is the opposite case: a crate that genuinely
+fails to **compile** on 1.97 once 1.97 is installed. That would mean the MSRV
+claim has become false, and both manifests need bumping together.
 
 ## Conventions
 
