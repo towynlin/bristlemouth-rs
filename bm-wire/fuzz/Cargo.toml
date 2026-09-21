@@ -122,6 +122,23 @@ test = false
 doc = false
 bench = false
 
+# Stack-backed as well, and under the same rule about `bcmp`. Ping is the one
+# exchange this harness drives from both ends: it asks the oracle to ping and
+# compares the request, then injects a request and compares the reply. Nothing
+# accumulates -- `bcmp_send_ping_request` frees its buffer, ping is registered
+# unsequenced so the C's sequence list never grows, and `EXPECTED_PAYLOAD` is
+# one slot that each iteration overwrites -- so no fork mode. It does carry
+# state forward on purpose: `ping.c`'s `BCMP_SEQ` and the Rust node's counter
+# both advance once per iteration, and that they advance together is part of
+# what is being compared. Only well-formed requests reach the C; see
+# divergence #27 for why a lying `payload_len` must not be injected.
+[[bin]]
+name = "ping"
+path = "fuzz_targets/ping.rs"
+test = false
+doc = false
+bench = false
+
 # Stack-backed like the two above, and the one target here that genuinely
 # accumulates: every new neighbour makes bcmp_update_neighbor call
 # bcmp_request_info, which appends to INFO_REQUEST_LIST with no de-duplication

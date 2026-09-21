@@ -6,6 +6,7 @@ use bm_stack::{Egress, Event, Identity, Node, deliver, transmit};
 use bm_wire::addr;
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
 use bm_wire::bcmp::neighbors::{NeighborTableReply, NeighborTableRequest};
+use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::PacketCfg;
 use bm_wire::bcmp::{
     BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, DeviceInfo, Heartbeat, MessageType, rx, tx,
@@ -646,6 +647,13 @@ enum Seen {
         seq_num: u32,
         source: u64,
     },
+    EchoReply {
+        source: u64,
+        id: u16,
+        seq_num: u16,
+        payload: Vec<u8>,
+        round_trip_ms: u32,
+    },
 }
 
 fn seen(event: Event<'_>) -> Seen {
@@ -674,6 +682,17 @@ fn seen(event: Event<'_>) -> Seen {
             message_type,
             seq_num,
             source,
+        },
+        Event::EchoReply {
+            source,
+            reply,
+            round_trip_ms,
+        } => Seen::EchoReply {
+            source,
+            id: reply.id,
+            seq_num: reply.seq_num,
+            payload: reply.payload.to_vec(),
+            round_trip_ms,
         },
         _ => unreachable!("Event is non_exhaustive; this test knows all of it"),
     }
@@ -1035,4 +1054,338 @@ fn the_run_loop_times_out_an_unanswered_request() {
         "the expiry ticker gave up on the request: {events:?}"
     );
     assert_eq!(node.registry().pending_len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Echo / ping -- card M1.
+//
+// The frames are compared against bm_core byte for byte in
+// `bm-wire-diff/tests/ping.rs`. What is here is the half that comparison
+// cannot reach: `bcmp_process_ping_reply` is static, transmits nothing, and
+// reports to nobody, so the acceptance rule has no oracle and is asserted from
+// the reading instead. See divergence #30.
+// ---------------------------------------------------------------------------
+
+/// The low sixteen bits of [`NODE_ID`], which is the whole of the `id` a ping
+/// from this node carries and the whole of what a reply is matched on.
+const OUR_PING_ID: u16 = NODE_ID as u16;
+
+fn echo_request_frame(target_node_id: u64, id: u16, seq_num: u16, payload: &[u8]) -> Vec<u8> {
+    echo_frame(
+        MessageType::ECHO_REQUEST,
+        target_node_id,
+        id,
+        seq_num,
+        payload,
+    )
+}
+
+fn echo_reply_frame(node_id: u64, id: u16, seq_num: u16, payload: &[u8]) -> Vec<u8> {
+    echo_frame(MessageType::ECHO_REPLY, node_id, id, seq_num, payload)
+}
+
+/// Both messages are the same fourteen bytes, so one builder does for both.
+fn echo_frame(
+    message_type: MessageType,
+    node_id: u64,
+    id: u16,
+    seq_num: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let request = EchoRequest {
+        target_node_id: node_id,
+        id,
+        seq_num,
+        payload,
+    };
+    let mut body = vec![0u8; request.encoded_len()];
+    request.encode(&mut body).unwrap();
+    peer_frame(message_type, &body, BmIpAddr::LINK_LOCAL_MULTICAST)
+}
+
+/// The body of whatever the node built, parsed back as an echo reply.
+fn sent_echo_reply(outbound: &bm_stack::Outbound<'_>) -> (MessageType, u32, Vec<u8>) {
+    let mut frame = outbound.frame().to_vec();
+    let received = rx::accept(&mut frame).expect("our own frame validates");
+    (
+        received.header.message_type,
+        received.header.seq_num,
+        received.payload.to_vec(),
+    )
+}
+
+#[test]
+fn the_ping_we_emit_carries_a_truncated_node_id_and_its_own_counter() {
+    let mut node = node();
+    assert_eq!(node.ping_sequence(), 0);
+
+    let outbound = node
+        .ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"ping")
+        .expect("a registered type is sent");
+    let (message_type, header_seq, body) = sent_echo_reply(&outbound);
+
+    assert_eq!(message_type, MessageType::ECHO_REQUEST);
+    assert_eq!(
+        header_seq, 0,
+        "ping_init registers both types unsequenced, so the header number is zero"
+    );
+
+    let request = EchoRequest::decode(&body).unwrap();
+    assert_eq!(request.target_node_id, PEER_ID);
+    assert_eq!(request.id, OUR_PING_ID, "(uint16_t)node_id()");
+    assert_eq!(request.seq_num, 0, "BCMP_SEQ, before the increment");
+    assert_eq!(request.payload, b"ping");
+    assert_eq!(node.expected_ping_payload(), Some(&b"ping"[..]));
+    assert_eq!(node.ping_sequence(), 1);
+}
+
+/// `BCMP_SEQ` is `ping.c`'s own counter, not `packet.c`'s `message_count`: it
+/// advances per ping while the header's sequence number stays at zero, and it
+/// is the *body* field that carries it.
+#[test]
+fn successive_pings_advance_a_sequence_space_of_their_own() {
+    let mut node = node();
+    for expected in 0..4u16 {
+        let outbound = node
+            .ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, 0, b"x")
+            .expect("sent");
+        let (_, header_seq, body) = sent_echo_reply(&outbound);
+        assert_eq!(header_seq, 0, "the header never counts");
+        assert_eq!(EchoRequest::decode(&body).unwrap().seq_num, expected);
+    }
+    assert_eq!(node.ping_sequence(), 4);
+    // And nothing was recorded as outstanding: unsequenced means packet.c
+    // never hears about it.
+    assert_eq!(node.registry().pending_len(), 0);
+}
+
+#[test]
+fn an_echo_request_is_answered_with_the_same_bytes_back() {
+    let mut node = node();
+    let mut frame = echo_request_frame(NODE_ID, 0x1234, 0xFEDC, b"echo me");
+    let owed = node.on_frame(0, 1, &mut frame);
+    let outbound = owed.reply.expect("a ping to us must be answered");
+    let (message_type, header_seq, body) = sent_echo_reply(&outbound);
+
+    assert_eq!(message_type, MessageType::ECHO_REPLY);
+    assert_eq!(
+        header_seq, 0,
+        "bcmp_send_ping_reply asks bcmp_tx to echo the body's seq_num, and \
+         serialize throws it away because ping is unsequenced -- divergence #29"
+    );
+
+    let reply = EchoReply::decode(&body).unwrap();
+    assert_eq!(reply.node_id, NODE_ID, "target_node_id becomes ours");
+    assert_eq!(reply.id, 0x1234, "everything else rides back out unchanged");
+    assert_eq!(reply.seq_num, 0xFEDC);
+    assert_eq!(reply.payload, b"echo me");
+}
+
+#[test]
+fn a_ping_to_every_node_is_answered_and_one_to_another_node_is_not() {
+    let mut node = node();
+    let mut broadcast = echo_request_frame(0, 1, 1, b"");
+    assert!(node.on_frame(0, 1, &mut broadcast).reply.is_some());
+
+    let mut elsewhere = echo_request_frame(PEER_ID, 1, 1, b"");
+    assert!(node.on_frame(0, 1, &mut elsewhere).reply.is_none());
+}
+
+/// bm_core answers a ping by overwriting `target_node_id` in the *received*
+/// buffer and casting it, but L2 has already taken its forwarding copy by
+/// then. The port builds a fresh reply instead, so the relayed copy of a
+/// global-multicast ping still says what the sender said.
+#[test]
+fn answering_a_ping_does_not_disturb_the_copy_being_relayed() {
+    let mut node = node();
+    let request = EchoRequest {
+        target_node_id: 0,
+        id: 7,
+        seq_num: 7,
+        payload: b"relay me",
+    };
+    let mut body = vec![0u8; request.encoded_len()];
+    request.encode(&mut body).unwrap();
+    let mut frame = peer_frame(MessageType::ECHO_REQUEST, &body, BmIpAddr::GLOBAL_MULTICAST);
+
+    let owed = node.on_frame(0, 1, &mut frame);
+    assert!(owed.reply.is_some(), "a broadcast ping is answered");
+    let relayed = owed
+        .relay
+        .expect("global multicast is relayed")
+        .frame()
+        .to_vec();
+
+    let mut copy = relayed;
+    let received = rx::accept(&mut copy).expect("the relayed copy validates");
+    let relayed_request = EchoRequest::decode(received.payload).unwrap();
+    assert_eq!(
+        relayed_request.target_node_id, 0,
+        "the relayed copy must still carry the sender's target, not ours"
+    );
+    assert_eq!(relayed_request.payload, b"relay me");
+}
+
+#[test]
+fn a_matching_echo_reply_is_reported_and_the_dispatch_is_reported_too() {
+    let mut node = node();
+    node.ping(1_000, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"ping")
+        .expect("sent");
+
+    let mut frame = echo_reply_frame(PEER_ID, OUR_PING_ID, 0, b"ping");
+    let mut events = Vec::new();
+    node.on_frame_with(1_042, 1, &mut frame, |e| events.push(seen(e)));
+
+    assert_eq!(
+        events,
+        vec![
+            Seen::Message {
+                message_type: MessageType::ECHO_REPLY,
+                seq_num: 0,
+                source: PEER_ID,
+            },
+            Seen::EchoReply {
+                source: PEER_ID,
+                id: OUR_PING_ID,
+                seq_num: 0,
+                payload: b"ping".to_vec(),
+                round_trip_ms: 42,
+            },
+        ],
+        "the dispatch first, then ping.c's verdict on it"
+    );
+}
+
+#[test]
+fn a_reply_with_the_wrong_id_length_or_bytes_is_not_reported() {
+    for (what, frame) in [
+        ("id", echo_reply_frame(PEER_ID, OUR_PING_ID ^ 1, 0, b"ping")),
+        ("length", echo_reply_frame(PEER_ID, OUR_PING_ID, 0, b"pin")),
+        ("bytes", echo_reply_frame(PEER_ID, OUR_PING_ID, 0, b"pong")),
+    ] {
+        let mut node = node();
+        node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"ping")
+            .expect("sent");
+        let mut frame = frame;
+        let mut events = Vec::new();
+        node.on_frame_with(0, 1, &mut frame, |e| events.push(seen(e)));
+        assert!(
+            !events.iter().any(|e| matches!(e, Seen::EchoReply { .. })),
+            "a reply with the wrong {what} must not be accepted: {events:?}"
+        );
+    }
+}
+
+/// Divergence #28: the reply's own `node_id` and `seq_num` are never compared,
+/// so a reply from a node that was never pinged answers just as well.
+#[test]
+fn a_reply_from_the_wrong_node_carrying_the_wrong_counter_still_answers() {
+    let mut node = node();
+    node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"ping")
+        .expect("sent");
+
+    let mut frame = echo_reply_frame(0xDEAD_BEEF_DEAD_BEEF, OUR_PING_ID, 999, b"ping");
+    let mut events = Vec::new();
+    node.on_frame_with(0, 1, &mut frame, |e| events.push(seen(e)));
+    assert!(
+        events.iter().any(|e| matches!(e, Seen::EchoReply { .. })),
+        "the C compares neither field, and neither does the port: {events:?}"
+    );
+}
+
+/// Divergence #30: nothing ever clears `EXPECTED_PAYLOAD`. A matched reply
+/// does not, and no timer does, so the last ping's payload keeps answering.
+#[test]
+fn the_last_pings_payload_answers_for_as_long_as_the_node_runs() {
+    let mut node = node();
+    node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"ping")
+        .expect("sent");
+
+    for now_ms in [10u32, 100_000, 3_600_000] {
+        let mut frame = echo_reply_frame(PEER_ID, OUR_PING_ID, 0, b"ping");
+        let mut events = Vec::new();
+        node.on_frame_with(now_ms, 1, &mut frame, |e| events.push(seen(e)));
+        assert!(
+            events.iter().any(|e| matches!(e, Seen::EchoReply { .. })),
+            "still accepted at {now_ms} ms: {events:?}"
+        );
+    }
+    assert_eq!(node.expected_ping_payload(), Some(&b"ping"[..]));
+}
+
+/// A payload-free ping leaves `EXPECTED_PAYLOAD` null, and the C then compares
+/// nothing but the length and the id — so any empty reply answers it.
+#[test]
+fn a_payload_free_ping_is_answered_by_any_empty_reply() {
+    let mut node = node();
+    node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, 0, b"")
+        .expect("sent");
+    assert_eq!(node.expected_ping_payload(), None, "the C's NULL");
+
+    let mut frame = echo_reply_frame(0, OUR_PING_ID, 4242, b"");
+    let mut events = Vec::new();
+    node.on_frame_with(0, 1, &mut frame, |e| events.push(seen(e)));
+    assert!(events.iter().any(|e| matches!(e, Seen::EchoReply { .. })));
+}
+
+/// A second ping replaces the first's expectations, as
+/// `bcmp_send_ping_request` does by freeing and reallocating: only one ping is
+/// ever outstanding.
+#[test]
+fn a_second_ping_forgets_the_first() {
+    let mut node = node();
+    node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"first")
+        .expect("sent");
+    node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"second")
+        .expect("sent");
+    assert_eq!(node.expected_ping_payload(), Some(&b"second"[..]));
+
+    let mut stale = echo_reply_frame(PEER_ID, OUR_PING_ID, 0, b"first");
+    let mut events = Vec::new();
+    node.on_frame_with(0, 1, &mut stale, |e| events.push(seen(e)));
+    assert!(
+        !events.iter().any(|e| matches!(e, Seen::EchoReply { .. })),
+        "the first ping's reply no longer matches anything: {events:?}"
+    );
+}
+
+/// The one place ping's behaviour here is a choice rather than a port: there is
+/// no heap to grow the expectation slot, so a payload that will not fit is
+/// refused outright — and refused *before* anything is disturbed.
+#[test]
+fn a_ping_longer_than_the_slot_is_refused_and_changes_nothing() {
+    let mut node: Node<TestIdentity, 4, 4, 8> = Node::new(TestIdentity, PORTS);
+    node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"eight!!!")
+        .expect("exactly the slot size fits");
+    assert_eq!(node.ping_sequence(), 1);
+
+    assert!(
+        node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"nine more")
+            .is_none(),
+        "one byte past the slot"
+    );
+    assert_eq!(node.ping_sequence(), 1, "the counter did not advance");
+    assert_eq!(
+        node.expected_ping_payload(),
+        Some(&b"eight!!!"[..]),
+        "and the outstanding ping was left alone"
+    );
+}
+
+#[test]
+fn an_unregistered_echo_type_is_neither_sent_nor_answered() {
+    let mut node = node();
+    assert!(node.unregister(MessageType::ECHO_REQUEST));
+    assert!(
+        node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"x")
+            .is_none(),
+        "the C's BmENODEV: serialize writes nothing and bcmp_tx sends nothing"
+    );
+    // But the counter and the payload moved first, exactly as they do in the C,
+    // where BCMP_SEQ++ and the copy both happen before bcmp_tx is called.
+    assert_eq!(node.ping_sequence(), 1);
+    assert_eq!(node.expected_ping_payload(), Some(&b"x"[..]));
+
+    let mut frame = echo_request_frame(NODE_ID, 1, 1, b"x");
+    assert!(node.on_frame(0, 1, &mut frame).reply.is_none());
 }

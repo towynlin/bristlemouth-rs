@@ -35,7 +35,7 @@ Status values:
 | 9 | `process_received_message` rewrites the source address before verifying the checksum, undocumented | replicated | reading |
 | 10 | A rejected frame is left with its checksum field zeroed | replicated | reading |
 | 11 | `clear_ports_legacy` performs a misaligned 32-bit access on every received frame | benign | **UBSan** |
-| 12 | The egress-port checksum patch drops the one's-complement end-around carry | replicated | reading, then measured |
+| 12 | The egress-port checksum patch drops the one's-complement end-around carry | replicated | reading, then measured; **hit by `cargo fuzz run ping`** |
 | 13 | L2 silently drops any frame whose destination is not multicast | replicated | reading |
 | 14 | Device-info and neighbour-table replies are parsed with unchecked, attacker-supplied lengths | domain-limited | reading |
 | 15 | `bcmp_remove_neighbor_from_table` frees, and reports the free's result as the removal's | c-only | **a double free while writing the comparator** |
@@ -50,6 +50,10 @@ Status values:
 | 24 | A forwarded frame's multicast MAC carries the egress port | replicated | reading, confirmed differentially |
 | 25 | `bcmp_ll_forward` writes its new checksum into the frame it was asked to forward | c-only | reading |
 | 26 | `bcmp_ll_forward` reports a forward with nowhere to go as `BmEINVAL` | replicated | reading |
+| 27 | `bcmp/ping.c` echoes and compares an unchecked, attacker-supplied `payload_len` | domain-limited | reading |
+| 28 | A ping reply is matched on sixteen bits of node id and the payload, and nothing else | replicated | reading |
+| 29 | `bcmp_send_ping_reply` echoes a `seq_num` that `serialize` then discards | replicated | reading, confirmed differentially |
+| 30 | `bcmp/ping.c` reports the result of a ping to nobody, and never forgets one | c-only | reading |
 
 ---
 
@@ -436,6 +440,19 @@ carrying UDP frame's checksum does not match the frame, and that a
 double-carrying BCMP frame is rejected by `bcmp::rx::accept`. Both carry a
 note to say that if they start passing, the C has been fixed and the port must
 follow.
+
+**Card M1 reached it from the other end.** The ping comparator asks the oracle
+to answer an echo request whose payload the fuzzer chose, so its reply frames
+range over the checksum space freely — and within two minutes `cargo fuzz run
+ping` produced one that double-carries. It first showed up as the *harness*
+failing, because the comparator was classifying captured frames with
+`rx::accept`; the C was right and the assertion was wrong. It is now
+`bm-wire/fuzz/seeds/ping/reply-checksum-double-carry`, and
+`a_reply_whose_stamped_checksum_double_carries_is_wrong_on_both_sides` in
+`bm-wire-diff/tests/ping.rs` asserts both nodes build the same invalid frame.
+This is the first time the 0.0122% path has been hit by a real message rather
+than a synthetic one, which is some measure of how live it is on hardware:
+every one of those frames is a ping a node answered and nobody heard.
 
 The fix upstream is to fold the carry back in, in both branches. For BCMP:
 
@@ -1075,3 +1092,155 @@ port and a loop on the other.
 `bcmp::forward::ll_forward_is_a_no_op` is the predicate for the `BmEINVAL`. The
 fix upstream is to return `BmOK` when there was nothing to do, and to refuse an
 ingress port of zero.
+
+## 27. `bcmp/ping.c` echoes and compares an unchecked, attacker-supplied `payload_len`
+
+The same shape as divergence #14, in a second module. `BcmpProcessData` carries
+`size` — how many body bytes actually arrived — and both of ping's processors
+ignore it in favour of a length read out of the frame.
+
+`bcmp_process_ping_request` answers with
+
+```c
+return bcmp_tx(addr, BcmpEchoReplyMessage, (uint8_t *)echo_reply,
+               sizeof(*echo_reply) + echo_reply->payload_len, seq_num, NULL);
+```
+
+so a fourteen-byte request declaring `payload_len = 0xFFFF` makes the node
+transmit 65 549 bytes starting at the received frame — up to 64 KiB of whatever
+the allocator had next — to a multicast address. It is a remote memory
+disclosure reachable by any node on the link, needing one frame and no prior
+state. `bcmp_tx`'s `max_payload_len` guard rejects the largest of these, but
+everything up to 1460 bytes goes out.
+
+`bcmp_process_ping_reply` has the read half of it:
+
+```c
+if (EXPECTED_PAYLOAD_LEN == echo_reply->payload_len && ...) {
+  if (EXPECTED_PAYLOAD != NULL) {
+    if (memcmp(EXPECTED_PAYLOAD, echo_reply->payload, echo_reply->payload_len) != 0) {
+```
+
+Here the declared length has to equal what this node last pinged with, so the
+read is bounded by the node's own choice rather than the sender's — but it is
+still a read of `payload_len` bytes from a frame that may carry none of them.
+
+**Ruling: domain-limited.** There is no defined behaviour to reproduce.
+`bm_wire::bcmp::ping`'s decoders validate the declared length against the
+buffer and return `BmWireError::Truncated` instead, and
+`bm-wire-diff/src/ping.rs` never injects a request whose `payload_len` is not
+what it carries; the `decode_probe` bytes exercise the Rust decoders with
+arbitrary input, and never reach the C. The fix upstream is one comparison
+against `data.size`, which is already in the struct.
+
+## 28. A ping reply is matched on sixteen bits of node id and the payload, and nothing else
+
+`bcmp_process_ping_reply` accepts a reply when three things hold: the declared
+`payload_len` equals `EXPECTED_PAYLOAD_LEN`, `(uint16_t)node_id()` equals the
+reply's `id`, and — only if `EXPECTED_PAYLOAD` is non-null — the payload bytes
+compare equal.
+
+What it never looks at is as interesting:
+
+- **`echo_reply->seq_num`.** `bcmp_send_ping_request` increments `BCMP_SEQ` per
+  request and the reply faithfully echoes it, and then nothing compares it. A
+  reply to a ping sent an hour ago answers today's, as long as the payload is
+  the same.
+- **`echo_reply->node_id`,** and the source address it arrived from. A ping
+  aimed at one node is answered by whichever node replies first — or by a node
+  that was never pinged at all.
+- **Whether a ping is outstanding.** The statics are never cleared: not by a
+  matched reply, not by a timer. A node that has pinged once accepts that
+  reply's shape for the rest of its uptime.
+
+The `id` is the only correlation there is, and `ping.c:42` makes it
+`(uint16_t)node_id()` with a `TODO` saying it should be random. Two nodes whose
+ids share their low sixteen bits — the same nibble-packed serial range, say —
+cannot tell each other's ping traffic apart.
+
+**Ruling: replicated.** `bm_wire::bcmp::ping::EchoReply::answers` is that rule,
+comment for comment, and `bm_stack::Node` keeps the single slot it reads from.
+The fix upstream is a random `id` per request and a comparison of `seq_num`;
+both are wire-compatible, since the fields already exist and are already echoed.
+
+## 29. `bcmp_send_ping_reply` echoes a `seq_num` that `serialize` then discards
+
+```c
+static BmErr bcmp_send_ping_reply(BcmpEchoReply *echo_reply, void *addr,
+                                  uint16_t seq_num) {
+  return bcmp_tx(addr, BcmpEchoReplyMessage, (uint8_t *)echo_reply,
+                 sizeof(*echo_reply) + echo_reply->payload_len, seq_num, NULL);
+}
+```
+
+called as `bcmp_send_ping_reply((BcmpEchoReply *)echo_req, data.dst, echo_req->seq_num)`
+— the request's *body* sequence number, passed down to be written into the
+*header*. It never gets there. `ping_init` registers both echo types as
+`{false, false}`, and `serialize` writes the caller's number only for a
+`sequenced_reply`:
+
+```c
+if (cfg->sequenced_reply) {
+  header->seq_num = seq_num;
+} else if (cfg->sequenced_request) {
+  /* ... */
+} else {
+  header->seq_num = 0;
+}
+```
+
+So every echo reply on the wire carries a header sequence number of zero, and
+the parameter, the argument and the three casts that carry it exist to be
+thrown away. The correlation the author reached for is in the body, where the
+in-place reuse of the request buffer had already preserved it.
+
+Worth noting alongside divergence #2, which is the other thing that happens to
+`BcmpEchoRequest::seq_num`: `check_endianness` swaps it with `swap_32bit`
+although it is a `uint16_t`, so on a big-endian host the swap runs over the
+adjacent `payload_len` as well — and `payload_len` is then swapped again by the
+next line. The `BcmpEchoReplyMessage` arm gets the same field right with
+`swap_16bit`. Neither is reachable on a little-endian target.
+
+**Ruling: replicated,** and measured: `bm-wire-diff/tests/ping.rs` compares the
+reply frame the oracle builds against the one `bm_stack::Node` builds, header
+included, and both carry zero. `Node::build_echo_reply` passes the body's
+`seq_num` to the registry anyway, so the call has the same shape as the C's and
+the discarding happens in the same place. The fix upstream is to delete the
+parameter — or, better, to register the reply as `sequenced_reply` and start
+using it, which would be a wire-visible change and needs coordination.
+
+## 30. `bcmp/ping.c` reports the result of a ping to nobody, and never forgets one
+
+`bcmp_send_ping_request` takes no callback, and `BcmpEchoReplyMessage` is
+registered unsequenced, so `packet.c`'s sequenced-reply machinery — the one
+path that reaches an application with `cb(data.payload)` — is never involved.
+When `bcmp_process_ping_reply` decides a reply matches, all that happens is a
+`bm_debug` line and a `BmOK` returned to `process_received_message`, which
+discards it. There is no way for anything above BCMP to learn that a ping
+succeeded, and no way at all for it to learn that one failed.
+
+Three smaller things travel with it:
+
+- **`PING_REQUEST_TIMEOUT` times nothing out.** It is stamped after every
+  `bcmp_tx` and read once, to print `time=%llu ms`. An unanswered ping is
+  simply never mentioned again.
+- **`EXPECTED_PAYLOAD` is kept forever.** Nothing frees it but the next
+  `bcmp_send_ping_request`, which is what makes divergence #28's "accepts that
+  reply's shape for the rest of its uptime" true.
+- **Its `bm_malloc` is not checked.** `EXPECTED_PAYLOAD = bm_malloc(payload_len)`
+  is followed immediately by `memcpy(EXPECTED_PAYLOAD, payload, payload_len)`,
+  so an allocation failure is a null-pointer write rather than a refused ping.
+
+**Ruling: c-only** for the reporting, which `bm-wire` has no counterpart to
+reproduce: `bm_stack::Event::EchoReply` is the verdict bm_core keeps to itself,
+reported alongside the `Event::Message` that `process_received_message`
+dispatched. It is also why the acceptance rule has no oracle —
+`bcmp_process_ping_reply` is `static`, transmits nothing and reports nothing, so
+`bm-wire-diff/src/ping.rs` compares the two frames on the wire and
+`bm_wire::bcmp::ping`'s unit tests assert the rule from the reading.
+
+The allocation is the one place `bm-stack` diverges deliberately rather than
+matching: it keeps a fixed slot, `Node`'s `PING_PAYLOAD`, and
+[`Node::ping`] refuses a payload that will not fit rather than sending a ping
+whose reply it could not check. The fix upstream is a callback argument on
+`bcmp_send_ping_request`, a null check, and a real timeout.

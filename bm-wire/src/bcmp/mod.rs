@@ -14,12 +14,17 @@
 //! [`forward`] is the third piece of the wire path: re-flooding a link-local
 //! message out the other ports, which `bcmp/time.c`, `bcmp/config.c` and
 //! `bcmp/dfu_core.c` all do for anything not addressed to this node.
+//!
+//! The message bodies each have a module of their own — [`heartbeat`],
+//! [`info`], [`neighbors`], [`ping`] — and are codecs and nothing else. What
+//! a node *does* with one is `bm-stack`'s business.
 
 pub mod forward;
 pub mod header;
 pub mod heartbeat;
 pub mod info;
 pub mod neighbors;
+pub mod ping;
 pub mod registry;
 pub mod rx;
 pub mod tx;
@@ -38,6 +43,7 @@ pub use neighbors::{
     NeighborInfo, NeighborTableReply, NeighborTableRequest, PortInfo, encode_neighbor_table_reply,
     neighbor_table_reply_len,
 };
+pub use ping::{ECHO_HEADER_LEN, EchoReply, EchoRequest, MAX_ECHO_PAYLOAD};
 pub use registry::{
     DEFAULT_MESSAGE_TIMEOUT_MS, Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, Outgoing, PacketCfg,
     PendingRequest, Registry, RegistryError,
