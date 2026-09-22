@@ -175,15 +175,21 @@ jobs:
       - uses: actions/checkout@v7
       - run: rustup toolchain install stable --profile minimal --no-self-update
       - run: rustup default stable
-      # "zero dependencies" is a property of the crate, not an aspiration:
-      # `cargo tree` prints bm-wire and nothing else, in every configuration.
-      - name: bm-wire depends on nothing
+      # bm-wire's dependency set is a property of the crate, not an
+      # aspiration: it is exactly cbor2 and what cbor2 pulls in, in every
+      # configuration. Enabling `std` must not change it -- bm-wire's `std`
+      # feature is a test marker and must never forward to cbor2, or firmware
+      # and tests would run different code.
+      - name: bm-wire depends on cbor2 and nothing else
         run: |
+          expected='bm-wire cbor2 serde serde_core'
           for args in "" "--all-features"; do
-            tree=$(cargo tree --locked -p bm-wire $args)
-            if [ "$(printf '%s\n' "$tree" | wc -l)" -ne 1 ]; then
-              echo "::error::bm-wire grew a dependency (cargo tree $args):"
-              printf '%s\n' "$tree"
+            got=$(cargo tree --locked -p bm-wire $args --prefix none \
+                    | awk 'NF {print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+            if [ "$got" != "$expected" ]; then
+              echo "::error::bm-wire's dependency set changed (cargo tree $args)"
+              echo "  expected: $expected"
+              echo "  got:      $got"
               exit 1
             fi
           done

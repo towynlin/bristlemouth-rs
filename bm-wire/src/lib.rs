@@ -14,6 +14,12 @@
 //!
 //! `no_std`, no `alloc`. Callers provide every buffer. Nothing here panics on
 //! untrusted input — parsers return [`BmWireError`] instead.
+//!
+//! One dependency, [`cbor2`], for the config chain's CBOR values; it is
+//! `no_std` and alloc-free in the configuration used here. See
+//! `docs/c-divergences.md` for where it and bm_core's vendored tinycbor
+//! disagree, and `bm-wire-diff/src/cbor.rs` for what is proven about the
+//! bytes they both produce.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -21,6 +27,7 @@
 
 pub mod addr;
 pub mod bcmp;
+pub mod cbor;
 pub mod checksum;
 pub mod crc;
 pub mod frame;

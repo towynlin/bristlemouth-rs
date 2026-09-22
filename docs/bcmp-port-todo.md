@@ -12,7 +12,9 @@ egress stamping, the link-local RX policy, the two forwarding paths in
 `bcmp::forward`) and three state machines, `bm-wire/src/neighbor.rs`,
 `bm-wire/src/bcmp/registry.rs` and `bm-wire/src/bcmp/resource.rs`.
 `MessageType` names all 45 of bm_core's constants; fourteen body structs have a
-codec.
+codec. CBOR, which the config chain needs, is the `cbor2` crate rather than a
+port; `bm-wire/src/cbor.rs` holds only the one deviation from its defaults
+that bm_core requires.
 
 `bm_stack::Node` drives that registry: `Node::register` is `packet_add`,
 `Node::request` is `bcmp_tx`, and `bm_stack::Event` is where a reply, a timeout
@@ -24,7 +26,6 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| CBOR codec | `third_party/tinycbor` | — | C1 |
 | Local config store | `bcmp/configuration.c` | 845 | C2 |
 | Config over BCMP `0xA0`–`0xA9` | `bcmp/config.c` | 857 | C3 |
 | DFU message codecs `0xD0`–`0xD9` | `bcmp/dfu_message_structs.h` | — | D1 |
@@ -32,8 +33,8 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-C1 and D1 are unblocked and may run in parallel. C2 needs C1. C3 needs C1 and
-C2. D2 needs D1; D3 and D4 each need D2.
+C2 and D1 are unblocked and may run in parallel. C3 needs C2. D2 needs D1; D3
+and D4 each need D2.
 
 ---
 
@@ -55,8 +56,9 @@ it up in the card's report.
 
 ### `bm-wire` rules
 
-`no_std`, no `alloc`, `forbid(unsafe_code)`, zero dependencies, and it may never
-depend on `bm-wire-sys` in any configuration. Use explicit little-endian
+`no_std`, no `alloc`, `forbid(unsafe_code)`, one dependency (`cbor2`, at
+`default-features = false`), and it may never depend on `bm-wire-sys` in any
+configuration. Use explicit little-endian
 codecs, never `repr(packed)` mirrors. The `std` feature is for tests and
 fuzzing only.
 
@@ -80,7 +82,7 @@ Literal byte arrays exist in five test files, mostly as inputs:
 | `bm_linux_test.cpp` | Real captured frames with a checksum a live node agreed on | **Yes** — harvested into `bm-wire-diff/src/gold_vectors.rs` |
 | `l2_policy_test.cpp` | 16-byte IPv6 address constants | Partly; the l2_policy port uses them |
 | `configuration_test.cpp` | A 10-byte test payload being stored | No |
-| `cbor_service_helper_test.cpp` | Small CBOR fragments | Marginal; useful for C1 |
+| `cbor_service_helper_test.cpp` | Small CBOR fragments | Yes — the 91-byte map is pinned by `the_cbor_service_helper_gold_map` |
 | `pcap_test.cpp` | A pcap file header | Not BCMP |
 
 `dfu_test.cpp`'s `client_golden` and `host_golden` are state-machine transition
@@ -141,7 +143,7 @@ cargo build -p bm-wire --target thumbv7em-none-eabihf
 cargo build -p bm-wire --target thumbv8m.main-none-eabihf
 cargo build -p bm-stack --target thumbv8m.main-none-eabihf
 cargo +1.97 check --workspace --all-targets
-cargo tree -p bm-wire                         # must show no dependencies
+cargo tree -p bm-wire                         # only cbor2, serde, serde_core
 ./bm-wire-sys/scripts/check_symbols.sh --check
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features \
   -p bm-wire -p bm-stack -p bm-wire-diff      # a bare `cargo doc` passes where CI fails
@@ -152,7 +154,7 @@ cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 On a crash: `cargo fuzz tmin <target> <artifact>`, then drop the minimized file
 into `bm-wire/fuzz/seeds/<target>/`.
 
-### What the landed cards (M1, M2, M3, M4, M5) left for the rest
+### What the landed cards (M1, M2, M3, M4, M5, C1) left for the rest
 
 - **Forwarding machinery is built.** `bm_stack::Owed::forward` is the decision,
   as a `Reflood` — a byte range within the received frame plus the ingress port,
@@ -271,6 +273,46 @@ into `bm-wire/fuzz/seeds/<target>/`.
   `bcmp_request_neighbor_table` records and keeps it;
   `bcmp_resource_discovery_send_request` transmits first and records only on
   success. All three are observable, and none is a pattern for the next.
+- **CBOR is the `cbor2` crate, not a port.** `bm-wire` depends on it at
+  `default-features = false`, which is `no_std` and alloc-free; `cbor2::core`
+  is the layer to use (`Encoder::push`/`write_all`, `Decoder::pull`), because
+  everything above it — `Value`, `from_slice`, `RawValue`, the serde
+  derives — needs `alloc`. Bodies come back through `Decoder::read_exact`
+  into a caller buffer.
+- **Floats must go through `bm_wire::cbor::push_f32_wide`** (divergence #43).
+  `cbor2::core::Header::Float` applies RFC 8949 preferred serialization and
+  narrows `1.0` to `f9 3c00`; `cbor_value_is_float` accepts only `0xfa`, and
+  `cbor_type_to_config` refuses to classify anything else, so a C node rejects
+  the whole `ConfigSet` rather than misreading it. This is the one place
+  cbor2's defaults are wrong for this wire.
+- **cbor2 does not count container items and does not report a shortfall.**
+  tinycbor's `close_container` checks the declared length and its encoder
+  keeps counting past the end of the buffer so `cbor_encoder_get_extra_bytes_needed`
+  can size a retry; cbor2's slice writer simply fails, and there is no close.
+  So the `services_cbor_as_map` retry loop has no direct analogue — size the
+  buffer with `cbor2::ser::serialized_size` (available without `alloc`), and
+  count map pairs yourself or the header will lie.
+- **Indefinite-length string reassembly is the caller's job.**
+  `Decoder::bytes_body`/`text_body` need `alloc`. A `ConfigSet` body can carry
+  a chunked string, so C2 needs a loop over `pull()` that accumulates into a
+  fixed buffer, and it is the first thing worth a comparator of its own —
+  `bm-wire-diff/src/cbor.rs` proves head agreement and definite-length bodies,
+  not reassembly.
+- **What the comparator proves is byte agreement, not behaviour agreement.**
+  cbor2 and tinycbor are different libraries and are not expected to make the
+  same judgements; `bm-wire-diff/src/cbor.rs` asserts they emit identical
+  bytes for every value shape `bcmp/configuration.c` stores, read the same
+  item head off arbitrary bytes, and disagree in exactly three enumerated
+  places (#40, #41, #43). A fourth kind of disagreement fails the fuzzer.
+- **Two tinycbor defects the port simply does not have** (#40, #41): a
+  failed `cbor_parser_init` that still reports a type and still reports valid,
+  and `cbor_value_get_int64` overflowing on `-(2^63) - 1`. Both are `c-only`
+  now. They still matter for reading bm_core's source: a C node behaves this
+  way.
+- **`services_cbor_as_map` cannot publish a partition holding an `ARRAY`**
+  (divergence #42), and reads an uninitialised `CborValue` when a key's value
+  cannot be read. C3 inherits both; do not port the map builder assuming it
+  round-trips.
 - **Compare the callbacks a module hands the application, not only its state.**
   `bcmp/neighbors.c` exposes none of its three statics, so the whole of M4's
   comparison is three observable effects: the request frame, the reply callback
@@ -290,32 +332,9 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 
 # The config chain
 
-## C1 — a `no_std`, alloc-free CBOR codec
-
-**Blocked by:** nothing.
-
-Config values are CBOR-encoded and `bm-wire` may not take a dependency, so C3
-is impossible without a CBOR reader and writer that are `no_std`, alloc-free
-and dependency-free.
-
-**Scope it to bm_core's actual use.** bm_core builds tinycbor with
-`CBOR_PARSER_MAX_RECURSIONS=10` and a custom allocator shim. Read
-`bcmp/configuration.c` and `middleware/cbor_service_helper.c` to find which
-major types and encodings are reachable, and implement that subset rather than
-all of RFC 8949. Say at the type what is not supported.
-
-**Comparator and fuzz target.** Diff against tinycbor through the oracle;
-tinycbor is already in tier T2. `cbor_service_helper_test.cpp` has a couple of
-small fragments worth asserting literally. Target `cbor`, seeds in
-`replay::TARGETS` (tinycbor is pure — no shim state needed).
-
-**Done when.** Encode and decode agree with tinycbor over the fuzzed input
-domain, the unsupported subset is documented, and `cargo tree -p bm-wire` still
-shows no dependencies.
-
 ## C2 — the local config store
 
-**Blocked by:** C1.
+**Blocked by:** nothing; C1 has landed.
 
 **C source.** `bcmp/configuration.c` (845 LoC) — not a wire module. Typed
 get/set for `UINT32`, `INT32`, `FLOAT`, `STR`, `BYTES`, `ARRAY`; a partition
@@ -336,7 +355,7 @@ same corrupt images.
 
 ## C3 — config over BCMP, `0xA0`–`0xA9`
 
-**Blocked by:** C1, C2. The re-flood these messages need is
+**Blocked by:** C2. The re-flood these messages need is
 `bm_stack::Node::forward_link_local`, which exists.
 
 **C source.** `bcmp/config.c` (857 LoC), one handler

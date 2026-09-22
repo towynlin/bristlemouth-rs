@@ -73,6 +73,10 @@ Four to fix first, in this order.
 | 37 | A resource-table request naming node zero is answered by nobody | replicated | reading, confirmed differentially |
 | 38 | `find_resource` compares the needle's length against every entry | domain-limited | reading |
 | 39 | `bcmp/resource_discovery.c` mishandles four allocations | c-only | reading |
+| 40 | A failed `cbor_parser_init` still reports a type, and still reports valid | c-only | reading, confirmed differentially |
+| 41 | `cbor_value_get_int64` overflows on the one negative integer it cannot hold | c-only | reading, confirmed differentially |
+| 42 | `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read | c-only | reading |
+| 43 | bm_core reads only the 5-byte float encoding, so a preferred-serialization float is unreadable to it | replicated | reading, confirmed differentially |
 
 ---
 
@@ -1540,3 +1544,237 @@ an out-of-memory path.
 cannot race because the table is borrowed for the call; `Node::build_resource_table_reply`
 says so. Fix 1–3 by checking and freeing; fix 4 by holding each list's
 semaphore across both passes, or by sizing and filling in one.
+
+## 40. A failed `cbor_parser_init` still reports a type, and still reports valid
+
+`third_party/tinycbor/src/cborparser.c:168`, `preparse_value`, assigns the
+type and the argument before anything can fail:
+
+```c
+    it->type = CborInvalidType;
+    it->flags &= FlagsToKeep;
+    if (!read_bytes(it, &descriptor, 0, 1))
+        return CborErrorUnexpectedEOF;
+
+    uint8_t type = descriptor & MajorTypeMask;
+    it->type = type;                      // before every error return below
+    it->extra = (descriptor &= SmallValueMask);
+```
+
+Only the empty-buffer case leaves `CborInvalidType` behind. Every other
+failure — additional information 28, 29 or 30; an indefinite length on a type
+that cannot have one; a buffer that ends inside the argument — returns an
+error with `it->type` set to the masked first byte, so `cbor_value_is_valid`
+is true and `cbor_value_get_type` answers. Three consequences:
+
+- **A truncated integer reads back as its own additional-information byte.**
+  `0x1b 0x00` is a `uint64` with one of eight argument bytes present.
+  `cbor_parser_init` returns `CborErrorUnexpectedEOF`, and because the
+  argument-reading block is what clears `extra`, `cbor_value_is_unsigned_integer`
+  is true and `cbor_value_get_uint64` yields **27**, the additional
+  information itself.
+- **Major type 1 is left holding `0x20`**, which is not a `CborType`
+  constant at all: `CborIntegerType` is `0x00` and the rewrite to it is the
+  last thing `preparse_value` does. So `cbor_value_get_type` can return a
+  value no `switch` over `CborType` has a case for, and every `cbor_value_is_*`
+  predicate is false.
+- **A lone break byte (`0xff`) reports `CborSimpleType` and valid**, with
+  `CborErrorUnexpectedBreak`.
+
+None of this reaches `bcmp/configuration.c`, which tests the `cbor_parser_init`
+error first in all four places it parses. It is one dropped error check away
+from doing so, and #42 is what that looks like.
+
+**c-only.** `bm-wire` uses the `cbor2` crate, whose `Decoder::pull` returns a
+`Result<Header, _>` — an error carries no value, so there is nothing to
+misread and no state to inspect afterwards. The defect has no counterpart to
+replicate.
+
+The reverse asymmetry, and the only one this harness accepts: a **break byte
+at the top level**. tinycbor reports `CborErrorUnexpectedBreak`; cbor2 returns
+`Ok(Header::Break)` and leaves the judgement to the caller. Neither reads a
+value out of it, and bm_core's callers reject it either way.
+`bm-wire-diff/src/cbor.rs`'s `check_decode` names that one case and panics on
+any other disagreement about whether a byte string is an item;
+`every_first_byte_reads_the_same_way` walks all 256 first bytes, and the
+`cbor` fuzz target walks the rest.
+
+Fix upstream in tinycbor by assigning `it->type` after the error returns
+rather than before. Not wire-visible; it changes what a caller that ignores
+the error sees.
+
+## 41. `cbor_value_get_int64` overflows on the one negative integer it cannot hold
+
+`third_party/tinycbor/src/cbor.h:428`:
+
+```c
+CBOR_INLINE_API CborError cbor_value_get_int64(const CborValue *value, int64_t *result)
+{
+    assert(cbor_value_is_integer(value));
+    *result = (int64_t) _cbor_value_extract_int64_helper(value);
+    if (value->flags & CborIteratorFlag_NegativeInteger)
+        *result = -*result - 1;
+    return CborNoError;
+}
+```
+
+CBOR encodes a negative integer as `-1 - argument`, so major type 1 with an
+8-byte argument spans `-1` down to `-(2^64)`. `int64_t` reaches only
+`-(2^63)`. For an argument of `1 << 63` — the nine bytes
+`3b 80 00 00 00 00 00 00 00`, the value `-(2^63) - 1` — the cast gives
+`INT64_MIN` and the negation overflows, which C leaves undefined. gcc and
+clang wrap, so the call returns `INT64_MAX`: a request for the most negative
+value representable answers with the most positive one, and reports
+`CborNoError` doing it.
+
+Arguments above `1 << 63` wrap without overflowing and are merely wrong:
+`3b ff ff ff ff ff ff ff ff` is `-(2^64)` and reads back as `0`.
+`cbor_value_get_int64_checked` exists and rejects both, and nothing in bm_core
+calls it.
+
+Reachable from the wire once card C3 lands: a `ConfigSet` (`0xA2`) body is
+stored verbatim by `set_config_cbor`, which accepts it as `INT32`, and
+`get_config_int32` then reads it with this function.
+
+**c-only.** `cbor2` reports a negative integer as `Header::Negative(u64)` —
+the encoded argument, not the represented value — so the narrowing is the
+caller's to do, at the caller's width, and nothing overflows inside the
+library. `bm-wire-diff/src/cbor.rs` compares that argument against the bytes
+on the wire rather than against `cbor_value_get_int64`, precisely so the
+comparison does not have to enter undefined behaviour to make its point;
+`integer_head_boundaries` pins both `3b 80 00…` and `3b ff ff…`.
+
+Fix upstream in tinycbor by computing the result as
+`*result = -(int64_t)(v + 1)` on the unsigned value, or by returning
+`CborErrorDataTooLarge` the way `cbor_value_get_int64_checked` does. Not
+wire-visible.
+
+## 42. `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read
+
+`middleware/cbor_service_helper.c:55`:
+
+```c
+      if (get_config_cbor(type, key.key_buf, key.key_len, tmpB, &tmpBSize) &&
+          cbor_parser_init(tmpB, tmpBSize, 0, &parser, &it) != CborNoError) {
+        break;
+      }
+      if (!cbor_value_is_valid(&it)) {
+        break;
+      }
+```
+
+`it` is a function-scope `CborValue` with no initialiser. The `&&`
+short-circuits, so when `get_config_cbor` fails `cbor_parser_init` never runs
+and `it` is whatever it was:
+
+| Which key | What `cbor_value_is_valid(&it)` reads |
+|---|---|
+| The first one in the loop | uninitialised stack |
+| Any later one | the **previous** key's value |
+
+In the second case the `switch` below then decodes the previous key's buffer
+and writes it into the map under the current key's name, and the encoded map
+is what `services_cbor_encoded_as_crc32` hashes — so two nodes with the same
+configuration can publish different CRC32s depending on which key failed.
+
+The intent is plainly `||`: every other error check in the file breaks out of
+the loop, and the `if` reads as "and the parse failed" only because the call
+was folded into the condition.
+
+`get_config_cbor` failing for a key that `get_stored_keys` just listed needs
+the stored `valueBuffer` not to preparse, which `set_config_cbor` and the five
+typed setters all prevent — so no wire-reachable path was established here. A
+partition loaded from NVM is trusted on its CRC32 alone, which is the place to
+look; card C2 owns that.
+
+**A partition holding any `ARRAY` value cannot be published at all**, from the
+same function. The `ARRAY` case writes into the map behind the encoder's back:
+
+```c
+      case ARRAY: {
+        if (internalSuccess && map.data.ptr + tmpBSize < map.end) {
+          memcpy(map.data.ptr, tmpB, tmpBSize);
+          map.data.ptr += tmpBSize;
+        }
+        break;
+      }
+```
+
+No `cbor_encode*` call, so `map.remaining` is decremented for the key and not
+for the value. `cbor_encoder_close_container` then finds `remaining != 1` and
+returns `CborErrorTooFewItems`, which is not `CborErrorOutOfMemory`, so
+`services_cbor_as_map` frees the buffer and returns NULL and
+`services_cbor_encoded_as_crc32` returns 0. The copy is wrong besides:
+`tmpBSize` is the whole 50-byte `valueBuffer` that `get_config_cbor` always
+reports, not the array's encoded length, so every trailing byte of the slot
+goes into the map too; and the bounds test is `<` where it means `<=`.
+
+One smaller fault, in `bcmp/configuration.c:366`: `get_config_cbor` tests
+`value_len == 0` — the pointer, not `*value_len` — in the same expression that
+has already dereferenced it.
+
+**c-only.** `bm-wire` has no counterpart yet — `services_cbor_as_map` is part
+of card C3, and the port will not have an uninitialised parser to read because
+`bm_wire::cbor::parse` returns its value rather than filling one in.
+
+Fix by turning the `&&` into `if (!get_config_cbor(...) || cbor_parser_init(...) != CborNoError)`.
+Not wire-visible in itself; it changes which CRC32 a misconfigured node
+publishes.
+
+## 43. bm_core reads only the 5-byte float encoding, so a preferred-serialization float is unreadable to it
+
+RFC 8949 §4.1 lets a float be encoded at any width that holds it exactly, and
+*preferred serialization* picks the shortest: `1.0` is three bytes, `f9 3c00`.
+bm_core neither writes nor reads that. `cbor_encode_float` always emits the
+5-byte `fa` form, and the read side is narrower still —
+`third_party/tinycbor/src/cbor.h:608`:
+
+```c
+CBOR_INLINE_API bool cbor_value_is_float(const CborValue *value)
+{ return value->type == CborFloatType; }
+```
+
+`CborFloatType` is `0xfa`. A half-precision float is `CborHalfFloatType`
+(`0xf9`) and a double is `CborDoubleType` (`0xfb`), so neither is a float to
+this predicate. Two consequences, both worse than losing precision:
+
+| Call | With `fa` | With `f9` |
+|---|---|---|
+| `get_config_float` (`bcmp/configuration.c:258`) | reads the value | returns false, no value |
+| `cbor_type_to_config` (`bcmp/configuration.c:633`) | `FLOAT` | falls through every case and returns **false** |
+
+The second is the sharp one: `set_config_cbor` calls `cbor_type_to_config` and
+gives up when it returns false, so a `ConfigSet` (`0xA2`) carrying a
+preferred-serialization float is **rejected outright** — not stored as the
+wrong type, not truncated, refused. Every "round" float — `0.0`, `1.0`, `0.5`,
+`2.0`, infinities — is exactly the case that narrows, so this is the common
+path, not an edge.
+
+`bcmp/configuration.c` is also the only reader: `services_cbor_as_map` uses
+`cbor_value_get_float`, which asserts the same type. A C node therefore cannot
+read a config partition a preferred-serialization encoder wrote, and cannot
+accept one over the wire.
+
+A second, smaller difference on the read side: `cbor2` decodes every float
+into `f64`, and that widening **quiets a signalling NaN** — `fa ff85ff01`
+comes back with the quiet bit set. tinycbor copies the four bytes out
+untouched. Every non-NaN `f32` round-trips through `f64` exactly, so the NaN
+payload is the whole of it. Found by `cargo fuzz run cbor` in under eight
+minutes; seed `bm-wire/fuzz/seeds/cbor/signalling-nan-float`.
+
+**replicated.** `bm_wire::cbor::push_f32_wide` writes the `fa` form, bypassing
+`cbor2::core::Header::Float`, and exists for no other reason; its module docs
+say so. `bm-wire-diff/src/cbor.rs` encodes every fuzzed float through it and
+asserts byte equality with `cbor_encode_float`, and
+`cbor2_narrows_floats_and_bm_core_cannot_read_them` pins the other half:
+for five values it asserts the narrow form is what cbor2 would have written,
+that `cbor_value_is_float` rejects it, and that `cbor_type_to_config` refuses
+to classify it at all. On the read side, `same_item` accepts a NaN for a NaN
+and nothing else.
+
+Fix upstream by testing `CborHalfFloatType` and `CborDoubleType` alongside
+`CborFloatType` and converting, which `cbor_value_get_half_float_as_float`
+already does — bm_core does not compile `cborparser_float.c`, so that would
+have to be added to the build too. Wire-visible and additive: a fixed node
+reads floats a deployed node rejects, and nothing that works today stops
+working.

@@ -12,3 +12,10 @@ default = []
 std = []
 
 [dependencies]
+# The only dependency, and deliberate: config values are CBOR, and a
+# hand-rolled codec is a worse bet than a maintained one. `default-features =
+# false` keeps it `no_std` and alloc-free -- the `std` feature above must never
+# forward to it, or firmware and tests would run different code. Only
+# `cbor2::core`, its low-level header encoder/decoder, is used; the serde
+# layer needs `alloc`.
+cbor2 = { version = "1.1.5", default-features = false }

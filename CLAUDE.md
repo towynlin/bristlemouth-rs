@@ -39,10 +39,11 @@ output.
 
 A cargo workspace.
 
-- `bm-wire/` — the port. `no_std`, no `alloc`, `forbid(unsafe_code)`, zero
-  dependencies. **Must never depend on `bm-wire-sys`**, in any configuration:
+- `bm-wire/` — the port. `no_std`, no `alloc`, `forbid(unsafe_code)`, and one
+  dependency: `cbor2`, at `default-features = false`, for the config chain's
+  CBOR values. **Must never depend on `bm-wire-sys`**, in any configuration:
   that keeps the host-only oracle out of firmware builds. The `std` feature is
-  for tests and fuzzing only.
+  for tests and fuzzing only, and must not forward to `cbor2`.
   - `fuzz/` — a `cargo fuzz` crate, its own workspace. Targets are ~6 lines
     each; the work is in `bm-wire-diff`.
   - `fuzz/seeds/` — committed seed corpora, one directory per target, replayed
@@ -137,7 +138,7 @@ cargo build -p bm-stack --target thumbv8m.main-none-eabihf
 cd bm-phy-adin2111 && cargo test                           # own workspace, needs network
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
 cargo +1.97 check --workspace --all-targets                # the declared MSRV
-cargo tree -p bm-wire                                      # must show no dependencies
+cargo tree -p bm-wire                                      # only cbor2, serde, serde_core
 ./bm-wire-sys/scripts/check_symbols.sh --check             # only libc may be unresolved
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features \
   -p bm-wire -p bm-stack -p bm-wire-diff                   # -D warnings, as CI does
@@ -149,6 +150,14 @@ cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 to a private one — is a warning by default, so a bare `cargo doc` passes where
 CI fails. `bm-wire-sys` is excluded because bindgen re-emits bm_core's own C
 comments as doc comments.
+
+There are three lockfiles — `Cargo.lock`, `bm-wire/fuzz/Cargo.lock` and
+`bm-phy-adin2111/Cargo.lock` — and the other two workspaces depend on the root
+crates by path. **Changing any dependency in `bm-wire`, `bm-stack` or
+`bm-wire-diff` invalidates all three**, and nothing in the root workspace says
+so: CI runs every job with `--locked`, so a stale lockfile fails the build
+before it compiles anything. Run all three verification blocks, not just the
+root one, and commit whichever lockfiles move.
 
 CI runs all of this on every push, plus four things this list leaves out:
 `cargo fmt --all --check` twice, since `bm-wire/fuzz` is its own workspace;
