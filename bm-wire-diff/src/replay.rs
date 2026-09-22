@@ -63,6 +63,9 @@ pub fn replay_target(target: &str) -> usize {
         }
         let bytes = std::fs::read(&path).expect("seed file is readable");
         match target {
+            "cbor" => replay_one::<crate::cbor::CborInput, _>(&bytes, |i| {
+                crate::cbor::check(i);
+            }),
             "crc" => replay_one::<crate::crc::CrcInput, _>(&bytes, crate::crc::check),
             "l2_policy" => replay_one::<crate::l2_policy::L2PolicyInput, _>(&bytes, |i| {
                 crate::l2_policy::check(i);
@@ -134,6 +137,7 @@ pub fn replay_target(target: &str) -> usize {
 pub const TARGETS: &[&str] = &[
     "addr",
     "bcmp",
+    "cbor",
     "checksum",
     "crc",
     "date_time",

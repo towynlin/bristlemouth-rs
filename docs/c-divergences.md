@@ -73,6 +73,9 @@ Four to fix first, in this order.
 | 37 | A resource-table request naming node zero is answered by nobody | replicated | reading, confirmed differentially |
 | 38 | `find_resource` compares the needle's length against every entry | domain-limited | reading |
 | 39 | `bcmp/resource_discovery.c` mishandles four allocations | c-only | reading |
+| 40 | A failed `cbor_parser_init` still reports a type, and still reports valid | replicated | reading, confirmed differentially |
+| 41 | `cbor_value_get_int64` overflows on the one negative integer it cannot hold | domain-limited | reading, confirmed differentially |
+| 42 | `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read | c-only | reading |
 
 ---
 
@@ -1540,3 +1543,173 @@ an out-of-memory path.
 cannot race because the table is borrowed for the call; `Node::build_resource_table_reply`
 says so. Fix 1–3 by checking and freeing; fix 4 by holding each list's
 semaphore across both passes, or by sizing and filling in one.
+
+## 40. A failed `cbor_parser_init` still reports a type, and still reports valid
+
+`third_party/tinycbor/src/cborparser.c:168`, `preparse_value`, assigns the
+type and the argument before anything can fail:
+
+```c
+    it->type = CborInvalidType;
+    it->flags &= FlagsToKeep;
+    if (!read_bytes(it, &descriptor, 0, 1))
+        return CborErrorUnexpectedEOF;
+
+    uint8_t type = descriptor & MajorTypeMask;
+    it->type = type;                      // before every error return below
+    it->extra = (descriptor &= SmallValueMask);
+```
+
+Only the empty-buffer case leaves `CborInvalidType` behind. Every other
+failure — additional information 28, 29 or 30; an indefinite length on a type
+that cannot have one; a buffer that ends inside the argument — returns an
+error with `it->type` set to the masked first byte, so `cbor_value_is_valid`
+is true and `cbor_value_get_type` answers. Three consequences:
+
+- **A truncated integer reads back as its own additional-information byte.**
+  `0x1b 0x00` is a `uint64` with one of eight argument bytes present.
+  `cbor_parser_init` returns `CborErrorUnexpectedEOF`, and because the
+  argument-reading block is what clears `extra`, `cbor_value_is_unsigned_integer`
+  is true and `cbor_value_get_uint64` yields **27**, the additional
+  information itself.
+- **Major type 1 is left holding `0x20`**, which is not a `CborType`
+  constant at all: `CborIntegerType` is `0x00` and the rewrite to it is the
+  last thing `preparse_value` does. So `cbor_value_get_type` can return a
+  value no `switch` over `CborType` has a case for, and every `cbor_value_is_*`
+  predicate is false.
+- **A lone break byte (`0xff`) reports `CborSimpleType` and valid**, with
+  `CborErrorUnexpectedBreak`.
+
+None of this reaches `bcmp/configuration.c`, which tests the `cbor_parser_init`
+error first in all four places it parses. It is one dropped error check away
+from doing so, and #42 is what that looks like.
+
+**replicated.** [`bm_wire::cbor::parse`] returns a `Parsed` carrying both the
+error and the value rather than a `Result`, so the difference cannot be
+collapsed by accident, and `Type::RawNegative` is the `0x20` case named at the
+type. Compared on every decode in `bm-wire-diff/src/cbor.rs` — the type, the
+validity and all nine predicates — and pinned in
+`divergence_40_a_failed_parse_is_still_valid_and_typed`.
+
+Fix upstream in tinycbor by assigning `it->type` after the error returns
+rather than before. Not wire-visible; it changes what a caller that ignores
+the error sees.
+
+## 41. `cbor_value_get_int64` overflows on the one negative integer it cannot hold
+
+`third_party/tinycbor/src/cbor.h:428`:
+
+```c
+CBOR_INLINE_API CborError cbor_value_get_int64(const CborValue *value, int64_t *result)
+{
+    assert(cbor_value_is_integer(value));
+    *result = (int64_t) _cbor_value_extract_int64_helper(value);
+    if (value->flags & CborIteratorFlag_NegativeInteger)
+        *result = -*result - 1;
+    return CborNoError;
+}
+```
+
+CBOR encodes a negative integer as `-1 - argument`, so major type 1 with an
+8-byte argument spans `-1` down to `-(2^64)`. `int64_t` reaches only
+`-(2^63)`. For an argument of `1 << 63` — the nine bytes
+`3b 80 00 00 00 00 00 00 00`, the value `-(2^63) - 1` — the cast gives
+`INT64_MIN` and the negation overflows, which C leaves undefined. gcc and
+clang wrap, so the call returns `INT64_MAX`: a request for the most negative
+value representable answers with the most positive one, and reports
+`CborNoError` doing it.
+
+Arguments above `1 << 63` wrap without overflowing and are merely wrong:
+`3b ff ff ff ff ff ff ff ff` is `-(2^64)` and reads back as `0`.
+`cbor_value_get_int64_checked` exists and rejects both, and nothing in bm_core
+calls it.
+
+Reachable from the wire once card C3 lands: a `ConfigSet` (`0xA2`) body is
+stored verbatim by `set_config_cbor`, which accepts it as `INT32`, and
+`get_config_int32` then reads it with this function.
+
+**domain-limited.** `Value::get_int64` computes `-x - 1` in wrapping
+arithmetic, so it produces the same `i64::MAX`, and
+`divergence_41_the_negative_integer_that_overflows` asserts the two agree.
+`bm-wire-diff/src/cbor.rs`'s `is_int64_negation_overflow` holds that one
+payload out of the differential comparison, recognising it from the bytes
+rather than from the port: under `cargo fuzz`, where `build.rs` compiles the C
+with `-fsanitize=undefined`, the C aborts instead of answering, so there would
+be nothing to compare against.
+
+Fix upstream in tinycbor by computing the result as
+`*result = -(int64_t)(v + 1)` on the unsigned value, or by returning
+`CborErrorDataTooLarge` the way `cbor_value_get_int64_checked` does. Not
+wire-visible.
+
+## 42. `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read
+
+`middleware/cbor_service_helper.c:55`:
+
+```c
+      if (get_config_cbor(type, key.key_buf, key.key_len, tmpB, &tmpBSize) &&
+          cbor_parser_init(tmpB, tmpBSize, 0, &parser, &it) != CborNoError) {
+        break;
+      }
+      if (!cbor_value_is_valid(&it)) {
+        break;
+      }
+```
+
+`it` is a function-scope `CborValue` with no initialiser. The `&&`
+short-circuits, so when `get_config_cbor` fails `cbor_parser_init` never runs
+and `it` is whatever it was:
+
+| Which key | What `cbor_value_is_valid(&it)` reads |
+|---|---|
+| The first one in the loop | uninitialised stack |
+| Any later one | the **previous** key's value |
+
+In the second case the `switch` below then decodes the previous key's buffer
+and writes it into the map under the current key's name, and the encoded map
+is what `services_cbor_encoded_as_crc32` hashes — so two nodes with the same
+configuration can publish different CRC32s depending on which key failed.
+
+The intent is plainly `||`: every other error check in the file breaks out of
+the loop, and the `if` reads as "and the parse failed" only because the call
+was folded into the condition.
+
+`get_config_cbor` failing for a key that `get_stored_keys` just listed needs
+the stored `valueBuffer` not to preparse, which `set_config_cbor` and the five
+typed setters all prevent — so no wire-reachable path was established here. A
+partition loaded from NVM is trusted on its CRC32 alone, which is the place to
+look; card C2 owns that.
+
+**A partition holding any `ARRAY` value cannot be published at all**, from the
+same function. The `ARRAY` case writes into the map behind the encoder's back:
+
+```c
+      case ARRAY: {
+        if (internalSuccess && map.data.ptr + tmpBSize < map.end) {
+          memcpy(map.data.ptr, tmpB, tmpBSize);
+          map.data.ptr += tmpBSize;
+        }
+        break;
+      }
+```
+
+No `cbor_encode*` call, so `map.remaining` is decremented for the key and not
+for the value. `cbor_encoder_close_container` then finds `remaining != 1` and
+returns `CborErrorTooFewItems`, which is not `CborErrorOutOfMemory`, so
+`services_cbor_as_map` frees the buffer and returns NULL and
+`services_cbor_encoded_as_crc32` returns 0. The copy is wrong besides:
+`tmpBSize` is the whole 50-byte `valueBuffer` that `get_config_cbor` always
+reports, not the array's encoded length, so every trailing byte of the slot
+goes into the map too; and the bounds test is `<` where it means `<=`.
+
+One smaller fault, in `bcmp/configuration.c:366`: `get_config_cbor` tests
+`value_len == 0` — the pointer, not `*value_len` — in the same expression that
+has already dereferenced it.
+
+**c-only.** `bm-wire` has no counterpart yet — `services_cbor_as_map` is part
+of card C3, and the port will not have an uninitialised parser to read because
+`bm_wire::cbor::parse` returns its value rather than filling one in.
+
+Fix by turning the `&&` into `if (!get_config_cbor(...) || cbor_parser_init(...) != CborNoError)`.
+Not wire-visible in itself; it changes which CRC32 a misconfigured node
+publishes.

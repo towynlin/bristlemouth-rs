@@ -22,6 +22,15 @@ test = false
 doc = false
 bench = false
 
+# tinycbor is pure -- no shim state, no allocation, no clock -- so this one
+# needs nothing brought up and shares a process with anything.
+[[bin]]
+name = "cbor"
+path = "fuzz_targets/cbor.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "time_remaining"
 path = "fuzz_targets/time_remaining.rs"
