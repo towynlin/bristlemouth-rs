@@ -16,12 +16,13 @@
 //! `bcmp/dfu_core.c` all do for anything not addressed to this node.
 //!
 //! The message bodies each have a module of their own — [`heartbeat`],
-//! [`info`], [`neighbors`], [`ping`] — and are codecs only. What a node *does*
-//! with one is `bm-stack`'s business. The exceptions are
-//! [`info::InfoRequests`], [`info::InfoCache`] and
-//! [`neighbors::TableRequests`], which are their modules' file-scope state
-//! rather than wire format, and are here for the same reason [`registry`] is:
-//! each correlates its own replies, because `packet.c` does not.
+//! [`info`], [`neighbors`], [`ping`], [`resource`] — and are codecs only. What
+//! a node *does* with one is `bm-stack`'s business. The exceptions are
+//! [`info::InfoRequests`], [`info::InfoCache`], [`neighbors::TableRequests`],
+//! [`resource::ResourceTable`] and [`resource::ResourceRequests`], which are
+//! their modules' file-scope state rather than wire format, and are here for
+//! the same reason [`registry`] is: each correlates its own replies, because
+//! `packet.c` does not.
 
 pub mod forward;
 pub mod header;
@@ -30,6 +31,7 @@ pub mod info;
 pub mod neighbors;
 pub mod ping;
 pub mod registry;
+pub mod resource;
 pub mod rx;
 pub mod time;
 pub mod tx;
@@ -56,6 +58,11 @@ pub use ping::{ECHO_HEADER_LEN, EchoReply, EchoRequest, MAX_ECHO_PAYLOAD};
 pub use registry::{
     DEFAULT_MESSAGE_TIMEOUT_MS, Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, Outgoing, PacketCfg,
     PendingRequest, Registry, RegistryError,
+};
+pub use resource::{
+    FindReadsOutOfBounds, RESOURCE_NAME_BYTES, Resource, ResourceAddError, ResourceReplyOutcome,
+    ResourceRequestKind, ResourceRequests, ResourceTable, ResourceTableReply, ResourceTableRequest,
+    ResourceType, encode_resource_table_reply,
 };
 pub use rx::{Received, RxError, accept};
 pub use time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};

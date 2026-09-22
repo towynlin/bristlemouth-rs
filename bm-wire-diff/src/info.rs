@@ -45,7 +45,9 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 use bm_stack::node::PING_PAYLOAD_BYTES;
 use bm_stack::{Event, Node, SoftRtc};
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
-use bm_wire::bcmp::{BCMP_HEADER_LEN, DeviceInfo, Heartbeat, InfoRequestKind, MessageType, rx, tx};
+use bm_wire::bcmp::{
+    BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, DeviceInfo, Heartbeat, InfoRequestKind, MessageType, tx,
+};
 use bm_wire::frame::{
     ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET,
     IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
@@ -57,9 +59,12 @@ use bm_wire::util::BmIpAddr;
 use crate::Domain;
 use crate::ll::LinkModel;
 use crate::stack::{
-    NUM_PORTS, OracleIdentity, clear_neighbor_table, drain, inject, oracle, pump_until_quiet,
-    tick_count,
+    Captured, NUM_PORTS, OracleIdentity, captured_message_type, clear_neighbor_table, drain,
+    inject, oracle, pump_until_quiet, tick_count,
 };
+
+/// Where a BCMP body starts in a frame, past the BCMP header.
+const BCMP_BODY_OFFSET: usize = BCMP_HEADER_OFFSET + BCMP_HEADER_LEN;
 
 /// The node ids a step may name.
 ///
@@ -472,10 +477,6 @@ impl OracleRequests {
     }
 }
 
-/// A frame the oracle transmitted, and the port it went out on — one element
-/// of what [`crate::stack::drain`] returns.
-type Captured = (u8, Vec<u8>);
-
 /// The `0x04` requests in a batch of captured frames, one entry per request
 /// rather than per port copy.
 ///
@@ -487,12 +488,11 @@ type Captured = (u8, Vec<u8>);
 fn captured_info_requests(captured: &[Captured]) -> Vec<(u64, Vec<Captured>)> {
     let copies: Vec<Captured> = captured
         .iter()
-        .filter(|(_, frame)| {
-            let mut copy = frame.clone();
-            rx::accept(&mut copy)
-                .map(|r| r.header.message_type == MessageType::DEVICE_INFO_REQUEST)
-                .unwrap_or(false)
-        })
+        // The type comes out of the BCMP header rather than out of
+        // `rx::accept`'s verdict: a frame the oracle stamped an egress port
+        // into need not validate, because divergence #12 drops the end-around
+        // carry. Filtering on `accept` would skip exactly those.
+        .filter(|(_, frame)| captured_message_type(frame) == Some(MessageType::DEVICE_INFO_REQUEST))
         .cloned()
         .collect();
     assert_eq!(
@@ -508,9 +508,7 @@ fn captured_info_requests(captured: &[Captured]) -> Vec<(u64, Vec<Captured>)> {
             let targets: Vec<u64> = chunk
                 .iter()
                 .map(|(_, frame)| {
-                    let mut copy = frame.clone();
-                    let received = rx::accept(&mut copy).expect("filtered on it parsing");
-                    DeviceInfoRequest::decode(received.payload)
+                    DeviceInfoRequest::decode(&frame[BCMP_BODY_OFFSET..])
                         .expect("the oracle builds an eight-byte body")
                         .target_node_id
                 })

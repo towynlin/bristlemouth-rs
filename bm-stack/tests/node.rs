@@ -11,6 +11,10 @@ use bm_wire::bcmp::neighbors::{
 };
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::PacketCfg;
+use bm_wire::bcmp::resource::{
+    ResourceAddError, ResourceRequestKind, ResourceTableReply, ResourceTableRequest, ResourceType,
+    encode_resource_table_reply,
+};
 use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
 use bm_wire::bcmp::{
     BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, DeviceInfo, Heartbeat, MessageType, rx, tx,
@@ -678,6 +682,13 @@ enum Seen {
     NeighborTableTimeout {
         target_node_id: u64,
     },
+    ResourceTable {
+        source: u64,
+        /// What the body claims, which here must equal `source`.
+        node_id: u64,
+        publishers: Vec<Vec<u8>>,
+        subscribers: Vec<Vec<u8>>,
+    },
 }
 
 fn seen(event: Event<'_>) -> Seen {
@@ -734,6 +745,12 @@ fn seen(event: Event<'_>) -> Seen {
         Event::NeighborTableTimeout { target_node_id } => {
             Seen::NeighborTableTimeout { target_node_id }
         }
+        Event::ResourceTable { source, reply } => Seen::ResourceTable {
+            source,
+            node_id: reply.node_id,
+            publishers: reply.publishers().map(|r| r.name.to_vec()).collect(),
+            subscribers: reply.subscribers().map(|r| r.name.to_vec()).collect(),
+        },
         _ => unreachable!("Event is non_exhaustive; this test knows all of it"),
     }
 }
@@ -2433,4 +2450,348 @@ fn a_reply_shorter_than_its_declared_counts_is_dropped() {
     );
     assert!(node.table_requests().is_armed());
     assert!(node.table_requests().timer_running());
+}
+
+// ---------------------------------------------------------------------------
+// Resource discovery, `0x0A` and `0x0B`
+// ---------------------------------------------------------------------------
+
+const PUB: ResourceType = ResourceType::Publisher;
+const SUB: ResourceType = ResourceType::Subscriber;
+
+/// A node advertising two topics it publishes and one it subscribes to.
+fn node_with_resources() -> Node<TestIdentity, SoftRtc, 4> {
+    let mut node = node();
+    node.add_resource(b"spotter/utc-time", PUB).unwrap();
+    node.add_resource(b"sensor/temp", PUB).unwrap();
+    node.add_resource(b"button", SUB).unwrap();
+    node
+}
+
+fn resource_request_frame(target_node_id: u64) -> Vec<u8> {
+    let mut body = [0u8; ResourceTableRequest::LEN];
+    ResourceTableRequest { target_node_id }
+        .encode(&mut body)
+        .unwrap();
+    peer_frame(
+        MessageType::RESOURCE_TABLE_REQUEST,
+        &body,
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    )
+}
+
+/// A `0x0B` from `PEER_ID`, claiming `claims`.
+fn resource_reply_frame(claims: u64, publishers: &[&[u8]], subscribers: &[&[u8]]) -> Vec<u8> {
+    let mut body = vec![0u8; 256];
+    let len = encode_resource_table_reply(
+        &mut body,
+        claims,
+        publishers.iter().copied(),
+        subscribers.iter().copied(),
+    )
+    .unwrap();
+    body.truncate(len);
+    peer_frame(
+        MessageType::RESOURCE_TABLE_REPLY,
+        &body,
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    )
+}
+
+/// The responder half: both lists go out whole, publishers first, to whatever
+/// address the request was sent to.
+#[test]
+fn a_directed_request_is_answered_with_both_lists() {
+    let mut node = node_with_resources();
+    let mut frame = resource_request_frame(NODE_ID);
+    let owed = node.on_frame(1000, 1, &mut frame);
+    let mut reply = owed.reply.expect("answered").frame().to_vec();
+
+    let received = rx::accept(&mut reply).expect("validates");
+    assert_eq!(
+        received.header.message_type,
+        MessageType::RESOURCE_TABLE_REPLY
+    );
+    assert_eq!(received.header.seq_num, 0);
+    assert_eq!(received.dst, BmIpAddr::LINK_LOCAL_MULTICAST);
+
+    let table = ResourceTableReply::decode(received.payload).unwrap();
+    assert_eq!(table.node_id, NODE_ID);
+    assert_eq!(table.publisher_count(), 2);
+    assert_eq!(table.subscriber_count(), 1);
+    assert!(
+        table
+            .publishers()
+            .map(|r| r.name)
+            .eq([&b"spotter/utc-time"[..], b"sensor/temp"])
+    );
+    assert!(table.subscribers().map(|r| r.name).eq([&b"button"[..]]));
+    assert_eq!(received.payload.len(), node.resources().reply_len());
+}
+
+/// A node with nothing to advertise still answers, with the head alone.
+#[test]
+fn an_empty_table_is_still_answered() {
+    let mut node = node();
+    let mut frame = resource_request_frame(NODE_ID);
+    let mut reply = node
+        .on_frame(1000, 1, &mut frame)
+        .reply
+        .expect("answered")
+        .frame()
+        .to_vec();
+    let received = rx::accept(&mut reply).unwrap();
+    assert_eq!(received.payload.len(), ResourceTableReply::HEADER_LEN);
+    let table = ResourceTableReply::decode(received.payload).unwrap();
+    assert_eq!(table.publisher_count(), 0);
+    assert_eq!(table.subscriber_count(), 0);
+}
+
+/// Divergence #37. The same request naming zero is answered by every other
+/// module in BCMP and by this one not at all.
+#[test]
+fn a_request_naming_zero_is_answered_by_nobody() {
+    let mut node = node_with_resources();
+    let mut resource = resource_request_frame(0);
+    assert!(
+        node.on_frame(1000, 1, &mut resource).reply.is_none(),
+        "resource discovery wants an exact match"
+    );
+
+    let mut info = peer_frame(
+        MessageType::DEVICE_INFO_REQUEST,
+        &0u64.to_le_bytes(),
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    );
+    assert!(
+        node.on_frame(1000, 1, &mut info).reply.is_some(),
+        "device info takes zero as a broadcast"
+    );
+
+    let mut neighbors = peer_frame(
+        MessageType::NEIGHBOR_TABLE_REQUEST,
+        &0u64.to_le_bytes(),
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    );
+    assert!(
+        node.on_frame(1000, 1, &mut neighbors).reply.is_some(),
+        "so does the neighbour table"
+    );
+}
+
+#[test]
+fn a_request_naming_another_node_is_ignored() {
+    let mut node = node_with_resources();
+    let mut frame = resource_request_frame(PEER_ID);
+    assert!(node.on_frame(1000, 1, &mut frame).reply.is_none());
+}
+
+/// The requester half: `FF02::1`, sequence number zero, and the target in the
+/// body.
+#[test]
+fn the_resource_request_we_issue_carries_what_the_c_puts_in_it() {
+    let mut node = node();
+    let mut frame = node
+        .request_resource_table(1000, PEER_ID, ResourceRequestKind::Report)
+        .expect("a registered type is sent")
+        .frame()
+        .to_vec();
+    let received = rx::accept(&mut frame).expect("validates");
+    assert_eq!(
+        received.header.message_type,
+        MessageType::RESOURCE_TABLE_REQUEST
+    );
+    assert_eq!(received.header.seq_num, 0);
+    assert_eq!(received.dst, BmIpAddr::LINK_LOCAL_MULTICAST);
+    assert_eq!(
+        ResourceTableRequest::decode(received.payload)
+            .unwrap()
+            .target_node_id,
+        PEER_ID
+    );
+    assert!(node.resource_requests().contains(PEER_ID));
+}
+
+#[test]
+fn a_reply_to_our_request_reaches_the_application() {
+    let mut node = node();
+    node.request_resource_table(0, PEER_ID, ResourceRequestKind::Report)
+        .unwrap();
+
+    let frame = resource_reply_frame(PEER_ID, &[b"a", b"bb"], &[b"ccc"]);
+    let events = table_events(&mut node, 10, &frame);
+    assert_eq!(
+        events,
+        [
+            Seen::Message {
+                message_type: MessageType::RESOURCE_TABLE_REPLY,
+                seq_num: 0,
+                source: PEER_ID,
+            },
+            Seen::ResourceTable {
+                source: PEER_ID,
+                node_id: PEER_ID,
+                publishers: vec![b"a".to_vec(), b"bb".to_vec()],
+                subscribers: vec![b"ccc".to_vec()],
+            }
+        ]
+    );
+    assert!(node.resource_requests().is_empty());
+
+    // Single-shot: the entry is gone, so a second reply is unsolicited.
+    let events = table_events(&mut node, 20, &frame);
+    assert_eq!(events.len(), 1, "dispatched, and matched against nothing");
+}
+
+/// The one correlation in BCMP that compares the body's claim against the
+/// address the frame arrived from. The request list is not even consulted.
+#[test]
+fn a_reply_whose_claim_disagrees_with_its_source_is_dropped() {
+    let mut node = node();
+    node.request_resource_table(0, PEER_ID, ResourceRequestKind::Report)
+        .unwrap();
+
+    let frame = resource_reply_frame(NODE_ID, &[b"a"], &[]);
+    let events = table_events(&mut node, 10, &frame);
+    assert_eq!(events.len(), 1, "dispatched and then refused");
+    assert!(
+        node.resource_requests().contains(PEER_ID),
+        "the entry survives, so the real reply can still answer it"
+    );
+}
+
+/// `fp == NULL`: the reply is matched, consumed, and reported to nobody.
+#[test]
+fn a_request_without_a_callback_consumes_its_reply_silently() {
+    let mut node = node();
+    node.request_resource_table(0, PEER_ID, ResourceRequestKind::Ignore)
+        .unwrap();
+    let frame = resource_reply_frame(PEER_ID, &[b"a"], &[]);
+    let events = table_events(&mut node, 10, &frame);
+    assert_eq!(events.len(), 1);
+    assert!(node.resource_requests().is_empty());
+}
+
+/// Divergence #33: the list key is the low 32 bits of the id, so a node
+/// sharing them answers another node's request.
+#[test]
+fn the_request_list_is_keyed_on_half_an_id() {
+    const WIDE: u64 = 0xDEAD_BEEF_55AA_0011;
+    assert_eq!(WIDE as u32, PEER_ID as u32);
+
+    let mut node = node();
+    node.request_resource_table(0, WIDE, ResourceRequestKind::Report)
+        .unwrap();
+    let frame = resource_reply_frame(PEER_ID, &[b"a"], &[]);
+    let events = table_events(&mut node, 10, &frame);
+    assert_eq!(events.len(), 2, "PEER_ID's reply answered WIDE's request");
+    assert!(node.resource_requests().is_empty());
+}
+
+/// A reply whose records do not fit the body it arrived in is dropped, where
+/// the C would walk off the end of the frame -- divergence #14.
+#[test]
+fn a_reply_declaring_records_that_did_not_arrive_is_dropped() {
+    let mut node = node();
+    node.request_resource_table(0, PEER_ID, ResourceRequestKind::Report)
+        .unwrap();
+
+    let mut body = vec![0u8; ResourceTableReply::HEADER_LEN];
+    body[0..8].copy_from_slice(&PEER_ID.to_le_bytes());
+    body[8..10].copy_from_slice(&1u16.to_le_bytes()); // one record, and no bytes of it
+    let frame = peer_frame(
+        MessageType::RESOURCE_TABLE_REPLY,
+        &body,
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    );
+    let events = table_events(&mut node, 10, &frame);
+    assert_eq!(events.len(), 1, "dispatched, and then refused");
+    assert!(node.resource_requests().contains(PEER_ID));
+}
+
+/// Divergence #38: the C's de-duplication compares the needle's length, so a
+/// prefix of a stored name is refused.
+#[test]
+fn adding_a_prefix_of_a_stored_resource_is_refused() {
+    let mut node = node_with_resources();
+    assert_eq!(
+        node.add_resource(b"sensor", PUB),
+        Err(ResourceAddError::AlreadyPresent)
+    );
+    assert_eq!(node.resources().count(PUB), 2);
+    node.add_resource(b"sensor", SUB).unwrap();
+    assert_eq!(node.resources().count(SUB), 2);
+}
+
+/// An unregistered type is neither sent nor answered, the C's `BmENODEV`.
+#[test]
+fn an_unregistered_resource_type_is_neither_sent_nor_answered() {
+    let mut node = node_with_resources();
+    assert!(node.unregister(MessageType::RESOURCE_TABLE_REQUEST));
+    assert!(
+        node.request_resource_table(0, PEER_ID, ResourceRequestKind::Report)
+            .is_none()
+    );
+    assert!(
+        node.resource_requests().is_empty(),
+        "bcmp_tx runs before ll_item_add, so a request that never went out \
+         records nothing"
+    );
+
+    let mut frame = resource_request_frame(NODE_ID);
+    assert!(
+        node.on_frame(1000, 1, &mut frame).reply.is_none(),
+        "the request is dropped before its body is read"
+    );
+}
+
+/// The other half: a node that unregisters `0x0B` after asking never hears the
+/// answer, and keeps the list entry forever.
+#[test]
+fn an_unregistered_resource_reply_is_dropped_before_it_is_matched() {
+    let mut asker = node();
+    asker
+        .request_resource_table(0, PEER_ID, ResourceRequestKind::Report)
+        .unwrap();
+    assert!(asker.unregister(MessageType::RESOURCE_TABLE_REPLY));
+    let frame = resource_reply_frame(PEER_ID, &[b"a"], &[]);
+    assert!(table_events(&mut asker, 10, &frame).is_empty());
+    assert!(asker.resource_requests().contains(PEER_ID));
+}
+
+/// The whole loop: a `0x0A` arrives on the PHY and a `0x0B` goes back out.
+#[test]
+fn the_run_loop_answers_a_resource_request() {
+    let mut phy = MockPhy::new(
+        PORTS,
+        vec![Script::Receive {
+            port: 1,
+            frame: resource_request_frame(NODE_ID),
+        }],
+    );
+    let mut node = node_with_resources();
+    block_on(node.run(&mut phy));
+
+    let replies: Vec<&Sent> = phy
+        .sent
+        .iter()
+        .filter(|sent| {
+            let mut copy = sent.frame.clone();
+            rx::accept(&mut copy)
+                .map(|r| r.header.message_type == MessageType::RESOURCE_TABLE_REPLY)
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(
+        replies.len(),
+        usize::from(PORTS),
+        "a link-local reply is stamped once per port"
+    );
+
+    let mut copy = replies[0].frame.clone();
+    let received = rx::accept(&mut copy).unwrap();
+    let table = ResourceTableReply::decode(received.payload).unwrap();
+    assert_eq!(table.node_id, NODE_ID);
+    assert_eq!(table.publisher_count(), 2);
+    assert_eq!(table.subscriber_count(), 1);
 }

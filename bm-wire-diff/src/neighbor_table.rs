@@ -63,7 +63,7 @@ use bm_wire::bcmp::neighbors::{
     NeighborInfo, NeighborTableRequest, PortInfo, TableRequestKind, encode_neighbor_table_reply,
     neighbor_table_reply_len,
 };
-use bm_wire::bcmp::{BCMP_HEADER_LEN, MessageType, rx, tx};
+use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, MessageType, tx};
 use bm_wire::frame::{
     ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET,
     IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
@@ -74,8 +74,12 @@ use bm_wire::util::{BmIpAddr, time_remaining};
 
 use crate::Domain;
 use crate::stack::{
-    NUM_PORTS, OracleIdentity, drain, inject, oracle, pump_until_quiet, tick_count,
+    Captured, NUM_PORTS, OracleIdentity, captured_message_type, drain, inject, oracle,
+    pump_until_quiet, tick_count,
 };
+
+/// Where a BCMP body starts in a frame, past the BCMP header.
+const BCMP_BODY_OFFSET: usize = BCMP_HEADER_OFFSET + BCMP_HEADER_LEN;
 
 /// The node ids a step may name.
 ///
@@ -428,9 +432,6 @@ impl Model {
 // The comparison
 // ---------------------------------------------------------------------------
 
-/// A frame the oracle transmitted, and the port it went out on.
-type Captured = (u8, Vec<u8>);
-
 /// The `0x08` requests in a batch of captured frames, one entry per request
 /// rather than per port copy.
 ///
@@ -442,14 +443,11 @@ type Captured = (u8, Vec<u8>);
 fn captured_table_requests(captured: &[Captured]) -> Vec<(u64, Vec<Captured>)> {
     let copies: Vec<Captured> = captured
         .iter()
+        // The type comes out of the BCMP header, not out of `rx::accept`'s
+        // verdict: a frame the C stamped an egress port into need not
+        // validate (divergence #12), and those are the ones worth comparing.
         .filter(|(_, frame)| {
-            // The type comes out of the BCMP header, not out of `rx::accept`'s
-            // verdict: a frame the C stamped need not validate (divergence
-            // #12).
-            let mut copy = frame.clone();
-            rx::accept(&mut copy)
-                .map(|r| r.header.message_type == MessageType::NEIGHBOR_TABLE_REQUEST)
-                .unwrap_or(false)
+            captured_message_type(frame) == Some(MessageType::NEIGHBOR_TABLE_REQUEST)
         })
         .cloned()
         .collect();
@@ -466,9 +464,7 @@ fn captured_table_requests(captured: &[Captured]) -> Vec<(u64, Vec<Captured>)> {
             let targets: Vec<u64> = chunk
                 .iter()
                 .map(|(_, frame)| {
-                    let mut copy = frame.clone();
-                    let received = rx::accept(&mut copy).expect("filtered on it parsing");
-                    NeighborTableRequest::decode(received.payload)
+                    NeighborTableRequest::decode(&frame[BCMP_BODY_OFFSET..])
                         .expect("the oracle builds an eight-byte body")
                         .target_node_id
                 })

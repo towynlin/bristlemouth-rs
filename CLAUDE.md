@@ -139,13 +139,24 @@ cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
 cargo +1.97 check --workspace --all-targets                # the declared MSRV
 cargo tree -p bm-wire                                      # must show no dependencies
 ./bm-wire-sys/scripts/check_symbols.sh --check             # only libc may be unresolved
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features \
+  -p bm-wire -p bm-stack -p bm-wire-diff                   # -D warnings, as CI does
 cd bm-wire/fuzz && mkdir -p corpus/<target>                # libFuzzer wants it to exist
 cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 ```
 
-CI runs all of this on every push; see `.github/workflows/`. Fuzzing is the
-exception — `cargo test` replays the committed seeds, and `fuzz.yml` does
-open-ended runs nightly and on demand.
+`RUSTDOCFLAGS` matters: a broken intra-doc link — usually a public item linking
+to a private one — is a warning by default, so a bare `cargo doc` passes where
+CI fails. `bm-wire-sys` is excluded because bindgen re-emits bm_core's own C
+comments as doc comments.
+
+CI runs all of this on every push, plus four things this list leaves out:
+`cargo fmt --all --check` twice, since `bm-wire/fuzz` is its own workspace;
+`cargo clippy --workspace --all-targets -- -D warnings`; the same clippy for
+`thumbv8m.main-none-eabihf`; and `cargo test -p bm-wire` alone, the only run
+with the `std` feature off. `.github/workflows/ci.yml` is the whole of it.
+Fuzzing is the exception — `cargo test` replays the committed seeds, and
+`fuzz.yml` does open-ended runs nightly and on demand.
 
 MSRV is 1.97, declared in `[workspace.package]` and repeated in
 bm-phy-adin2111's manifest. It is embassy's number: embassy promises only that
