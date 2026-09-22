@@ -143,6 +143,8 @@ cargo build -p bm-stack --target thumbv8m.main-none-eabihf
 cargo +1.97 check --workspace --all-targets
 cargo tree -p bm-wire                         # must show no dependencies
 ./bm-wire-sys/scripts/check_symbols.sh --check
+RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features \
+  -p bm-wire -p bm-stack -p bm-wire-diff      # a bare `cargo doc` passes where CI fails
 cd bm-wire/fuzz && mkdir -p corpus/<target>
 cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 ```
