@@ -151,6 +151,14 @@ to a private one — is a warning by default, so a bare `cargo doc` passes where
 CI fails. `bm-wire-sys` is excluded because bindgen re-emits bm_core's own C
 comments as doc comments.
 
+There are three lockfiles — `Cargo.lock`, `bm-wire/fuzz/Cargo.lock` and
+`bm-phy-adin2111/Cargo.lock` — and the other two workspaces depend on the root
+crates by path. **Changing any dependency in `bm-wire`, `bm-stack` or
+`bm-wire-diff` invalidates all three**, and nothing in the root workspace says
+so: CI runs every job with `--locked`, so a stale lockfile fails the build
+before it compiles anything. Run all three verification blocks, not just the
+root one, and commit whichever lockfiles move.
+
 CI runs all of this on every push, plus four things this list leaves out:
 `cargo fmt --all --check` twice, since `bm-wire/fuzz` is its own workspace;
 `cargo clippy --workspace --all-targets -- -D warnings`; the same clippy for
