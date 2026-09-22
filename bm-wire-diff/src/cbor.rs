@@ -1,759 +1,457 @@
-//! Differential comparators for `bm_wire::cbor` against the tinycbor bm_core
-//! vendors.
+//! Differential comparators for the `cbor2` crate against the tinycbor
+//! bm_core vendors.
+//!
+//! `bm-wire` does not carry a CBOR codec of its own; it depends on `cbor2`.
+//! So what this file proves is narrower and more useful than a port
+//! comparison: **for the values bm_core actually stores, cbor2 and tinycbor
+//! put the same bytes on the wire, and read the same item back off it.**
 //!
 //! tinycbor is pure — no shim state, no allocation, no clock — so this
 //! comparator needs nothing brought up and its target lives in
 //! [`crate::replay::TARGETS`].
 //!
-//! Two halves, run against the same input:
+//! # What is compared, and what is not
 //!
-//! * **encode** — a scripted sequence of `cbor_encode*` calls into a buffer
-//!   deliberately small enough that overflow is the common case, comparing the
-//!   error, the cursor, the shortfall and the bytes after every call;
-//! * **decode** — `cbor_parser_init` over arbitrary bytes, comparing the
-//!   error, `cbor_value_is_valid`, `cbor_value_get_type`, every predicate
-//!   `bcmp/configuration.c` calls and every accessor those predicates unlock.
+//! | Compared | Not compared |
+//! |---|---|
+//! | Encoded bytes, for every value shape `bcmp/configuration.c` stores | Buffer-overflow behaviour: cbor2 fails the write, tinycbor keeps counting and reports a shortfall. Neither is visible on the wire. |
+//! | The head of one decoded item: kind, argument, and whether the length is known | Container item counts: tinycbor's encoder tracks them and cbor2's does not, by design. |
+//! | Definite-length string bodies | Indefinite-length string *reassembly*, which cbor2 leaves to the caller without `alloc`. C2 needs a helper; see `docs/bcmp-port-todo.md`. |
 //!
-//! The two are independent: nothing the encoder writes is fed to the parser,
-//! because a round trip would only ever exercise the well-formed subset and
-//! the parser's real input is a `ConfigSet` (`0xA2`) body from the wire.
-
-use std::mem::MaybeUninit;
+//! # The two places they disagree
+//!
+//! Both are asserted here rather than papered over, so a cbor2 upgrade that
+//! changes either fails CI.
+//!
+//! 1. **Floats.** `Header::Float` applies RFC 8949 preferred serialization and
+//!    narrows to the shortest lossless width, so `1.0` encodes as `f9 3c00`.
+//!    tinycbor's `cbor_encode_float` always emits the 5-byte `fa` form, and
+//!    `cbor_value_is_float` accepts *only* `fa` — so a half-precision float is
+//!    not a `FLOAT` to bm_core, and `cbor_type_to_config` rejects the value
+//!    outright. Anything writing a config value for a C node to read must push
+//!    the wide form, which [`bm_wire::cbor::push_f32_wide`] is. Divergence #43.
+//! 2. **A break byte at the top level.** tinycbor reports
+//!    `CborErrorUnexpectedBreak`; cbor2 returns `Ok(Header::Break)` and leaves
+//!    the judgement to the caller. Divergence #40.
 
 use arbitrary::{Arbitrary, Result, Unstructured};
-use bm_wire::cbor::{Copied, Encoder, Error};
+use bm_wire::cbor::push_f32_wide;
+use cbor2::core::{Decoder, Encoder, Header};
 
-/// Largest encoder output buffer a step may ask for.
-///
-/// The gold vector from `cbor_service_helper_test.cpp` is 91 bytes, so this
-/// is enough to encode something real while staying small enough that
-/// libFuzzer reaches the overflow paths constantly.
-pub const MAX_BUFFER: usize = 160;
-
-/// Largest buffer a `copy_*_string` step may be given.
-pub const MAX_COPY: usize = 80;
-
-/// Deepest the encode script will nest containers.
-///
-/// Half of [`bm_wire::cbor::MAX_NESTING`], so [`check`] can assert the port's
-/// ceiling was never what stopped a step.
-pub const MAX_SCRIPT_DEPTH: usize = 4;
-
-/// One `cbor_encode*` call.
+/// One value-encoding step, in the shapes `bcmp/configuration.c` stores.
 #[derive(Debug, Clone)]
 pub enum Op {
-    /// `cbor_encode_uint`.
+    /// `UINT32`, though the whole `u64` range is encoded.
     Uint(u64),
-    /// `cbor_encode_int`.
+    /// `INT32`, over the whole `i64` range.
     Int(i64),
-    /// `cbor_encode_float`, carried as bits so a NaN compares as itself —
-    /// tinycbor copies the bits out without inspecting them.
+    /// `FLOAT`, carried as bits so a NaN compares as itself.
     Float(u32),
-    /// `cbor_encode_text_string`. No UTF-8 constraint: neither side validates.
+    /// `STR`. No UTF-8 constraint: tinycbor does not validate, and cbor2's
+    /// raw header path does not either.
     Text(Vec<u8>),
-    /// `cbor_encode_byte_string`.
+    /// `BYTES`.
     Bytes(Vec<u8>),
-    /// `cbor_encoder_create_map`.
+    /// The map `services_cbor_as_map` builds.
     OpenMap(u8),
-    /// `cbor_encoder_create_array`.
+    /// `ARRAY`.
     OpenArray(u8),
-    /// `cbor_encoder_close_container`.
-    Close,
 }
 
 /// An encode script plus a decode payload.
 #[derive(Debug, Clone)]
 pub struct CborInput {
-    /// Size of the encoder's output buffer, 0..=[`MAX_BUFFER`].
-    pub buffer_len: usize,
-    /// Calls to make, in order.
+    /// Values to encode, in order.
     pub ops: Vec<Op>,
-    /// Bytes handed to `cbor_parser_init`. Unconstrained: a `ConfigSet` body
-    /// is whatever the sender put in it.
+    /// Bytes handed to both decoders. Unconstrained: a `ConfigSet` (`0xA2`)
+    /// body is whatever the sender put in it.
     pub payload: Vec<u8>,
-    /// Size of the buffer handed to `cbor_value_copy_*_string`,
-    /// 0..=[`MAX_COPY`].
-    pub copy_len: usize,
 }
 
-impl<'a> Arbitrary<'a> for Op {
-    fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
-        Ok(match u.int_in_range(0u8..=7)? {
-            0 => Self::Uint(u.arbitrary()?),
-            1 => Self::Int(u.arbitrary()?),
-            2 => Self::Float(u.arbitrary()?),
-            3 => Self::Text(bounded_bytes(u)?),
-            4 => Self::Bytes(bounded_bytes(u)?),
-            5 => Self::OpenMap(u.int_in_range(0u8..=4)?),
-            6 => Self::OpenArray(u.int_in_range(0u8..=4)?),
-            _ => Self::Close,
-        })
-    }
-}
-
-/// A string body, kept short enough that a step can both fit and overflow.
-fn bounded_bytes(u: &mut Unstructured<'_>) -> Result<Vec<u8>> {
-    let len = u.int_in_range(0usize..=48)?;
+/// A string body, short enough to keep the fuzzer's inputs dense.
+fn bounded_bytes(u: &mut Unstructured<'_>, max: usize) -> Result<Vec<u8>> {
+    let len = u.int_in_range(0..=max)?;
     let mut bytes = vec![0u8; len];
     u.fill_buffer(&mut bytes)?;
     Ok(bytes)
 }
 
+impl<'a> Arbitrary<'a> for Op {
+    fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
+        Ok(match u.int_in_range(0u8..=6)? {
+            0 => Self::Uint(u.arbitrary()?),
+            1 => Self::Int(u.arbitrary()?),
+            2 => Self::Float(u.arbitrary()?),
+            3 => Self::Text(bounded_bytes(u, 48)?),
+            4 => Self::Bytes(bounded_bytes(u, 48)?),
+            5 => Self::OpenMap(u.int_in_range(0u8..=4)?),
+            _ => Self::OpenArray(u.int_in_range(0u8..=4)?),
+        })
+    }
+}
+
 impl<'a> Arbitrary<'a> for CborInput {
     fn arbitrary(u: &mut Unstructured<'a>) -> Result<Self> {
-        let buffer_len = u.int_in_range(0..=MAX_BUFFER)?;
-        let copy_len = u.int_in_range(0..=MAX_COPY)?;
-        let op_count = u.int_in_range(0usize..=12)?;
+        let op_count = u.int_in_range(0usize..=10)?;
         let mut ops = Vec::with_capacity(op_count);
         for _ in 0..op_count {
             ops.push(u.arbitrary()?);
         }
-        let payload = bounded_bytes(u)?;
         Ok(Self {
-            buffer_len,
             ops,
-            payload,
-            copy_len,
+            payload: bounded_bytes(u, 48)?,
         })
     }
 }
 
-/// Assert the Rust CBOR codec agrees with tinycbor for this input.
+/// Assert cbor2 agrees with tinycbor for this input.
 ///
 /// # Panics
 ///
-/// On any divergence in either half.
+/// On any divergence outside the two recorded in this module's docs.
 pub fn check(input: &CborInput) {
-    check_encode(input.buffer_len, &input.ops);
-    check_decode(&input.payload, input.copy_len);
+    check_encode(&input.ops);
+    check_decode(&input.payload);
 }
 
-/// tinycbor's `CborError` for one of ours.
-fn c_error(err: Result<(), Error>) -> bm_wire_sys::CborError {
-    match err {
-        Ok(()) => bm_wire_sys::CborError_CborNoError,
-        Err(Error::UnknownLength) => bm_wire_sys::CborError_CborErrorUnknownLength,
-        Err(Error::UnexpectedEof) => bm_wire_sys::CborError_CborErrorUnexpectedEOF,
-        Err(Error::UnexpectedBreak) => bm_wire_sys::CborError_CborErrorUnexpectedBreak,
-        Err(Error::UnknownType) => bm_wire_sys::CborError_CborErrorUnknownType,
-        Err(Error::IllegalType) => bm_wire_sys::CborError_CborErrorIllegalType,
-        Err(Error::IllegalNumber) => bm_wire_sys::CborError_CborErrorIllegalNumber,
-        Err(Error::IllegalSimpleType) => bm_wire_sys::CborError_CborErrorIllegalSimpleType,
-        Err(Error::TooManyItems) => bm_wire_sys::CborError_CborErrorTooManyItems,
-        Err(Error::TooFewItems) => bm_wire_sys::CborError_CborErrorTooFewItems,
-        Err(Error::DataTooLarge) => bm_wire_sys::CborError_CborErrorDataTooLarge,
-        Err(Error::OutOfMemory) => bm_wire_sys::CborError_CborErrorOutOfMemory,
-        // Port-side ceilings with no C counterpart. `check_encode` asserts no
-        // step ever reaches one, so these are unreachable by construction.
-        Err(other) => panic!("{other:?} has no CborError; the script should not have reached it"),
-    }
-}
+/// Room for any script this comparator builds: ten ops, each at most a 9-byte
+/// head plus a 48-byte body.
+const SCRATCH: usize = 1024;
 
-/// What one op did to an encoder, on either side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Step {
-    err: bm_wire_sys::CborError,
-    buffer_size: usize,
-    extra_needed: usize,
-}
-
-/// Which ops the script must skip, on both sides.
+/// Encode `ops` through both libraries and compare the bytes.
 ///
-/// Two steps cannot be put to the C: a close with nothing open, and an open
-/// past [`MAX_SCRIPT_DEPTH`], which is as many `CborEncoder`s as the harness
-/// holds. The port answers both with an error that has no `CborError`, so
-/// there would be nothing to compare; skipping them on both sides keeps the
-/// two encoders in step for everything after. [`bm_wire::cbor`]'s own unit
-/// tests cover what the port does with them.
-fn skipped(ops: &[Op]) -> Vec<bool> {
-    let mut depth = 0usize;
-    ops.iter()
-        .map(|op| match op {
-            Op::OpenMap(_) | Op::OpenArray(_) => {
-                let full = depth == MAX_SCRIPT_DEPTH;
-                if !full {
-                    depth += 1;
-                }
-                full
+/// Both buffers are large enough that neither runs out, because the two
+/// overflow contracts genuinely differ and the wire never sees them; see the
+/// module docs.
+fn check_encode(ops: &[Op]) {
+    let mut rust_buf = [0u8; SCRATCH];
+    let rust_len = {
+        let mut tail: &mut [u8] = &mut rust_buf;
+        {
+            let mut enc = Encoder::from(&mut tail);
+            for op in ops {
+                let pushed = match op {
+                    Op::Uint(v) => enc.push(Header::Positive(*v)),
+                    // CBOR encodes a negative integer as `-1 - argument`, and
+                    // cbor2's `Negative` carries that argument, so the
+                    // complement is the conversion. tinycbor's
+                    // `cbor_encode_int` does the same thing with a sign-extend
+                    // and an xor.
+                    Op::Int(v) if *v < 0 => enc.push(Header::Negative(!(*v as u64))),
+                    Op::Int(v) => enc.push(Header::Positive(*v as u64)),
+                    // Not `Header::Float`: see `push_f32_wide`.
+                    Op::Float(bits) => push_f32_wide(&mut enc, f32::from_bits(*bits)),
+                    Op::Text(bytes) => enc
+                        .push(Header::Text(Some(bytes.len())))
+                        .and_then(|()| enc.write_all(bytes)),
+                    Op::Bytes(bytes) => enc
+                        .push(Header::Bytes(Some(bytes.len())))
+                        .and_then(|()| enc.write_all(bytes)),
+                    Op::OpenMap(n) => enc.push(Header::Map(Some(usize::from(*n)))),
+                    Op::OpenArray(n) => enc.push(Header::Array(Some(usize::from(*n)))),
+                };
+                pushed.expect("the scratch buffer is sized for any script");
             }
-            Op::Close => {
-                let empty = depth == 0;
-                if !empty {
-                    depth -= 1;
-                }
-                empty
-            }
-            _ => false,
-        })
-        .collect()
-}
-
-/// Run `ops` through both encoders and compare after every one.
-fn check_encode(buffer_len: usize, ops: &[Op]) {
-    let skip = skipped(ops);
-    let mut rust_buf = vec![0u8; buffer_len];
-    let mut rust_steps = Vec::with_capacity(ops.len());
-
-    {
-        let mut enc = Encoder::new(&mut rust_buf);
-        for (op, skip) in ops.iter().zip(&skip) {
-            if *skip {
-                rust_steps.push(None);
-                continue;
-            }
-            let err = match op {
-                Op::Uint(v) => enc.encode_uint(*v),
-                Op::Int(v) => enc.encode_int(*v),
-                Op::Float(bits) => enc.encode_float(f32::from_bits(*bits)),
-                Op::Text(bytes) => enc.encode_text(bytes),
-                Op::Bytes(bytes) => enc.encode_bytes(bytes),
-                Op::OpenMap(n) => enc.open_map(usize::from(*n)),
-                Op::OpenArray(n) => enc.open_array(usize::from(*n)),
-                Op::Close => enc.close_container(),
-            };
-            assert_ne!(
-                err,
-                Err(Error::NestingTooDeep),
-                "the port's MAX_NESTING ceiling was reached; the script is \
-                 capped at {MAX_SCRIPT_DEPTH} and the ceiling must stay out of reach"
-            );
-            rust_steps.push(Some(Step {
-                err: c_error(err),
-                buffer_size: enc.buffer_size(),
-                extra_needed: enc.extra_bytes_needed(),
-            }));
         }
-    }
+        SCRATCH - tail.len()
+    };
 
-    let mut c_buf = vec![0u8; buffer_len];
-    let c_steps = run_c_encoder(&mut c_buf, ops, &skip);
-
-    for (index, (op, (rs, c))) in ops.iter().zip(rust_steps.iter().zip(&c_steps)).enumerate() {
-        let (Some(rs), Some(c)) = (rs, c) else {
-            assert_eq!(
-                rs.is_none(),
-                c.is_none(),
-                "op {index} ({op:?}) was skipped on one side only"
-            );
-            continue;
-        };
-        assert_eq!(
-            rs.err, c.err,
-            "op {index} ({op:?}) returned a different error into a {buffer_len}-byte buffer"
-        );
-        assert_eq!(
-            rs.extra_needed, c.extra_needed,
-            "op {index} ({op:?}) left a different shortfall"
-        );
-        if rs.extra_needed == 0 {
-            // Once tinycbor has overflowed, `data.ptr` is the union member
-            // holding `bytes_needed`, so `cbor_encoder_get_buffer_size` is a
-            // pointer difference against a count. Nothing is written after
-            // that point, so the bytes stay comparable but the cursor does not.
-            assert_eq!(
-                rs.buffer_size, c.buffer_size,
-                "op {index} ({op:?}) left a different cursor"
-            );
-        }
-    }
+    let mut c_buf = [0u8; SCRATCH];
+    let c_len = run_c_encoder(&mut c_buf, ops);
 
     assert_eq!(
-        rust_buf,
-        c_buf,
-        "the encoded buffers differ after {} ops into {buffer_len} bytes",
-        ops.len()
+        &c_buf[..c_len],
+        &rust_buf[..rust_len],
+        "cbor2 and tinycbor encoded {ops:?} differently"
     );
 }
 
-/// Drive tinycbor's encoder through the same script, skipping what
-/// [`skipped`] marks.
-fn run_c_encoder(buf: &mut [u8], ops: &[Op], skip: &[bool]) -> Vec<Option<Step>> {
-    let mut encoders = [bm_wire_sys::CborEncoder::default(); MAX_SCRIPT_DEPTH + 1];
-    let len = buf.len();
+/// Drive tinycbor's encoder through the same script.
+///
+/// Containers are opened and never closed, exactly as the cbor2 side does:
+/// `cbor_encoder_close_container` writes nothing for a definite-length
+/// container, it only checks the item count, and cbor2's encoder does not
+/// track item counts at all. Nothing that reaches the wire is skipped.
+fn run_c_encoder(buf: &mut [u8], ops: &[Op]) -> usize {
+    let mut enc = bm_wire_sys::CborEncoder::default();
     let ptr = buf.as_mut_ptr();
-    // SAFETY: `encoders[0]` is a live, correctly-sized CborEncoder, and
-    // `ptr`/`len` describe a buffer that outlives every call below.
-    unsafe { bm_wire_sys::cbor_encoder_init(&raw mut encoders[0], ptr, len, 0) };
+    // SAFETY: `enc` is a live, correctly-sized CborEncoder and `ptr`/`len`
+    // describe a buffer that outlives every call below.
+    unsafe { bm_wire_sys::cbor_encoder_init(&raw mut enc, ptr, buf.len(), 0) };
 
-    let mut depth = 0usize;
-    let mut steps = Vec::with_capacity(ops.len());
-    for (op, skip) in ops.iter().zip(skip) {
-        if *skip {
-            steps.push(None);
-            continue;
-        }
-        // SAFETY: every call below takes `&raw mut encoders[depth]`, which is
-        // in bounds because `depth` never exceeds MAX_SCRIPT_DEPTH, and any
-        // pointer/length pair comes from a slice that outlives the call.
+    for op in ops {
+        // SAFETY: `enc` stays live for the whole loop, and every pointer and
+        // length pair comes from a slice that outlives its call. A container
+        // is written through the same encoder rather than a child, which is
+        // what `create_container` would do to it anyway minus the item count.
         let err = unsafe {
-            let active = &raw mut encoders[depth];
+            let e = &raw mut enc;
             match op {
-                Op::Uint(v) => bm_wire_sys::cbor_encode_uint(active, *v),
-                Op::Int(v) => bm_wire_sys::cbor_encode_int(active, *v),
-                Op::Float(bits) => bm_wire_sys::cbor_encode_float(active, f32::from_bits(*bits)),
+                Op::Uint(v) => bm_wire_sys::cbor_encode_uint(e, *v),
+                Op::Int(v) => bm_wire_sys::cbor_encode_int(e, *v),
+                Op::Float(bits) => bm_wire_sys::cbor_encode_float(e, f32::from_bits(*bits)),
                 Op::Text(bytes) => {
-                    bm_wire_sys::cbor_encode_text_string(active, bytes.as_ptr().cast(), bytes.len())
+                    bm_wire_sys::cbor_encode_text_string(e, bytes.as_ptr().cast(), bytes.len())
                 }
                 Op::Bytes(bytes) => {
-                    bm_wire_sys::cbor_encode_byte_string(active, bytes.as_ptr(), bytes.len())
+                    bm_wire_sys::cbor_encode_byte_string(e, bytes.as_ptr(), bytes.len())
                 }
+                // `create_container` writes the head through the *child*
+                // and leaves the parent's cursor where it was until a close
+                // resyncs it. Nothing is ever closed here, so the child
+                // becomes the working encoder; for a definite-length
+                // container that loses only the item count, which
+                // `close_container` checks and never writes.
                 Op::OpenMap(n) | Op::OpenArray(n) => {
-                    let child = &raw mut encoders[depth + 1];
+                    let mut child = bm_wire_sys::CborEncoder::default();
                     let err = if matches!(op, Op::OpenMap(_)) {
-                        bm_wire_sys::cbor_encoder_create_map(active, child, usize::from(*n))
+                        bm_wire_sys::cbor_encoder_create_map(e, &raw mut child, usize::from(*n))
                     } else {
-                        bm_wire_sys::cbor_encoder_create_array(active, child, usize::from(*n))
+                        bm_wire_sys::cbor_encoder_create_array(e, &raw mut child, usize::from(*n))
                     };
-                    depth += 1;
+                    enc = child;
                     err
-                }
-                Op::Close => {
-                    let parent = &raw mut encoders[depth - 1];
-                    let child = &raw const encoders[depth];
-                    depth -= 1;
-                    bm_wire_sys::cbor_encoder_close_container(parent, child)
                 }
             }
         };
-        // SAFETY: `encoders[depth]` is live, and `ptr` is the same buffer
-        // pointer `cbor_encoder_init` was given.
-        let (buffer_size, extra_needed) = unsafe {
-            let active = &raw const encoders[depth];
-            (
-                bm_wire_sys::cbor_encoder_get_buffer_size(active, ptr),
-                bm_wire_sys::cbor_encoder_get_extra_bytes_needed(active),
-            )
-        };
-        steps.push(Some(Step {
+        assert_eq!(
             err,
-            buffer_size,
-            extra_needed,
-        }));
+            bm_wire_sys::CborError_CborNoError,
+            "tinycbor refused {op:?} into a {SCRATCH}-byte buffer"
+        );
     }
-    steps
+
+    // SAFETY: `enc` is live and `ptr` is the buffer it was initialised with.
+    unsafe { bm_wire_sys::cbor_encoder_get_buffer_size(&raw const enc, ptr) }
 }
 
-/// Parse `payload` on both sides and compare everything reachable.
-fn check_decode(payload: &[u8], copy_len: usize) {
-    let mut parser = MaybeUninit::<bm_wire_sys::CborParser>::zeroed();
-    let mut it = MaybeUninit::<bm_wire_sys::CborValue>::zeroed();
-    // SAFETY: `payload`'s pointer and length describe a live slice, and both
-    // out-parameters are correctly-sized and aligned. tinycbor reads no byte
-    // beyond `payload.as_ptr() + payload.len()`.
-    let c_err = unsafe {
-        bm_wire_sys::cbor_parser_init(
+/// One decoded item head, normalised so the two libraries can be compared.
+///
+/// Floats carry their wire width as well as their value: the width is what
+/// `cbor_value_is_float` discriminates on, so two floats of equal value and
+/// different width are not interchangeable to bm_core.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Item {
+    Positive(u64),
+    /// The encoded argument, i.e. the `n` of `-1 - n`, as both libraries
+    /// report it.
+    Negative(u64),
+    Bytes(Option<u64>),
+    Text(Option<u64>),
+    Array(Option<u64>),
+    Map(Option<u64>),
+    Tag(u64),
+    Simple(u8),
+    /// `(additional information, the f32 bits)`, the second only for `fa`.
+    Float(u8, Option<u32>),
+    Break,
+}
+
+/// Decode one item head with both libraries and compare.
+fn check_decode(payload: &[u8]) {
+    let c = c_head(payload);
+    let mut decoder = Decoder::from(payload);
+    let rust = decoder
+        .pull()
+        .ok()
+        .map(|header| cbor2_item(header, payload));
+
+    match (c, rust) {
+        (Some(c), Some(rust)) => assert!(
+            same_item(c, rust),
+            "cbor2 and tinycbor read a different item from {payload:02x?}: \
+             tinycbor {c:?}, cbor2 {rust:?}"
+        ),
+        (None, None) => {}
+        // The one accepted asymmetry, divergence #40: tinycbor calls a
+        // top-level break `CborErrorUnexpectedBreak`; cbor2 hands it back and
+        // lets the caller decide. Neither reads a value out of it.
+        (None, Some(Item::Break)) => {}
+        (c, rust) => panic!(
+            "cbor2 and tinycbor disagreed on whether {payload:02x?} is an item: \
+             tinycbor {c:?}, cbor2 {rust:?}"
+        ),
+    }
+}
+
+/// Whether the two libraries read the same item.
+///
+/// Equality, except for NaN: cbor2's decoder widens every float to `f64`, and
+/// that conversion quiets a signalling NaN, so the payload bits of a `fa`
+/// NaN do not survive it. tinycbor copies the four bytes out untouched.
+/// Divergence #43 records it. Every non-NaN `f32` round-trips through `f64`
+/// exactly, so this is the whole of the float difference on the read side.
+fn same_item(c: Item, rust: Item) -> bool {
+    match (c, rust) {
+        (Item::Float(cw, Some(cb)), Item::Float(rw, Some(rb))) => {
+            cw == rw && (cb == rb || (f32::from_bits(cb).is_nan() && f32::from_bits(rb).is_nan()))
+        }
+        _ => c == rust,
+    }
+}
+
+/// Normalise a cbor2 header. `payload` supplies the wire width of a float,
+/// which `Header::Float` has already widened away.
+fn cbor2_item(header: Header, payload: &[u8]) -> Item {
+    let width = payload.first().map_or(0, |b| b & 0x1f);
+    match header {
+        Header::Positive(v) => Item::Positive(v),
+        Header::Negative(v) => Item::Negative(v),
+        Header::Bytes(len) => Item::Bytes(len.map(|l| l as u64)),
+        Header::Text(len) => Item::Text(len.map(|l| l as u64)),
+        Header::Array(len) => Item::Array(len.map(|l| l as u64)),
+        Header::Map(len) => Item::Map(len.map(|l| l as u64)),
+        Header::Tag(v) => Item::Tag(v),
+        Header::Simple(v) => Item::Simple(v),
+        Header::Break => Item::Break,
+        Header::Float(v) => Item::Float(
+            width,
+            // Only the 4-byte form is compared by value: tinycbor's
+            // half-float reader lives in `cborparser_float.c`, which
+            // `build.rs` does not compile, so there is no oracle for `f9`.
+            (width == 26).then_some(v as f32).map(f32::to_bits),
+        ),
+    }
+}
+
+/// tinycbor's view of the same head, or `None` if `cbor_parser_init` failed.
+fn c_head(payload: &[u8]) -> Option<Item> {
+    let mut parser = std::mem::MaybeUninit::<bm_wire_sys::CborParser>::zeroed();
+    let mut it = std::mem::MaybeUninit::<bm_wire_sys::CborValue>::zeroed();
+    // SAFETY: both out-parameters are correctly sized and aligned, and
+    // `payload` describes a live slice tinycbor never reads past the end of.
+    let (err, it) = unsafe {
+        let err = bm_wire_sys::cbor_parser_init(
             payload.as_ptr(),
             payload.len(),
             0,
             parser.as_mut_ptr(),
             it.as_mut_ptr(),
-        )
+        );
+        (err, it.assume_init())
     };
-    // SAFETY: cbor_parser_init writes every field of both structs before it
-    // returns, on the error paths as well as the success one.
-    let (parser, it) = unsafe { (parser.assume_init(), it.assume_init()) };
-    let _ = parser; // `it` borrows it; keep it alive for the accessors below.
+    if err != bm_wire_sys::CborError_CborNoError {
+        return None;
+    }
     let value = &raw const it;
+    let width = payload.first().map_or(0, |b| b & 0x1f);
 
-    let rs = bm_wire::cbor::parse(payload);
-    assert_eq!(
-        c_error(rs.result),
-        c_err,
-        "cbor_parser_init diverged for {payload:02x?}"
-    );
-
-    // SAFETY (all of the below): `value` points at the initialised CborValue,
-    // and every accessor is guarded by the predicate its C assertion demands.
+    // SAFETY: every accessor below is called behind the predicate its C
+    // assertion names, and `value` points at the initialised CborValue.
     unsafe {
-        assert_eq!(
-            bm_wire_sys::cbor_value_is_valid(value),
-            rs.value.is_valid(),
-            "cbor_value_is_valid diverged for {payload:02x?}"
-        );
-        assert_eq!(
-            u8::try_from(bm_wire_sys::cbor_value_get_type(value)).unwrap(),
-            rs.value.ty().as_u8(),
-            "cbor_value_get_type diverged for {payload:02x?}"
-        );
+        let len = |known: bool| -> Option<u64> {
+            let mut out = 0usize;
+            known.then(|| {
+                let e = bm_wire_sys::cbor_value_get_string_length(value, &raw mut out);
+                assert_eq!(e, bm_wire_sys::CborError_CborNoError);
+                out as u64
+            })
+        };
+        let known = bm_wire_sys::cbor_value_is_length_known(value);
 
-        for (name, c, rust) in [
-            (
-                "is_integer",
-                bm_wire_sys::cbor_value_is_integer(value),
-                rs.value.is_integer(),
-            ),
-            (
-                "is_unsigned_integer",
-                bm_wire_sys::cbor_value_is_unsigned_integer(value),
-                rs.value.is_unsigned_integer(),
-            ),
-            (
-                "is_negative_integer",
-                bm_wire_sys::cbor_value_is_negative_integer(value),
-                rs.value.is_negative_integer(),
-            ),
-            (
-                "is_byte_string",
-                bm_wire_sys::cbor_value_is_byte_string(value),
-                rs.value.is_byte_string(),
-            ),
-            (
-                "is_text_string",
-                bm_wire_sys::cbor_value_is_text_string(value),
-                rs.value.is_text_string(),
-            ),
-            (
-                "is_array",
-                bm_wire_sys::cbor_value_is_array(value),
-                rs.value.is_array(),
-            ),
-            (
-                "is_map",
-                bm_wire_sys::cbor_value_is_map(value),
-                rs.value.is_map(),
-            ),
-            (
-                "is_float",
-                bm_wire_sys::cbor_value_is_float(value),
-                rs.value.is_float(),
-            ),
-            (
-                "is_length_known",
-                bm_wire_sys::cbor_value_is_length_known(value),
-                rs.value.is_length_known(),
-            ),
-        ] {
-            assert_eq!(c, rust, "cbor_value_{name} diverged for {payload:02x?}");
-        }
-
-        if rs.value.is_unsigned_integer() {
+        if bm_wire_sys::cbor_value_is_unsigned_integer(value) {
             let mut out = 0u64;
-            let err = bm_wire_sys::cbor_value_get_uint64(value, &raw mut out);
-            assert_eq!(err, bm_wire_sys::CborError_CborNoError);
-            assert_eq!(
-                Some(out),
-                rs.value.get_uint64(),
-                "cbor_value_get_uint64 diverged for {payload:02x?}"
-            );
+            bm_wire_sys::cbor_value_get_uint64(value, &raw mut out);
+            return Some(Item::Positive(out));
         }
-
-        if rs.value.is_integer() && !is_int64_negation_overflow(payload) {
-            let mut out = 0i64;
-            let err = bm_wire_sys::cbor_value_get_int64(value, &raw mut out);
-            assert_eq!(err, bm_wire_sys::CborError_CborNoError);
-            assert_eq!(
-                Some(out),
-                rs.value.get_int64(),
-                "cbor_value_get_int64 diverged for {payload:02x?}"
-            );
+        if bm_wire_sys::cbor_value_is_negative_integer(value) {
+            // Read the argument off the wire rather than through
+            // `cbor_value_get_int64`, which overflows for arguments at or
+            // above `1 << 63` (divergence #41) and is undefined there.
+            return Some(Item::Negative(argument(payload)));
         }
-
-        if rs.value.is_float() {
+        if bm_wire_sys::cbor_value_is_byte_string(value) {
+            return Some(Item::Bytes(len(known)));
+        }
+        if bm_wire_sys::cbor_value_is_text_string(value) {
+            return Some(Item::Text(len(known)));
+        }
+        if bm_wire_sys::cbor_value_is_array(value) {
+            let mut out = 0usize;
+            return Some(Item::Array(known.then(|| {
+                bm_wire_sys::cbor_value_get_array_length(value, &raw mut out);
+                out as u64
+            })));
+        }
+        if bm_wire_sys::cbor_value_is_map(value) {
+            let mut out = 0usize;
+            return Some(Item::Map(known.then(|| {
+                bm_wire_sys::cbor_value_get_map_length(value, &raw mut out);
+                out as u64
+            })));
+        }
+        if bm_wire_sys::cbor_value_is_tag(value) {
+            let mut out = 0u64;
+            bm_wire_sys::cbor_value_get_tag(value, &raw mut out);
+            return Some(Item::Tag(out));
+        }
+        if bm_wire_sys::cbor_value_is_float(value) {
             let mut out = 0f32;
-            let err = bm_wire_sys::cbor_value_get_float(value, &raw mut out);
-            assert_eq!(err, bm_wire_sys::CborError_CborNoError);
-            assert_eq!(
-                out.to_bits(),
-                rs.value.get_float().map(f32::to_bits).unwrap(),
-                "cbor_value_get_float diverged for {payload:02x?}"
-            );
+            bm_wire_sys::cbor_value_get_float(value, &raw mut out);
+            return Some(Item::Float(width, Some(out.to_bits())));
         }
-
-        if rs.value.is_byte_string() || rs.value.is_text_string() {
-            check_length(
-                "get_string_length",
-                bm_wire_sys::cbor_value_get_string_length,
-                value,
-                rs.value.string_length().unwrap(),
-                payload,
-            );
-            check_copy(&rs.value, value, copy_len, payload);
+        // Half and double floats: no value oracle, only the width. See
+        // `cbor2_item`.
+        if matches!(
+            u8::try_from(bm_wire_sys::cbor_value_get_type(value)).unwrap(),
+            0xf9 | 0xfb
+        ) {
+            return Some(Item::Float(width, None));
         }
-        if rs.value.is_array() {
-            check_length(
-                "get_array_length",
-                bm_wire_sys::cbor_value_get_array_length,
-                value,
-                rs.value.array_length().unwrap(),
-                payload,
-            );
-        }
-        if rs.value.is_map() {
-            check_length(
-                "get_map_length",
-                bm_wire_sys::cbor_value_get_map_length,
-                value,
-                rs.value.map_length().unwrap(),
-                payload,
-            );
-        }
+        // Booleans, null and undefined are major type 7 values that tinycbor
+        // gives their own `CborType`; cbor2 leaves them as simple values.
+        Some(Item::Simple(
+            match u8::try_from(bm_wire_sys::cbor_value_get_type(value)).unwrap() {
+                0xf5 => payload[0] & 0x1f, // false is 20, true is 21
+                0xf6 => 22,
+                0xf7 => 23,
+                _ => {
+                    let mut out = 0u8;
+                    bm_wire_sys::cbor_value_get_simple_type(value, &raw mut out);
+                    out
+                }
+            },
+        ))
     }
 }
 
-/// `-(2^63) - 1`, the one CBOR value `cbor_value_get_int64` cannot read.
-///
-/// tinycbor computes a negative integer as `-(int64_t)argument - 1`. For an
-/// argument of `1 << 63` that negation overflows `int64_t`, which C leaves
-/// undefined; gcc and clang wrap and yield [`i64::MAX`], and `bm-wire`
-/// reproduces that in wrapping arithmetic (divergence #41). Under
-/// `cargo fuzz`, where `build.rs` compiles the C with
-/// `-fsanitize=undefined`, the C aborts instead of answering, so there is
-/// nothing to compare against and this one input is held out.
-///
-/// The head is recognised from the bytes rather than from the port, so the
-/// thing under test does not decide its own domain.
-fn is_int64_negation_overflow(payload: &[u8]) -> bool {
-    payload.len() >= 9
-        && payload[0] == 0x3b
-        && payload[1] == 0x80
-        && payload[2..9].iter().all(|&b| b == 0)
-}
-
-/// Compare one of the three `get_*_length` accessors.
-unsafe fn check_length(
-    name: &str,
-    c_fn: unsafe extern "C" fn(*const bm_wire_sys::CborValue, *mut usize) -> bm_wire_sys::CborError,
-    value: *const bm_wire_sys::CborValue,
-    rust: std::result::Result<usize, Error>,
-    payload: &[u8],
-) {
-    let mut out = usize::MAX;
-    // SAFETY: the caller has checked the predicate `c_fn` asserts on.
-    let err = unsafe { c_fn(value, &raw mut out) };
-    assert_eq!(
-        err,
-        c_error(rust.map(|_| ())),
-        "cbor_value_{name} returned a different error for {payload:02x?}"
-    );
-    if let Ok(len) = rust {
-        assert_eq!(
-            out, len,
-            "cbor_value_{name} returned a different length for {payload:02x?}"
-        );
+/// The argument of the head at the start of `payload`, read off the wire.
+fn argument(payload: &[u8]) -> u64 {
+    let low = payload[0] & 0x1f;
+    if low < 24 {
+        return u64::from(low);
     }
+    let n = 1usize << (low - 24);
+    payload[1..=n]
+        .iter()
+        .fold(0u64, |a, &b| (a << 8) | u64::from(b))
 }
-
-/// Compare `cbor_value_copy_text_string` / `_byte_string` into a buffer of
-/// `copy_len` bytes: the error, the length written back, and every byte of
-/// the buffer including the ones neither side should have touched.
-unsafe fn check_copy(
-    rs: &bm_wire::cbor::Value<'_>,
-    value: *const bm_wire_sys::CborValue,
-    copy_len: usize,
-    payload: &[u8],
-) {
-    /// Neither 0 nor anything a chunk is likely to carry, so an untouched
-    /// byte is distinguishable from a written one.
-    const FILL: u8 = 0xa7;
-
-    let text = rs.is_text_string();
-    let mut c_buf = vec![FILL; copy_len];
-    let mut c_len = copy_len;
-    // SAFETY: the caller has checked the predicate the C asserts on, and
-    // `c_buf`/`c_len` are a live buffer and its length.
-    let c_err = unsafe {
-        if text {
-            bm_wire_sys::cbor_value_copy_text_string(
-                value,
-                c_buf.as_mut_ptr().cast(),
-                &raw mut c_len,
-                std::ptr::null_mut(),
-            )
-        } else {
-            bm_wire_sys::cbor_value_copy_byte_string(
-                value,
-                c_buf.as_mut_ptr(),
-                &raw mut c_len,
-                std::ptr::null_mut(),
-            )
-        }
-    };
-
-    let mut rust_buf = vec![FILL; copy_len];
-    let rust = if text {
-        rs.copy_text_string(&mut rust_buf).unwrap()
-    } else {
-        rs.copy_byte_string(&mut rust_buf).unwrap()
-    };
-
-    let rust_err = match rust {
-        Ok(Copied::Fits { .. }) => Ok(()),
-        Ok(Copied::TooSmall { .. }) => Err(Error::OutOfMemory),
-        Err(err) => Err(err),
-    };
-    assert_eq!(
-        c_err,
-        c_error(rust_err),
-        "copy_string returned a different error for {payload:02x?} into {copy_len} bytes"
-    );
-    assert_eq!(
-        c_buf, rust_buf,
-        "copy_string wrote different bytes for {payload:02x?} into {copy_len} bytes"
-    );
-    if let Ok(copied) = rust {
-        // tinycbor writes the total back through `buflen` whether or not the
-        // whole string fit, and only leaves it alone on the errors that come
-        // out of chunk iteration.
-        assert_eq!(
-            c_len,
-            copied.len(),
-            "copy_string reported a different length for {payload:02x?} into {copy_len} bytes"
-        );
-    } else {
-        assert_eq!(
-            c_len, copy_len,
-            "copy_string overwrote buflen on an error path for {payload:02x?}"
-        );
-    }
-}
-
-/// Every `CborType` value tinycbor can assign, for the test that pins the
-/// port's discriminants to the C's.
-#[cfg(test)]
-const C_TYPES: &[(bm_wire::cbor::Type, bm_wire_sys::CborType)] = &[
-    (
-        bm_wire::cbor::Type::Integer,
-        bm_wire_sys::CborType_CborIntegerType,
-    ),
-    (
-        bm_wire::cbor::Type::ByteString,
-        bm_wire_sys::CborType_CborByteStringType,
-    ),
-    (
-        bm_wire::cbor::Type::TextString,
-        bm_wire_sys::CborType_CborTextStringType,
-    ),
-    (
-        bm_wire::cbor::Type::Array,
-        bm_wire_sys::CborType_CborArrayType,
-    ),
-    (bm_wire::cbor::Type::Map, bm_wire_sys::CborType_CborMapType),
-    (bm_wire::cbor::Type::Tag, bm_wire_sys::CborType_CborTagType),
-    (
-        bm_wire::cbor::Type::Simple,
-        bm_wire_sys::CborType_CborSimpleType,
-    ),
-    (
-        bm_wire::cbor::Type::Boolean,
-        bm_wire_sys::CborType_CborBooleanType,
-    ),
-    (
-        bm_wire::cbor::Type::Null,
-        bm_wire_sys::CborType_CborNullType,
-    ),
-    (
-        bm_wire::cbor::Type::Undefined,
-        bm_wire_sys::CborType_CborUndefinedType,
-    ),
-    (
-        bm_wire::cbor::Type::HalfFloat,
-        bm_wire_sys::CborType_CborHalfFloatType,
-    ),
-    (
-        bm_wire::cbor::Type::Float,
-        bm_wire_sys::CborType_CborFloatType,
-    ),
-    (
-        bm_wire::cbor::Type::Double,
-        bm_wire_sys::CborType_CborDoubleType,
-    ),
-    (
-        bm_wire::cbor::Type::Invalid,
-        bm_wire_sys::CborType_CborInvalidType,
-    ),
-];
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn run(buffer_len: usize, ops: &[Op], payload: &[u8], copy_len: usize) {
+    fn run(ops: &[Op], payload: &[u8]) {
         check(&CborInput {
-            buffer_len,
             ops: ops.to_vec(),
             payload: payload.to_vec(),
-            copy_len,
         });
     }
 
-    fn decode(payload: &[u8]) {
-        for copy_len in [0, 1, 4, 43, MAX_COPY] {
-            run(0, &[], payload, copy_len);
-        }
+    fn encode(ops: &[Op]) -> Vec<u8> {
+        let mut buf = [0u8; SCRATCH];
+        let n = run_c_encoder(&mut buf, ops);
+        check_encode(ops);
+        buf[..n].to_vec()
     }
 
-    /// The port's `Type` discriminants are compared against the C's on every
-    /// decode, so they have to be the C's.
-    #[test]
-    fn every_type_discriminant_is_the_c_constant() {
-        for (rust, c) in C_TYPES {
-            assert_eq!(
-                u32::from(rust.as_u8()),
-                *c,
-                "{rust:?} does not carry tinycbor's CborType value"
-            );
-        }
-    }
-
-    #[test]
-    fn every_first_byte_parses_the_same_way() {
-        for byte in 0u8..=255 {
-            decode(&[byte]);
-            // With a full 8-byte argument behind it, so the multi-byte heads
-            // reach their fixups instead of stopping at end-of-buffer.
-            decode(&[byte, 1, 2, 3, 4, 5, 6, 7, 8]);
-            decode(&[byte, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        }
-    }
-
-    #[test]
-    fn truncated_heads() {
-        for byte in [0x18u8, 0x19, 0x1a, 0x1b, 0x38, 0x3a, 0x3b, 0xf9, 0xfa, 0xfb] {
-            for len in 0..9 {
-                let payload: Vec<u8> = core::iter::repeat_n(byte, 1)
-                    .chain(core::iter::repeat_n(0x5a, len))
-                    .collect();
-                decode(&payload);
-            }
-        }
-    }
-
-    #[test]
-    fn indefinite_length_strings() {
-        // Two chunks and a break, well formed.
-        decode(&[0x7f, 0x63, b'f', b'o', b'o', 0x62, b'e', b'r', 0xff]);
-        decode(&[0x5f, 0x41, 0xde, 0x42, 0xad, 0xbe, 0xff]);
-        // No break byte.
-        decode(&[0x7f, 0x63, b'f', b'o', b'o']);
-        // Empty.
-        decode(&[0x7f, 0xff]);
-        decode(&[0x5f, 0xff]);
-        // A chunk of the wrong major type.
-        decode(&[0x7f, 0x43, 1, 2, 3, 0xff]);
-        // A chunk that is itself indefinite.
-        decode(&[0x7f, 0x7f, 0xff, 0xff]);
-        // A chunk whose declared length runs off the end.
-        decode(&[0x7f, 0x78, 0x40, b'a', 0xff]);
-        // A definite string with a length longer than the buffer.
-        decode(&[0x78, 0x40, b'a']);
-    }
-
-    /// The negative integer whose negation overflows, and its neighbours.
-    #[test]
-    fn negative_integer_extremes() {
-        decode(&[0x3b, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        decode(&[0x3b, 0x80, 0, 0, 0, 0, 0, 0, 0]);
-        decode(&[0x3b, 0x80, 0, 0, 0, 0, 0, 0, 1]);
-        decode(&[0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-    }
-
-    /// The map `cbor_service_helper_test.cpp` builds, byte for byte, plus the
-    /// 91-byte total it asserts. Both encoders have to produce it.
-    /// `float baz = 3.14159;` from the gtest, as bits. Written this way
-    /// because the literal is what the gold vector encodes —
-    /// `f32::consts::PI` is `0x4049_0fdb` and would not reproduce it.
+    /// `float baz = 3.14159;` from `cbor_service_helper_test.cpp`, as bits.
+    /// The literal is what the gold vector encodes; `f32::consts::PI` is
+    /// `0x4049_0fdb` and would not reproduce it.
     const GOLD_BAZ: u32 = 0x4049_0fd0;
 
+    /// The map `cbor_service_helper_test.cpp` builds, byte for byte, plus the
+    /// 91-byte total it asserts. cbor2 has to produce it too.
     #[test]
     fn the_cbor_service_helper_gold_map() {
         const SILLY: &[u8] = b"The quick brown fox jumps over the lazy dog";
@@ -770,27 +468,8 @@ mod tests {
             Op::Text(SILLY.to_vec()),
             Op::Text(b"bytes".to_vec()),
             Op::Bytes(BYTES.to_vec()),
-            Op::Close,
         ];
-        run(MAX_BUFFER, &ops, &[], 0);
-
-        // The literal the gtest asserts, from the cbor.me listing in its
-        // comment. Nothing in bm_core pins these bytes; the test pins the
-        // eleven offsets it happens to check, and this pins all 91.
-        let mut buf = [0u8; MAX_BUFFER];
-        let mut enc = Encoder::new(&mut buf);
-        enc.open_map(5).unwrap();
-        enc.encode_text(b"foo").unwrap();
-        enc.encode_uint(42).unwrap();
-        enc.encode_text(b"bar").unwrap();
-        enc.encode_int(-1000).unwrap();
-        enc.encode_text(b"baz").unwrap();
-        enc.encode_float(f32::from_bits(GOLD_BAZ)).unwrap();
-        enc.encode_text(b"silly").unwrap();
-        enc.encode_text(SILLY).unwrap();
-        enc.encode_text(b"bytes").unwrap();
-        enc.encode_bytes(BYTES).unwrap();
-        enc.close_container().unwrap();
+        let got = encode(&ops);
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&[0xa5, 0x63, b'f', b'o', b'o', 0x18, 0x2a]);
@@ -801,9 +480,9 @@ mod tests {
         expected.extend_from_slice(&[0x65, b'b', b'y', b't', b'e', b's', 0x4a]);
         expected.extend_from_slice(BYTES);
 
-        assert_eq!(enc.buffer_size(), 91, "the gtest asserts 91 bytes");
-        assert_eq!(enc.written(), expected);
-        // The eleven offsets cbor_service_helper_test.cpp checks by hand.
+        assert_eq!(got.len(), 91, "the gtest asserts 91 bytes");
+        assert_eq!(got, expected);
+        // The eleven offsets the gtest checks by hand.
         for (offset, byte) in [
             (0, 0xa5),
             (1, 0x63),
@@ -822,37 +501,152 @@ mod tests {
         }
     }
 
-    /// The five values `cbor_service_helper_test.cpp` stores, each on its own,
-    /// which is what `set_config_cbor` is handed.
+    /// Divergence #43. `Header::Float` narrows to the shortest lossless
+    /// width; bm_core reads only the 5-byte form. This is the whole reason
+    /// [`bm_wire::cbor::push_f32_wide`] exists, and the table is the evidence that skipping
+    /// it breaks interoperability rather than merely wasting two bytes.
     #[test]
-    fn the_cbor_service_helper_gold_values() {
-        run(MAX_COPY, &[Op::Uint(42)], &[0x18, 0x2a], MAX_COPY);
-        run(MAX_COPY, &[Op::Int(-1000)], &[0x39, 0x03, 0xe7], MAX_COPY);
-        run(
-            MAX_COPY,
-            &[Op::Float(GOLD_BAZ)],
-            &[0xfa, 0x40, 0x49, 0x0f, 0xd0],
-            MAX_COPY,
-        );
-        let mut silly = vec![0x78, 0x2b];
-        silly.extend_from_slice(b"The quick brown fox jumps over the lazy dog");
-        run(
-            MAX_COPY,
-            &[Op::Text(
-                b"The quick brown fox jumps over the lazy dog".to_vec(),
-            )],
-            &silly,
-            MAX_COPY,
-        );
-        run(
-            MAX_COPY,
-            &[Op::Bytes(vec![0xde, 0xad, 0xbe, 0xef])],
-            &[0x44, 0xde, 0xad, 0xbe, 0xef],
-            MAX_COPY,
-        );
+    fn cbor2_narrows_floats_and_bm_core_cannot_read_them() {
+        for (value, preferred, wide) in [
+            (
+                1.0f32,
+                &[0xf9, 0x3c, 0x00][..],
+                &[0xfa, 0x3f, 0x80, 0x00, 0x00][..],
+            ),
+            (0.0, &[0xf9, 0x00, 0x00], &[0xfa, 0x00, 0x00, 0x00, 0x00]),
+            (-0.0, &[0xf9, 0x80, 0x00], &[0xfa, 0x80, 0x00, 0x00, 0x00]),
+            (0.5, &[0xf9, 0x38, 0x00], &[0xfa, 0x3f, 0x00, 0x00, 0x00]),
+            (
+                f32::INFINITY,
+                &[0xf9, 0x7c, 0x00],
+                &[0xfa, 0x7f, 0x80, 0x00, 0x00],
+            ),
+        ] {
+            let mut buf = [0u8; 16];
+            let n = {
+                let mut tail: &mut [u8] = &mut buf;
+                {
+                    let mut enc = Encoder::from(&mut tail);
+                    enc.push(Header::Float(f64::from(value))).unwrap();
+                }
+                16 - tail.len()
+            };
+            assert_eq!(&buf[..n], preferred, "cbor2's preferred form for {value}");
+
+            let mut buf = [0u8; 16];
+            let n = {
+                let mut tail: &mut [u8] = &mut buf;
+                {
+                    let mut enc = Encoder::from(&mut tail);
+                    push_f32_wide(&mut enc, value).unwrap();
+                }
+                16 - tail.len()
+            };
+            assert_eq!(&buf[..n], wide, "push_f32_wide's form for {value}");
+
+            // What bm_core makes of each: only the wide form is a FLOAT, and
+            // `cbor_type_to_config` refuses the narrow one outright, so the
+            // whole ConfigSet would be rejected rather than misread.
+            assert!(!c_is_float(preferred), "bm_core must not see f9 as a float");
+            assert!(c_is_float(wide), "bm_core must see fa as a float");
+            assert!(
+                !c_classifies(preferred),
+                "cbor_type_to_config must refuse the narrow form"
+            );
+            assert!(c_classifies(wide));
+        }
+
+        // cbor2 also quiets a signalling NaN on the way through f64, so even
+        // the width is not the whole story.
+        let mut buf = [0u8; 16];
+        let n = {
+            let mut tail: &mut [u8] = &mut buf;
+            {
+                let mut enc = Encoder::from(&mut tail);
+                enc.push(Header::Float(f64::from(f32::from_bits(0x7f80_0001))))
+                    .unwrap();
+            }
+            16 - tail.len()
+        };
+        assert_eq!(&buf[..n], &[0xfa, 0x7f, 0xc0, 0x00, 0x01]);
     }
 
-    /// The head lengths tinycbor picks, at every boundary.
+    /// `cbor_value_is_float` over a payload, which is what `get_config_float`
+    /// gates on.
+    fn c_is_float(payload: &[u8]) -> bool {
+        with_c_value(payload, |v| unsafe { bm_wire_sys::cbor_value_is_float(v) })
+    }
+
+    /// `cbor_type_to_config`, which is what `set_config_cbor` gates on.
+    fn c_classifies(payload: &[u8]) -> bool {
+        with_c_value(payload, |v| unsafe {
+            let mut ty = 0u32;
+            bm_wire_sys::cbor_type_to_config(v, &raw mut ty)
+        })
+    }
+
+    fn with_c_value<T>(payload: &[u8], f: impl FnOnce(*const bm_wire_sys::CborValue) -> T) -> T {
+        let mut parser = std::mem::MaybeUninit::<bm_wire_sys::CborParser>::zeroed();
+        let mut it = std::mem::MaybeUninit::<bm_wire_sys::CborValue>::zeroed();
+        // SAFETY: both out-parameters are correctly sized; `payload` is live.
+        let it = unsafe {
+            bm_wire_sys::cbor_parser_init(
+                payload.as_ptr(),
+                payload.len(),
+                0,
+                parser.as_mut_ptr(),
+                it.as_mut_ptr(),
+            );
+            it.assume_init()
+        };
+        f(&raw const it)
+    }
+
+    #[test]
+    fn every_first_byte_reads_the_same_way() {
+        for byte in 0u8..=255 {
+            run(&[], &[byte]);
+            run(&[], &[byte, 1, 2, 3, 4, 5, 6, 7, 8]);
+            run(&[], &[byte, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+        }
+    }
+
+    #[test]
+    fn truncated_heads() {
+        for byte in [
+            0x18u8, 0x19, 0x1a, 0x1b, 0x38, 0x3a, 0x3b, 0xf8, 0xf9, 0xfa, 0xfb,
+        ] {
+            for len in 0..9 {
+                let mut payload = vec![byte];
+                payload.extend(core::iter::repeat_n(0x5au8, len));
+                run(&[], &payload);
+            }
+        }
+    }
+
+    #[test]
+    fn indefinite_and_malformed_heads() {
+        for payload in [
+            &[0x7f, 0x63, b'f', b'o', b'o', 0xff][..],
+            &[0x5f, 0x41, 0xde, 0xff][..],
+            &[0x7f][..],
+            &[0x5f][..],
+            &[0x9f][..],
+            &[0xbf][..],
+            &[0xff][..], // the accepted asymmetry
+            &[0x1c][..],
+            &[0x1d][..],
+            &[0x1e][..],
+            &[0x3f][..],
+            &[0xdf][..],
+            &[0xff, 0xff][..],
+            &[0x78, 0x40, b'a'][..],
+        ] {
+            run(&[], payload);
+        }
+    }
+
+    /// The whole `i64` and `u64` head-width ladder, both libraries.
     #[test]
     fn integer_head_boundaries() {
         for value in [
@@ -867,9 +661,7 @@ mod tests {
             0x1_0000_0000,
             u64::MAX,
         ] {
-            for len in 0..=10 {
-                run(len, &[Op::Uint(value)], &[], 0);
-            }
+            run(&[Op::Uint(value)], &[]);
         }
         for value in [
             0i64,
@@ -883,251 +675,58 @@ mod tests {
             i64::MIN,
             i64::MAX,
         ] {
-            for len in 0..=10 {
-                run(len, &[Op::Int(value)], &[], 0);
-            }
+            run(&[Op::Int(value)], &[]);
         }
+        // The negative integer tinycbor's `cbor_value_get_int64` cannot read
+        // without overflowing (divergence #41). cbor2 hands back the argument
+        // and never overflows, so both sides agree on the head.
+        run(&[], &[0x3b, 0x80, 0, 0, 0, 0, 0, 0, 0]);
+        run(&[], &[0x3b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
     }
 
-    /// Overflow, the retry loop `services_cbor_as_map` runs, and the close
-    /// that reports it.
+    /// The five values `cbor_service_helper_test.cpp` stores, each alone,
+    /// which is the shape `set_config_cbor` is handed.
     #[test]
-    fn overflow_reports_the_exact_shortfall() {
-        let ops = vec![
-            Op::OpenMap(2),
-            Op::Text(b"alpha".to_vec()),
-            Op::Uint(1_000_000),
-            Op::Text(b"beta".to_vec()),
-            Op::Bytes(vec![7; 20]),
-            Op::Close,
-        ];
-        for len in 0..48 {
-            run(len, &ops, &[], 0);
-        }
-
-        // 8 bytes holds the map head and "alpha" and nothing else, so the
-        // uint is the first call to overflow and every call after it only
-        // counts.
-        let mut buf = [0u8; 8];
-        let mut enc = Encoder::new(&mut buf);
-        enc.open_map(2).unwrap();
-        assert_eq!(enc.encode_text(b"alpha"), Ok(()));
-        assert_eq!(enc.buffer_size(), 7);
-        assert_eq!(enc.encode_uint(1_000_000), Err(Error::OutOfMemory));
-        assert_eq!(enc.encode_text(b"beta"), Err(Error::OutOfMemory));
-        assert_eq!(enc.encode_bytes(&[7; 20]), Err(Error::OutOfMemory));
-        // The item count still came out right, so the close reports the
-        // buffer rather than the script.
-        assert_eq!(enc.close_container(), Err(Error::OutOfMemory));
-        let needed = enc.extra_bytes_needed();
-        assert_eq!(needed, 30);
-
-        // The point of the shortfall: a retry into `len + needed` fits exactly.
-        let mut big = vec![0u8; 8 + needed];
-        let mut enc = Encoder::new(&mut big);
-        enc.open_map(2).unwrap();
-        enc.encode_text(b"alpha").unwrap();
-        enc.encode_uint(1_000_000).unwrap();
-        enc.encode_text(b"beta").unwrap();
-        enc.encode_bytes(&[7; 20]).unwrap();
-        enc.close_container().unwrap();
-        assert_eq!(enc.buffer_size(), 8 + needed);
-    }
-
-    #[test]
-    fn container_item_counts() {
-        // Too few, too many, and exactly right.
-        for declared in 0u8..=3 {
-            for items in 0u8..=6 {
-                let mut ops = vec![Op::OpenArray(declared)];
-                ops.extend((0..items).map(|i| Op::Uint(u64::from(i))));
-                ops.push(Op::Close);
-                run(MAX_BUFFER, &ops, &[], 0);
-            }
-        }
-        for declared in 0u8..=2 {
-            for items in 0u8..=5 {
-                let mut ops = vec![Op::OpenMap(declared)];
-                ops.extend((0..items).map(|i| Op::Uint(u64::from(i))));
-                ops.push(Op::Close);
-                run(MAX_BUFFER, &ops, &[], 0);
-            }
-        }
-    }
-
-    #[test]
-    fn nested_containers() {
-        let ops = vec![
-            Op::OpenArray(1),
-            Op::OpenMap(1),
-            Op::Text(b"k".to_vec()),
-            Op::OpenArray(2),
-            Op::Uint(1),
-            Op::Uint(2),
-            Op::Close,
-            Op::Close,
-            Op::Close,
-        ];
-        for len in [0, 4, 8, 12, MAX_BUFFER] {
-            run(len, &ops, &[], 0);
-        }
-    }
-
-    /// A close with nothing open and an open past the script's depth are the
-    /// two steps the C cannot be asked to do; both sides must skip the same
-    /// ones and stay in step afterwards.
-    #[test]
-    fn steps_the_c_cannot_be_asked_to_do() {
-        run(MAX_BUFFER, &[Op::Close, Op::Uint(1)], &[], 0);
-        let mut ops = vec![Op::OpenArray(1); MAX_SCRIPT_DEPTH + 2];
-        ops.push(Op::Uint(9));
-        run(MAX_BUFFER, &ops, &[], 0);
-    }
-
-    /// What the port does with the two steps the comparator has to skip.
-    /// Neither has a `CborError`, so only this pins them.
-    #[test]
-    fn the_ports_own_refusals() {
-        let mut buf = [0u8; 16];
-        let mut enc = Encoder::new(&mut buf);
-        assert_eq!(enc.close_container(), Err(Error::NotInContainer));
-        assert_eq!(enc.buffer_size(), 0);
-
-        for _ in 0..bm_wire::cbor::MAX_NESTING - 1 {
-            assert_eq!(enc.open_array(0), Ok(()));
-        }
-        assert_eq!(enc.open_array(0), Err(Error::NestingTooDeep));
-    }
-
-    #[test]
-    fn float_bit_patterns_round_trip_through_both_encoders() {
-        for bits in [
-            0x0000_0000u32,
-            0x8000_0000,
-            0x3f80_0000,
-            0x7f80_0000,
-            0xff80_0000,
-            0x7fc0_0000,
-            0x7f80_0001,
-            0x0000_0001,
-        ] {
-            run(MAX_BUFFER, &[Op::Float(bits)], &[], 0);
-            let mut payload = vec![0xfa];
-            payload.extend_from_slice(&bits.to_be_bytes());
-            decode(&payload);
-        }
-    }
-
-    /// Read the C's own answer for a payload, bypassing every predicate.
-    /// Only the two divergence tests below need this.
-    fn c_parse(payload: &[u8]) -> (bm_wire_sys::CborError, u32, bool) {
-        let mut parser = MaybeUninit::<bm_wire_sys::CborParser>::zeroed();
-        let mut it = MaybeUninit::<bm_wire_sys::CborValue>::zeroed();
-        // SAFETY: both out-parameters are correctly sized, and `payload`
-        // describes a live slice.
-        unsafe {
-            let err = bm_wire_sys::cbor_parser_init(
-                payload.as_ptr(),
-                payload.len(),
-                0,
-                parser.as_mut_ptr(),
-                it.as_mut_ptr(),
-            );
-            let it = it.assume_init();
-            let value = &raw const it;
-            (
-                err,
-                bm_wire_sys::cbor_value_get_type(value),
-                bm_wire_sys::cbor_value_is_valid(value),
-            )
-        }
-    }
-
-    /// Divergence #40: a failed `cbor_parser_init` still reports a type and
-    /// still reports valid. Major type 1 is left holding `0x20`, which is not
-    /// a `CborType` constant.
-    #[test]
-    fn divergence_40_a_failed_parse_is_still_valid_and_typed() {
-        for (payload, ty) in [
-            // Additional information 28, on each major type.
-            (&[0x1c][..], 0x00u32),
-            (&[0x3c][..], 0x20),
-            (&[0x5c][..], 0x40),
-            (&[0xdc][..], 0xc0),
-            // A break byte at the top level.
-            (&[0xff][..], 0xe0),
-            // An 8-byte argument with one byte behind it.
-            (&[0x1b, 0][..], 0x00),
-            (&[0x3b, 0][..], 0x20),
-        ] {
-            let (err, c_ty, valid) = c_parse(payload);
-            assert_ne!(err, bm_wire_sys::CborError_CborNoError, "{payload:02x?}");
-            assert!(valid, "cbor_value_is_valid was false for {payload:02x?}");
-            assert_eq!(c_ty, ty, "cbor_value_get_type for {payload:02x?}");
-        }
-        // The one type value that is not in `CborType`.
-        assert!(!C_TYPES.iter().any(|(_, c)| *c == 0x20));
-        // And the truncated unsigned integer that reads back as its own
-        // additional-information byte.
-        let payload = [0x1bu8, 0];
-        let rs = bm_wire::cbor::parse(&payload);
-        assert!(rs.result.is_err());
-        assert_eq!(rs.value.get_uint64(), Some(27));
-    }
-
-    /// Divergence #41: `-(2^63) - 1` overflows tinycbor's negation and comes
-    /// back as `i64::MAX`. Asserted against the C here rather than in `check`,
-    /// which holds this one input out because UBSan aborts on it.
-    #[test]
-    fn divergence_41_the_negative_integer_that_overflows() {
-        let payload = [0x3bu8, 0x80, 0, 0, 0, 0, 0, 0, 0];
-        let mut parser = MaybeUninit::<bm_wire_sys::CborParser>::zeroed();
-        let mut it = MaybeUninit::<bm_wire_sys::CborValue>::zeroed();
-        let mut out = 0i64;
-        // SAFETY: as in `c_parse`; the value is a negative integer, which is
-        // what `cbor_value_get_int64` asserts on.
-        let c = unsafe {
-            bm_wire_sys::cbor_parser_init(
-                payload.as_ptr(),
-                payload.len(),
-                0,
-                parser.as_mut_ptr(),
-                it.as_mut_ptr(),
-            );
-            let it = it.assume_init();
-            bm_wire_sys::cbor_value_get_int64(&raw const it, &raw mut out);
-            out
-        };
-        assert_eq!(c, i64::MAX, "gcc and clang wrap the overflowing negation");
-        assert_eq!(bm_wire::cbor::parse(&payload).value.get_int64(), Some(c));
-
-        // One less is the largest negative integer that is well defined, and
-        // it is i64::MIN.
-        let payload = [0x3bu8, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+    fn the_cbor_service_helper_gold_values() {
+        assert_eq!(encode(&[Op::Uint(42)]), [0x18, 0x2a]);
+        assert_eq!(encode(&[Op::Int(-1000)]), [0x39, 0x03, 0xe7]);
         assert_eq!(
-            bm_wire::cbor::parse(&payload).value.get_int64(),
-            Some(i64::MIN)
+            encode(&[Op::Float(GOLD_BAZ)]),
+            [0xfa, 0x40, 0x49, 0x0f, 0xd0]
         );
+        assert_eq!(
+            encode(&[Op::Bytes(vec![0xde, 0xad, 0xbe, 0xef])]),
+            [0x44, 0xde, 0xad, 0xbe, 0xef]
+        );
+        let silly = b"The quick brown fox jumps over the lazy dog";
+        let mut expect = vec![0x78, 0x2b];
+        expect.extend_from_slice(silly);
+        assert_eq!(encode(&[Op::Text(silly.to_vec())]), expect);
     }
 
-    /// From `cargo fuzz run cbor`: a chunk declaring `u64::MAX` bytes.
-    /// tinycbor checks the bytes are there before it checks the running total
-    /// for overflow, so the answer is `UnexpectedEOF`, not `DataTooLarge`.
+    /// What cbor2 does *not* do that tinycbor does, so C3 does not discover
+    /// it the hard way. Neither is visible on the wire; both change what the
+    /// caller must do.
     #[test]
-    fn a_chunk_longer_than_the_address_space() {
-        decode(&[
-            0x7f, 0x62, b'2', b'{', 0x7b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        ]);
-        decode(&[0x7b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
-        decode(&[
-            0x5f, 0x5b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        ]);
+    fn the_contracts_that_do_not_carry_over() {
+        // 1. No item counting. tinycbor's close reports TooFewItems; cbor2
+        //    has no close and will happily emit a map that lies about its
+        //    length.
+        let short = encode(&[Op::OpenMap(5), Op::Uint(1)]);
+        assert_eq!(short, [0xa5, 0x01], "cbor2 emits a map declaring 5 pairs");
+
+        // 2. No shortfall accounting. tinycbor keeps counting past the end of
+        //    the buffer and reports how much more it needed; cbor2's slice
+        //    writer just fails. `serialized_size` is the replacement, and it
+        //    is available without `alloc`.
+        let mut tiny = [0u8; 2];
+        let mut tail: &mut [u8] = &mut tiny;
+        let mut enc = Encoder::from(&mut tail);
+        assert!(enc.push(Header::Positive(1_000_000)).is_err());
     }
 
     #[test]
-    fn empty_payload_and_empty_buffers() {
-        run(0, &[], &[], 0);
-        run(0, &[Op::Uint(0)], &[], 0);
-        decode(&[]);
+    fn empty_input() {
+        run(&[], &[]);
     }
 }

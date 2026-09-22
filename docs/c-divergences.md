@@ -73,9 +73,10 @@ Four to fix first, in this order.
 | 37 | A resource-table request naming node zero is answered by nobody | replicated | reading, confirmed differentially |
 | 38 | `find_resource` compares the needle's length against every entry | domain-limited | reading |
 | 39 | `bcmp/resource_discovery.c` mishandles four allocations | c-only | reading |
-| 40 | A failed `cbor_parser_init` still reports a type, and still reports valid | replicated | reading, confirmed differentially |
-| 41 | `cbor_value_get_int64` overflows on the one negative integer it cannot hold | domain-limited | reading, confirmed differentially |
+| 40 | A failed `cbor_parser_init` still reports a type, and still reports valid | c-only | reading, confirmed differentially |
+| 41 | `cbor_value_get_int64` overflows on the one negative integer it cannot hold | c-only | reading, confirmed differentially |
 | 42 | `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read | c-only | reading |
+| 43 | bm_core reads only the 5-byte float encoding, so a preferred-serialization float is unreadable to it | replicated | reading, confirmed differentially |
 
 ---
 
@@ -1584,12 +1585,19 @@ None of this reaches `bcmp/configuration.c`, which tests the `cbor_parser_init`
 error first in all four places it parses. It is one dropped error check away
 from doing so, and #42 is what that looks like.
 
-**replicated.** [`bm_wire::cbor::parse`] returns a `Parsed` carrying both the
-error and the value rather than a `Result`, so the difference cannot be
-collapsed by accident, and `Type::RawNegative` is the `0x20` case named at the
-type. Compared on every decode in `bm-wire-diff/src/cbor.rs` — the type, the
-validity and all nine predicates — and pinned in
-`divergence_40_a_failed_parse_is_still_valid_and_typed`.
+**c-only.** `bm-wire` uses the `cbor2` crate, whose `Decoder::pull` returns a
+`Result<Header, _>` — an error carries no value, so there is nothing to
+misread and no state to inspect afterwards. The defect has no counterpart to
+replicate.
+
+The reverse asymmetry, and the only one this harness accepts: a **break byte
+at the top level**. tinycbor reports `CborErrorUnexpectedBreak`; cbor2 returns
+`Ok(Header::Break)` and leaves the judgement to the caller. Neither reads a
+value out of it, and bm_core's callers reject it either way.
+`bm-wire-diff/src/cbor.rs`'s `check_decode` names that one case and panics on
+any other disagreement about whether a byte string is an item;
+`every_first_byte_reads_the_same_way` walks all 256 first bytes, and the
+`cbor` fuzz target walks the rest.
 
 Fix upstream in tinycbor by assigning `it->type` after the error returns
 rather than before. Not wire-visible; it changes what a caller that ignores
@@ -1628,14 +1636,13 @@ Reachable from the wire once card C3 lands: a `ConfigSet` (`0xA2`) body is
 stored verbatim by `set_config_cbor`, which accepts it as `INT32`, and
 `get_config_int32` then reads it with this function.
 
-**domain-limited.** `Value::get_int64` computes `-x - 1` in wrapping
-arithmetic, so it produces the same `i64::MAX`, and
-`divergence_41_the_negative_integer_that_overflows` asserts the two agree.
-`bm-wire-diff/src/cbor.rs`'s `is_int64_negation_overflow` holds that one
-payload out of the differential comparison, recognising it from the bytes
-rather than from the port: under `cargo fuzz`, where `build.rs` compiles the C
-with `-fsanitize=undefined`, the C aborts instead of answering, so there would
-be nothing to compare against.
+**c-only.** `cbor2` reports a negative integer as `Header::Negative(u64)` —
+the encoded argument, not the represented value — so the narrowing is the
+caller's to do, at the caller's width, and nothing overflows inside the
+library. `bm-wire-diff/src/cbor.rs` compares that argument against the bytes
+on the wire rather than against `cbor_value_get_int64`, precisely so the
+comparison does not have to enter undefined behaviour to make its point;
+`integer_head_boundaries` pins both `3b 80 00…` and `3b ff ff…`.
 
 Fix upstream in tinycbor by computing the result as
 `*result = -(int64_t)(v + 1)` on the unsigned value, or by returning
@@ -1713,3 +1720,61 @@ of card C3, and the port will not have an uninitialised parser to read because
 Fix by turning the `&&` into `if (!get_config_cbor(...) || cbor_parser_init(...) != CborNoError)`.
 Not wire-visible in itself; it changes which CRC32 a misconfigured node
 publishes.
+
+## 43. bm_core reads only the 5-byte float encoding, so a preferred-serialization float is unreadable to it
+
+RFC 8949 §4.1 lets a float be encoded at any width that holds it exactly, and
+*preferred serialization* picks the shortest: `1.0` is three bytes, `f9 3c00`.
+bm_core neither writes nor reads that. `cbor_encode_float` always emits the
+5-byte `fa` form, and the read side is narrower still —
+`third_party/tinycbor/src/cbor.h:608`:
+
+```c
+CBOR_INLINE_API bool cbor_value_is_float(const CborValue *value)
+{ return value->type == CborFloatType; }
+```
+
+`CborFloatType` is `0xfa`. A half-precision float is `CborHalfFloatType`
+(`0xf9`) and a double is `CborDoubleType` (`0xfb`), so neither is a float to
+this predicate. Two consequences, both worse than losing precision:
+
+| Call | With `fa` | With `f9` |
+|---|---|---|
+| `get_config_float` (`bcmp/configuration.c:258`) | reads the value | returns false, no value |
+| `cbor_type_to_config` (`bcmp/configuration.c:633`) | `FLOAT` | falls through every case and returns **false** |
+
+The second is the sharp one: `set_config_cbor` calls `cbor_type_to_config` and
+gives up when it returns false, so a `ConfigSet` (`0xA2`) carrying a
+preferred-serialization float is **rejected outright** — not stored as the
+wrong type, not truncated, refused. Every "round" float — `0.0`, `1.0`, `0.5`,
+`2.0`, infinities — is exactly the case that narrows, so this is the common
+path, not an edge.
+
+`bcmp/configuration.c` is also the only reader: `services_cbor_as_map` uses
+`cbor_value_get_float`, which asserts the same type. A C node therefore cannot
+read a config partition a preferred-serialization encoder wrote, and cannot
+accept one over the wire.
+
+A second, smaller difference on the read side: `cbor2` decodes every float
+into `f64`, and that widening **quiets a signalling NaN** — `fa ff85ff01`
+comes back with the quiet bit set. tinycbor copies the four bytes out
+untouched. Every non-NaN `f32` round-trips through `f64` exactly, so the NaN
+payload is the whole of it. Found by `cargo fuzz run cbor` in under eight
+minutes; seed `bm-wire/fuzz/seeds/cbor/signalling-nan-float`.
+
+**replicated.** `bm_wire::cbor::push_f32_wide` writes the `fa` form, bypassing
+`cbor2::core::Header::Float`, and exists for no other reason; its module docs
+say so. `bm-wire-diff/src/cbor.rs` encodes every fuzzed float through it and
+asserts byte equality with `cbor_encode_float`, and
+`cbor2_narrows_floats_and_bm_core_cannot_read_them` pins the other half:
+for five values it asserts the narrow form is what cbor2 would have written,
+that `cbor_value_is_float` rejects it, and that `cbor_type_to_config` refuses
+to classify it at all. On the read side, `same_item` accepts a NaN for a NaN
+and nothing else.
+
+Fix upstream by testing `CborHalfFloatType` and `CborDoubleType` alongside
+`CborFloatType` and converting, which `cbor_value_get_half_float_as_float`
+already does — bm_core does not compile `cborparser_float.c`, so that would
+have to be added to the build too. Wire-visible and additive: a fixed node
+reads floats a deployed node rejects, and nothing that works today stops
+working.
