@@ -4,7 +4,7 @@ use bm_stack::mock::{MockPhy, Script, Sent};
 use bm_stack::node::{EXPIRY_PERIOD_MS, HOP_LIMIT, LINK_LOCAL_PREFIX};
 use bm_stack::{Egress, Event, Identity, Node, Rtc, RtcTimeAndDate, SoftRtc, deliver, transmit};
 use bm_wire::addr;
-use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
+use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest, InfoRequestKind};
 use bm_wire::bcmp::neighbors::{NeighborTableReply, NeighborTableRequest};
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::PacketCfg;
@@ -1763,4 +1763,217 @@ fn the_run_loop_answers_a_time_request() {
     let received = rx::accept(&mut copy).unwrap();
     let response = SystemTimeResponse::decode(received.payload).unwrap();
     assert_eq!(response.utc_time_us, NOON_ISH.to_utc_micros());
+}
+
+// ---------------------------------------------------------------------------
+// Device-information replies -- card M3.
+// ---------------------------------------------------------------------------
+
+/// A heartbeat frame from `node_id` rather than from the peer.
+fn heartbeat_frame_from(node_id: u64, uptime_us: u64) -> Vec<u8> {
+    let mut frame = heartbeat_frame(uptime_us);
+    frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
+        .copy_from_slice(&addr::nodeid_to_ip(LINK_LOCAL_PREFIX, node_id).0);
+    // The source address is inside the checksum, so it has to be rebuilt.
+    let body = frame[BCMP_HEADER_OFFSET + BCMP_HEADER_LEN..].to_vec();
+    tx::serialize(&mut frame, MessageType::HEARTBEAT, 0, &body).unwrap();
+    frame
+}
+
+/// A device-info reply frame from the peer, claiming `node_id`.
+fn info_reply_frame(node_id: u64, version: &[u8], name: &[u8]) -> Vec<u8> {
+    let reply = DeviceInfoReply {
+        info: DeviceInfo {
+            node_id,
+            vendor_id: 0x1234,
+            product_id: 0x5678,
+            serial_num: *b"peer-serial-0001",
+            git_sha: 0xABCD_EF01,
+            ver_major: 9,
+            ver_minor: 8,
+            ver_rev: 7,
+            ver_hw: 6,
+        },
+        version_string: version,
+        device_name: name,
+    };
+    let mut body = vec![0u8; reply.encoded_len()];
+    reply.encode(&mut body).unwrap();
+    peer_frame(
+        MessageType::DEVICE_INFO_REPLY,
+        &body,
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    )
+}
+
+/// The heartbeat asks, the reply answers, and the node keeps the answer.
+#[test]
+fn a_reply_to_the_request_a_heartbeat_provoked_is_cached() {
+    let mut node = node();
+    let mut heartbeat = heartbeat_frame(1_000_000);
+    assert!(
+        node.on_frame(0, 1, &mut heartbeat).reply.is_some(),
+        "a new neighbour is asked for its information"
+    );
+    assert!(node.info_requests().contains(PEER_ID));
+    assert!(node.device_info(PEER_ID).is_none());
+
+    let mut reply = info_reply_frame(PEER_ID, b"1.2.3", b"peer");
+    assert!(
+        node.on_frame(10, 1, &mut reply).is_empty(),
+        "a reply is answered with nothing"
+    );
+
+    let cached = node.device_info(PEER_ID).expect("the reply was kept");
+    assert_eq!(cached.info.node_id, PEER_ID);
+    assert_eq!(cached.info.git_sha, 0xABCD_EF01);
+    assert_eq!(cached.version_string, b"1.2.3");
+    assert_eq!(cached.device_name, b"peer");
+    assert!(
+        !node.info_requests().contains(PEER_ID),
+        "and the request is no longer outstanding"
+    );
+}
+
+/// `ll_get_item` misses, so `bcmp_process_info_reply` returns before it reaches
+/// the neighbour table.
+#[test]
+fn a_reply_nothing_asked_for_is_dropped() {
+    let mut node = node();
+    let mut heartbeat = heartbeat_frame(1_000_000);
+    node.on_frame(0, 1, &mut heartbeat);
+    let mut first = info_reply_frame(PEER_ID, b"1.2.3", b"peer");
+    node.on_frame(10, 1, &mut first);
+
+    // Nothing asked a second time, so nothing is taken from the second reply.
+    let mut second = info_reply_frame(PEER_ID, b"9.9.9", b"other");
+    node.on_frame(20, 1, &mut second);
+    let cached = node.device_info(PEER_ID).unwrap();
+    assert_eq!(cached.version_string, b"1.2.3");
+    assert_eq!(cached.device_name, b"peer");
+}
+
+/// The cache belongs to the neighbour table: a reply from a node that is not a
+/// neighbour is matched, consumed and kept nowhere.
+#[test]
+fn a_reply_from_a_node_that_is_not_a_neighbour_is_kept_nowhere() {
+    let mut node = node();
+    node.request_device_info(0, PEER_ID, InfoRequestKind::Cache)
+        .expect("a registered type is sent");
+    assert!(node.info_requests().contains(PEER_ID));
+
+    let mut reply = info_reply_frame(PEER_ID, b"1.2.3", b"peer");
+    node.on_frame(10, 1, &mut reply);
+    assert!(node.device_info(PEER_ID).is_none());
+    assert!(
+        !node.info_requests().contains(PEER_ID),
+        "but the request is consumed all the same"
+    );
+}
+
+/// A request carrying a callback reports and caches nothing.
+#[test]
+fn a_reported_request_reaches_the_application_instead_of_the_cache() {
+    let mut node = node();
+    let mut heartbeat = heartbeat_frame(1_000_000);
+    node.on_frame(0, 1, &mut heartbeat);
+    // Consume the request the heartbeat made, so the next reply answers ours.
+    let mut first = info_reply_frame(PEER_ID, b"1.2.3", b"peer");
+    node.on_frame(10, 1, &mut first);
+
+    node.request_device_info(20, PEER_ID, InfoRequestKind::Report)
+        .expect("a registered type is sent");
+    let mut reply = info_reply_frame(PEER_ID, b"4.5.6", b"renamed");
+    let mut reported = Vec::new();
+    node.on_frame_with(30, 1, &mut reply, |event| {
+        if let Event::DeviceInfo { source, reply } = event {
+            reported.push((source, reply.version_string.to_vec()));
+        }
+    });
+
+    assert_eq!(reported, [(PEER_ID, b"4.5.6".to_vec())]);
+    let cached = node.device_info(PEER_ID).unwrap();
+    assert_eq!(
+        cached.version_string, b"1.2.3",
+        "the callback branch leaves the cache alone"
+    );
+}
+
+/// The restart path asks about `neighbor->info.node_id`, which is zero until a
+/// reply has been cached. Divergence #34.
+#[test]
+fn a_restart_asks_about_the_node_id_the_cache_holds() {
+    fn target_of(outbound: &bm_stack::Outbound<'_>) -> u64 {
+        let mut frame = outbound.frame().to_vec();
+        let received = rx::accept(&mut frame).unwrap();
+        assert_eq!(
+            received.header.message_type,
+            MessageType::DEVICE_INFO_REQUEST
+        );
+        DeviceInfoRequest::decode(received.payload)
+            .unwrap()
+            .target_node_id
+    }
+
+    let mut node = node();
+    let mut heartbeat = heartbeat_frame(9_000_000);
+    let owed = node.on_frame(0, 1, &mut heartbeat);
+    assert_eq!(
+        target_of(&owed.reply.unwrap()),
+        PEER_ID,
+        "bcmp_update_neighbor asks about the node it was given"
+    );
+
+    // Uptime goes backwards with nothing cached: the C reads a zeroed
+    // `info.node_id` and broadcasts.
+    let mut restart = heartbeat_frame(1_000);
+    let owed = node.on_frame(10, 1, &mut restart);
+    assert_eq!(
+        target_of(&owed.reply.unwrap()),
+        0,
+        "nothing is cached, so the request names nobody"
+    );
+
+    // Cache something, and the same restart names the peer.
+    let mut reply = info_reply_frame(PEER_ID, b"1.2.3", b"peer");
+    node.on_frame(20, 1, &mut reply);
+    let mut again = heartbeat_frame(500);
+    let owed = node.on_frame(30, 1, &mut again);
+    assert_eq!(target_of(&owed.reply.unwrap()), PEER_ID);
+}
+
+/// One neighbour per port, and the information goes with the entry.
+#[test]
+fn evicting_a_neighbour_forgets_what_it_reported() {
+    const OTHER_ID: u64 = 0x0000_0000_55AA_0022;
+
+    let mut node = node();
+    let mut heartbeat = heartbeat_frame(1_000_000);
+    node.on_frame(0, 1, &mut heartbeat);
+    let mut reply = info_reply_frame(PEER_ID, b"1.2.3", b"peer");
+    node.on_frame(10, 1, &mut reply);
+    assert!(node.device_info(PEER_ID).is_some());
+
+    // A different node takes port 1.
+    let mut other = heartbeat_frame_from(OTHER_ID, 1_000_000);
+    node.on_frame(20, 1, &mut other);
+
+    assert!(node.neighbors().find(PEER_ID).is_none(), "it lost the port");
+    assert!(
+        node.device_info(PEER_ID).is_none(),
+        "and its strings went with it"
+    );
+}
+
+/// A request for an unregistered type is never sent, and leaves the list as it
+/// found it.
+#[test]
+fn an_unregistered_request_type_records_nothing() {
+    let mut node = node();
+    assert!(node.unregister(MessageType::DEVICE_INFO_REQUEST));
+    assert!(
+        node.request_device_info(0, PEER_ID, InfoRequestKind::Cache)
+            .is_none()
+    );
+    assert!(node.info_requests().is_empty());
 }

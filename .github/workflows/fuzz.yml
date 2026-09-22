@@ -48,6 +48,7 @@ jobs:
           - crc
           - date_time
           - forward
+          - info
           - l2_egress
           - l2_policy
           - neighbor
@@ -63,6 +64,10 @@ jobs:
           # expiry (divergence #19). Bounded per iteration, unbounded across a
           # run, so it gets a fresh process per input.
           - target: neighbor
+            libfuzzer_args: '-fork=1'
+          # Same reason, one step further on: this one answers every request
+          # it provokes before it returns, but a crash leaves the list behind.
+          - target: info
             libfuzzer_args: '-fork=1'
     defaults:
       run:

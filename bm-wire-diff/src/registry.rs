@@ -50,9 +50,10 @@
 //! then unlinked too; the next `ll_item_add` writes through it. That is
 //! divergence #20, and it is reachable from here — three outstanding requests,
 //! a reply to the middle one, a reply to the last one, then another request.
-//! `LinkModel` tracks the C's `previous` pointers so [`check`] can decline
-//! to make that fourth call. **This is a domain restriction, never a relaxed
-//! assertion**: every step the comparator does perform is compared in full.
+//! [`crate::ll::LinkModel`] tracks the C's `previous` pointers so [`check`]
+//! can decline to make that fourth call. **This is a domain restriction, never
+//! a relaxed assertion**: every step the comparator does perform is compared
+//! in full.
 
 use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -72,6 +73,7 @@ use bm_wire::frame::{
 use bm_wire::util::BmIpAddr;
 
 use crate::Domain;
+use crate::ll::LinkModel;
 
 /// Message types this comparator registers, with the configuration each gets.
 ///
@@ -337,62 +339,6 @@ fn oracle() -> MutexGuard<'static, ()> {
 
 fn tick_count() -> u32 {
     unsafe { bm_wire_sys::bm_shim_tick_count() }
-}
-
-// ---------------------------------------------------------------------------
-// The C's linked-list shape, modelled just far enough to stay out of #20
-// ---------------------------------------------------------------------------
-
-/// A model of `PACKET.sequence_list`'s link structure.
-///
-/// Only the `previous` pointers matter, and only for the tail: `ll_remove`
-/// reads `current->previous` when it unlinks a node that is the tail but not
-/// the head, and does not fix up the `previous` of a node whose predecessor it
-/// just freed. So the tail's `previous` can dangle, and `ll_item_add`
-/// dereferences `LL::tail` on the very next append. See divergence #20.
-#[derive(Debug, Default)]
-struct LinkModel {
-    /// `(node id, id of the node that was the tail when this one was added)`,
-    /// in list order.
-    nodes: Vec<(u64, Option<u64>)>,
-    next_id: u64,
-    /// `LL::tail` points at a freed node.
-    tail_dangling: bool,
-}
-
-impl LinkModel {
-    /// Whether an `ll_item_add` right now would write through a dangling
-    /// `LL::tail`. The list emptying through the head branch clears the
-    /// hazard: `ll_item_add` looks at `LL::head`, and takes the branch that
-    /// rebuilds both pointers when it is null.
-    fn add_is_undefined(&self) -> bool {
-        self.tail_dangling && !self.nodes.is_empty()
-    }
-
-    fn add(&mut self) {
-        assert!(
-            !self.add_is_undefined(),
-            "the comparator must not append through a dangling tail"
-        );
-        let previous = self.nodes.last().map(|(id, _)| *id);
-        self.nodes.push((self.next_id, previous));
-        self.next_id += 1;
-    }
-
-    fn remove(&mut self, index: usize) {
-        let is_tail = index + 1 == self.nodes.len();
-        if is_tail && self.nodes.len() >= 2 {
-            let previous = self.nodes[index].1;
-            let alive = previous.is_some_and(|id| self.nodes.iter().any(|(n, _)| *n == id));
-            if !alive {
-                self.tail_dangling = true;
-            }
-        }
-        self.nodes.remove(index);
-        if self.nodes.is_empty() {
-            self.tail_dangling = false;
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

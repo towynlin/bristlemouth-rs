@@ -186,6 +186,52 @@ pub fn inject(port: u8, frame: &[u8]) {
     }
 }
 
+/// Empty bm_core's neighbour table, so a comparator can start from a known
+/// state.
+///
+/// This is the only reset the oracle has. It also clears the device
+/// information each entry carries: `bcmp_free_neighbor` frees `version_str`
+/// and `device_name` with the entry holding them.
+///
+/// `bcmp_remove_neighbor_from_table` unlinks **and frees**, despite
+/// `bcmp_free_neighbor` being documented as the half that frees. Calling both,
+/// as its header reads, is a double free — see divergence #15.
+pub fn clear_neighbor_table() {
+    unsafe {
+        // Walk the list first and collect the nodes, so a malformed list shows
+        // up as a diagnosis rather than as a double free.
+        let mut nodes: Vec<*mut bm_wire_sys::BcmpNeighbor> = Vec::new();
+        let mut count = 0u8;
+        let mut node = bm_wire_sys::bcmp_get_neighbors(&mut count);
+        while !node.is_null() {
+            assert!(
+                !nodes.contains(&node),
+                "bm_core's neighbour list contains {node:?} twice"
+            );
+            assert!(
+                nodes.len() < 64,
+                "bm_core's neighbour list is longer than anything here should produce"
+            );
+            nodes.push(node);
+            node = (*node).next;
+        }
+
+        for node in nodes {
+            // No bcmp_free_neighbor here: this already did it.
+            assert!(
+                bm_wire_sys::bcmp_remove_neighbor_from_table(node),
+                "removing {node:?} from the list failed"
+            );
+        }
+    }
+}
+
+/// The tick the shim's virtual clock is on.
+#[must_use]
+pub fn tick_count() -> u32 {
+    unsafe { bm_wire_sys::bm_shim_tick_count() }
+}
+
 // ---------------------------------------------------------------------------
 // The same node, in Rust
 // ---------------------------------------------------------------------------

@@ -37,6 +37,18 @@
 //! ported modules — heartbeat, ping, system time, device info and the
 //! neighbour table; [`Node::register`] adds more.
 //!
+//! # Device information is asked for, and kept
+//!
+//! `bcmp/info.c` correlates its own replies, as `bcmp/ping.c` does: `0x05` is
+//! registered unsequenced, so `packet.c` never matches one to a request, and
+//! the module keeps `INFO_REQUEST_LIST` instead. [`Node::request_device_info`]
+//! is `bcmp_request_info` and the list is
+//! [`bm_wire::bcmp::info::InfoRequests`]; a reply nothing asked for is
+//! dropped. What a reply is worth depends on how it was asked for
+//! ([`InfoRequestKind`]): `Cache` puts it in [`Node::device_info_cache`] if
+//! the sender is a neighbour, and `Report` hands it to the application as
+//! [`Event::DeviceInfo`] and caches nothing.
+//!
 //! # Ping is correlated outside the registry
 //!
 //! `bcmp/ping.c` registers both of its types unsequenced, so `packet.c` never
@@ -55,7 +67,10 @@
 //! make the port give up on requests at different moments from a C node.
 
 use bm_wire::addr;
-use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
+use bm_wire::bcmp::info::{
+    CACHED_STRING_BYTES, CachedInfo, DeviceInfoReply, DeviceInfoRequest, InfoCache,
+    InfoRequestKind, InfoRequests,
+};
 use bm_wire::bcmp::neighbors::{NeighborTableRequest, PortInfo, encode_neighbor_table_reply};
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::{
@@ -186,6 +201,26 @@ pub enum Event<'a> {
         /// Milliseconds since [`Node::ping`] built the request, the value
         /// bm_core prints as `time=`. Wrapping, like every other clock here.
         round_trip_ms: u32,
+    },
+    /// A device-info reply answered a request made with
+    /// [`InfoRequestKind::Report`] — `bcmp_process_info_reply` reaching
+    /// `cb(info)`.
+    ///
+    /// Reported **in addition to** [`Event::Message`] for the same frame, as
+    /// [`Event::EchoReply`] is. Nothing is cached: the C takes the callback
+    /// branch *instead of* the neighbour branch, so an application that wants
+    /// both has to keep the reply itself.
+    ///
+    /// The request this answers was matched on the low 32 bits of the node id
+    /// the reply claims, and on nothing else — see divergence #33.
+    DeviceInfo {
+        /// Node id the reply came from, from the frame's source address.
+        ///
+        /// Not what was matched on: that is
+        /// [`DeviceInfoReply::info`]`.node_id`, which the sender chose.
+        source: u64,
+        /// The reply as it arrived.
+        reply: DeviceInfoReply<'a>,
     },
 }
 
@@ -337,6 +372,15 @@ impl Snapshot {
     }
 }
 
+/// Default number of unanswered device-info requests a node remembers,
+/// [`Node`]'s `INFO_REQUESTS`.
+///
+/// bm_core's `INFO_REQUEST_LIST` is unbounded and never expires an entry
+/// (divergence #19), so there is no C number to match. This is a ceiling the
+/// port adds: past it a request still goes out, but its reply is unsolicited
+/// and nothing is cached.
+pub const INFO_REQUESTS_DEFAULT: usize = 8;
+
 /// Default size of a node's expected-ping-payload buffer, [`Node`]'s
 /// `PING_PAYLOAD`.
 ///
@@ -417,18 +461,30 @@ impl<const PAYLOAD: usize> PingState<PAYLOAD> {
 /// send. bm_core has no equivalent limit, only an unchecked `bm_malloc` whose
 /// failure it dereferences. This is the one place ping's behaviour here is a
 /// choice rather than a port.
+///
+/// `INFO_REQUESTS` is how many unanswered device-info requests are remembered,
+/// and `INFO_STRINGS` how many bytes of each cached string are kept. Both are
+/// ceilings bm_core does not have; the defaults keep every string whole, so
+/// only the first is reachable in ordinary operation.
 pub struct Node<
     I,
     R = NoRtc,
     const NEIGHBORS: usize = 4,
     const PENDING: usize = 4,
     const PING_PAYLOAD: usize = PING_PAYLOAD_BYTES,
+    const INFO_REQUESTS: usize = INFO_REQUESTS_DEFAULT,
+    const INFO_STRINGS: usize = CACHED_STRING_BYTES,
 > {
     identity: I,
     rtc: R,
     neighbors: NeighborTable<NEIGHBORS>,
     registry: Registry<MESSAGE_TYPES, PENDING>,
     ping: PingState<PING_PAYLOAD>,
+    /// `INFO_REQUEST_LIST`, and the device information the replies to it
+    /// carried. bm_core hangs the second off its neighbour table entries and
+    /// frees it with them, which is what [`NeighborTable`] evictions do here.
+    info_requests: InfoRequests<INFO_REQUESTS>,
+    info: InfoCache<NEIGHBORS, INFO_STRINGS>,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -438,8 +494,15 @@ pub struct Node<
     tx: [u8; MTU],
 }
 
-impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLOAD: usize>
-    Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD>
+impl<
+    I: Identity,
+    R: Rtc,
+    const NEIGHBORS: usize,
+    const PENDING: usize,
+    const PING_PAYLOAD: usize,
+    const INFO_REQUESTS: usize,
+    const INFO_STRINGS: usize,
+> Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD, INFO_REQUESTS, INFO_STRINGS>
 {
     /// A node with an empty neighbour table, at time zero.
     ///
@@ -474,6 +537,8 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
             neighbors: NeighborTable::new(),
             registry,
             ping: PingState::default(),
+            info_requests: InfoRequests::new(),
+            info: InfoCache::new(),
             port_count,
             link_mask: 0,
             tx: [0u8; MTU],
@@ -710,12 +775,28 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
                 let outcome = self
                     .neighbors
                     .on_heartbeat(now_ms, source, ingress_port, &heartbeat);
+                if let Some(evicted) = outcome.evicted {
+                    // `bcmp_add_neighbor` clears the port before it inserts,
+                    // and `bcmp_remove_neighbor_from_table` frees the entry's
+                    // two strings along with it.
+                    self.info.forget(evicted);
+                }
                 if !outcome.request_info {
                     return (None, None);
                 }
-                // bm_core asks on the link-local multicast address rather than
-                // the one the heartbeat arrived on.
-                self.build_device_info_request(now_ms, source)
+                // The two call sites ask about different nodes.
+                // `bcmp_update_neighbor` passes the `node_id` it was given;
+                // `bcmp_process_heartbeat`'s restart path passes
+                // `neighbor->info.node_id`, which is whatever the last cached
+                // reply said and zero until one arrives. See divergence #34.
+                let target_node_id = if outcome.reset {
+                    self.info
+                        .get(source)
+                        .map_or(0, |cached| cached.info.node_id)
+                } else {
+                    source
+                };
+                self.request_device_info(now_ms, target_node_id, InfoRequestKind::Cache)
             }
             MessageType::DEVICE_INFO_REQUEST => {
                 let Ok(request) = DeviceInfoRequest::decode(received.payload) else {
@@ -734,6 +815,36 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
                     return (None, None);
                 }
                 self.build_neighbor_table_reply(now_ms, &reply_to, seq_num)
+            }
+            MessageType::DEVICE_INFO_REPLY => {
+                // `bcmp_process_info_reply`. The declared string lengths are
+                // checked here and nowhere in the C -- divergence #14.
+                let Ok(info_reply) = DeviceInfoReply::decode(received.payload) else {
+                    return (None, None);
+                };
+                // `ll_get_item` then `ll_remove`, both keyed on the low 32
+                // bits of the node id the *reply* claims rather than on the
+                // address it came from. A reply nothing asked for does
+                // nothing at all.
+                match self.info_requests.take(info_reply.info.node_id) {
+                    Some(InfoRequestKind::Report) => events(Event::DeviceInfo {
+                        source,
+                        reply: info_reply,
+                    }),
+                    // `bcmp_find_neighbor(info->info.node_id)`: the C keeps
+                    // this on the neighbour, so a claimed node id of zero
+                    // never matches -- divergence #18.
+                    Some(InfoRequestKind::Cache)
+                        if self.neighbors.find(info_reply.info.node_id).is_some() =>
+                    {
+                        self.info.store(&info_reply);
+                    }
+                    // A reply nothing asked for, and one that was asked for
+                    // but names a node that is not a neighbour: both are
+                    // decoded, matched, consumed and dropped.
+                    Some(InfoRequestKind::Cache) | None => {}
+                }
+                None
             }
             MessageType::ECHO_REQUEST => {
                 let Ok(request) = EchoRequest::decode(received.payload) else {
@@ -1153,6 +1264,79 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
         )
     }
 
+    /// Ask `target_node_id` to describe itself, or every node if it is zero —
+    /// `bcmp_request_info`.
+    ///
+    /// Goes to `FF02::1`, which is the address both of bm_core's own call
+    /// sites pass. The request is recorded in [`Node::info_requests`] first
+    /// and the record is dropped again if nothing could be sent, which is the
+    /// C's `ll_item_add` before `bcmp_tx` and its `ll_remove` after a failure.
+    ///
+    /// `kind` is the C's `cb` argument. Both of bm_core's own call sites pass
+    /// `NULL`, which is [`InfoRequestKind::Cache`].
+    ///
+    /// Returns `None` without sending when
+    /// [`MessageType::DEVICE_INFO_REQUEST`] is unregistered. A request the
+    /// list had no room for is still sent, and its reply then arrives as
+    /// unsolicited traffic — the same shape as an untracked sequenced request.
+    pub fn request_device_info(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        kind: InfoRequestKind,
+    ) -> Option<Outbound<'_>> {
+        let mut body = [0u8; DeviceInfoRequest::LEN];
+        DeviceInfoRequest { target_node_id }
+            .encode(&mut body)
+            .ok()?;
+        let recorded = self.info_requests.record(target_node_id, kind);
+        // `bcmp_tx` fails for an unregistered type and nothing else here: the
+        // body is eight bytes, so the size guard cannot refuse it. Asking the
+        // registry before the transmit borrow begins puts the C's `ll_remove`
+        // ahead of the failure it answers, which is the same end state.
+        if self
+            .registry
+            .cfg(MessageType::DEVICE_INFO_REQUEST)
+            .is_none()
+        {
+            if recorded {
+                // `ll_remove` takes the first entry with the key, which is not
+                // necessarily the one just added -- see divergence #19.
+                self.info_requests.take(target_node_id);
+            }
+            return None;
+        }
+        self.request(
+            now_ms,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            MessageType::DEVICE_INFO_REQUEST,
+            &body,
+        )
+    }
+
+    /// What is known about `node_id`, or `None` if nothing is.
+    ///
+    /// Populated by a [`InfoRequestKind::Cache`] reply from a node that is
+    /// already in the neighbour table, and forgotten when that neighbour is
+    /// evicted. An *offline* neighbour keeps its entry, as it keeps its table
+    /// row.
+    #[must_use]
+    pub fn device_info(&self, node_id: u64) -> Option<CachedInfo<'_>> {
+        self.info.get(node_id)
+    }
+
+    /// Everything known about every node — what `populate_neighbor_info`
+    /// writes onto bm_core's neighbour table entries.
+    pub fn device_info_cache(&self) -> &InfoCache<NEIGHBORS, INFO_STRINGS> {
+        &self.info
+    }
+
+    /// `INFO_REQUEST_LIST`: which nodes have been asked to describe themselves
+    /// and have not answered.
+    pub fn info_requests(&self) -> &InfoRequests<INFO_REQUESTS> {
+        &self.info_requests
+    }
+
     fn addressed_to_us(&self, target_node_id: u64) -> bool {
         target_node_id == 0 || target_node_id == self.identity.node_id()
     }
@@ -1192,23 +1376,6 @@ impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PI
                 heartbeat.encode(body)?;
                 Ok(Heartbeat::LEN)
             },
-        )
-    }
-
-    fn build_device_info_request(
-        &mut self,
-        now_ms: u32,
-        target_node_id: u64,
-    ) -> Option<Outbound<'_>> {
-        let mut body = [0u8; DeviceInfoRequest::LEN];
-        DeviceInfoRequest { target_node_id }
-            .encode(&mut body)
-            .ok()?;
-        self.request(
-            now_ms,
-            &BmIpAddr::LINK_LOCAL_MULTICAST,
-            MessageType::DEVICE_INFO_REQUEST,
-            &body,
         )
     }
 
@@ -1536,8 +1703,15 @@ pub async fn deliver<P: Phy>(
 // The async loop
 // ---------------------------------------------------------------------------
 
-impl<I: Identity, R: Rtc, const NEIGHBORS: usize, const PENDING: usize, const PING_PAYLOAD: usize>
-    Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD>
+impl<
+    I: Identity,
+    R: Rtc,
+    const NEIGHBORS: usize,
+    const PENDING: usize,
+    const PING_PAYLOAD: usize,
+    const INFO_REQUESTS: usize,
+    const INFO_STRINGS: usize,
+> Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD, INFO_REQUESTS, INFO_STRINGS>
 {
     /// Run the node until the PHY fails, discarding every [`Event`].
     ///
