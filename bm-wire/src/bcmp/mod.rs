@@ -17,10 +17,11 @@
 //!
 //! The message bodies each have a module of their own — [`heartbeat`],
 //! [`info`], [`neighbors`], [`ping`] — and are codecs only. What a node *does*
-//! with one is `bm-stack`'s business. The two exceptions are
-//! [`info::InfoRequests`] and [`info::InfoCache`], which are `bcmp/info.c`'s
-//! file-scope state rather than wire format, and are here for the same reason
-//! [`registry`] is.
+//! with one is `bm-stack`'s business. The exceptions are
+//! [`info::InfoRequests`], [`info::InfoCache`] and
+//! [`neighbors::TableRequests`], which are their modules' file-scope state
+//! rather than wire format, and are here for the same reason [`registry`] is:
+//! each correlates its own replies, because `packet.c` does not.
 
 pub mod forward;
 pub mod header;
@@ -47,8 +48,9 @@ pub use info::{
     InfoRequestKind, InfoRequests,
 };
 pub use neighbors::{
-    NeighborInfo, NeighborTableReply, NeighborTableRequest, PortInfo, encode_neighbor_table_reply,
-    neighbor_table_reply_len,
+    NEIGHBOR_REQUEST_TIMEOUT_MS, NEIGHBOR_TABLE_MAX_LEN, NeighborInfo, NeighborTableReply,
+    NeighborTableRequest, PortInfo, TableReplyOutcome, TableRequestKind, TableRequests,
+    encode_neighbor_table_reply, neighbor_table_reply_len,
 };
 pub use ping::{ECHO_HEADER_LEN, EchoReply, EchoRequest, MAX_ECHO_PAYLOAD};
 pub use registry::{

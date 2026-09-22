@@ -49,6 +49,18 @@
 //! the sender is a neighbour, and `Report` hands it to the application as
 //! [`Event::DeviceInfo`] and caches nothing.
 //!
+//! # So is the neighbour table, differently
+//!
+//! `bcmp/neighbors.c` correlates its replies too, from three statics that hold
+//! one request between them. [`Node::request_neighbor_table`] is
+//! `bcmp_request_neighbor_table` and the statics are
+//! [`bm_wire::bcmp::neighbors::TableRequests`]. A reply claiming the node that
+//! was asked arrives as [`Event::NeighborTable`]; the 1 s timer the request
+//! arms arrives as [`Event::NeighborTableTimeout`] and does **not** end the
+//! request. Two things are asymmetric with the responder side and are
+//! divergences rather than choices: a broadcast request is answered by every
+//! node and accepted from none (#35), and the timeout disarms nothing (#36).
+//!
 //! # Ping is correlated outside the registry
 //!
 //! `bcmp/ping.c` registers both of its types unsequenced, so `packet.c` never
@@ -71,7 +83,10 @@ use bm_wire::bcmp::info::{
     CACHED_STRING_BYTES, CachedInfo, DeviceInfoReply, DeviceInfoRequest, InfoCache,
     InfoRequestKind, InfoRequests,
 };
-use bm_wire::bcmp::neighbors::{NeighborTableRequest, PortInfo, encode_neighbor_table_reply};
+use bm_wire::bcmp::neighbors::{
+    NEIGHBOR_TABLE_MAX_LEN, NeighborTableReply, NeighborTableRequest, PortInfo, TableReplyOutcome,
+    TableRequestKind, TableRequests, encode_neighbor_table_reply, neighbor_table_reply_len,
+};
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::{
     Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, PacketCfg, PendingRequest, Registry, RegistryError,
@@ -118,6 +133,15 @@ pub const MESSAGE_TYPES: usize = 32;
 /// Not a deadline the node schedules against: the sweep's phase lives in the
 /// registry, so this is only the *longest* a caller may leave between calls.
 pub const EXPIRY_PERIOD_MS: u32 = MESSAGE_TIMER_EXPIRY_PERIOD_MS;
+
+/// How long a neighbour-table request waits before
+/// [`Node::on_neighbor_request_timer`] reports
+/// [`Event::NeighborTableTimeout`], `bcmp_neighbor_timer_timeout_s`.
+///
+/// Unlike [`EXPIRY_PERIOD_MS`] this *is* a deadline: the C's timer is a
+/// one-shot armed by the request. What it is not is a give-up — see
+/// divergence #36.
+pub const NEIGHBOR_REQUEST_TIMEOUT_MS: u32 = bm_wire::bcmp::neighbors::NEIGHBOR_REQUEST_TIMEOUT_MS;
 
 /// What a received message, or a request that gave up waiting, tells the
 /// application.
@@ -221,6 +245,40 @@ pub enum Event<'a> {
         source: u64,
         /// The reply as it arrived.
         reply: DeviceInfoReply<'a>,
+    },
+    /// A neighbour-table reply answered a request made with
+    /// [`TableRequestKind::Report`] — `bcmp_process_neighbor_table_reply`
+    /// reaching `NEIGHBOR_REQUEST_CB(reply)`.
+    ///
+    /// Reported **in addition to** [`Event::Message`] for the same frame, as
+    /// [`Event::DeviceInfo`] is. Reported at most once per
+    /// [`Node::request_neighbor_table`]: the C clears the callback here.
+    ///
+    /// What was matched is `reply.node_id` against `TARGET_NODE_ID`, all 64
+    /// bits of it, and nothing else — not the source address, and not whether
+    /// the request has already timed out. See divergences #35 and #36.
+    NeighborTable {
+        /// Node id the reply came from, from the frame's source address.
+        source: u64,
+        /// The reply as it arrived, both of its arrays borrowed from the
+        /// frame.
+        reply: NeighborTableReply<'a>,
+    },
+    /// `NEIGHBOR_TIMER` fired: a neighbour-table request has gone unanswered
+    /// for [`NEIGHBOR_REQUEST_TIMEOUT_MS`]. The C's `timeout` argument to
+    /// `bcmp_request_neighbor_table`.
+    ///
+    /// **This gives up on nothing.** The request stays armed behind it, so a
+    /// reply arriving afterwards still comes back as
+    /// [`Event::NeighborTable`] — unlike [`Event::Timeout`], which is the end
+    /// of its request. Divergence #36.
+    NeighborTableTimeout {
+        /// `TARGET_NODE_ID`: the node that was asked, or zero for the
+        /// broadcast that nothing can answer (divergence #35).
+        ///
+        /// The C's timeout callback is a `BmTimerCallback` and is handed only
+        /// the timer, so an integrator has to remember this itself.
+        target_node_id: u64,
     },
 }
 
@@ -485,6 +543,10 @@ pub struct Node<
     /// frees it with them, which is what [`NeighborTable`] evictions do here.
     info_requests: InfoRequests<INFO_REQUESTS>,
     info: InfoCache<NEIGHBORS, INFO_STRINGS>,
+    /// `bcmp/neighbors.c`'s `TARGET_NODE_ID`, `NEIGHBOR_REQUEST_CB` and
+    /// `NEIGHBOR_TIMER` — one outstanding neighbour-table request, however
+    /// many have been sent.
+    table_requests: TableRequests,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -539,6 +601,7 @@ impl<
             ping: PingState::default(),
             info_requests: InfoRequests::new(),
             info: InfoCache::new(),
+            table_requests: TableRequests::new(),
             port_count,
             link_mask: 0,
             tx: [0u8; MTU],
@@ -816,6 +879,29 @@ impl<
                 }
                 self.build_neighbor_table_reply(now_ms, &reply_to, seq_num)
             }
+            MessageType::NEIGHBOR_TABLE_REPLY => {
+                // `bcmp_process_neighbor_table_reply`. The declared entry
+                // counts are checked here and nowhere in the C -- divergence
+                // #14, whose worse half is `topology.c`'s.
+                let Ok(table) = NeighborTableReply::decode(received.payload) else {
+                    return (None, None);
+                };
+                // `TARGET_NODE_ID == reply->node_id`: the id the *body*
+                // claims, matched whole, against a slot that is never cleared
+                // and that a timeout does not disarm.
+                match self.table_requests.accept(table.node_id) {
+                    TableReplyOutcome::Reported => events(Event::NeighborTable {
+                        source,
+                        reply: table,
+                    }),
+                    // `Accepted`: the target matched but no callback was
+                    // armed, so the C stops the timer and drops the reply.
+                    // `Rejected`: it names another node, and the C returns
+                    // before even the timer stop.
+                    TableReplyOutcome::Accepted | TableReplyOutcome::Rejected => {}
+                }
+                None
+            }
             MessageType::DEVICE_INFO_REPLY => {
                 // `bcmp_process_info_reply`. The declared string lengths are
                 // checked here and nowhere in the C -- divergence #14.
@@ -1040,6 +1126,7 @@ impl<
         self.registry.on_tick(uptime_ms, |request| {
             events(Event::Timeout { request: *request });
         });
+        self.on_neighbor_request_timer(uptime_ms, &mut events);
         self.build_heartbeat(uptime_ms)
     }
 
@@ -1055,6 +1142,7 @@ impl<
         self.registry.on_tick(now_ms, |request| {
             events(Event::Timeout { request: *request });
         });
+        self.on_neighbor_request_timer(now_ms, &mut events);
     }
 
     /// Serialize a BCMP message and hand it back ready to transmit — `bcmp_tx`.
@@ -1314,6 +1402,77 @@ impl<
         )
     }
 
+    /// Ask `target_node_id` for its neighbour table —
+    /// `bcmp_request_neighbor_table`.
+    ///
+    /// `dst` is the C's `addr`, and which one it is matters: bm_core's only
+    /// caller, `integrations/topology.c`, passes `multicast_global_addr`, so
+    /// the request is relayed across the whole network rather than only to
+    /// this node's neighbours.
+    ///
+    /// `kind` is the C's `request` argument, and a
+    /// [`TableRequestKind::Report`] reply arrives as
+    /// [`Event::NeighborTable`]. Passing zero for `target_node_id` asks every
+    /// node and accepts no answer — see divergence #35.
+    ///
+    /// **The request is recorded whether or not it is sent**, which is the C's
+    /// order: `TARGET_NODE_ID`, the timer and the callback are all written
+    /// before `bcmp_tx`, and none of them is undone when it fails.
+    /// [`Node::request_device_info`] is the other way round. So a `None` here
+    /// still arms the timeout, and still makes the node accept a reply — the
+    /// C reports the error to its caller and leaves the same state behind.
+    ///
+    /// Returns `None` without sending when
+    /// [`MessageType::NEIGHBOR_TABLE_REQUEST`] is unregistered.
+    pub fn request_neighbor_table(
+        &mut self,
+        now_ms: u32,
+        dst: &BmIpAddr,
+        target_node_id: u64,
+        kind: TableRequestKind,
+    ) -> Option<Outbound<'_>> {
+        self.table_requests.record(now_ms, target_node_id, kind);
+        let mut body = [0u8; NeighborTableRequest::LEN];
+        NeighborTableRequest { target_node_id }
+            .encode(&mut body)
+            .ok()?;
+        self.request(now_ms, dst, MessageType::NEIGHBOR_TABLE_REQUEST, &body)
+    }
+
+    /// `bcmp/neighbors.c`'s requester state: which node was asked for its
+    /// neighbour table, whether an answer is still owed to the application,
+    /// and how long the timer has left.
+    #[must_use]
+    pub fn table_requests(&self) -> &TableRequests {
+        &self.table_requests
+    }
+
+    /// Run `NEIGHBOR_TIMER`, reporting [`Event::NeighborTableTimeout`] if it is
+    /// due.
+    ///
+    /// Schedule it from [`Node::neighbor_request_remaining_ms`], or call it
+    /// often enough that a second is not much overshot. Like
+    /// [`Node::on_expiry`] the
+    /// deadline lives in the state, so calling this early, late or twice
+    /// changes nothing — and unlike the expiry sweep it fires at the deadline
+    /// rather than on a grid, because the C's timer is a one-shot armed by the
+    /// request. [`Node::on_tick`] and [`Node::on_expiry`] also run it, so a
+    /// node driven only by those still times out, up to their period late.
+    pub fn on_neighbor_request_timer(&mut self, now_ms: u32, mut events: impl FnMut(Event<'_>)) {
+        if self.table_requests.on_timer(now_ms) {
+            events(Event::NeighborTableTimeout {
+                target_node_id: self.table_requests.target_node_id(),
+            });
+        }
+    }
+
+    /// Milliseconds until [`Node::on_neighbor_request_timer`] has something to
+    /// report, or `None` when no neighbour-table request is being timed.
+    #[must_use]
+    pub fn neighbor_request_remaining_ms(&self, now_ms: u32) -> Option<u32> {
+        self.table_requests.remaining_ms(now_ms)
+    }
+
     /// What is known about `node_id`, or `None` if nothing is.
     ///
     /// Populated by a [`InfoRequestKind::Cache`] reply from a node that is
@@ -1476,6 +1635,16 @@ impl<
         dst: &BmIpAddr,
         reply_seq_num: u32,
     ) -> Option<Outbound<'_>> {
+        // `bcmp_send_neighbor_table`'s first act: a table that would not fit
+        // `bcmp_table_max_len` is answered with nothing at all. Checked before
+        // the registry is asked, as the C checks it before `bcmp_tx`. Out of
+        // reach at any plausible `NEIGHBORS` -- 101 neighbours on a two-port
+        // node -- so nothing differential covers it.
+        if neighbor_table_reply_len(usize::from(self.port_count), self.neighbors.len())
+            > NEIGHBOR_TABLE_MAX_LEN
+        {
+            return None;
+        }
         let (seq_num, mask) =
             self.outgoing(now_ms, MessageType::NEIGHBOR_TABLE_REPLY, reply_seq_num)?;
         let Self {
@@ -1777,8 +1946,8 @@ impl<
         phy: &mut P,
         mut events: impl FnMut(Event<'_>),
     ) -> P::Error {
-        use embassy_futures::select::{Either3, select3};
-        use embassy_time::{Duration, Instant, Ticker};
+        use embassy_futures::select::{Either4, select4};
+        use embassy_time::{Duration, Instant, Ticker, Timer};
 
         let started = Instant::now();
         let mut ticker = Ticker::every(Duration::from_secs(u64::from(HEARTBEAT_PERIOD_S)));
@@ -1800,8 +1969,27 @@ impl<
                 started.elapsed().as_millis() as u32
             };
 
-            match select3(phy.receive(&mut rx), ticker.next(), expiry.next()).await {
-                Either3::First(Ok((port, len))) => {
+            // `NEIGHBOR_TIMER`: a one-shot armed by the request rather than a
+            // ticker, so it gets an arm of its own that waits exactly as long
+            // as the request has left. Nothing outstanding means nothing to
+            // wait for, and the other three arms are the only way out.
+            let neighbor_wait = self.neighbor_request_remaining_ms(uptime_ms(()));
+            let neighbor_timer = async move {
+                match neighbor_wait {
+                    Some(ms) => Timer::after(Duration::from_millis(u64::from(ms))).await,
+                    None => core::future::pending().await,
+                }
+            };
+
+            match select4(
+                phy.receive(&mut rx),
+                ticker.next(),
+                expiry.next(),
+                neighbor_timer,
+            )
+            .await
+            {
+                Either4::First(Ok((port, len))) => {
                     let now = uptime_ms(());
                     let owed = self.on_frame_with(now, port, &mut rx[..len], &mut events);
                     // Copied out before `owed` is consumed: the re-flood needs
@@ -1816,8 +2004,8 @@ impl<
                         return error;
                     }
                 }
-                Either3::First(Err(error)) => return error,
-                Either3::Second(()) => {
+                Either4::First(Err(error)) => return error,
+                Either4::Second(()) => {
                     let now = uptime_ms(());
                     if let Some(outbound) = self.on_tick_with(now, &mut events)
                         && let Err(error) = transmit(phy, outbound, port_count).await
@@ -1825,9 +2013,13 @@ impl<
                         return error;
                     }
                 }
-                Either3::Third(()) => {
+                Either4::Third(()) => {
                     let now = uptime_ms(());
                     self.on_expiry(now, &mut events);
+                }
+                Either4::Fourth(()) => {
+                    let now = uptime_ms(());
+                    self.on_neighbor_request_timer(now, &mut events);
                 }
             }
         }

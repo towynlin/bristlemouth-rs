@@ -1,11 +1,14 @@
 //! The node, driven with a mock PHY.
 
 use bm_stack::mock::{MockPhy, Script, Sent};
-use bm_stack::node::{EXPIRY_PERIOD_MS, HOP_LIMIT, LINK_LOCAL_PREFIX};
+use bm_stack::node::{EXPIRY_PERIOD_MS, HOP_LIMIT, LINK_LOCAL_PREFIX, NEIGHBOR_REQUEST_TIMEOUT_MS};
 use bm_stack::{Egress, Event, Identity, Node, Rtc, RtcTimeAndDate, SoftRtc, deliver, transmit};
 use bm_wire::addr;
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest, InfoRequestKind};
-use bm_wire::bcmp::neighbors::{NeighborTableReply, NeighborTableRequest};
+use bm_wire::bcmp::neighbors::{
+    NeighborInfo, NeighborTableReply, NeighborTableRequest, PortInfo, TableRequestKind,
+    encode_neighbor_table_reply, neighbor_table_reply_len,
+};
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::PacketCfg;
 use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
@@ -659,6 +662,22 @@ enum Seen {
         payload: Vec<u8>,
         round_trip_ms: u32,
     },
+    DeviceInfo {
+        source: u64,
+        node_id: u64,
+    },
+    NeighborTable {
+        source: u64,
+        /// What the body claims, which is what was matched.
+        node_id: u64,
+        /// One `state` byte per port described.
+        ports: Vec<u8>,
+        /// `(node_id, port, online)` per neighbour described.
+        neighbors: Vec<(u64, u8, u8)>,
+    },
+    NeighborTableTimeout {
+        target_node_id: u64,
+    },
 }
 
 fn seen(event: Event<'_>) -> Seen {
@@ -699,6 +718,22 @@ fn seen(event: Event<'_>) -> Seen {
             payload: reply.payload.to_vec(),
             round_trip_ms,
         },
+        Event::DeviceInfo { source, reply } => Seen::DeviceInfo {
+            source,
+            node_id: reply.info.node_id,
+        },
+        Event::NeighborTable { source, reply } => Seen::NeighborTable {
+            source,
+            node_id: reply.node_id,
+            ports: reply.ports().map(|port| port.state).collect(),
+            neighbors: reply
+                .neighbors()
+                .map(|n| (n.node_id, n.port, n.online))
+                .collect(),
+        },
+        Event::NeighborTableTimeout { target_node_id } => {
+            Seen::NeighborTableTimeout { target_node_id }
+        }
         _ => unreachable!("Event is non_exhaustive; this test knows all of it"),
     }
 }
@@ -1976,4 +2011,426 @@ fn an_unregistered_request_type_records_nothing() {
             .is_none()
     );
     assert!(node.info_requests().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Neighbour-table replies -- card M4.
+// ---------------------------------------------------------------------------
+
+/// A neighbour-table reply frame from the peer, claiming `node_id` and
+/// describing two ports and two neighbours.
+fn table_reply_frame(node_id: u64) -> Vec<u8> {
+    let ports = [
+        PortInfo {
+            state: 1,
+            port_type: 0,
+        },
+        PortInfo {
+            state: 0,
+            port_type: 0,
+        },
+    ];
+    let neighbors = [
+        NeighborInfo {
+            node_id: NODE_ID,
+            port: 1,
+            online: 1,
+        },
+        NeighborInfo {
+            node_id: 0x0000_0000_55AA_0033,
+            port: 2,
+            online: 0,
+        },
+    ];
+    let mut body = vec![0u8; neighbor_table_reply_len(ports.len(), neighbors.len())];
+    encode_neighbor_table_reply(&mut body, node_id, &ports, &neighbors).unwrap();
+    peer_frame(
+        MessageType::NEIGHBOR_TABLE_REPLY,
+        &body,
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    )
+}
+
+/// The target a `0x08` request the node built names.
+fn table_request_target(outbound: &bm_stack::Outbound<'_>) -> u64 {
+    let mut frame = outbound.frame().to_vec();
+    let received = rx::accept(&mut frame).unwrap();
+    assert_eq!(
+        received.header.message_type,
+        MessageType::NEIGHBOR_TABLE_REQUEST
+    );
+    NeighborTableRequest::decode(received.payload)
+        .unwrap()
+        .target_node_id
+}
+
+/// Every `Event` a step produced, in order.
+fn table_events(node: &mut Node<TestIdentity, SoftRtc, 4>, now_ms: u32, frame: &[u8]) -> Vec<Seen> {
+    let mut frame = frame.to_vec();
+    let mut seen_events = Vec::new();
+    node.on_frame_with(now_ms, 1, &mut frame, |event| {
+        seen_events.push(seen(event));
+    });
+    seen_events
+}
+
+/// `topology.c` asks over `FF03::1`, which is the whole point of the request
+/// being addressed: a link-local one reaches only this node's neighbours,
+/// while a global one is relayed across the network.
+#[test]
+fn a_request_goes_to_the_address_it_was_given() {
+    let mut node = node();
+    let outbound = node
+        .request_neighbor_table(
+            0,
+            &BmIpAddr::GLOBAL_MULTICAST,
+            PEER_ID,
+            TableRequestKind::Report,
+        )
+        .expect("sent");
+    assert_eq!(table_request_target(&outbound), PEER_ID);
+    assert_eq!(
+        &outbound.frame()[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16],
+        &BmIpAddr::GLOBAL_MULTICAST.0
+    );
+
+    // And it therefore goes out unstamped, once, rather than once per port.
+    let mut phy = MockPhy::new(PORTS, vec![]);
+    block_on(transmit(&mut phy, outbound, PORTS)).unwrap();
+    assert_eq!(phy.sent.len(), 1);
+    assert_eq!(phy.sent[0].egress, Egress::AllPorts);
+}
+
+/// The exchange the card is about: ask a node, get its table back.
+#[test]
+fn a_neighbour_table_reply_answers_the_request_that_named_its_sender() {
+    let mut node = node();
+    let outbound = node
+        .request_neighbor_table(
+            0,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            PEER_ID,
+            TableRequestKind::Report,
+        )
+        .expect("a registered type is sent");
+    assert_eq!(table_request_target(&outbound), PEER_ID);
+    assert_eq!(node.table_requests().target_node_id(), PEER_ID);
+    assert!(node.table_requests().is_armed());
+
+    let events = table_events(&mut node, 10, &table_reply_frame(PEER_ID));
+    assert_eq!(
+        events,
+        [
+            Seen::Message {
+                message_type: MessageType::NEIGHBOR_TABLE_REPLY,
+                seq_num: 0,
+                source: PEER_ID,
+            },
+            Seen::NeighborTable {
+                source: PEER_ID,
+                node_id: PEER_ID,
+                ports: vec![1, 0],
+                neighbors: vec![(NODE_ID, 1, 1), (0x0000_0000_55AA_0033, 2, 0)],
+            },
+        ],
+        "the dispatch first, then what neighbors.c made of it"
+    );
+    assert!(
+        !node.table_requests().is_armed(),
+        "the callback is single-shot"
+    );
+    assert!(!node.table_requests().timer_running());
+}
+
+/// `TARGET_NODE_ID` is the whole test, and it is on the body's claim rather
+/// than on the source address.
+#[test]
+fn a_reply_claiming_another_node_is_rejected() {
+    const OTHER_ID: u64 = 0x0000_0000_55AA_0022;
+
+    let mut node = node();
+    node.request_neighbor_table(
+        0,
+        &BmIpAddr::LINK_LOCAL_MULTICAST,
+        PEER_ID,
+        TableRequestKind::Report,
+    )
+    .unwrap();
+
+    // Sent by the peer, claiming somebody else.
+    let events = table_events(&mut node, 10, &table_reply_frame(OTHER_ID));
+    assert_eq!(events.len(), 1, "dispatched, and then dropped");
+    assert!(node.table_requests().is_armed(), "still waiting");
+    assert!(
+        node.table_requests().timer_running(),
+        "and a stranger's reply does not stop the timer"
+    );
+}
+
+/// A request made with no callback still accepts the reply, and reports
+/// nothing. `bcmp_request_neighbor_table(.., NULL, NULL)`.
+#[test]
+fn a_request_with_no_callback_reports_nothing() {
+    let mut node = node();
+    node.request_neighbor_table(
+        0,
+        &BmIpAddr::LINK_LOCAL_MULTICAST,
+        PEER_ID,
+        TableRequestKind::Ignore,
+    )
+    .unwrap();
+    let events = table_events(&mut node, 10, &table_reply_frame(PEER_ID));
+    assert_eq!(events.len(), 1);
+    assert!(
+        !node.table_requests().timer_running(),
+        "accepted all the same"
+    );
+}
+
+/// Nothing asked, so the reply is dispatched and dropped. `TARGET_NODE_ID`
+/// starts at zero and the peer is not zero.
+#[test]
+fn an_unsolicited_reply_is_dropped() {
+    let mut node = node();
+    let events = table_events(&mut node, 0, &table_reply_frame(PEER_ID));
+    assert_eq!(events.len(), 1);
+}
+
+/// Divergence #35, the requester's half: `target_node_id == 0` is the
+/// broadcast the responder honours, and no reply can match it because no
+/// replying node calls itself zero.
+#[test]
+fn a_broadcast_request_goes_out_and_nothing_can_answer_it() {
+    let mut node = node();
+    let outbound = node
+        .request_neighbor_table(
+            0,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            0,
+            TableRequestKind::Report,
+        )
+        .unwrap();
+    assert_eq!(table_request_target(&outbound), 0, "asked everybody");
+
+    // The peer answers, as a C node would: `bcmp_process_neighbor_table_request`
+    // treats a zero target as "for everyone".
+    let events = table_events(&mut node, 10, &table_reply_frame(PEER_ID));
+    assert_eq!(events.len(), 1, "and the answer is thrown away");
+    assert!(node.table_requests().is_armed(), "still waiting, forever");
+
+    // Only a node calling itself zero is heard, which is the other half of
+    // the asymmetry: `bcmp_find_neighbor` would never match that id.
+    let events = table_events(&mut node, 20, &table_reply_frame(0));
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[1], Seen::NeighborTable { node_id: 0, .. }));
+}
+
+/// Divergence #36: the timeout fires and the request survives it.
+#[test]
+fn a_late_reply_is_reported_as_an_answer_after_the_timeout() {
+    let mut node = node();
+    node.request_neighbor_table(
+        0,
+        &BmIpAddr::LINK_LOCAL_MULTICAST,
+        PEER_ID,
+        TableRequestKind::Report,
+    )
+    .unwrap();
+
+    let mut timeouts = Vec::new();
+    node.on_neighbor_request_timer(NEIGHBOR_REQUEST_TIMEOUT_MS - 1, |event| {
+        timeouts.push(seen(event));
+    });
+    assert!(timeouts.is_empty(), "one millisecond early");
+    assert_eq!(
+        node.neighbor_request_remaining_ms(NEIGHBOR_REQUEST_TIMEOUT_MS - 1),
+        Some(1)
+    );
+
+    node.on_neighbor_request_timer(NEIGHBOR_REQUEST_TIMEOUT_MS, |event| {
+        timeouts.push(seen(event));
+    });
+    assert_eq!(
+        timeouts,
+        [Seen::NeighborTableTimeout {
+            target_node_id: PEER_ID
+        }]
+    );
+    assert_eq!(
+        node.neighbor_request_remaining_ms(NEIGHBOR_REQUEST_TIMEOUT_MS),
+        None,
+        "one-shot"
+    );
+
+    // An hour later, and still believed.
+    let events = table_events(&mut node, 3_600_000, &table_reply_frame(PEER_ID));
+    assert_eq!(events.len(), 2);
+    assert!(matches!(events[1], Seen::NeighborTable { .. }));
+}
+
+/// The 150 ms sweep and the 10 s heartbeat both run the neighbour timer, so a
+/// node driven by either still reports the timeout.
+#[test]
+fn the_expiry_sweep_also_runs_the_neighbour_timer() {
+    let mut node = node();
+    node.request_neighbor_table(
+        0,
+        &BmIpAddr::LINK_LOCAL_MULTICAST,
+        PEER_ID,
+        TableRequestKind::Report,
+    )
+    .unwrap();
+
+    let mut timeouts = Vec::new();
+    let mut at = 0;
+    while at < NEIGHBOR_REQUEST_TIMEOUT_MS + EXPIRY_PERIOD_MS {
+        at += EXPIRY_PERIOD_MS;
+        node.on_expiry(at, |event| {
+            if let Event::NeighborTableTimeout { target_node_id } = event {
+                timeouts.push((at, target_node_id));
+            }
+        });
+    }
+    assert_eq!(
+        timeouts,
+        [(1050, PEER_ID)],
+        "the first sweep at or past the deadline, and only that one"
+    );
+}
+
+/// A request for an unregistered type is not sent — and the C arms the timer
+/// and the callback before it finds that out.
+#[test]
+fn an_unsendable_request_still_arms_the_timer() {
+    let mut node = node();
+    assert!(node.unregister(MessageType::NEIGHBOR_TABLE_REQUEST));
+    assert!(
+        node.request_neighbor_table(
+            0,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            PEER_ID,
+            TableRequestKind::Report
+        )
+        .is_none()
+    );
+    assert_eq!(node.table_requests().target_node_id(), PEER_ID);
+    assert!(node.table_requests().is_armed());
+    assert_eq!(
+        node.neighbor_request_remaining_ms(0),
+        Some(NEIGHBOR_REQUEST_TIMEOUT_MS)
+    );
+}
+
+/// A second request takes the slot whole: the first can no longer be answered
+/// and can no longer time out.
+#[test]
+fn a_second_request_replaces_the_first() {
+    const OTHER_ID: u64 = 0x0000_0000_55AA_0022;
+
+    let mut node = node();
+    node.request_neighbor_table(
+        0,
+        &BmIpAddr::LINK_LOCAL_MULTICAST,
+        PEER_ID,
+        TableRequestKind::Report,
+    )
+    .unwrap();
+    node.request_neighbor_table(
+        600,
+        &BmIpAddr::LINK_LOCAL_MULTICAST,
+        OTHER_ID,
+        TableRequestKind::Report,
+    )
+    .unwrap();
+
+    let events = table_events(&mut node, 700, &table_reply_frame(PEER_ID));
+    assert_eq!(events.len(), 1, "the first request is gone");
+
+    let mut timeouts = Vec::new();
+    node.on_neighbor_request_timer(1_000, |event| timeouts.push(seen(event)));
+    assert!(timeouts.is_empty(), "so is its deadline");
+    node.on_neighbor_request_timer(1_600, |event| timeouts.push(seen(event)));
+    assert_eq!(
+        timeouts,
+        [Seen::NeighborTableTimeout {
+            target_node_id: OTHER_ID
+        }]
+    );
+}
+
+/// The run loop's own arm for `NEIGHBOR_TIMER`, which is a one-shot at the
+/// deadline rather than a ticker. The script's steps are too small to reach a
+/// heartbeat or to let the expiry sweep be what fires it.
+#[test]
+fn the_run_loop_times_out_a_neighbour_table_request() {
+    let mut node = node();
+    let mut phy = MockPhy::new(
+        PORTS,
+        vec![
+            Script::Idle { ms: 400 },
+            Script::Idle { ms: 400 },
+            Script::Idle { ms: 400 },
+        ],
+    );
+
+    let outbound = node
+        .request_neighbor_table(
+            0,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            PEER_ID,
+            TableRequestKind::Report,
+        )
+        .expect("sent");
+    block_on(transmit(&mut phy, outbound, PORTS)).unwrap();
+    assert_eq!(phy.sent.len(), usize::from(PORTS), "once per port");
+
+    let mut events = Vec::new();
+    let error = block_on(node.run_with(&mut phy, |e| events.push(seen(e))));
+    assert_eq!(error, bm_stack::mock::MockError::ScriptFinished);
+
+    assert_eq!(
+        events,
+        [Seen::NeighborTableTimeout {
+            target_node_id: PEER_ID
+        }],
+        "the neighbour timer fired once, on its own deadline"
+    );
+    assert!(node.table_requests().is_armed(), "and gave up on nothing");
+}
+
+/// A reply too short for the entry counts it declares is refused before the
+/// acceptance test, so it neither answers nor stops the timer. The C reads
+/// past the frame instead — divergence #14.
+#[test]
+fn a_reply_shorter_than_its_declared_counts_is_dropped() {
+    let mut node = node();
+    node.request_neighbor_table(
+        0,
+        &BmIpAddr::LINK_LOCAL_MULTICAST,
+        PEER_ID,
+        TableRequestKind::Report,
+    )
+    .unwrap();
+
+    let mut body = vec![0u8; NeighborTableReply::HEADER_LEN];
+    body[0..8].copy_from_slice(&PEER_ID.to_le_bytes());
+    body[8] = 2; // two ports, and not a byte of them
+    let frame = peer_frame(
+        MessageType::NEIGHBOR_TABLE_REPLY,
+        &body,
+        BmIpAddr::LINK_LOCAL_MULTICAST,
+    );
+
+    let events = table_events(&mut node, 10, &frame);
+    assert_eq!(
+        events,
+        [Seen::Message {
+            message_type: MessageType::NEIGHBOR_TABLE_REPLY,
+            seq_num: 0,
+            source: PEER_ID,
+        }],
+        "dispatched, since packet.c does not parse bodies, and then refused"
+    );
+    assert!(node.table_requests().is_armed());
+    assert!(node.table_requests().timer_running());
 }

@@ -192,3 +192,18 @@ path = "fuzz_targets/info.rs"
 test = false
 doc = false
 bench = false
+
+# Stack-backed, same rule about `bcmp`. The neighbour-table requester is the
+# one exchange whose state is a single slot rather than a list, and the only
+# one bm_core puts a real timer on, so this target advances the virtual clock
+# to fire it. It does not need `-fork=1`: heartbeats are outside the input
+# domain, so nothing appends to `INFO_REQUEST_LIST`, and `neighbors.c`'s three
+# statics are put back by `reset_requester` at the start of every iteration
+# rather than at the end -- so a crash leaves nothing behind that the next
+# iteration does not undo.
+[[bin]]
+name = "neighbor_table"
+path = "fuzz_targets/neighbor_table.rs"
+test = false
+doc = false
+bench = false
