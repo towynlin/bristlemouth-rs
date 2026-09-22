@@ -215,12 +215,12 @@ type ResourceNode = Node<
     REQUEST_CAPACITY,
 >;
 
-/// The record lists a `0x0B` arriving from a peer may carry, as index pairs
-/// into [`NAMES`].
+/// The record lists a `0x0B` arriving from a peer may carry, as
+/// `(publisher indices, subscriber indices)` into [`NAMES`].
 ///
 /// Only the storable names, so a reply reads the way a real node's would. What
 /// is being compared is the walk, so the shapes vary in both counts.
-const REPLY_SHAPES: &[(&[usize], &[usize])] = &[
+pub const REPLY_SHAPES: &[(&[usize], &[usize])] = &[
     (&[], &[]),
     (&[0], &[]),
     (&[], &[1]),
