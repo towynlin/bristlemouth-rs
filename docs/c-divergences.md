@@ -70,6 +70,9 @@ Four to fix first, in this order.
 | 34 | A restarted neighbour is asked about `info.node_id`, which is zero until it has answered once | replicated | reading, confirmed differentially |
 | 35 | A broadcast neighbour-table request is answered by every node and accepted from none | replicated | reading, confirmed differentially |
 | 36 | A neighbour-table request's callback and timer outlive the request | replicated | reading, confirmed differentially |
+| 37 | A resource-table request naming node zero is answered by nobody | replicated | reading, confirmed differentially |
+| 38 | `find_resource` compares the needle's length against every entry | domain-limited | reading |
+| 39 | `bcmp/resource_discovery.c` mishandles four allocations | c-only | reading |
 
 ---
 
@@ -610,6 +613,13 @@ it is not: a node heartbeating from `fe80::` appends an entry per heartbeat.
 `bcmp/packet.c` solves the same problem with a 150 ms sweep that expires
 entries and fires their callbacks with `NULL`; `INFO_REQUEST_LIST` has no
 equivalent.
+
+`bcmp/resource_discovery.c`'s `RESOURCE_REQUEST_LIST` is the same list with the
+same three properties: `bcmp_resource_discovery_send_request` appends
+unconditionally and `bcmp_process_resource_discovery_reply` is the only
+removal. It is worse in one respect — #37 means a request naming zero can never
+be answered, so every such call leaks an entry — and better in another, since
+nothing appends to it without an application asking.
 
 **c-only.** `bm-wire` is sans-io; `HeartbeatOutcome::request_info` tells the
 runtime a request is owed. This is why the `neighbor` fuzz target needs
@@ -1192,8 +1202,13 @@ compare all 64 bits, so the *cache* is written against the claim rather than
 against the request.
 
 `bcmp/resource_discovery.c` has the same defect in the same shape:
-`RESOURCE_REQUEST_LIST` is created with `target_node_id` at line 355 and read
-with `src_node_id` at 164, both `uint64_t`. Card M5 inherits it.
+`RESOURCE_REQUEST_LIST` is created with `target_node_id` and read with
+`src_node_id`, both `uint64_t`. `ResourceRequests::key` replicates it, and
+`the_request_list_is_keyed_on_half_an_id` (`bm-wire-diff/tests/resource.rs`)
+compares it. That half is *not* reachable from the wire the way `bcmp/info.c`'s
+is: `bcmp_process_resource_discovery_reply` requires `repl->node_id` to equal
+the source address before it consults the list, so the key is the sender's real
+id rather than one it chose.
 `bcmp/packet.c` is unaffected — its two lists are keyed on a `uint32_t`
 sequence number and a `uint16_t` message type.
 
@@ -1370,3 +1385,158 @@ Fix by giving `bm_timer_create` a bm_core trampoline that clears
 `NEIGHBOR_REQUEST_CB` and `TARGET_NODE_ID` before invoking the caller's
 `timeout`, and by stopping the timer when `bcmp_tx` fails. Neither is
 wire-visible.
+
+## 37. A resource-table request naming node zero is answered by nobody
+
+Four BCMP request types carry a `target_node_id` whose `bcmp/messages.h`
+comment reads "Zeroed = all nodes". Three implement it:
+
+| Module | Test |
+|---|---|
+| `bcmp/info.c:89` | `if ((request->target_node_id == 0) \|\| (request->target_node_id == node_id()))` |
+| `bcmp/ping.c:104` | `if ((echo_req->target_node_id == 0) \|\| (echo_req->target_node_id == node_id()))` |
+| `bcmp/neighbors.c:90` | `if (request->target_node_id == 0 \|\| node_id() == request->target_node_id)` |
+
+`bcmp/resource_discovery.c:105` does not:
+
+```c
+static BmErr bcmp_process_resource_discovery_request(BcmpProcessData data) {
+  BmErr err = BmEBADMSG;
+  BcmpResourceTableRequest *req = (BcmpResourceTableRequest *)data.payload;
+  do {
+    if (req->target_node_id != node_id()) {
+      break;
+    }
+```
+
+So a `0x0A` naming zero reaches every node on the link and is answered by none
+of them, and there is no way to enumerate a network's resources in one
+exchange — the caller has to know each node id first, which is what
+`bcmp_resource_discovery_send_request`'s single `target_node_id` argument
+assumes.
+
+Two consequences beyond the missing broadcast:
+
+- **A node whose link-local address is exactly `fe80::` answers only requests
+  naming zero**, since `node_id()` is then zero. That is the same address #18
+  makes invisible to the neighbour table.
+- **The asymmetry is invisible from the requester side.** The request is sent
+  to `multicast_ll_addr` either way and nothing times out (#19), so a caller
+  that asks for zero waits forever with no error.
+
+**replicated.** `ResourceTableRequest::is_for` is the exact match and says why;
+`Node::submit` calls it rather than `addressed_to_us`, which is what the other
+three use. Compared in `a_request_naming_zero_is_answered_by_nobody`
+(`bm-wire-diff/tests/resource.rs` and `bm-stack/tests/node.rs`), with the seed
+`bm-wire/fuzz/seeds/resource/zero-is-a-dead-letter`. The `bm-stack` test puts
+the same request to `0x04` and `0x08` in the same node, which do answer it.
+
+Fix by matching the other three modules. Wire-visible: a fixed node starts
+answering a request a deployed node ignores, which is additive — nothing today
+sends a `0x0A` naming zero expecting silence.
+
+## 38. `bcmp_resource_discovery_find_resource` compares the needle's length against every entry
+
+`bcmp/resource_discovery.c:33`:
+
+```c
+static bool bcmp_resource_discovery_find_resource_priv(
+    const char *resource, const uint16_t resource_len, ResourceType type) {
+  BcmpResourceNode *cur = res_list->start;
+  while (cur) {
+    if (memcmp(resource, cur->resource->resource, resource_len) == 0) {
+      return true;
+    }
+    cur = cur->next;
+  }
+```
+
+`cur->resource_len` is never read. Each entry is a `bm_malloc(sizeof(BcmpResource)
++ resource_len)` sized for *its own* name, so the comparison is against
+`resource_len` bytes of an allocation that may be shorter. Two behaviours fall
+out:
+
+- **A shorter needle is a prefix match.** Searching for `sensor` finds a stored
+  `sensor/temp`, and `bcmp_resource_discovery_add_resource` therefore refuses
+  to add `sensor` — reporting `BmEAGAIN` for a name that is not in the list.
+  A node that publishes `sensor/temp` can never also publish `sensor`, and
+  `bcmp_resource_discovery_find_resource` tells the application a resource is
+  present when it is not.
+- **A longer needle reads out of bounds.** Searching for `sensor/temperature`
+  in a list whose head is `sensor/temp` reads eight bytes past that entry's
+  allocation. The needle comes from the application rather than off the wire,
+  so this is not remotely reachable — but every resource name in a Bristlemouth
+  network is a pub/sub topic, and `middleware/pubsub.c:400` calls this on every
+  `bm_pub`, and `pubsub.c:177` on every `bm_sub`.
+
+**domain-limited**, in the second half only. `ResourceTable::find` reproduces
+the prefix match and its unit tests pin it; a needle longer than an entry the
+walk reaches simply does not match, which is a choice rather than a port,
+because there is no defined C behaviour to match. `ResourceTable::find_over_reads`
+reports where the C would have gone out of bounds, and
+`bm-wire-diff/src/resource.rs` uses it to keep every step it performs inside
+the defined half: every needle is at most twelve bytes and nothing shorter than
+that is ever stored. The lists have no remove, so that rule has to look ahead —
+one short entry would make every longer needle undefined for the rest of the
+process.
+
+Fix by comparing the lengths first:
+
+```c
+if (cur->resource->resource_len == resource_len &&
+    memcmp(resource, cur->resource->resource, resource_len) == 0) {
+```
+
+Not wire-visible. It does change which `bcmp_resource_discovery_add_resource`
+calls succeed, so a node that was silently sharing one entry between two topics
+starts advertising both.
+
+## 39. `bcmp/resource_discovery.c` mishandles four allocations
+
+Four separate faults in one module, none of them reachable from the wire, all
+in the same two functions.
+
+**1. An unchecked `bm_malloc` is dereferenced.** `bcmp_resource_discovery_add_resource`
+checks the node allocation and not the buffer one:
+
+```c
+  uint8_t *resource_buffer = (uint8_t *)bm_malloc(resource_size);
+  BcmpResource *resource = (BcmpResource *)resource_buffer;
+  resource->resource_len = resource_len;          // resource may be NULL
+  memcpy(resource->resource, res, resource_len);
+
+  BcmpResourceNode *resource_node =
+      (BcmpResourceNode *)bm_malloc(sizeof(BcmpResourceNode));
+  if (resource_node) {                            // this one is checked
+```
+
+**2. The same function leaks on the failure it does check.** When
+`resource_node` is NULL it reports `BmENOMEM` and drops `resource_buffer`.
+
+**3. The request handler leaks its reply.** `bcmp_process_resource_discovery_request`
+`break`s out of its `do {} while (0)` on a populate failure, past the
+`bm_free(reply_buf)` at the bottom:
+
+```c
+    if (!bcmp_resource_populate_msg_data(PUB, reply, &data_offset)) {
+      bm_debug("Failed to get publishers list\n.");
+      break;                                      // reply_buf leaks
+    }
+```
+
+`bcmp_resource_discovery_get_local_resources` has the same shape and gets it
+right, freeing on a `success` flag.
+
+**4. The reply buffer is sized and filled under different locks.**
+`bcmp_resource_compute_list_size` takes each list's semaphore, sums the sizes
+and gives it back; `bcmp_resource_populate_msg_data` then takes it again and
+`memcpy`s. A `bcmp_resource_discovery_add_resource` between the two — from the
+application task, which is where every call to it comes from — grows a list
+after its size has been decided, and the `memcpy` runs off the end of the
+`bm_malloc`. This is a heap overflow in ordinary multi-threaded operation, not
+an out-of-memory path.
+
+**c-only.** `bm-wire` has no allocator, and `ResourceTable::encode_reply`
+cannot race because the table is borrowed for the call; `Node::build_resource_table_reply`
+says so. Fix 1–3 by checking and freeing; fix 4 by holding each list's
+semaphore across both passes, or by sizing and filling in one.

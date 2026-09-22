@@ -3,14 +3,16 @@
 What of BCMP is still unported, in dependency order, as task cards sized for
 one agent each.
 
-`bm-wire` carries five of BCMP's exchanges — heartbeat (`0x01`), echo
+`bm-wire` carries six of BCMP's exchanges — heartbeat (`0x01`), echo
 (`0x02`/`0x03`, both halves), device info (`0x04`/`0x05`, both halves),
-neighbour table (`0x08`/`0x09`, both halves) and system time (`0x10`–`0x12`,
-both halves) — plus the wire engine under them (`bcmp::tx::serialize`,
-`bcmp::rx::accept`, L2 egress stamping, the link-local RX policy, the two
-forwarding paths in `bcmp::forward`) and two state machines,
-`bm-wire/src/neighbor.rs` and `bm-wire/src/bcmp/registry.rs`. `MessageType`
-names all 45 of bm_core's constants; eleven body structs have a codec.
+neighbour table (`0x08`/`0x09`, both halves), resource discovery
+(`0x0A`/`0x0B`, both halves) and system time (`0x10`–`0x12`, both halves) —
+plus the wire engine under them (`bcmp::tx::serialize`, `bcmp::rx::accept`, L2
+egress stamping, the link-local RX policy, the two forwarding paths in
+`bcmp::forward`) and three state machines, `bm-wire/src/neighbor.rs`,
+`bm-wire/src/bcmp/registry.rs` and `bm-wire/src/bcmp/resource.rs`.
+`MessageType` names all 45 of bm_core's constants; fourteen body structs have a
+codec.
 
 `bm_stack::Node` drives that registry: `Node::register` is `packet_add`,
 `Node::request` is `bcmp_tx`, and `bm_stack::Event` is where a reply, a timeout
@@ -22,7 +24,6 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| Resource discovery `0x0A`,`0x0B` | `bcmp/resource_discovery.c` | 444 | M5 |
 | CBOR codec | `third_party/tinycbor` | — | C1 |
 | Local config store | `bcmp/configuration.c` | 845 | C2 |
 | Config over BCMP `0xA0`–`0xA9` | `bcmp/config.c` | 857 | C3 |
@@ -31,8 +32,8 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-M5, C1 and D1 are unblocked and may run in parallel. C2 needs C1. C3
-needs C1 and C2. D2 needs D1; D3 and D4 each need D2.
+C1 and D1 are unblocked and may run in parallel. C2 needs C1. C3 needs C1 and
+C2. D2 needs D1; D3 and D4 each need D2.
 
 ---
 
@@ -149,7 +150,7 @@ cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 On a crash: `cargo fuzz tmin <target> <artifact>`, then drop the minimized file
 into `bm-wire/fuzz/seeds/<target>/`.
 
-### What the landed cards (M1, M2, M3, M4) left for the rest
+### What the landed cards (M1, M2, M3, M4, M5) left for the rest
 
 - **Forwarding machinery is built.** `bm_stack::Owed::forward` is the decision,
   as a `Reflood` — a byte range within the received frame plus the ingress port,
@@ -200,23 +201,25 @@ into `bm-wire/fuzz/seeds/<target>/`.
 - **Divergence #20 is no longer theoretical, and `bm-wire-diff/src/ll.rs` is
   where to stay out of it.** `cargo fuzz run info` reached `ll_item_add`'s
   heap-use-after-free within four minutes, from three frames any node can send.
-  `LinkModel` is shared by `registry.rs` and `info.rs`; any card whose module
-  removes from an `LL` out of insertion order — C3 on `sequence_list`, M5 on
-  `RESOURCE_REQUEST_LIST` — needs it too.
+  `LinkModel` is shared by `registry.rs`, `info.rs` and `resource.rs`; any card
+  whose module removes from an `LL` out of insertion order — C3 on
+  `sequence_list` — needs it too.
 - **Size the port's ceilings out of reach, and assert they stayed there.** The
   port bounds what bm_core leaves unbounded, and a full fixed-capacity
   structure compares as a divergence rather than as a limit. `info::check`
   asserts both the request list and the info cache have a slot to spare, the
   way `neighbor::check` asserts `!outcome.table_full`. Both of those assertions
   fired on the fuzzer's first two runs.
-- **BCMP's node-id-keyed lists hold 32 bits of a 64-bit id** (divergence #33),
-  and M5's `RESOURCE_REQUEST_LIST` inherits it verbatim. Keeping two ids that
-  share their low 32 bits in every comparator's `NODE_IDS` is what separates a
+- **BCMP's node-id-keyed lists hold 32 bits of a 64-bit id** (divergence #33);
+  `INFO_REQUEST_LIST` and `RESOURCE_REQUEST_LIST` both do. Keeping two ids that
+  share their low 32 bits in every comparator's id pool is what separates a
   32-bit key from a 64-bit compare without any extra machinery.
 - **Read each module's own correlation; do not assume the last card's.**
   `bcmp/info.c` keeps an unbounded list keyed on half an id; `bcmp/neighbors.c`
   keeps one slot matched on the whole of one; `bcmp/ping.c` keeps four statics
-  and matches on sixteen bits and a payload. Only `bcmp/config.c` uses
+  and matches on sixteen bits and a payload; `bcmp/resource_discovery.c` keeps
+  an unbounded list keyed on half an id and, alone in BCMP, requires the reply's
+  body to name the address it arrived from. Only `bcmp/config.c` uses
   `packet.c`'s machinery at all.
 - **bm_core puts a real timer on exactly one exchange, and it expires
   nothing.** `NEIGHBOR_TIMER` is a one-shot armed by the request, so its
@@ -234,6 +237,38 @@ into `bm-wire/fuzz/seeds/<target>/`.
   answers it, which is the only route back to the state a process starts in.
   It runs at the **start** of every seed rather than the end, so a seed that
   panics does not poison the next one — prefer that to `info::check`'s order.
+- **A module with no deinit forces a bounded input pool.**
+  `bcmp/resource_discovery.c`'s `PUB_LIST` and `SUB_LIST` have no remove, no
+  clear and no deinit, so they are process-global and monotone: the only reset
+  is `bcmp_resource_discovery_init`, which drops the chain and leaks two
+  semaphores. `bm-wire-diff/src/resource.rs` answers that with a fixed name
+  pool, a process-global `Model` that the port's table is rebuilt from at the
+  start of each seed, and a comparison that asserts *agreement* rather than any
+  particular state — so every test in `tests/resource.rs` is order-independent,
+  and has to be. C2's config store is the next card with state that outlives a
+  seed.
+- **The oracle's stack is not a blank slate.** `bm_shim_stack_init` brings
+  `metrics_service_init` up, which calls `bm_sub` and so leaves
+  `<node id>/metrics/req` in `SUB_LIST` before any comparator runs. Read a
+  module's state out of the C on first use rather than assuming it starts
+  empty; `resource::oracle_local_resources` is that, through
+  `bcmp_resource_discovery_get_local_resources`.
+- **`stack::captured_message_type` is how to classify a captured frame**, and
+  `stack::Captured` is what `drain` returns. `rx::accept` verifies the
+  checksum, so filtering on it silently drops the frames divergence #12 broke —
+  exactly the ones worth comparing. M5 added the helper and moved `info.rs` and
+  `neighbor_table.rs` onto it.
+- **Tell the oracle's own frames from the ones it relayed.**
+  `resource::is_ours` compares the node id in the source address, which the
+  egress-port stamp does not touch. It is also why that comparator's peer ids
+  exclude the node's own: L2 keeps the sender's source address on a relay, so a
+  peer calling itself by the oracle's id would be indistinguishable from
+  something the oracle built.
+- **Every module orders `bcmp_tx` against its own bookkeeping differently.**
+  `bcmp_request_info` records first and `ll_remove`s on failure;
+  `bcmp_request_neighbor_table` records and keeps it;
+  `bcmp_resource_discovery_send_request` transmits first and records only on
+  success. All three are observable, and none is a pattern for the next.
 - **Compare the callbacks a module hands the application, not only its state.**
   `bcmp/neighbors.c` exposes none of its three statics, so the whole of M4's
   comparison is three observable effects: the request frame, the reply callback
@@ -248,39 +283,6 @@ into `bm-wire/fuzz/seeds/<target>/`.
 Each card gives: the C source, the Rust to create, the comparator and fuzz
 target, any new port seam, the C quirks to reproduce, what blocks it, and what
 "done" means.
-
----
-
-# Messages bm_core implements
-
-## M5 — resource discovery, `0x0A` and `0x0B`
-
-**Blocked by:** nothing. Both types are unsequenced, so the requester half is
-`Node::request` plus a match arm.
-
-**C source.** `bcmp/resource_discovery.c` (444 LoC). Two `BcmpResourceList`s —
-`PUB_LIST` and `SUB_LIST` — each a singly-linked list with its own semaphore
-(default take timeout 100 ms), plus `RESOURCE_REQUEST_LIST` with no expiry.
-
-**Wire format.** `BcmpResourceTableReply` is `node_id`, `num_pubs`, `num_subs`,
-then `num_pubs + num_subs` variable-length `BcmpResource { uint16 len; char[] }`
-records, **publishers first**. The most variable-length message in BCMP after
-the neighbour table; divergence #14's domain-limiting discipline applies.
-
-**Two probable new divergences.**
-
-- `resource_discovery.c:105` rejects the request unless
-  `req->target_node_id != node_id()` fails — so it does **not** treat
-  `target_node_id == 0` as a broadcast, unlike ping, info and neighbours.
-  Verify and record.
-- On a populate failure the handler `break`s before `bm_free`, leaking
-  `reply_buf`. `c-only`, but it belongs in the list.
-
-**Rust to create.** `bm-wire/src/bcmp/resource.rs` for the codecs and a
-fixed-capacity resource table; the two lists become one sans-io structure.
-
-**Done when.** Codecs round-trip, the broadcast asymmetry is recorded, and the
-table's add/find behaviour matches the C under a scripted comparator.
 
 ---
 

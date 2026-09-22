@@ -33,6 +33,7 @@ pub mod neighbor_table;
 pub mod ping;
 pub mod registry;
 pub mod replay;
+pub mod resource;
 pub mod stack;
 pub mod time;
 pub mod util;

@@ -207,3 +207,19 @@ path = "fuzz_targets/neighbor_table.rs"
 test = false
 doc = false
 bench = false
+
+# Stack-backed, same rule about `bcmp`. Resource discovery has no timer, so
+# nothing here advances the clock; what it has instead is two lists with no
+# remove, no clear and no deinit, so `PUB_LIST` and `SUB_LIST` grow across a
+# run and the names a step may use come from a fixed pool. Give it fork mode:
+# `RESOURCE_REQUEST_LIST` never expires an entry (divergence #19), and although
+# `check` empties it at the start of every iteration, a crash leaves the two
+# resource lists behind in a state the comparator's model no longer describes.
+#
+#   cargo fuzz run resource corpus/resource seeds/resource -- -fork=1
+[[bin]]
+name = "resource"
+path = "fuzz_targets/resource.rs"
+test = false
+doc = false
+bench = false

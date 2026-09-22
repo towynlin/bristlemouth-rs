@@ -34,8 +34,8 @@
 //!
 //! A type nothing registers is neither sent nor dispatched, which is the C's
 //! `BmENODEV`. [`Node::new`] registers what `bcmp_init` registers for the
-//! ported modules — heartbeat, ping, system time, device info and the
-//! neighbour table; [`Node::register`] adds more.
+//! ported modules — heartbeat, ping, system time, device info, the neighbour
+//! table and resource discovery; [`Node::register`] adds more.
 //!
 //! # Device information is asked for, and kept
 //!
@@ -60,6 +60,22 @@
 //! request. Two things are asymmetric with the responder side and are
 //! divergences rather than choices: a broadcast request is answered by every
 //! node and accepted from none (#35), and the timeout disarms nothing (#36).
+//!
+//! # And the resource table, differently again
+//!
+//! `bcmp/resource_discovery.c` keeps two append-only lists of topic names —
+//! [`Node::resources`], which [`Node::add_resource`] grows — and answers a
+//! `0x0A` with all of both. [`Node::request_resource_table`] is
+//! `bcmp_resource_discovery_send_request` and `RESOURCE_REQUEST_LIST` is
+//! [`bm_wire::bcmp::resource::ResourceRequests`]; a reply arrives as
+//! [`Event::ResourceTable`].
+//!
+//! Two things here are this module's alone. A request naming node zero is
+//! answered by **nobody**, where the same request to `bcmp/info.c`,
+//! `bcmp/ping.c` or `bcmp/neighbors.c` is answered by everybody — divergence
+//! #37. And a reply is accepted only when the `node_id` in its body equals the
+//! address it arrived from, which is the only place in BCMP those two are
+//! compared.
 //!
 //! # Ping is correlated outside the registry
 //!
@@ -90,6 +106,10 @@ use bm_wire::bcmp::neighbors::{
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::{
     Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, PacketCfg, PendingRequest, Registry, RegistryError,
+};
+use bm_wire::bcmp::resource::{
+    RESOURCE_NAME_BYTES, ResourceAddError, ResourceReplyOutcome, ResourceRequestKind,
+    ResourceRequests, ResourceTable, ResourceTableReply, ResourceTableRequest, ResourceType,
 };
 use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, Heartbeat, MessageType, forward, rx, tx};
@@ -263,6 +283,27 @@ pub enum Event<'a> {
         /// The reply as it arrived, both of its arrays borrowed from the
         /// frame.
         reply: NeighborTableReply<'a>,
+    },
+    /// A resource-table reply answered a request made with
+    /// [`ResourceRequestKind::Report`] —
+    /// `bcmp_process_resource_discovery_reply` reaching `cb->cb(repl)`.
+    ///
+    /// Reported **in addition to** [`Event::Message`] for the same frame, as
+    /// [`Event::NeighborTable`] is.
+    ///
+    /// What was matched is two things, and this is the only exchange in BCMP
+    /// that checks the second: the low 32 bits of the source address against
+    /// [`Node::resource_requests`] (divergence #33), and
+    /// [`ResourceTableReply::node_id`] against the whole of that source
+    /// address. A reply whose body names a node other than the one it came
+    /// from is dropped without the list being consulted at all.
+    ResourceTable {
+        /// Node id the reply came from, from the frame's source address —
+        /// which here is also what the body claims.
+        source: u64,
+        /// The reply as it arrived, both halves of its record list borrowed
+        /// from the frame.
+        reply: ResourceTableReply<'a>,
     },
     /// `NEIGHBOR_TIMER` fired: a neighbour-table request has gone unanswered
     /// for [`NEIGHBOR_REQUEST_TIMEOUT_MS`]. The C's `timeout` argument to
@@ -439,6 +480,22 @@ impl Snapshot {
 /// and nothing is cached.
 pub const INFO_REQUESTS_DEFAULT: usize = 8;
 
+/// Default number of resources a node's [`ResourceTable`] holds across both
+/// of its lists, [`Node`]'s `RESOURCES`.
+///
+/// bm_core's `PUB_LIST` and `SUB_LIST` are `bm_malloc`'d and have no ceiling.
+/// A node advertising more topics than this raises the parameter;
+/// [`Node::add_resource`] reports [`ResourceAddError::Full`] rather than
+/// truncating a name, because a truncated name is a different name.
+pub const RESOURCES_DEFAULT: usize = 8;
+
+/// Default number of unanswered resource-table requests a node remembers,
+/// [`Node`]'s `RESOURCE_REQUESTS`.
+///
+/// `RESOURCE_REQUEST_LIST` is unbounded and never expires an entry, as
+/// `INFO_REQUEST_LIST` is (divergence #19), so there is no C number to match.
+pub const RESOURCE_REQUESTS_DEFAULT: usize = 4;
+
 /// Default size of a node's expected-ping-payload buffer, [`Node`]'s
 /// `PING_PAYLOAD`.
 ///
@@ -524,6 +581,11 @@ impl<const PAYLOAD: usize> PingState<PAYLOAD> {
 /// and `INFO_STRINGS` how many bytes of each cached string are kept. Both are
 /// ceilings bm_core does not have; the defaults keep every string whole, so
 /// only the first is reachable in ordinary operation.
+///
+/// `RESOURCES` is how many resources the node advertises across both of
+/// `bcmp/resource_discovery.c`'s lists, `RESOURCE_NAME` the longest name one
+/// may have, and `RESOURCE_REQUESTS` how many unanswered resource-table
+/// requests are remembered. All three are ceilings bm_core does not have.
 pub struct Node<
     I,
     R = NoRtc,
@@ -532,6 +594,9 @@ pub struct Node<
     const PING_PAYLOAD: usize = PING_PAYLOAD_BYTES,
     const INFO_REQUESTS: usize = INFO_REQUESTS_DEFAULT,
     const INFO_STRINGS: usize = CACHED_STRING_BYTES,
+    const RESOURCES: usize = RESOURCES_DEFAULT,
+    const RESOURCE_NAME: usize = RESOURCE_NAME_BYTES,
+    const RESOURCE_REQUESTS: usize = RESOURCE_REQUESTS_DEFAULT,
 > {
     identity: I,
     rtc: R,
@@ -547,6 +612,10 @@ pub struct Node<
     /// `NEIGHBOR_TIMER` — one outstanding neighbour-table request, however
     /// many have been sent.
     table_requests: TableRequests,
+    /// `PUB_LIST` and `SUB_LIST`, which a `0x0A` is answered with, and
+    /// `RESOURCE_REQUEST_LIST`, which correlates the `0x0B`s that come back.
+    resources: ResourceTable<RESOURCES, RESOURCE_NAME>,
+    resource_requests: ResourceRequests<RESOURCE_REQUESTS>,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -564,7 +633,22 @@ impl<
     const PING_PAYLOAD: usize,
     const INFO_REQUESTS: usize,
     const INFO_STRINGS: usize,
-> Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD, INFO_REQUESTS, INFO_STRINGS>
+    const RESOURCES: usize,
+    const RESOURCE_NAME: usize,
+    const RESOURCE_REQUESTS: usize,
+>
+    Node<
+        I,
+        R,
+        NEIGHBORS,
+        PENDING,
+        PING_PAYLOAD,
+        INFO_REQUESTS,
+        INFO_STRINGS,
+        RESOURCES,
+        RESOURCE_NAME,
+        RESOURCE_REQUESTS,
+    >
 {
     /// A node with an empty neighbour table, at time zero.
     ///
@@ -573,9 +657,10 @@ impl<
     /// [`Node::on_tick`]'s uptime clock starts.
     pub fn new(identity: I, rtc: R, port_count: u8) -> Self {
         let mut registry = Registry::new();
-        // heartbeat.c, ping.c, time.c, neighbors.c and info.c, in the order
-        // `bcmp_init` calls their inits. Every one of them is
-        // `{false, false}`: outside `bcmp/config.c`, nothing in bm_core is
+        // heartbeat.c, ping.c, time.c, neighbors.c, info.c and
+        // resource_discovery.c, in the order `bcmp_init` calls their inits --
+        // minus dfu_core.c and config.c, which are unported. Every one of them
+        // is `{false, false}`: outside `bcmp/config.c`, nothing in bm_core is
         // sequenced at all, so all of this rides on the wire with a sequence
         // number of zero.
         for message_type in [
@@ -589,6 +674,8 @@ impl<
             MessageType::NEIGHBOR_TABLE_REPLY,
             MessageType::DEVICE_INFO_REQUEST,
             MessageType::DEVICE_INFO_REPLY,
+            MessageType::RESOURCE_TABLE_REQUEST,
+            MessageType::RESOURCE_TABLE_REPLY,
         ] {
             // Cannot fail: MESSAGE_TYPES is far larger than this list.
             let _ = registry.add(message_type, PacketCfg::UNSEQUENCED);
@@ -602,6 +689,8 @@ impl<
             info_requests: InfoRequests::new(),
             info: InfoCache::new(),
             table_requests: TableRequests::new(),
+            resources: ResourceTable::new(),
+            resource_requests: ResourceRequests::new(),
             port_count,
             link_mask: 0,
             tx: [0u8; MTU],
@@ -929,6 +1018,46 @@ impl<
                     // but names a node that is not a neighbour: both are
                     // decoded, matched, consumed and dropped.
                     Some(InfoRequestKind::Cache) | None => {}
+                }
+                None
+            }
+            MessageType::RESOURCE_TABLE_REQUEST => {
+                let Ok(request) = ResourceTableRequest::decode(received.payload) else {
+                    return (None, None);
+                };
+                // Not `addressed_to_us`:
+                // `bcmp_process_resource_discovery_request` breaks unless the
+                // target is an exact match, so a request naming zero is
+                // answered by nobody where every other request type in BCMP
+                // takes zero as a broadcast. Divergence #37.
+                if !request.is_for(self.identity.node_id()) {
+                    return (None, None);
+                }
+                self.build_resource_table_reply(now_ms, &reply_to)
+            }
+            MessageType::RESOURCE_TABLE_REPLY => {
+                // `bcmp_process_resource_discovery_reply`. The record lengths
+                // are checked here and nowhere in the C -- divergence #14
+                // again, and worse than its other two cases: each record's
+                // length advances the cursor for the next one.
+                let Ok(reply) = ResourceTableReply::decode(received.payload) else {
+                    return (None, None);
+                };
+                // `repl->node_id == src_node_id` first, then `ll_get_item`
+                // and `ll_remove` on the low 32 bits of that source. The
+                // module transmits nothing either way.
+                match self.resource_requests.accept(reply.node_id, source) {
+                    ResourceReplyOutcome::Reported => {
+                        events(Event::ResourceTable { source, reply });
+                    }
+                    // `Accepted`: consumed, and `cb->cb` was null, so the C
+                    // only printed it. `Unsolicited`: the claim agreed with
+                    // the source but nothing had asked. `Mismatched`: the
+                    // body named another node, and the C returned before the
+                    // list was consulted.
+                    ResourceReplyOutcome::Accepted
+                    | ResourceReplyOutcome::Unsolicited
+                    | ResourceReplyOutcome::Mismatched => {}
                 }
                 None
             }
@@ -1473,6 +1602,83 @@ impl<
         self.table_requests.remaining_ms(now_ms)
     }
 
+    /// Advertise a resource — `bcmp_resource_discovery_add_resource`.
+    ///
+    /// `bm_stack` has no publish/subscribe layer, so nothing calls this by
+    /// itself: the two lists are what the firmware puts in them, and they are
+    /// what a `0x0A` is answered with.
+    ///
+    /// # Errors
+    ///
+    /// [`ResourceAddError::AlreadyPresent`] if the list already covers `name`
+    /// — which, the C's de-duplication being a prefix match, includes names
+    /// that are not in it (divergence #38). [`ResourceAddError::Full`] once
+    /// `RESOURCES` resources are held or for a name longer than
+    /// `RESOURCE_NAME`, neither of which bm_core has.
+    pub fn add_resource(
+        &mut self,
+        name: &[u8],
+        kind: ResourceType,
+    ) -> Result<(), ResourceAddError> {
+        self.resources.add(name, kind)
+    }
+
+    /// `PUB_LIST` and `SUB_LIST`: the resources this node advertises.
+    pub fn resources(&self) -> &ResourceTable<RESOURCES, RESOURCE_NAME> {
+        &self.resources
+    }
+
+    /// `RESOURCE_REQUEST_LIST`: which nodes have been asked for their resource
+    /// table and have not answered.
+    pub fn resource_requests(&self) -> &ResourceRequests<RESOURCE_REQUESTS> {
+        &self.resource_requests
+    }
+
+    /// Ask `target_node_id` for its resource table —
+    /// `bcmp_resource_discovery_send_request`.
+    ///
+    /// Goes to `FF02::1`, the address the C hard-codes. Passing zero asks
+    /// nobody: the responder wants an exact match, so the request reaches
+    /// every node and is answered by none (divergence #37).
+    ///
+    /// `kind` is the C's `fp` argument, and a [`ResourceRequestKind::Report`]
+    /// reply arrives as [`Event::ResourceTable`].
+    ///
+    /// **The request is recorded only if it was sent**, which is the C's
+    /// order: `bcmp_tx` runs first and `ll_item_add` only on its success.
+    /// [`Node::request_device_info`] records first and undoes it;
+    /// [`Node::request_neighbor_table`] records and keeps it. All three
+    /// modules differ, so none of them is a pattern for the next.
+    ///
+    /// Returns `None` without sending when
+    /// [`MessageType::RESOURCE_TABLE_REQUEST`] is unregistered. A request the
+    /// list had no room for is still sent, and its reply then arrives as
+    /// unsolicited traffic — the C reaches the same place when `ll_item_add`
+    /// fails, and reports `BmENOMEM` for a request already on the wire.
+    pub fn request_resource_table(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        kind: ResourceRequestKind,
+    ) -> Option<Outbound<'_>> {
+        let mut body = [0u8; ResourceTableRequest::LEN];
+        ResourceTableRequest { target_node_id }
+            .encode(&mut body)
+            .ok()?;
+        // An unregistered type is the only failure `bcmp_tx` can report here:
+        // the body is eight bytes, so the size guard cannot refuse it. Asking
+        // the registry before the transmit borrow begins keeps the C's order,
+        // where nothing is recorded for a request that did not go out.
+        self.registry.cfg(MessageType::RESOURCE_TABLE_REQUEST)?;
+        self.resource_requests.record(target_node_id, kind);
+        self.request(
+            now_ms,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            MessageType::RESOURCE_TABLE_REQUEST,
+            &body,
+        )
+    }
+
     /// What is known about `node_id`, or `None` if nothing is.
     ///
     /// Populated by a [`InfoRequestKind::Cache`] reply from a node that is
@@ -1626,6 +1832,37 @@ impl<
                 response.encode(body)?;
                 Ok(SystemTimeResponse::LEN)
             },
+        )
+    }
+
+    /// `bcmp_process_resource_discovery_request`'s answer: the whole of both
+    /// lists, publishers first.
+    ///
+    /// bm_core sizes a `bm_malloc` with `bcmp_resource_compute_list_size` and
+    /// then fills it under the lists' locks a second time, so a concurrent
+    /// `bcmp_resource_discovery_add_resource` overflows it — divergence #39.
+    /// Here the table cannot change while the reply is being built.
+    ///
+    /// The `seq_num` handed to `bcmp_tx` is a literal zero rather than the
+    /// request's, which for an unsequenced type is what `serialize` would have
+    /// written anyway (the other side of divergence #31).
+    fn build_resource_table_reply(&mut self, now_ms: u32, dst: &BmIpAddr) -> Option<Outbound<'_>> {
+        let (seq_num, mask) = self.outgoing(now_ms, MessageType::RESOURCE_TABLE_REPLY, 0)?;
+        let Self {
+            identity,
+            resources,
+            tx,
+            ..
+        } = self;
+        let node_id = identity.node_id();
+        build_outbound(
+            tx,
+            node_id,
+            dst,
+            MessageType::RESOURCE_TABLE_REPLY,
+            seq_num,
+            mask,
+            |body| resources.encode_reply(body, node_id),
         )
     }
 
@@ -1880,7 +2117,22 @@ impl<
     const PING_PAYLOAD: usize,
     const INFO_REQUESTS: usize,
     const INFO_STRINGS: usize,
-> Node<I, R, NEIGHBORS, PENDING, PING_PAYLOAD, INFO_REQUESTS, INFO_STRINGS>
+    const RESOURCES: usize,
+    const RESOURCE_NAME: usize,
+    const RESOURCE_REQUESTS: usize,
+>
+    Node<
+        I,
+        R,
+        NEIGHBORS,
+        PENDING,
+        PING_PAYLOAD,
+        INFO_REQUESTS,
+        INFO_STRINGS,
+        RESOURCES,
+        RESOURCE_NAME,
+        RESOURCE_REQUESTS,
+    >
 {
     /// Run the node until the PHY fails, discarding every [`Event`].
     ///

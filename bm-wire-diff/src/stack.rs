@@ -26,7 +26,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use bm_stack::port::{Egress, Identity, Phy, RtcTimeAndDate, SoftRtc};
 use bm_stack::{Node, Outbound, Reflood};
-use bm_wire::bcmp::DeviceInfo;
+use bm_wire::bcmp::{BCMP_HEADER_OFFSET, BcmpHeader, DeviceInfo, MessageType};
+use bm_wire::frame::{ETHERNET_TYPE_IPV6, IP_PROTO_BCMP, IPV6_NEXT_HEADER_OFFSET, ethernet_type};
 
 /// Ports the capture device reports, from `SHIM_NUM_PORTS` in
 /// `bm-wire-sys/csrc/bm_net_device_shim.c`.
@@ -163,6 +164,34 @@ pub fn drain() -> Vec<(u8, Vec<u8>)> {
         buf.truncate(len);
         out.push((port, buf));
     }
+}
+
+/// A frame the oracle transmitted, and the port it went out on — one element
+/// of what [`drain`] returns.
+pub type Captured = (u8, Vec<u8>);
+
+/// The BCMP message type a captured frame carries, without asking whether the
+/// frame is valid.
+///
+/// [`bm_wire::bcmp::rx::accept`] would be the obvious classifier and is the
+/// wrong one: it verifies the checksum, and a frame the oracle stamped an
+/// egress port into may correctly fail that — divergence #12 drops the
+/// end-around carry on roughly one BCMP frame in forty thousand. A comparator
+/// filtering on `accept` would silently stop comparing exactly the frames
+/// worth comparing. [`BcmpHeader::decode`] reads the type and verifies
+/// nothing.
+///
+/// `None` for a frame that is not BCMP at all, or is too short to say.
+#[must_use]
+pub fn captured_message_type(frame: &[u8]) -> Option<MessageType> {
+    if ethernet_type(frame)? != ETHERNET_TYPE_IPV6 {
+        return None;
+    }
+    if *frame.get(IPV6_NEXT_HEADER_OFFSET)? != IP_PROTO_BCMP {
+        return None;
+    }
+    let header = BcmpHeader::decode(frame.get(BCMP_HEADER_OFFSET..)?).ok()?;
+    Some(header.message_type)
 }
 
 /// Deliver `frame` to L2 as if it arrived on `port`, then run the tasks.
