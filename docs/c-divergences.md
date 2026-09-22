@@ -68,6 +68,8 @@ Four to fix first, in this order.
 | 32 | `bcmp/ping.c` reports the result of a ping to nobody, and never forgets one | c-only | reading |
 | 33 | BCMP's node-id-keyed lists hold only the low 32 bits of the id | replicated | reading, confirmed differentially |
 | 34 | A restarted neighbour is asked about `info.node_id`, which is zero until it has answered once | replicated | reading, confirmed differentially |
+| 35 | A broadcast neighbour-table request is answered by every node and accepted from none | replicated | reading, confirmed differentially |
+| 36 | A neighbour-table request's callback and timer outlive the request | replicated | reading, confirmed differentially |
 
 ---
 
@@ -1243,3 +1245,128 @@ cache on the reset path and sends zero when there is nothing there;
 every step, so the byte that differs is the one under test. Fix by passing
 `neighbor->node_id`, which is always populated. Wire-visible: a fixed node
 stops broadcasting where an unfixed one does.
+
+## 35. A broadcast neighbour-table request is answered by every node and accepted from none
+
+`bcmp/neighbors.c` tests the target twice, at opposite ends of the exchange,
+and the two tests disagree about what zero means.
+
+The responder treats it as "for everyone":
+
+```c
+if (request->target_node_id == 0 || node_id() == request->target_node_id) {
+  err = bcmp_send_neighbor_table(data.dst);
+}
+```
+
+The requester wants an exact match against the id the *replier* puts in its own
+body, and `bcmp_send_neighbor_table` fills that in as
+`neighbor_table_reply->node_id = node_id()`:
+
+```c
+if (TARGET_NODE_ID == reply->node_id) {
+```
+
+| `target_node_id` asked for | Nodes that answer | Replies accepted |
+|---|---|---|
+| a specific node id | that one | that one's |
+| `0` | **every node on the link** | **none** |
+
+So `bcmp_request_neighbor_table(0, ...)` puts one frame on the wire, every node
+answers it, every answer is discarded, and a second later the caller's
+`timeout` fires instead. bm_core's own doc comment — "target node id to send
+request to (0 for all nodes)" — is true of the request and false of the reply.
+`integrations/topology.c` always names a specific node, so nothing upstream
+notices.
+
+The one id that *would* match a broadcast is zero itself, which belongs to a
+node whose link-local address is exactly `fe80::` — the node of #18. This is
+#18's mirror image: `bcmp_find_neighbor` refuses to match zero and nothing
+else, while this matches zero and nothing else. And since `TARGET_NODE_ID` is a
+zero-initialised static, a reply claiming node id zero is accepted **before any
+request has been made**: with no callback armed all that happens is
+`bm_timer_stop(NULL)`, but ask about node zero and that reply is reported as
+its answer.
+
+Same shape as #27 in a third module.
+
+**replicated.** `TableRequests::accept` is the exact match and
+`Node::request_neighbor_table` sends the broadcast. Pinned in
+`a_broadcast_request_is_answered_by_everyone_and_accepted_from_nobody` and
+`a_reply_claiming_node_zero_is_accepted_before_any_request`
+(`bm-wire-diff/tests/neighbor_table.rs`), with the seed
+`bm-wire/fuzz/seeds/neighbor_table/broadcast-unanswerable`.
+
+Fix by dropping the responder's zero test, or by having the requester accept
+any reply when it asked for everyone — the second is what the doc promises.
+Neither is wire-visible: the frames are the same either way, and nothing can be
+relying on a broadcast going unanswered, since nothing has ever consumed one.
+
+## 36. A neighbour-table request's callback and timer outlive the request
+
+`bcmp_request_neighbor_table` writes three statics and transmits last:
+
+```c
+TARGET_NODE_ID = target_node_id;
+if (NEIGHBOR_TIMER) {
+  bm_timer_delete(NEIGHBOR_TIMER, 10);
+}
+NEIGHBOR_TIMER = bm_timer_create("neighbor_request_timer",
+                                 bcmp_neighbor_timer_timeout_s * 1000, false,
+                                 NULL, timeout);
+if (NEIGHBOR_TIMER) {
+  err = bm_timer_start(NEIGHBOR_TIMER, 10);
+  bm_err_check(err, bcmp_tx(...));
+  NEIGHBOR_REQUEST_CB = request;
+}
+```
+
+and `bcmp_process_neighbor_table_reply` is the only thing that ever clears one:
+
+```c
+if (TARGET_NODE_ID == reply->node_id) {
+  err = bm_timer_stop(NEIGHBOR_TIMER, 10);
+  if (NEIGHBOR_REQUEST_CB) {
+    bm_err_check(err, NEIGHBOR_REQUEST_CB(reply));
+    NEIGHBOR_REQUEST_CB = NULL;
+  }
+}
+```
+
+Three consequences:
+
+- **The timeout gives up on nothing.** The timer's callback is the integrator's
+  `timeout`, which bm_core hands to `bm_timer_create` untouched; it never sees
+  `NEIGHBOR_REQUEST_CB`. A reply arriving a minute after the timeout is matched
+  and reported as an answer. `integrations/topology.c` is exposed: its
+  `BcmpTopoEvtTimeout` handler increments `RETRY_COUNT` and re-requests but
+  never clears `SENT_REQUEST`, which is the only thing gating
+  `neighbor_request_cb`, so a late reply is inserted into the walk as the
+  *current* cursor's neighbour table.
+- **`TARGET_NODE_ID` is never cleared.** After a successful exchange the last
+  target is still the accepted one, so a duplicate reply reaches
+  `bm_timer_stop` again. Inert on its own — the callback is null by then — and
+  it is what keeps the point above reachable.
+- **A request that failed to transmit is still armed.** The timer is created
+  and started before `bcmp_tx` and nothing undoes it, so a caller gets an error
+  return *and* a timeout a second later. topology.c calls `topology_end()` on
+  the error and then takes a `BcmpTopoEvtTimeout` into a finished walk.
+
+Compare `bcmp_request_info`, which does `ll_remove` its `INFO_REQUEST_LIST`
+entry when `bcmp_tx` fails, and `packet.c`, whose sweep does clear the request
+it gives up on (#22).
+
+**replicated.** `TableRequests::on_timer` clears the timer and nothing else and
+says so at the type; `Node::request_neighbor_table` records before it sends and
+does not undo the record. Measured in
+`a_reply_after_the_timeout_is_still_reported` and
+`the_timeout_fires_once_per_request` (`bm-wire-diff/tests/neighbor_table.rs`),
+with the seed `bm-wire/fuzz/seeds/neighbor_table/timeout-then-late-reply`. The
+third bullet is from reading only: the comparator's requests always transmit,
+so it is pinned one-sidedly in `an_unsendable_request_still_arms_the_timer`
+(`bm-stack/tests/node.rs`).
+
+Fix by giving `bm_timer_create` a bm_core trampoline that clears
+`NEIGHBOR_REQUEST_CB` and `TARGET_NODE_ID` before invoking the caller's
+`timeout`, and by stopping the timer when `bcmp_tx` fails. Neither is
+wire-visible.

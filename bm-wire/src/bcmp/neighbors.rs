@@ -7,8 +7,44 @@
 //! message that carried them — see divergence #14. [`NeighborTableReply`]
 //! borrows the two arrays out of the frame, so the bounds are checked once, at
 //! decode, and the iterators cannot walk past them.
+//!
+//! # The reply's consumer
+//!
+//! [`TableRequests`] is `bcmp/neighbors.c`'s requester state —
+//! `TARGET_NODE_ID`, `NEIGHBOR_REQUEST_CB` and `NEIGHBOR_TIMER`, which hold one
+//! request between them. It is here for the reason [`super::info::InfoRequests`]
+//! is: module state rather than wire format, and sans-io, so `bm_stack::Node`
+//! owns the transmission and the clock.
+//!
+//! The two are not the same shape, and the difference is the whole of the
+//! requester side:
+//!
+//! | | `INFO_REQUEST_LIST` (`0x04`) | `bcmp/neighbors.c` (`0x08`) |
+//! |---|---|---|
+//! | Outstanding requests | unbounded list | one |
+//! | Keyed on | low 32 bits of the id (#33) | all 64 bits |
+//! | Matched against | the reply's body `node_id` | the reply's body `node_id` |
+//! | A broadcast request | answered and consumed | answered by everyone, accepted from nobody (#35) |
+//! | Expiry | none (#19) | a 1 s one-shot timer that expires nothing (#36) |
 
 use crate::BmWireError;
+use crate::util::time_remaining;
+
+/// `bcmp_table_max_len`: longest reply `bcmp_send_neighbor_table` will build.
+///
+/// Above it the C returns `BmEINVAL` and answers nothing at all — its `TODO -
+/// handle more gracefully` is the whole of the handling. On a two-port node
+/// that is 101 neighbours, so no device reaches it.
+pub const NEIGHBOR_TABLE_MAX_LEN: usize = 1024;
+
+/// `bcmp_neighbor_timer_timeout_s`, as milliseconds: how long
+/// `bcmp_request_neighbor_table` waits before it fires the caller's `timeout`.
+///
+/// Unlike `packet.c`'s sequenced requests (divergence #22) this is a one-shot
+/// timer armed at the moment of the request, so the deadline is the deadline.
+/// What it does *not* do is give up on the request — see [`TableRequests`] and
+/// divergence #36.
+pub const NEIGHBOR_REQUEST_TIMEOUT_MS: u32 = 1000;
 
 /// `BcmpNeighborTableRequest`: ask one node, or every node, for its neighbours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -252,6 +288,178 @@ pub fn encode_neighbor_table_reply(
     Ok(end)
 }
 
+// ---------------------------------------------------------------------------
+// The requester: `TARGET_NODE_ID`, `NEIGHBOR_REQUEST_CB` and `NEIGHBOR_TIMER`
+// ---------------------------------------------------------------------------
+
+/// `bcmp_request_neighbor_table`'s `request` argument, as a choice rather than
+/// a pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableRequestKind {
+    /// `request == NULL`. A matching reply is still accepted — the timer is
+    /// stopped — and then dropped. What `neighbors_test.cpp` passes on its
+    /// failure cases; nothing in bm_core passes it in earnest.
+    Ignore,
+    /// `request != NULL`. A matching reply reaches the caller, **once**: the C
+    /// clears `NEIGHBOR_REQUEST_CB` immediately after invoking it.
+    /// `integrations/topology.c` is the only caller.
+    Report,
+}
+
+/// What `bcmp_process_neighbor_table_reply` made of a reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableReplyOutcome {
+    /// `TARGET_NODE_ID != reply->node_id`. The C returns `BmENOTINTREC` having
+    /// done nothing — not even stopped the timer.
+    Rejected,
+    /// Accepted with no callback armed: the timer is stopped and the reply is
+    /// dropped. Either the request was made with [`TableRequestKind::Ignore`],
+    /// or a reply already consumed the callback.
+    Accepted,
+    /// Accepted with a callback armed: the reply is reported, and the callback
+    /// is disarmed so the next one is merely [`Self::Accepted`].
+    Reported,
+}
+
+/// `bcmp/neighbors.c`'s three requester statics, which hold one request between
+/// them.
+///
+/// `bcmp_request_neighbor_table` writes all three; `bcmp_process_neighbor_table_reply`
+/// reads the first and clears the second. Reproduced here rather than tidied,
+/// because three things about them are observable on the wire and to the
+/// application:
+///
+/// * **`TARGET_NODE_ID` is an exact 64-bit match against the reply's *body*
+///   `node_id`,** not against the address it arrived from and not against the
+///   type of the request. It starts at zero and is never cleared, so a reply
+///   claiming the last target is accepted for the life of the process.
+/// * **Zero is a target like any other.** A node whose link-local address is
+///   exactly `fe80::` replies with `node_id == 0` and matches, which is the
+///   opposite of `bcmp_find_neighbor`'s refusal to match zero (divergence
+///   #18). It also matches the zero this starts at, so such a reply is
+///   accepted before any request has been made. A *broadcast* request is the
+///   mirror image: `target_node_id == 0` asks every node, every node answers
+///   with its own id, and none of those ids is zero. See divergence #35.
+/// * **The timer expires nothing.** `NEIGHBOR_TIMER` fires the caller's
+///   `timeout` and leaves `NEIGHBOR_REQUEST_CB` armed, so a reply arriving
+///   afterwards is reported as though it had been on time. See divergence #36.
+///
+/// [`Self::on_timer`] is the timer; the caller owns the clock that drives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TableRequests {
+    target_node_id: u64,
+    armed: bool,
+    /// `NEIGHBOR_TIMER`'s start instant while it is running. The deadline
+    /// rather than the instant would not survive a wrapping clock any better:
+    /// [`time_remaining`] is what the C compares with.
+    started_ms: Option<u32>,
+}
+
+impl Default for TableRequests {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TableRequests {
+    /// The state `bcmp/neighbors.c` starts a process in: no callback, no timer,
+    /// and a `TARGET_NODE_ID` of zero that a reply claiming zero matches.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            target_node_id: 0,
+            armed: false,
+            started_ms: None,
+        }
+    }
+
+    /// `TARGET_NODE_ID`: the node id a reply must claim to be accepted.
+    #[must_use]
+    pub const fn target_node_id(&self) -> u64 {
+        self.target_node_id
+    }
+
+    /// Whether `NEIGHBOR_REQUEST_CB` is non-null — a reply is still owed to
+    /// somebody.
+    #[must_use]
+    pub const fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Whether `NEIGHBOR_TIMER` is running.
+    #[must_use]
+    pub const fn timer_running(&self) -> bool {
+        self.started_ms.is_some()
+    }
+
+    /// Milliseconds until [`Self::on_timer`] will fire, or `None` when the
+    /// timer is not running.
+    ///
+    /// Zero means it is due now. This is `time_remaining`, bm_core's own
+    /// wrap-safe comparison, against a start instant rather than a deadline —
+    /// so a clock that has gone backwards reads as "not yet", as it does
+    /// everywhere else in bm_core except `packet.c`.
+    #[must_use]
+    pub fn remaining_ms(&self, now_ms: u32) -> Option<u32> {
+        self.started_ms
+            .map(|started| time_remaining(started, now_ms, NEIGHBOR_REQUEST_TIMEOUT_MS))
+    }
+
+    /// `bcmp_request_neighbor_table`: name the target, re-arm the timer, record
+    /// the callback.
+    ///
+    /// The C does all three **before** `bcmp_tx`, and undoes none of them if
+    /// the transmit fails — unlike `bcmp_request_info`, which removes its list
+    /// entry. A caller whose request never reached the wire therefore still
+    /// gets a timeout a second later, and still accepts a reply. The old timer
+    /// is deleted rather than stopped, so a previous request's deadline is
+    /// gone whether or not it had been answered.
+    pub fn record(&mut self, now_ms: u32, target_node_id: u64, kind: TableRequestKind) {
+        self.target_node_id = target_node_id;
+        self.armed = matches!(kind, TableRequestKind::Report);
+        self.started_ms = Some(now_ms);
+    }
+
+    /// `bcmp_process_neighbor_table_reply`: the acceptance test and its
+    /// effects.
+    ///
+    /// `reply_node_id` is [`NeighborTableReply::node_id`] — what the sender
+    /// says it is, which the C trusts in preference to the frame's source
+    /// address.
+    pub fn accept(&mut self, reply_node_id: u64) -> TableReplyOutcome {
+        if self.target_node_id != reply_node_id {
+            return TableReplyOutcome::Rejected;
+        }
+        // `bm_timer_stop`, which the C calls whether or not the timer is
+        // running and whether or not it was ever created.
+        self.started_ms = None;
+        if self.armed {
+            self.armed = false;
+            TableReplyOutcome::Reported
+        } else {
+            TableReplyOutcome::Accepted
+        }
+    }
+
+    /// Run `NEIGHBOR_TIMER`, reporting whether it fired.
+    ///
+    /// One-shot: it fires at most once per [`Self::record`]. The deadline is
+    /// held here rather than by the caller, so calling this early, late or
+    /// twice changes nothing — only a call at or after the deadline fires it.
+    ///
+    /// **Nothing else changes.** The callback stays armed and
+    /// `TARGET_NODE_ID` keeps its value, so a reply that arrives after this is
+    /// still [`TableReplyOutcome::Reported`]. That is divergence #36, not an
+    /// omission here.
+    pub fn on_timer(&mut self, now_ms: u32) -> bool {
+        if self.remaining_ms(now_ms) != Some(0) {
+            return false;
+        }
+        self.started_ms = None;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +601,144 @@ mod tests {
             encode_neighbor_table_reply(&mut tiny, 0, &[], &[]),
             Err(BmWireError::Truncated)
         );
+    }
+
+    /// `bcmp_send_neighbor_table` refuses to answer at all above
+    /// `bcmp_table_max_len`. On a two-port node the cliff is between 100 and
+    /// 101 neighbours.
+    #[test]
+    fn the_reply_size_ceiling_falls_where_the_c_puts_it() {
+        assert_eq!(NEIGHBOR_TABLE_MAX_LEN, 1024);
+        assert_eq!(neighbor_table_reply_len(2, 100), 1015);
+        assert_eq!(neighbor_table_reply_len(2, 101), 1025);
+        assert!(neighbor_table_reply_len(2, 100) <= NEIGHBOR_TABLE_MAX_LEN);
+        assert!(neighbor_table_reply_len(2, 101) > NEIGHBOR_TABLE_MAX_LEN);
+    }
+
+    #[test]
+    fn a_fresh_requester_is_waiting_for_nothing_from_node_zero() {
+        let requests = TableRequests::new();
+        assert_eq!(requests.target_node_id(), 0);
+        assert!(!requests.is_armed());
+        assert!(!requests.timer_running());
+        assert_eq!(requests.remaining_ms(0), None);
+    }
+
+    /// `TARGET_NODE_ID` starts at zero, so a reply claiming node id zero is
+    /// accepted before anything has been asked. Nothing is reported, because
+    /// `NEIGHBOR_REQUEST_CB` is null — but the C does reach `bm_timer_stop`.
+    #[test]
+    fn a_reply_claiming_node_zero_is_accepted_before_any_request() {
+        let mut requests = TableRequests::new();
+        assert_eq!(requests.accept(0), TableReplyOutcome::Accepted);
+        assert_eq!(requests.accept(1), TableReplyOutcome::Rejected);
+    }
+
+    #[test]
+    fn a_reported_reply_disarms_the_callback_and_stops_the_timer() {
+        let mut requests = TableRequests::new();
+        requests.record(100, 0xAA, TableRequestKind::Report);
+        assert!(requests.is_armed());
+        assert_eq!(requests.remaining_ms(100), Some(1000));
+
+        assert_eq!(requests.accept(0xAA), TableReplyOutcome::Reported);
+        assert!(!requests.is_armed());
+        assert!(!requests.timer_running());
+
+        // Still the target, so still accepted -- but there is nobody left to
+        // report it to.
+        assert_eq!(requests.accept(0xAA), TableReplyOutcome::Accepted);
+    }
+
+    /// The whole of `bcmp_request_neighbor_table(NULL, ...)`: the reply is
+    /// accepted, and goes nowhere.
+    #[test]
+    fn a_request_with_no_callback_accepts_without_reporting() {
+        let mut requests = TableRequests::new();
+        requests.record(0, 0xAA, TableRequestKind::Ignore);
+        assert!(!requests.is_armed());
+        assert!(requests.timer_running());
+        assert_eq!(requests.accept(0xAA), TableReplyOutcome::Accepted);
+    }
+
+    /// A rejected reply leaves the timer alone. The C returns before
+    /// `bm_timer_stop`, so somebody else's reply cannot extend or cancel this
+    /// node's wait.
+    #[test]
+    fn a_rejected_reply_leaves_the_timer_running() {
+        let mut requests = TableRequests::new();
+        requests.record(0, 0xAA, TableRequestKind::Report);
+        assert_eq!(requests.accept(0xBB), TableReplyOutcome::Rejected);
+        assert!(requests.is_armed());
+        assert_eq!(requests.remaining_ms(500), Some(500));
+    }
+
+    /// Divergence #36: the timeout fires, and the request is still armed
+    /// behind it.
+    #[test]
+    fn the_timeout_fires_once_and_gives_up_on_nothing() {
+        let mut requests = TableRequests::new();
+        requests.record(0, 0xAA, TableRequestKind::Report);
+
+        assert!(!requests.on_timer(999), "one millisecond early");
+        assert_eq!(requests.remaining_ms(999), Some(1));
+        assert!(requests.on_timer(1000), "due at exactly the period");
+        assert!(!requests.on_timer(5000), "and one-shot");
+
+        assert!(requests.is_armed(), "the callback outlives its timeout");
+        assert_eq!(
+            requests.accept(0xAA),
+            TableReplyOutcome::Reported,
+            "a reply an hour late is reported as an answer"
+        );
+    }
+
+    /// A second request deletes the first's timer and takes its slot, so the
+    /// first can no longer time out and its callback is gone.
+    #[test]
+    fn a_second_request_replaces_the_first_whole() {
+        let mut requests = TableRequests::new();
+        requests.record(0, 0xAA, TableRequestKind::Report);
+        requests.record(600, 0xBB, TableRequestKind::Ignore);
+
+        assert_eq!(requests.target_node_id(), 0xBB);
+        assert!(!requests.is_armed());
+        assert_eq!(requests.accept(0xAA), TableReplyOutcome::Rejected);
+        assert!(
+            !requests.on_timer(1000),
+            "the first request's deadline went with its timer"
+        );
+        assert!(requests.on_timer(1600));
+    }
+
+    /// `TARGET_NODE_ID` is compared whole, unlike `INFO_REQUEST_LIST`'s
+    /// 32-bit key (divergence #33).
+    #[test]
+    fn the_target_is_matched_on_all_sixty_four_bits() {
+        let mut requests = TableRequests::new();
+        requests.record(0, 0xDEAD_BEEF_55AA_0011, TableRequestKind::Report);
+        assert_eq!(
+            requests.accept(0x0000_0000_55AA_0011),
+            TableReplyOutcome::Rejected,
+            "the low half agreeing is not enough"
+        );
+        assert_eq!(
+            requests.accept(0xDEAD_BEEF_55AA_0011),
+            TableReplyOutcome::Reported
+        );
+    }
+
+    /// The timer is armed against a wrapping millisecond clock, so a request
+    /// made just before the wrap still times out a second later.
+    #[test]
+    fn the_timeout_survives_the_clock_wrapping() {
+        let mut requests = TableRequests::new();
+        let started = u32::MAX - 500;
+        requests.record(started, 0xAA, TableRequestKind::Report);
+        assert_eq!(requests.remaining_ms(started), Some(1000));
+        // The deadline wrapped to 499. 701 ms in, and still waiting.
+        assert!(!requests.on_timer(200));
+        assert_eq!(requests.remaining_ms(200), Some(299));
+        assert!(requests.on_timer(499));
     }
 }

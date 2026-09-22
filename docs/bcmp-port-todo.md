@@ -4,8 +4,8 @@ What of BCMP is still unported, in dependency order, as task cards sized for
 one agent each.
 
 `bm-wire` carries five of BCMP's exchanges — heartbeat (`0x01`), echo
-(`0x02`/`0x03`, both halves), device info (`0x04`/`0x05`, responder only),
-neighbour table (`0x08`/`0x09`, responder only) and system time (`0x10`–`0x12`,
+(`0x02`/`0x03`, both halves), device info (`0x04`/`0x05`, both halves),
+neighbour table (`0x08`/`0x09`, both halves) and system time (`0x10`–`0x12`,
 both halves) — plus the wire engine under them (`bcmp::tx::serialize`,
 `bcmp::rx::accept`, L2 egress stamping, the link-local RX policy, the two
 forwarding paths in `bcmp::forward`) and two state machines,
@@ -22,8 +22,6 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| ~~Device-info reply consumption `0x05`~~ | `bcmp/info.c` | 264 | **M3, landed** |
-| Neighbour-table reply consumption `0x09` | `bcmp/neighbors.c` | 489 | M4 |
 | Resource discovery `0x0A`,`0x0B` | `bcmp/resource_discovery.c` | 444 | M5 |
 | CBOR codec | `third_party/tinycbor` | — | C1 |
 | Local config store | `bcmp/configuration.c` | 845 | C2 |
@@ -33,8 +31,8 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-M4, M5, C1 and D1 are unblocked and may run in parallel. C2 needs C1. C3
-needs C1 and C2. D2 needs D1; D3 and D4 each need D2. M3 has landed.
+M5, C1 and D1 are unblocked and may run in parallel. C2 needs C1. C3
+needs C1 and C2. D2 needs D1; D3 and D4 each need D2.
 
 ---
 
@@ -151,7 +149,7 @@ cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 On a crash: `cargo fuzz tmin <target> <artifact>`, then drop the minimized file
 into `bm-wire/fuzz/seeds/<target>/`.
 
-### What the landed cards (M1, M2) left for the rest
+### What the landed cards (M1, M2, M3, M4) left for the rest
 
 - **Forwarding machinery is built.** `bm_stack::Owed::forward` is the decision,
   as a `Reflood` — a byte range within the received frame plus the ingress port,
@@ -184,6 +182,64 @@ into `bm-wire/fuzz/seeds/<target>/`.
   it by construction and `stack::set_both_clocks` makes it a shared input rather
   than a comparison. Everything downstream is compared. Say the same thing at
   the same volume for any new seam.
+- **Compare the request a step provokes, not only the state it leaves.**
+  Divergence #34 is invisible in the info cache and obvious in the frame.
+  `bm-wire-diff/src/info.rs` reads the C's `0x04` transmissions out of the
+  capture ring and compares them byte for byte against `Owed::reply`. Every
+  card with a requester side wants the same.
+- **A string bm_core keeps as a `char *` is only readable to its first NUL**,
+  since no length is kept beside it. `info.rs`'s `STRINGS` are NUL-free and say
+  why at the constant.
+- **A module's own statics have to be normalised between seeds.**
+  `INFO_REQUEST_LIST` never expires an entry (divergence #19), so an unanswered
+  request outlives the seed that made it and would satisfy a later one.
+  `info::check` tracks the list from the C's own transmissions and answers
+  everything outstanding before returning; `stack::clear_neighbor_table` resets
+  the other half. Only `bm_l2_deinit` exists upstream, so every card has this
+  problem for whatever statics its module keeps.
+- **Divergence #20 is no longer theoretical, and `bm-wire-diff/src/ll.rs` is
+  where to stay out of it.** `cargo fuzz run info` reached `ll_item_add`'s
+  heap-use-after-free within four minutes, from three frames any node can send.
+  `LinkModel` is shared by `registry.rs` and `info.rs`; any card whose module
+  removes from an `LL` out of insertion order — C3 on `sequence_list`, M5 on
+  `RESOURCE_REQUEST_LIST` — needs it too.
+- **Size the port's ceilings out of reach, and assert they stayed there.** The
+  port bounds what bm_core leaves unbounded, and a full fixed-capacity
+  structure compares as a divergence rather than as a limit. `info::check`
+  asserts both the request list and the info cache have a slot to spare, the
+  way `neighbor::check` asserts `!outcome.table_full`. Both of those assertions
+  fired on the fuzzer's first two runs.
+- **BCMP's node-id-keyed lists hold 32 bits of a 64-bit id** (divergence #33),
+  and M5's `RESOURCE_REQUEST_LIST` inherits it verbatim. Keeping two ids that
+  share their low 32 bits in every comparator's `NODE_IDS` is what separates a
+  32-bit key from a 64-bit compare without any extra machinery.
+- **Read each module's own correlation; do not assume the last card's.**
+  `bcmp/info.c` keeps an unbounded list keyed on half an id; `bcmp/neighbors.c`
+  keeps one slot matched on the whole of one; `bcmp/ping.c` keeps four statics
+  and matches on sixteen bits and a payload. Only `bcmp/config.c` uses
+  `packet.c`'s machinery at all.
+- **bm_core puts a real timer on exactly one exchange, and it expires
+  nothing.** `NEIGHBOR_TIMER` is a one-shot armed by the request, so its
+  deadline *is* its deadline — unlike `packet.c`'s auto-reload sweep
+  (divergence #22). A card adding a timed exchange keeps the deadline in its
+  sans-io state (`TableRequests::remaining_ms`) and gets its own arm in
+  `Node::run_with` rather than being folded onto a ticker.
+- **`bm_timer_*` is the second integrator seam with no oracle**, after
+  `bm_rtc_*`. `csrc/bm_os_shim.c` fires a timer once
+  `(int32_t)(tick - due) >= 0`, which is `time_remaining` restated, and
+  `TableRequests` compares with `time_remaining` — so the instant agrees by
+  construction and what is compared is whether the callback ran.
+- **A module's statics can usually be reset through its own front door.**
+  `neighbor_table::reset_requester` makes a request naming node zero and
+  answers it, which is the only route back to the state a process starts in.
+  It runs at the **start** of every seed rather than the end, so a seed that
+  panics does not poison the next one — prefer that to `info::check`'s order.
+- **Compare the callbacks a module hands the application, not only its state.**
+  `bcmp/neighbors.c` exposes none of its three statics, so the whole of M4's
+  comparison is three observable effects: the request frame, the reply callback
+  and the timeout callback. `Model` in `bm-wire-diff/src/neighbor_table.rs` is
+  the comparator's belief about the statics behind them, asserted against both
+  sides on every step.
 
 ---
 
@@ -196,76 +252,6 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 ---
 
 # Messages bm_core implements
-
-## M3 — device-info reply consumption, `0x05` receive side — **landed**
-
-`bm_wire::bcmp::info::InfoRequests` is `INFO_REQUEST_LIST` and
-`bm_wire::bcmp::info::InfoCache` is what `populate_neighbor_info` writes onto a
-`BcmpNeighbor`. `bm_stack::Node::request_device_info` is `bcmp_request_info`,
-`Node::device_info` reads the cache back, and a request made with
-`InfoRequestKind::Report` — the C's non-null `cb` — arrives as
-`Event::DeviceInfo` instead of being cached. `bm-wire-diff/src/info.rs` is the
-comparator and `info` the fuzz target, in `STACK_TARGETS` and needing `-fork=1`.
-
-`INFO_EXPECT_NODE_ID` has no counterpart: `bcmp_expect_info_from_node_id` has
-no caller in bm_core outside its own test, and the branch it arms prints a
-temporary neighbour and frees it, retaining and transmitting nothing.
-
-**What it left for the rest.**
-
-- **Two new divergences, both from reading and both confirmed differentially.**
-  #33: `LLItem::id` is a `uint32_t` while node ids are 64-bit, so
-  `INFO_REQUEST_LIST` — and `RESOURCE_REQUEST_LIST`, which M5 inherits — holds
-  only the low half. #34: the restart path asks about `neighbor->info.node_id`,
-  which is zero until a reply has been cached, so a restart before the first
-  reply broadcasts.
-- **Compare the request a step provokes, not only the state it leaves.** #34 is
-  invisible in the cache and obvious in the frame. `info.rs` reads the C's
-  `0x04` transmissions out of the capture ring and compares them byte for byte
-  against `Owed::reply`; M4 and M5 both have a requester side to do the same
-  with.
-- **A string bm_core keeps as a `char *` is only readable to its first NUL**,
-  since no length is kept beside it. `info.rs`'s `STRINGS` are NUL-free and say
-  why at the constant.
-- **`INFO_REQUEST_LIST` has to be left empty between seeds.** Divergence #19
-  means an unanswered request outlives the seed that made it and would satisfy
-  a later one. `info::check` tracks the list from the C's own transmissions and
-  answers everything outstanding before returning; `stack::clear_neighbor_table`
-  (moved there from `neighbor.rs`) resets the other half.
-- **Divergence #20 is no longer theoretical, and `bm-wire-diff/src/ll.rs` is
-  where to stay out of it.** `cargo fuzz run info` reached `ll_item_add`'s
-  heap-use-after-free within four minutes, from three frames any node can send.
-  `LinkModel` moved out of `registry.rs` into `ll.rs` so both comparators share
-  it; any card whose module removes from an `LL` out of insertion order —
-  C3 on `sequence_list`, M5 on `RESOURCE_REQUEST_LIST` — needs it too.
-- **Size the port's ceilings out of reach, and assert they stayed there.** The
-  port bounds what bm_core leaves unbounded, and a full fixed-capacity
-  structure compares as a divergence rather than as a limit. `info::check`
-  asserts both the request list and the info cache have a slot to spare, the
-  way `neighbor::check` asserts `!outcome.table_full`. Both of those
-  assertions fired on the fuzzer's first two runs.
-
-## M4 — neighbour-table reply consumption, `0x09` receive side
-
-**Blocked by:** nothing, on the same terms as M3.
-
-**The gap.** `NeighborTableReply` decodes and `build_neighbor_table_reply`
-answers, but no requester side exists and received replies are ignored.
-
-**C source.** `bcmp/neighbors.c` (489 LoC), `bcmp_request_neighbor_table` and
-`bcmp_process_neighbor_table_reply`. State: `NEIGHBOR_REQUEST_CB` is single-shot
-and cleared after use; `TARGET_NODE_ID` gates acceptance; `NEIGHBOR_TIMER` is a
-one-shot 1 s timer deleted and recreated per request. The reply is capped at
-`bcmp_table_max_len` = 1024 bytes.
-
-**Quirks.** Divergences #14 (the parse) and #15
-(`bcmp_remove_neighbor_from_table` frees despite its doc and returns the free's
-result). Divergence #18 (`bcmp_find_neighbor` never matches node id 0) is
-directly relevant to what the requester accepts.
-
-**Done when.** A requester `Node` walking a two-node table produces the same
-accepted/rejected decisions as the C for every seed, including the node-id-0
-case.
 
 ## M5 — resource discovery, `0x0A` and `0x0B`
 
@@ -480,7 +466,9 @@ reverse — completes an image transfer with identical frames at every step.
   implements them upstream.
 - **`integrations/topology.c`** (674 LoC) — the network topology walk. A
   consumer of M4 rather than part of BCMP, with its own thread, timer and
-  doubly-linked cursor. A natural follow-on once M4 lands.
+  doubly-linked cursor. Unblocked now that M4 has landed, and it is where
+  divergences #14, #35 and #36 all bite: it is the only caller of
+  `bcmp_request_neighbor_table` in bm_core.
 - **`middleware/pubsub.c`, `bm_service*.c` and the built-in services** — above
   the wire.
 - **`bm-phy-adin2111`** — embassy#7024 is merged; `docs/embassy-port-tracking-prompt.md`
