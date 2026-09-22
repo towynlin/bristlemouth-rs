@@ -75,6 +75,9 @@ pub fn replay_target(target: &str) -> usize {
                     crate::bcmp_messages::check(i);
                 })
             }
+            "info" => replay_one::<crate::info::InfoInput, _>(&bytes, |i| {
+                crate::info::check(i);
+            }),
             "neighbor" => replay_one::<crate::neighbor::NeighborInput, _>(&bytes, |i| {
                 crate::neighbor::check(i);
             }),
@@ -143,6 +146,7 @@ pub const TARGETS: &[&str] = &[
 pub const STACK_TARGETS: &[&str] = &[
     "bcmp_messages",
     "forward",
+    "info",
     "l2_egress",
     "neighbor",
     "ping",

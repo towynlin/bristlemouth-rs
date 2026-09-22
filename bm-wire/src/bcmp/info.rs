@@ -12,6 +12,20 @@
 //! actually arrived. [`DeviceInfoReply::decode`] validates both against the
 //! buffer instead. See divergence #14 — this is a domain limit, not a
 //! behaviour the port reproduces: there is no defined C behaviour to match.
+//!
+//! # The reply's consumer
+//!
+//! [`InfoRequests`] is `INFO_REQUEST_LIST` and [`InfoCache`] is the
+//! `BcmpDeviceInfo`, `version_str` and `device_name` that
+//! `populate_neighbor_info` writes onto a `BcmpNeighbor`. Both are sans-io:
+//! `bm_stack::Node` transmits the request, gates the cache on its neighbour
+//! table and forgets an entry when the neighbour holding it is evicted.
+//!
+//! `INFO_EXPECT_NODE_ID` has no counterpart. `bcmp_expect_info_from_node_id`
+//! has no caller in bm_core outside its own test, and the branch it arms
+//! builds a temporary neighbour, passes it to `bcmp_print_neighbor_info` and
+//! frees it — it retains nothing and transmits nothing, so there is nothing
+//! for a port to reproduce.
 
 use crate::BmWireError;
 
@@ -206,6 +220,321 @@ impl<'a> DeviceInfoReply<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// `INFO_REQUEST_LIST` and the information it collects
+// ---------------------------------------------------------------------------
+
+/// Longest string [`InfoCache`] keeps per field by default, which is the
+/// longest either field can describe on the wire.
+pub const CACHED_STRING_BYTES: usize = DeviceInfoReply::MAX_STRING_LEN;
+
+/// `bcmp_request_info`'s `cb` argument, as a choice rather than a pointer.
+///
+/// `bcmp_process_info_reply` takes one branch or the other, never both: a
+/// request made with a callback never updates the cache, and one made without
+/// never reaches the application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfoRequestKind {
+    /// `cb == NULL`, which is what both of bm_core's own call sites pass
+    /// (`bcmp_update_neighbor` and `bcmp_process_heartbeat`'s restart path).
+    /// The reply updates [`InfoCache`], and only if the sender is already in
+    /// the neighbour table.
+    Cache,
+    /// `cb != NULL`. The reply goes to the caller and no cache is touched.
+    Report,
+}
+
+/// `INFO_REQUEST_LIST`: which nodes have been asked to describe themselves and
+/// have not answered.
+///
+/// bm_core keeps a `bm_malloc`'d `LL`. This is a fixed-capacity array with the
+/// three properties of that list that are observable:
+///
+/// * **No de-duplication.** `ll_item_add` appends unconditionally, so asking
+///   the same node twice leaves two entries and it takes two replies to clear
+///   them. See divergence #19.
+/// * **No expiry.** The only removal is a reply, so a node that is asked and
+///   never answers keeps its entry for the life of the process. `N` is
+///   therefore a ceiling bm_core does not have: [`Self::record`] reports a
+///   full list rather than growing.
+/// * **Thirty-two bit keys.** `LLItem::id` is a `uint32_t` while node ids are
+///   64-bit, so the list is keyed on the low half of one. See divergence #33.
+#[derive(Debug, Clone)]
+pub struct InfoRequests<const N: usize> {
+    entries: [(u32, InfoRequestKind); N],
+    len: usize,
+}
+
+impl<const N: usize> Default for InfoRequests<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> InfoRequests<N> {
+    /// An empty list.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: [(0, InfoRequestKind::Cache); N],
+            len: 0,
+        }
+    }
+
+    /// The key `ll_create_item` is given: the low 32 bits of the node id.
+    #[must_use]
+    pub const fn key(node_id: u64) -> u32 {
+        node_id as u32
+    }
+
+    /// How many requests are outstanding, duplicates counted separately.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing is outstanding.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Most entries the list can hold.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    /// The outstanding requests, in the order they were made.
+    pub fn iter(&self) -> impl Iterator<Item = (u32, InfoRequestKind)> + '_ {
+        self.entries[..self.len].iter().copied()
+    }
+
+    /// Whether anything is outstanding for `node_id`, by the truncated key.
+    #[must_use]
+    pub fn contains(&self, node_id: u64) -> bool {
+        let key = Self::key(node_id);
+        self.entries[..self.len].iter().any(|(k, _)| *k == key)
+    }
+
+    /// Record a request — `ll_create_item` and `ll_item_add`.
+    ///
+    /// Appends without looking for an existing entry, as the C does. Returns
+    /// `false`, and records nothing, once `N` entries are outstanding; the C
+    /// reaches the same place only on a `bm_malloc` failure, which it reports
+    /// as `BmENOMEM` and does not transmit for either.
+    pub fn record(&mut self, target_node_id: u64, kind: InfoRequestKind) -> bool {
+        if self.len == N {
+            return false;
+        }
+        self.entries[self.len] = (Self::key(target_node_id), kind);
+        self.len += 1;
+        true
+    }
+
+    /// Consume the first request outstanding for `node_id` — `ll_get_item`
+    /// followed by `ll_remove`, which both match on the first entry with the
+    /// key.
+    ///
+    /// `None` when nothing was asked, which is what makes an unsolicited
+    /// device-info reply do nothing at all.
+    pub fn take(&mut self, node_id: u64) -> Option<InfoRequestKind> {
+        let key = Self::key(node_id);
+        let index = self.entries[..self.len]
+            .iter()
+            .position(|(k, _)| *k == key)?;
+        let kind = self.entries[index].1;
+        self.entries.copy_within(index + 1..self.len, index);
+        self.len -= 1;
+        Some(kind)
+    }
+}
+
+/// One node's device information, borrowed out of [`InfoCache`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachedInfo<'a> {
+    /// The fixed part, as the reply carried it.
+    pub info: DeviceInfo,
+    /// The version string most recently reported, empty if none ever was.
+    pub version_string: &'a [u8],
+    /// The device name most recently reported, empty if none ever was.
+    pub device_name: &'a [u8],
+}
+
+/// What `populate_neighbor_info` leaves on a `BcmpNeighbor`: the fixed part of
+/// each node's self-description and its two strings.
+///
+/// bm_core hangs this off the neighbour table entry and frees it with the
+/// entry; here it is a table of its own, keyed by node id, and `bm_stack`
+/// forgets an entry when the neighbour holding it is evicted.
+///
+/// `STRING` is how many bytes of each string are kept. bm_core `bm_malloc`s
+/// exactly what arrived, so the default, [`CACHED_STRING_BYTES`], is the
+/// longest a `u8` length can describe and nothing is ever truncated. A smaller
+/// value is a deliberate divergence for a node that cannot spare the memory:
+/// the excess is dropped, and what is kept is still the prefix that arrived.
+#[derive(Debug, Clone)]
+pub struct InfoCache<const N: usize, const STRING: usize = CACHED_STRING_BYTES> {
+    entries: [CacheEntry<STRING>; N],
+    len: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CacheEntry<const STRING: usize> {
+    node_id: u64,
+    info: DeviceInfo,
+    version_len: usize,
+    version: [u8; STRING],
+    name_len: usize,
+    name: [u8; STRING],
+}
+
+impl<const STRING: usize> CacheEntry<STRING> {
+    const EMPTY: Self = Self {
+        node_id: 0,
+        info: DeviceInfo {
+            node_id: 0,
+            vendor_id: 0,
+            product_id: 0,
+            serial_num: [0; 16],
+            git_sha: 0,
+            ver_major: 0,
+            ver_minor: 0,
+            ver_rev: 0,
+            ver_hw: 0,
+        },
+        version_len: 0,
+        version: [0; STRING],
+        name_len: 0,
+        name: [0; STRING],
+    };
+
+    fn view(&self) -> CachedInfo<'_> {
+        CachedInfo {
+            info: self.info,
+            version_string: &self.version[..self.version_len],
+            device_name: &self.name[..self.name_len],
+        }
+    }
+}
+
+impl<const N: usize, const STRING: usize> Default for InfoCache<N, STRING> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize, const STRING: usize> InfoCache<N, STRING> {
+    /// An empty cache.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: [CacheEntry::EMPTY; N],
+            len: 0,
+        }
+    }
+
+    /// How many nodes are described.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing is described.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Most nodes the cache can describe.
+    #[must_use]
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    /// The node ids described, in insertion order.
+    pub fn node_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries[..self.len].iter().map(|entry| entry.node_id)
+    }
+
+    /// What is known about `node_id`.
+    #[must_use]
+    pub fn get(&self, node_id: u64) -> Option<CachedInfo<'_>> {
+        self.entries[..self.len]
+            .iter()
+            .find(|entry| entry.node_id == node_id)
+            .map(CacheEntry::view)
+    }
+
+    /// Every entry, in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = CachedInfo<'_>> + '_ {
+        self.entries[..self.len].iter().map(CacheEntry::view)
+    }
+
+    /// Record a reply against the node it names — `populate_neighbor_info`.
+    ///
+    /// The fixed part is replaced whole, every time. **A string is replaced
+    /// only when the reply declares a non-zero length for it**: the C guards
+    /// each `bm_free`/`bm_malloc`/`memcpy` with `if (dev_info->ver_str_len)`,
+    /// so a reply carrying no strings updates the numbers and leaves whatever
+    /// the last reply said the node was called.
+    ///
+    /// Returns `false`, changing nothing, when the node is new and the cache
+    /// is full. bm_core has no such ceiling: its storage is the neighbour
+    /// table entry, which already exists by the time this runs.
+    pub fn store(&mut self, reply: &DeviceInfoReply<'_>) -> bool {
+        let node_id = reply.info.node_id;
+        let index = match self.entries[..self.len]
+            .iter()
+            .position(|entry| entry.node_id == node_id)
+        {
+            Some(index) => index,
+            None => {
+                if self.len == N {
+                    return false;
+                }
+                self.entries[self.len] = CacheEntry::EMPTY;
+                self.entries[self.len].node_id = node_id;
+                self.len += 1;
+                self.len - 1
+            }
+        };
+
+        let entry = &mut self.entries[index];
+        entry.info = reply.info;
+        if !reply.version_string.is_empty() {
+            entry.version_len = copy_truncating(&mut entry.version, reply.version_string);
+        }
+        if !reply.device_name.is_empty() {
+            entry.name_len = copy_truncating(&mut entry.name, reply.device_name);
+        }
+        true
+    }
+
+    /// Forget `node_id` — `bcmp_free_neighbor`, which frees both strings along
+    /// with the entry holding them.
+    ///
+    /// Reports whether there was anything to forget.
+    pub fn forget(&mut self, node_id: u64) -> bool {
+        let Some(index) = self.entries[..self.len]
+            .iter()
+            .position(|entry| entry.node_id == node_id)
+        else {
+            return false;
+        };
+        self.entries.copy_within(index + 1..self.len, index);
+        self.len -= 1;
+        true
+    }
+}
+
+/// Copy as much of `src` as fits, reporting how much that was.
+fn copy_truncating(dst: &mut [u8], src: &[u8]) -> usize {
+    let len = src.len().min(dst.len());
+    dst[..len].copy_from_slice(&src[..len]);
+    len
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +656,173 @@ mod tests {
         assert_eq!(reply.version_string, &[0xAA, 0xAA]);
         assert_eq!(reply.device_name, &[0xAA, 0xAA]);
         assert_eq!(reply.encoded_len(), DeviceInfoReply::HEADER_LEN + 4);
+    }
+
+    fn reply<'a>(node_id: u64, version: &'a [u8], name: &'a [u8]) -> DeviceInfoReply<'a> {
+        DeviceInfoReply {
+            info: DeviceInfo {
+                node_id,
+                ..DeviceInfo::default()
+            },
+            version_string: version,
+            device_name: name,
+        }
+    }
+
+    #[test]
+    fn a_request_list_is_keyed_on_the_low_half_of_the_node_id() {
+        // `LLItem::id` is a uint32_t; `bcmp_request_info` hands it a uint64_t.
+        assert_eq!(
+            InfoRequests::<4>::key(0xDEAD_BEEF_1234_5678),
+            0x1234_5678,
+            "the top half never reaches the list"
+        );
+
+        let mut list = InfoRequests::<4>::new();
+        assert!(list.record(0x0000_0001_0000_0009, InfoRequestKind::Cache));
+        assert!(
+            list.contains(0xFFFF_FFFF_0000_0009),
+            "a node sharing the low 32 bits looks like the one that was asked"
+        );
+        assert_eq!(
+            list.take(0xFFFF_FFFF_0000_0009),
+            Some(InfoRequestKind::Cache)
+        );
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn a_request_list_does_not_de_duplicate_and_never_expires() {
+        let mut list = InfoRequests::<4>::new();
+        for _ in 0..3 {
+            assert!(list.record(0xAA, InfoRequestKind::Cache));
+        }
+        assert_eq!(list.len(), 3, "ll_item_add appends unconditionally");
+
+        // One reply clears one entry, so the other two wait forever.
+        assert_eq!(list.take(0xAA), Some(InfoRequestKind::Cache));
+        assert_eq!(list.len(), 2);
+    }
+
+    #[test]
+    fn a_request_list_consumes_its_entries_in_order() {
+        let mut list = InfoRequests::<4>::new();
+        assert!(list.record(0xAA, InfoRequestKind::Report));
+        assert!(list.record(0xBB, InfoRequestKind::Cache));
+        assert!(list.record(0xAA, InfoRequestKind::Cache));
+
+        // ll_get_item and ll_remove both stop at the first match.
+        assert_eq!(list.take(0xAA), Some(InfoRequestKind::Report));
+        assert!(
+            list.iter().eq([
+                (0xBBu32, InfoRequestKind::Cache),
+                (0xAA, InfoRequestKind::Cache)
+            ]),
+            "the rest keep their order"
+        );
+        assert_eq!(list.take(0xCC), None, "nothing was asked of that node");
+    }
+
+    #[test]
+    fn a_full_request_list_records_nothing() {
+        let mut list = InfoRequests::<2>::new();
+        assert!(list.record(1, InfoRequestKind::Cache));
+        assert!(list.record(2, InfoRequestKind::Cache));
+        assert!(!list.record(3, InfoRequestKind::Cache));
+        assert_eq!(list.len(), 2);
+        assert!(!list.contains(3));
+    }
+
+    #[test]
+    fn a_cached_reply_reads_back_whole() {
+        let mut cache = InfoCache::<4>::new();
+        let mut reply = reply(0xAA, b"1.2.3", b"bm_sbc");
+        reply.info.vendor_id = 0xBEEF;
+        reply.info.ver_hw = 7;
+        assert!(cache.store(&reply));
+
+        let cached = cache.get(0xAA).unwrap();
+        assert_eq!(cached.info, reply.info);
+        assert_eq!(cached.version_string, b"1.2.3");
+        assert_eq!(cached.device_name, b"bm_sbc");
+        assert_eq!(cache.len(), 1);
+        assert!(cache.node_ids().eq([0xAAu64]));
+        assert!(cache.get(0xBB).is_none());
+    }
+
+    /// `populate_neighbor_info` guards each string with `if (len)`, so a reply
+    /// carrying none updates the numbers and leaves the old strings in place.
+    #[test]
+    fn an_empty_string_keeps_the_last_one_rather_than_clearing_it() {
+        let mut cache = InfoCache::<4>::new();
+        assert!(cache.store(&reply(0xAA, b"1.2.3", b"bm_sbc")));
+
+        let mut second = reply(0xAA, b"", b"");
+        second.info.git_sha = 0x1234_5678;
+        assert!(cache.store(&second));
+
+        let cached = cache.get(0xAA).unwrap();
+        assert_eq!(
+            cached.info.git_sha, 0x1234_5678,
+            "the fixed part is replaced"
+        );
+        assert_eq!(cached.version_string, b"1.2.3", "the string is not");
+        assert_eq!(cached.device_name, b"bm_sbc");
+        assert_eq!(cache.len(), 1, "and it is the same entry");
+    }
+
+    #[test]
+    fn a_non_empty_string_replaces_the_last_one() {
+        let mut cache = InfoCache::<4>::new();
+        assert!(cache.store(&reply(0xAA, b"1.2.3", b"bm_sbc")));
+        assert!(cache.store(&reply(0xAA, b"9", b"")));
+
+        let cached = cache.get(0xAA).unwrap();
+        assert_eq!(cached.version_string, b"9");
+        assert_eq!(cached.device_name, b"bm_sbc");
+    }
+
+    #[test]
+    fn forgetting_an_entry_closes_the_gap() {
+        let mut cache = InfoCache::<4>::new();
+        assert!(cache.store(&reply(0xAA, b"a", b"a")));
+        assert!(cache.store(&reply(0xBB, b"b", b"b")));
+        assert!(cache.store(&reply(0xCC, b"c", b"c")));
+
+        assert!(cache.forget(0xBB));
+        assert!(!cache.forget(0xBB), "and only once");
+        assert!(cache.node_ids().eq([0xAAu64, 0xCC]));
+        assert!(cache.get(0xBB).is_none());
+    }
+
+    #[test]
+    fn a_full_cache_refuses_a_new_node_but_still_updates_a_known_one() {
+        let mut cache = InfoCache::<2>::new();
+        assert!(cache.store(&reply(0xAA, b"a", b"a")));
+        assert!(cache.store(&reply(0xBB, b"b", b"b")));
+        assert!(!cache.store(&reply(0xCC, b"c", b"c")));
+        assert!(cache.get(0xCC).is_none());
+        assert!(cache.store(&reply(0xAA, b"a2", b"a2")));
+        assert_eq!(cache.get(0xAA).unwrap().version_string, b"a2");
+    }
+
+    /// The default keeps everything a `u8` length can describe. A smaller
+    /// `STRING` is the deliberate divergence the type documents.
+    #[test]
+    fn the_default_string_capacity_never_truncates() {
+        assert_eq!(CACHED_STRING_BYTES, DeviceInfoReply::MAX_STRING_LEN);
+        let longest = [b'x'; CACHED_STRING_BYTES];
+        let mut cache = InfoCache::<1>::new();
+        assert!(cache.store(&reply(0xAA, &longest, &longest)));
+        let cached = cache.get(0xAA).unwrap();
+        assert_eq!(cached.version_string, &longest[..]);
+        assert_eq!(cached.device_name, &longest[..]);
+
+        let mut small = InfoCache::<1, 2>::new();
+        assert!(small.store(&reply(0xAA, b"abcdef", b"ghijkl")));
+        let cached = small.get(0xAA).unwrap();
+        assert_eq!(cached.version_string, b"ab", "the prefix that arrived");
+        assert_eq!(cached.device_name, b"gh");
     }
 
     #[test]

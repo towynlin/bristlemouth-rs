@@ -43,7 +43,7 @@ use bm_wire::neighbor::{Neighbor, NeighborTable};
 use bm_wire::util::BmIpAddr;
 
 use crate::Domain;
-use crate::stack::{NUM_PORTS, drain, inject, oracle};
+use crate::stack::{NUM_PORTS, clear_neighbor_table, drain, inject, oracle, tick_count};
 
 /// Capacity of the port's table. With one neighbour per port and two ports,
 /// nothing here can fill it; the comparator asserts that.
@@ -244,45 +244,6 @@ fn oracle_table() -> Vec<Neighbor> {
     out
 }
 
-/// Empty bm_core's neighbour table, so each run starts from a known state.
-///
-/// `bcmp_remove_neighbor_from_table` unlinks **and frees**, despite
-/// `bcmp_free_neighbor` being documented as the half that frees. Calling both,
-/// as its header reads, is a double free — see divergence #15.
-fn clear_oracle_table() {
-    unsafe {
-        // Walk the list first and collect the nodes, so a malformed list shows
-        // up as a diagnosis rather than as a double free.
-        let mut nodes: Vec<*mut bm_wire_sys::BcmpNeighbor> = Vec::new();
-        let mut count = 0u8;
-        let mut node = bm_wire_sys::bcmp_get_neighbors(&mut count);
-        while !node.is_null() {
-            assert!(
-                !nodes.contains(&node),
-                "bm_core's neighbour list contains {node:?} twice"
-            );
-            assert!(
-                nodes.len() < 64,
-                "bm_core's neighbour list is longer than anything here should produce"
-            );
-            nodes.push(node);
-            node = (*node).next;
-        }
-
-        for node in nodes {
-            // No bcmp_free_neighbor here: this already did it.
-            assert!(
-                bm_wire_sys::bcmp_remove_neighbor_from_table(node),
-                "removing {node:?} from the list failed"
-            );
-        }
-    }
-}
-
-fn tick_count() -> u32 {
-    unsafe { bm_wire_sys::bm_shim_tick_count() }
-}
-
 /// Apply the same steps to bm_core's table and the port's, and assert they
 /// agree after every one.
 ///
@@ -298,7 +259,7 @@ pub fn check(input: &NeighborInput) {
     register_discovery_callback();
     // Both tables start empty. bm_core has no reset, but it does expose the
     // two halves of a removal, so the table can be emptied one entry at a time.
-    clear_oracle_table();
+    clear_neighbor_table();
     let mut table = NeighborTable::<CAPACITY>::new();
     drain();
     take_discoveries();

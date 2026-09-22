@@ -21,18 +21,14 @@ Status values:
 
 ## Recommended upstream priority
 
-Three to fix first, in this order.
+Four to fix first, in this order.
 
 | Rank | # | Why now |
 |---|---|---|
 | 1 | [#29](#29-bcmppingc-echoes-and-compares-an-unchecked-payload_len) | Remote memory disclosure. One unauthenticated frame from any node on the link makes a node transmit up to 1460 bytes of adjacent heap to a multicast address. No prior state needed. The fix is one comparison against `data.size`, already in the struct. |
 | 2 | [#12](#12-the-egress-port-checksum-patch-drops-the-end-around-carry) | Live frame loss on deployed hardware: ~1 BCMP frame in 40 000 leaves a two-port node with a checksum the far end rejects. Ports M1 and M2 raised the rate from theoretical to routine, and config/DFU bodies will raise it further. The fix is additive — a fixed node is strictly more interoperable. |
-| 3 | [#14](#14-device-info-and-neighbour-table-replies-are-parsed-with-unchecked-lengths) | Same class as #29 in two more parsers, reachable by any node on the link, and `topology.c`'s length also wraps in `uint16_t`. Not wire-visible to fix. |
-
-Runner-up: [#20](#20-ll_remove-leaves-lltail-pointing-at-a-freed-node) —
-`ll_remove` corrupts any list removed from out of insertion order, and
-`bcmp/config.c` already issues concurrent sequenced requests. Two lines to fix,
-but it needs a maintainer who can confirm the list invariants.
+| 3 | [#20](#20-ll_remove-leaves-lltail-pointing-at-a-freed-node) | Was a runner-up on reading; card M3 made it a measured remote write. `cargo fuzz run info` reaches the use-after-free in `ll_item_add` from three unauthenticated frames, because `INFO_REQUEST_LIST` is removed from out of insertion order on keys the sender chooses. Two lines to fix, but it needs a maintainer who can confirm the list invariants. |
+| 4 | [#14](#14-device-info-and-neighbour-table-replies-are-parsed-with-unchecked-lengths) | Same class as #29 in two more parsers, reachable by any node on the link, and `topology.c`'s length also wraps in `uint16_t`. Not wire-visible to fix. |
 
 ## Index
 
@@ -57,7 +53,7 @@ but it needs a maintainer who can confirm the list invariants.
 | 17 | A new neighbour is announced to the application twice | replicated | reading, confirmed differentially |
 | 18 | A node id of zero is never recognised | replicated | reading, confirmed differentially |
 | 19 | `INFO_REQUEST_LIST` grows without de-duplication or expiry | c-only | reading |
-| 20 | `ll_remove` leaves `LL::tail` pointing at a freed node | domain-limited | reading, then modelled to stay out of it |
+| 20 | `ll_remove` leaves `LL::tail` pointing at a freed node | domain-limited | reading, then hit by `cargo fuzz run info` |
 | 21 | A sequenced reply is matched on its sequence number alone | replicated | reading, confirmed differentially |
 | 22 | A sequenced request's timeout is the 150 ms sweep, not the 24 ms constant | replicated | reading, then measured |
 | 23 | `bcmp_ll_forward` replaces the originator's source address with the forwarder's | replicated | reading, confirmed differentially |
@@ -70,6 +66,8 @@ but it needs a maintainer who can confirm the list invariants.
 | 30 | A ping reply is matched on 16 bits of node id and the payload, nothing else | replicated | reading |
 | 31 | `bcmp_send_ping_reply` echoes a `seq_num` that `serialize` discards | replicated | reading, confirmed differentially |
 | 32 | `bcmp/ping.c` reports the result of a ping to nobody, and never forgets one | c-only | reading |
+| 33 | BCMP's node-id-keyed lists hold only the low 32 bits of the id | replicated | reading, confirmed differentially |
+| 34 | A restarted neighbour is asked about `info.node_id`, which is zero until it has answered once | replicated | reading, confirmed differentially |
 
 ---
 
@@ -673,13 +671,37 @@ so the expiry sweep never fires its callback — not with a payload, and not wit
 `NULL`. The caller waits forever.
 
 `ll_remove` is shared by every list in bm_core, so anything removing out of
-insertion order is exposed. `bcmp/config.c` will hit it first: it is the only
-module issuing sequenced requests, and it issues several concurrently.
+insertion order is exposed.
 
-**domain-limited.** `bm-wire-diff/src/registry.rs` carries a `LinkModel` that
-tracks which of the C's `previous` pointers are stale and declines step 4; the
-seed `bm-wire/fuzz/seeds/registry/dangling-tail` drives the shape to the edge.
-The fix is two lines: clear the new head's `previous`, and set
+**`INFO_REQUEST_LIST` reaches it from the network, and card M3 measured that.**
+`cargo fuzz run info` reported the heap-use-after-free at `ll.c:159` within
+four minutes of its first run, from a sequence any node on the link can send:
+
+1. three `bcmp_request_info` calls leave three entries — two of them are what
+   `bcmp_update_neighbor` issues for any two new neighbours;
+2. a device-info reply whose body claims the *middle* entry's node id unlinks
+   it, leaving the third entry's `previous` dangling;
+3. a second reply claiming the third entry's node id stores that freed pointer
+   into `LL::tail`;
+4. the next new neighbour — one heartbeat — makes `bcmp_request_info` write
+   through it.
+
+The keys are the sender's to choose, since `bcmp_process_info_reply` looks up
+`info->info.node_id` out of the reply body and compares only its low 32 bits
+(#33). Nothing about this needs the attacker to be a neighbour, to guess a
+sequence number, or to win a race, and #19 means the entries never expire out
+from under it.
+
+`bcmp/config.c` is exposed on `packet.c`'s `sequence_list` for the same reason:
+it is the only module issuing sequenced requests, and it issues several
+concurrently.
+
+**domain-limited.** `bm-wire-diff/src/ll.rs`'s `LinkModel` tracks which of the
+C's `previous` pointers are stale and declines the append that would be
+undefined; `bm-wire-diff/src/registry.rs` and `bm-wire-diff/src/info.rs` both
+use it, and the seeds `bm-wire/fuzz/seeds/registry/dangling-tail` and
+`bm-wire/fuzz/seeds/info/ll-tail-uaf-domain-limit` drive each shape to the
+edge. The fix is two lines: clear the new head's `previous`, and set
 `current->next->previous = current->previous` before freeing.
 
 ## 21. A sequenced reply is matched on its sequence number alone
@@ -1129,3 +1151,95 @@ will not fit rather than sending a ping whose reply it could not check.
 
 Fix with a callback argument on `bcmp_send_ping_request`, a null check, and a
 real timeout.
+
+## 33. BCMP's node-id-keyed lists hold only the low 32 bits of the id
+
+`common/ll.h` gives an `LLItem` a 32-bit identifier:
+
+```c
+typedef struct LLItem {
+  struct LLItem *next;
+  struct LLItem *previous;
+  void *data;
+  uint32_t id;
+  uint8_t dynamic;
+} LLItem;
+```
+
+`bcmp/info.c` keys that list on node ids, which are 64-bit, at both ends of
+the exchange:
+
+```c
+item = ll_create_item(item, &info_cb, sizeof(info_cb), target_node_id);
+/* ... */
+err = ll_get_item(&INFO_REQUEST_LIST, info->info.node_id, (void **)&cb);
+/* ... */
+ll_remove(&INFO_REQUEST_LIST, info->info.node_id);
+```
+
+Both `uint64_t` arguments are truncated by the implicit conversion, so two
+nodes whose ids agree in their low 32 bits are one entry. A device-info reply
+from either one satisfies and clears a request made about the other, and takes
+that request's callback with it.
+
+Reachability is the same as #14's: the sender chooses the `node_id` in the
+reply body, so no id collision is even needed — a node that answers with
+someone else's low half is matched against their outstanding request. What
+happens next is gated on `bcmp_find_neighbor(info->info.node_id)`, which does
+compare all 64 bits, so the *cache* is written against the claim rather than
+against the request.
+
+`bcmp/resource_discovery.c` has the same defect in the same shape:
+`RESOURCE_REQUEST_LIST` is created with `target_node_id` at line 355 and read
+with `src_node_id` at 164, both `uint64_t`. Card M5 inherits it.
+`bcmp/packet.c` is unaffected — its two lists are keyed on a `uint32_t`
+sequence number and a `uint16_t` message type.
+
+**replicated.** `bm_wire::bcmp::info::InfoRequests` keys on
+`node_id as u32` and says so at `InfoRequests::key`. Fix by widening `LLItem::id`
+to `uint64_t`, which is not wire-visible, or by comparing the full id in
+`bcmp_process_info_reply` after the list hit.
+
+## 34. A restarted neighbour is asked about `info.node_id`, which is zero until it has answered once
+
+`bcmp/info.c` is asked for a neighbour's information from two places, and they
+name the neighbour differently. `bcmp/neighbors.c:304`, on insert:
+
+```c
+      bcmp_request_info(node_id, &multicast_ll_addr, NULL);
+```
+
+`bcmp/heartbeat.c:56`, when a neighbour's `time_since_boot_us` goes backwards:
+
+```c
+      bcmp_request_info(neighbor->info.node_id, &multicast_ll_addr, NULL);
+```
+
+`neighbor->info` is the `BcmpDeviceInfo` that `populate_neighbor_info` writes
+when a reply is consumed, and `bcmp_add_neighbor` `memset`s the whole entry to
+zero. So `info.node_id` is **0** for any neighbour that has not answered a
+device-info request yet, and the restart request goes out as a broadcast —
+`target_node_id == 0`, which every node on the link answers — rather than as a
+question for the node that restarted.
+
+Two consequences, both on the wire:
+
+| State when the restart arrives | `target_node_id` sent | Who answers |
+|---|---|---|
+| No reply cached | `0` | every node on the link |
+| A reply cached | the neighbour's id | the neighbour |
+
+and `INFO_REQUEST_LIST` gains an entry keyed `0` in the first case, which the
+first reply to arrive from *any* node claiming id 0 would clear — and nothing
+else ever will, per #19.
+
+A neighbour that restarts before answering is the common case, not a corner
+one: `bcmp_update_neighbor` asks for information the moment the entry exists,
+and a node that reboots twice inside one round trip is in exactly this state.
+
+**replicated.** `bm_stack::Node::on_frame` reads the target out of its info
+cache on the reset path and sends zero when there is nothing there;
+`bm-wire-diff/src/info.rs` compares the request frame the two nodes build for
+every step, so the byte that differs is the one under test. Fix by passing
+`neighbor->node_id`, which is always populated. Wire-visible: a fixed node
+stops broadcasting where an unfixed one does.

@@ -177,3 +177,18 @@ path = "fuzz_targets/registry.rs"
 test = false
 doc = false
 bench = false
+
+# Stack-backed, same rule about `bcmp`. It drives a whole `bm_stack::Node`
+# alongside bm_core's stack, because the info cache is gated on the neighbour
+# table and the requests it provokes are what divergence #34 is about. Give it
+# fork mode: `INFO_REQUEST_LIST` never expires an entry (divergence #19), and
+# although `check` answers everything it provoked before returning, a crash
+# leaves the list behind.
+#
+#   cargo fuzz run info corpus/info seeds/info -- -fork=1
+[[bin]]
+name = "info"
+path = "fuzz_targets/info.rs"
+test = false
+doc = false
+bench = false
