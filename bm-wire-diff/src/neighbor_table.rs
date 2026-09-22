@@ -47,7 +47,7 @@
 //! nowhere in bm_core; the only implementation here is ours, in
 //! `bm-wire-sys/csrc/bm_os_shim.c`, which fires a timer once
 //! `(int32_t)(tick - due) >= 0`. That is
-//! [`time_remaining`][bm_wire::util::time_remaining] restated, which is what
+//! [`time_remaining`] restated, which is what
 //! [`bm_wire::bcmp::neighbors::TableRequests`] compares with, so the two agree
 //! by construction rather than by comparison — as `bm_rtc_get` does for card
 //! M2. Everything downstream *is* compared: whether the timeout ran, and
