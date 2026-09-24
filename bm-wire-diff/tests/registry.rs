@@ -16,11 +16,16 @@
 //! directly in `bm_wire::bcmp::registry`'s unit tests as well as being
 //! compared here.
 //!
-//! Nothing upstream tests expiry at all: the gtest suite fakes `bm_timer_*`,
-//! so `sequence_list_timer_callback` never runs there. Everything below about
-//! timeouts is measured against the real timer in the shim.
+//! The same test calls the timer callback by hand under a faked clock, and
+//! asserts one re-send per call for `packet_retry_count` calls and none after.
+//! That is asserted in `bm_wire::bcmp::registry`'s unit tests too. What the
+//! gtest cannot see is the sweep's phase, since it fakes `bm_timer_*`:
+//! everything below about when a request expires is measured against the real
+//! timer in the shim.
 
-use bm_wire::bcmp::registry::{DEFAULT_MESSAGE_TIMEOUT_MS, MESSAGE_TIMER_EXPIRY_PERIOD_MS};
+use bm_wire::bcmp::registry::{
+    DEFAULT_MESSAGE_TIMEOUT_MS, MESSAGE_TIMER_EXPIRY_PERIOD_MS, PACKET_RETRY_COUNT,
+};
 use bm_wire_diff::registry::{MAX_STEPS, RegistryInput, SeqChoice, Step, check};
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
 
@@ -90,10 +95,37 @@ fn a_request_and_its_reply() {
     run(vec![send(CONFIG_GET), reply_to(CONFIG_VALUE, 0)]);
 }
 
+/// Each sweep is its own step, so each retry is compared as it happens: three
+/// re-sends, then the callback with nothing.
 #[test]
-fn a_request_nobody_answers_times_out() {
+fn a_request_nobody_answers_is_resent_then_times_out() {
+    let mut steps = vec![send(CONFIG_GET)];
+    for _ in 0..=PACKET_RETRY_COUNT {
+        steps.push(advance(MESSAGE_TIMER_EXPIRY_PERIOD_MS));
+    }
+    run(steps);
+}
+
+/// A request sent without a callback times out into `cfg->process`, with
+/// zeroed data: `serialize` stored `cfg->process` as its `full` callback.
+#[test]
+fn a_request_without_a_callback_times_out_into_its_processor() {
+    let mut steps = vec![send_without_callback(CONFIG_GET)];
+    for _ in 0..=PACKET_RETRY_COUNT {
+        steps.push(advance(MESSAGE_TIMER_EXPIRY_PERIOD_MS));
+    }
+    run(steps);
+}
+
+/// A retry changes nothing about the match: the reply still answers the
+/// request, and the retries stop.
+#[test]
+fn a_reply_after_a_retry_still_answers_the_request() {
     run(vec![
         send(CONFIG_GET),
+        advance(MESSAGE_TIMER_EXPIRY_PERIOD_MS),
+        advance(MESSAGE_TIMER_EXPIRY_PERIOD_MS),
+        reply_to(CONFIG_VALUE, 0),
         advance(MESSAGE_TIMER_EXPIRY_PERIOD_MS),
     ]);
 }
@@ -103,11 +135,12 @@ fn a_request_nobody_answers_times_out() {
 /// caller has already been told the request failed.
 #[test]
 fn a_reply_that_arrives_after_the_timeout_is_an_unsolicited_message() {
-    run(vec![
-        send(CONFIG_GET),
-        advance(MESSAGE_TIMER_EXPIRY_PERIOD_MS),
-        receive(CONFIG_VALUE, 0),
-    ]);
+    let mut steps = vec![send(CONFIG_GET)];
+    for _ in 0..=PACKET_RETRY_COUNT {
+        steps.push(advance(MESSAGE_TIMER_EXPIRY_PERIOD_MS));
+    }
+    steps.push(receive(CONFIG_VALUE, 0));
+    run(steps);
 }
 
 /// Nothing expires between sweeps, however far past the nominal timeout the
@@ -124,29 +157,29 @@ fn the_nominal_timeout_expires_nothing_on_its_own() {
 }
 
 /// The boundary itself, from both sides. `default_message_timeout_ms` is 24
-/// and the comparison is strict, so a request that is exactly 24 ms old when
-/// the sweep reaches it survives — and the next sweep is 150 ms away. One
-/// millisecond of difference costs a request 150 ms of life.
+/// and a request is kept while it is younger than that, so one exactly 24 ms
+/// old when the sweep reaches it expires — and one 23 ms old waits 150 ms for
+/// the next sweep.
 #[test]
 fn the_timeout_boundary_from_both_sides() {
-    // 25 ms old at the sweep: the youngest a request can be and still die.
-    run(vec![
-        align(DEFAULT_MESSAGE_TIMEOUT_MS + 1),
-        send(CONFIG_GET),
-        advance(DEFAULT_MESSAGE_TIMEOUT_MS + 1),
-    ]);
-    // 24 ms old at the sweep: survives it, and dies at the next one.
+    // 24 ms old at the sweep: the youngest a request can be and still expire.
     run(vec![
         align(DEFAULT_MESSAGE_TIMEOUT_MS),
         send(CONFIG_GET),
         advance(DEFAULT_MESSAGE_TIMEOUT_MS),
+    ]);
+    // 23 ms old at the sweep: survives it, and expires at the next one.
+    run(vec![
+        align(DEFAULT_MESSAGE_TIMEOUT_MS - 1),
+        send(CONFIG_GET),
+        advance(DEFAULT_MESSAGE_TIMEOUT_MS - 1),
         advance(MESSAGE_TIMER_EXPIRY_PERIOD_MS),
     ]);
 }
 
-/// How long a request actually lives, measured rather than assumed: for every
+/// When a request first expires, measured rather than assumed: for every
 /// offset in the sweep's phase, send one and walk the clock forward a
-/// millisecond at a time until the C gives up on it. Divergence #22 quotes the
+/// millisecond at a time past its first expiry. Divergence #22 quotes the
 /// range this produces.
 #[test]
 fn the_effective_timeout_across_the_whole_phase() {
@@ -165,6 +198,7 @@ fn the_effective_timeout_across_the_whole_phase() {
     }
 }
 
+/// Retried together, in list order, and timed out together.
 #[test]
 fn several_requests_expire_together_in_the_order_they_were_sent() {
     run(vec![
@@ -343,7 +377,9 @@ fn the_sequence_counter_carries_across_runs() {
 }
 
 /// A clock advance long enough to skip whole sweeps: the shim fires the timer
-/// repeatedly to catch up, and everything due dies at the same instant.
+/// repeatedly to catch up, all at the same tick. The first firing retries the
+/// request and restamps it, so the rest find it unexpired: one retry, however
+/// many sweeps were skipped.
 #[test]
 fn a_long_advance_catches_the_timer_up() {
     run(vec![

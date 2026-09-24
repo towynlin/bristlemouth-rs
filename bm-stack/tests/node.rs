@@ -976,25 +976,47 @@ fn a_matched_reply_replaces_the_processing_its_type_would_have_had() {
 
 /// Divergence #22: the request is stamped with a 24 ms timeout and nothing
 /// applies it except a 150 ms sweep, so this one — sent on the sweep's phase —
-/// lives for 150 ms, not 24.
+/// is first retried at 150 ms, not 24. It is re-sent on three sweeps and
+/// given up on at the fourth.
 #[test]
-fn an_unanswered_request_dies_on_the_sweep_rather_than_on_its_timeout() {
+fn an_unanswered_request_is_retried_on_the_sweep_rather_than_at_its_timeout() {
     let mut node = requesting_node();
-    node.request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
-        .expect("sent");
+    let sent = node
+        .request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
+        .expect("sent")
+        .frame()
+        .to_vec();
+    let all_ports = node.all_ports_mask();
 
     let mut events = Vec::new();
     for now in 0..EXPIRY_PERIOD_MS {
         node.on_expiry(now, |e| events.push(seen(e)));
+        assert!(node.next_retransmission().is_none());
     }
     assert!(
         events.is_empty(),
         "still outstanding at {} ms, well past its 24 ms timeout",
         EXPIRY_PERIOD_MS - 1
     );
-    assert_eq!(node.registry().pending_len(), 1);
 
-    node.on_expiry(EXPIRY_PERIOD_MS, |e| events.push(seen(e)));
+    for sweep in 1..=3 {
+        node.on_expiry(sweep * EXPIRY_PERIOD_MS, |e| events.push(seen(e)));
+        let resent = node
+            .next_retransmission()
+            .unwrap_or_else(|| panic!("sweep {sweep} re-sends"));
+        assert_eq!(
+            resent.frame(),
+            &sent[..],
+            "sweep {sweep} re-sends the same bytes"
+        );
+        assert_eq!(resent.mask(), all_ports);
+        assert!(node.next_retransmission().is_none(), "once per sweep");
+        assert!(events.is_empty(), "a retry is not a timeout");
+        assert_eq!(node.registry().pending_len(), 1);
+    }
+
+    node.on_expiry(4 * EXPIRY_PERIOD_MS, |e| events.push(seen(e)));
+    assert!(node.next_retransmission().is_none(), "no fourth re-send");
     assert_eq!(
         events,
         vec![Seen::Timeout {
@@ -1003,6 +1025,30 @@ fn an_unanswered_request_dies_on_the_sweep_rather_than_on_its_timeout() {
         }]
     );
     assert_eq!(node.registry().pending_len(), 0);
+}
+
+/// A reply between retries ends them, and drops a re-send the caller had not
+/// yet taken.
+#[test]
+fn a_reply_between_retries_ends_them() {
+    let mut node = requesting_node();
+    node.request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[0xAB])
+        .expect("sent");
+
+    node.on_expiry(EXPIRY_PERIOD_MS, |_| {});
+    let mut frame = peer_frame_seq(REPLY_TYPE, &[0x42], BmIpAddr::LINK_LOCAL_MULTICAST, 0);
+    let mut events = Vec::new();
+    node.on_frame_with(EXPIRY_PERIOD_MS + 1, 1, &mut frame, |e| {
+        events.push(seen(e))
+    });
+    assert!(matches!(events[..], [Seen::Reply { .. }]));
+    assert!(node.next_retransmission().is_none());
+
+    for sweep in 2..=5 {
+        node.on_expiry(sweep * EXPIRY_PERIOD_MS, |e| events.push(seen(e)));
+        assert!(node.next_retransmission().is_none());
+    }
+    assert_eq!(events.len(), 1, "no timeout either");
 }
 
 /// The other half of divergence #22: a reply that arrives after the sweep has
@@ -1016,10 +1062,13 @@ fn a_reply_that_arrives_after_the_timeout_is_reported_twice() {
         .expect("sent");
 
     let mut events = Vec::new();
-    node.on_expiry(EXPIRY_PERIOD_MS, |e| events.push(seen(e)));
+    for sweep in 1..=4 {
+        node.on_expiry(sweep * EXPIRY_PERIOD_MS, |e| events.push(seen(e)));
+        while node.next_retransmission().is_some() {}
+    }
 
     let mut frame = peer_frame_seq(REPLY_TYPE, &[0x42], BmIpAddr::LINK_LOCAL_MULTICAST, 0);
-    node.on_frame_with(EXPIRY_PERIOD_MS + 1, 1, &mut frame, |e| {
+    node.on_frame_with(4 * EXPIRY_PERIOD_MS + 1, 1, &mut frame, |e| {
         events.push(seen(e))
     });
 
@@ -1076,21 +1125,17 @@ fn an_oversized_request_is_refused_before_it_is_recorded() {
 }
 
 /// The whole loop, on the mock clock: a request goes out, nothing answers it,
-/// and the expiry ticker reports it. `packet.c`'s sweep is a timer of its own,
-/// so this must not have to wait for the ten-second heartbeat.
+/// the expiry ticker re-sends it three times and then reports it. `packet.c`'s
+/// sweep is a timer of its own, so this must not have to wait for the
+/// ten-second heartbeat.
 #[test]
-fn the_run_loop_times_out_an_unanswered_request() {
+fn the_run_loop_retries_then_times_out_an_unanswered_request() {
     let mut node = requesting_node();
     let mut phy = MockPhy::new(
         PORTS,
-        // Comfortably past one sweep, in steps too small to reach a heartbeat.
-        vec![
-            Script::Idle { ms: 60 },
-            Script::Idle { ms: 60 },
-            Script::Idle { ms: 60 },
-            Script::Idle { ms: 60 },
-            Script::Idle { ms: 60 },
-        ],
+        // Comfortably past four sweeps, in steps too small to reach a
+        // heartbeat.
+        vec![Script::Idle { ms: 60 }; 12],
     );
 
     let outbound = node
@@ -1098,6 +1143,7 @@ fn the_run_loop_times_out_an_unanswered_request() {
         .expect("sent");
     block_on(transmit(&mut phy, outbound, PORTS)).unwrap();
     assert_eq!(phy.sent.len(), usize::from(PORTS), "once per port");
+    let first = phy.sent.clone();
 
     let mut events = Vec::new();
     let error = block_on(node.run_with(&mut phy, |e| events.push(seen(e))));
@@ -1111,6 +1157,14 @@ fn the_run_loop_times_out_an_unanswered_request() {
         "the expiry ticker gave up on the request: {events:?}"
     );
     assert_eq!(node.registry().pending_len(), 0);
+    assert_eq!(
+        phy.sent.len(),
+        4 * usize::from(PORTS),
+        "sent, then re-sent on three sweeps"
+    );
+    for retry in phy.sent.chunks(usize::from(PORTS)).skip(1) {
+        assert_eq!(retry, &first[..], "each re-send is the original, per port");
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -34,16 +34,18 @@
 //! written down rather than measured. What *is* compared here is everything
 //! that reaches the wire.
 //!
-//! # Input domain
+//! # Malformed requests
 //!
-//! Nothing malformed is handed to the C. `bcmp_process_ping_request` echoes
-//! `payload_len` bytes out of the received frame without ever comparing it
-//! against `BcmpProcessData.size`, which is right there in the same struct, so
-//! a request declaring more payload than it carries makes the C read — and
-//! transmit — past the frame. That is divergence #29, and it has no defined
-//! behaviour to compare against. Every injected request declares exactly what
-//! it carries; the [`PingInput::decode_probe`] bytes exercise the Rust
-//! decoders with arbitrary input instead, and never reach the C.
+//! Before bm_core `c77daa8`, `bcmp_process_ping_request` echoed `payload_len`
+//! bytes out of the received frame without comparing it against
+//! `BcmpProcessData.size`, so a request declaring more payload than it carried
+//! made the C read and transmit past the frame (divergence #29). It now drops
+//! such a request, as the port's decoder always has. So
+//! [`PingInput::decode_probe`] is injected as an echo request's body as well
+//! as fed to the Rust decoders: whatever it declares, both sides answer with
+//! the same frame or neither answers. The injected prefix is capped at
+//! [`MAX_PROBE_BODY`], which keeps the reply clear of the one-byte MTU
+//! disagreement in divergence #8.
 //!
 //! This module brings the stack up and so must not share a process with
 //! [`crate::bcmp`] — see [`crate::stack`].
@@ -76,6 +78,11 @@ pub const PEER_NODE_ID: u64 = 0x0000_0000_55AA_0011;
 /// inside it, keeps fuzz inputs small, and is what [`PingNode`]'s expectation
 /// slot is sized for.
 pub const MAX_PING_PAYLOAD: usize = 256;
+
+/// Longest prefix of [`PingInput::decode_probe`] injected into the C as an
+/// echo request body: the fixed fields and the longest payload the comparator
+/// otherwise uses.
+pub const MAX_PROBE_BODY: usize = bm_wire::bcmp::ping::ECHO_HEADER_LEN + MAX_PING_PAYLOAD;
 
 /// A `bm-stack` node whose ping slot is as large as this comparator's domain.
 pub type PingNode = Node<OracleIdentity, SoftRtc, 4, 4, MAX_PING_PAYLOAD>;
@@ -162,8 +169,10 @@ pub struct PingInput {
     pub null_payload: bool,
     /// The ping payload, capped at [`MAX_PING_PAYLOAD`] by [`Domain`].
     pub payload: Vec<u8>,
-    /// Arbitrary bytes fed to the Rust decoders and **never** to the C, for
-    /// the reason the module docs give.
+    /// Arbitrary bytes fed to the Rust decoders, and — up to
+    /// [`MAX_PROBE_BODY`], with the target patched in — injected into both
+    /// sides as an echo request body. Its `payload_len` is whatever the bytes
+    /// say.
     pub decode_probe: Vec<u8>,
 }
 
@@ -239,10 +248,8 @@ impl PingInput {
         }
     }
 
-    /// The echo request frame to inject, checksummed and ready.
-    ///
-    /// Its `payload_len` is what it carries. See the module docs for why the C
-    /// is never told otherwise.
+    /// The echo request frame to inject, checksummed and ready. Its
+    /// `payload_len` is what it carries.
     fn build_request(&self) -> Vec<u8> {
         let request = EchoRequest {
             target_node_id: self.target.node_id(),
@@ -252,7 +259,24 @@ impl PingInput {
         };
         let mut body = vec![0u8; request.encoded_len()];
         request.encode(&mut body).expect("body is sized for it");
+        self.request_frame(&body)
+    }
 
+    /// An echo request body made of the probe bytes: at most
+    /// [`MAX_PROBE_BODY`] of them, with the target node id written over the
+    /// first eight when there are eight, so the request is addressed like the
+    /// rest of the input. Everything else, `payload_len` included, is the
+    /// probe's.
+    fn probe_body(&self) -> Vec<u8> {
+        let mut body = self.decode_probe[..self.decode_probe.len().min(MAX_PROBE_BODY)].to_vec();
+        if let Some(target) = body.get_mut(..8) {
+            target.copy_from_slice(&self.target.node_id().to_le_bytes());
+        }
+        body
+    }
+
+    /// A frame from [`PEER_NODE_ID`] carrying `body` as an echo request.
+    fn request_frame(&self, body: &[u8]) -> Vec<u8> {
         let payload_len = BCMP_HEADER_LEN + body.len();
         let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
         frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
@@ -264,7 +288,7 @@ impl PingInput {
             .copy_from_slice(&bm_wire::addr::nodeid_to_ip(0xFE80_0000, PEER_NODE_ID).0);
         frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
             .copy_from_slice(&self.destination().0);
-        tx::serialize(&mut frame, MessageType::ECHO_REQUEST, 0, &body)
+        tx::serialize(&mut frame, MessageType::ECHO_REQUEST, 0, body)
             .expect("frame is sized for the body");
         frame
     }
@@ -431,19 +455,59 @@ pub fn check_request(input: &PingInput) {
 pub fn check_reply(input: &PingInput) {
     let mut input = input.clone();
     input.clamp_to_domain();
+    let frame = input.build_request();
+    compare_answers(&input, &frame);
+}
+
+/// Assert both sides answer the probe bytes as an echo request identically —
+/// or both decline to. The probe's `payload_len` may claim more than it
+/// carries, less, or exactly as much, and the body may be too short to hold
+/// the fixed fields at all.
+///
+/// # Panics
+///
+/// If one side answers and the other does not, or the answers differ.
+pub fn check_probe_request(input: &PingInput) {
+    let mut input = input.clone();
+    input.clamp_to_domain();
+    let frame = input.request_frame(&input.probe_body());
 
     let (_guard, mut node) = pair();
     assert!(
         drain().is_empty(),
         "the ring was not drained before this run"
     );
-
-    let frame = input.build_request();
     inject(input.ingress_port, &frame);
     let captured = drain();
     let replies = frames_of(&captured, MessageType::ECHO_REPLY);
 
     let mut ours_frame = frame.clone();
+    let ours = node
+        .on_frame(0, input.ingress_port, &mut ours_frame)
+        .reply
+        .map(|reply| reply.frame().to_vec());
+
+    match ours {
+        None => assert!(
+            replies.is_empty(),
+            "the C answered a probe the port declined ({input:?})"
+        ),
+        Some(ours) => compare_transmitted("probe echo reply", &input, &replies, ours),
+    }
+}
+
+fn compare_answers(input: &PingInput, frame: &[u8]) {
+    let (_guard, mut node) = pair();
+    assert!(
+        drain().is_empty(),
+        "the ring was not drained before this run"
+    );
+
+    inject(input.ingress_port, frame);
+    let captured = drain();
+    let replies = frames_of(&captured, MessageType::ECHO_REPLY);
+
+    let mut ours_frame = frame.to_vec();
     let owed = node.on_frame(0, input.ingress_port, &mut ours_frame);
     let ours = owed.reply.map(|reply| reply.frame().to_vec());
 
@@ -460,15 +524,14 @@ pub fn check_reply(input: &PingInput) {
     }
 
     let ours = ours.unwrap_or_else(|| panic!("the port did not answer a ping ({input:?})"));
-    compare_transmitted("echo reply", &input, &replies, ours);
+    compare_transmitted("echo reply", input, &replies, ours);
 }
 
 /// Feed arbitrary bytes to both ping decoders.
 ///
-/// There is no C counterpart to compare against — that is divergence #29 — so
-/// the property checked is the port's own: a decoder either refuses the bytes
+/// The property checked is the port's own: a decoder either refuses the bytes
 /// or produces something that re-encodes to a prefix of them, and it never
-/// panics.
+/// panics. [`check_probe_request`] compares the same bytes against the C.
 fn probe_decoders(bytes: &[u8]) {
     if let Ok(request) = EchoRequest::decode(bytes) {
         let len = request.encoded_len();
@@ -512,4 +575,5 @@ pub fn check(input: &PingInput) {
 
     check_request(&input);
     check_reply(&input);
+    check_probe_request(&input);
 }

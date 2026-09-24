@@ -16,8 +16,8 @@
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::{MessageType, rx};
 use bm_wire_diff::ping::{
-    MAX_PING_PAYLOAD, PEER_NODE_ID, PingInput, Target, build_request, check, check_reply,
-    check_request,
+    MAX_PING_PAYLOAD, PEER_NODE_ID, PingInput, Target, build_request, check, check_probe_request,
+    check_reply, check_request,
 };
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
 use bm_wire_diff::stack::NUM_PORTS;
@@ -200,21 +200,74 @@ fn the_decoders_survive_arbitrary_bytes() {
                 (state >> 33) as u8
             })
             .collect();
-        let mut probe = input(Target::OtherNode, 1, false, b"");
+        // All three targets, so a probe that decodes is answered by both
+        // sides, or by neither, and the comparison is not vacuous.
+        let target = [Target::All, Target::ThisNode, Target::OtherNode][len % 3];
+        let mut probe = input(target, 1, false, b"");
         probe.decode_probe = bytes;
         check(&probe);
     }
 }
 
-/// A saturated `payload_len` on a header-only body is the shape that would have
-/// `bcmp_process_ping_request` echo 64 KiB of whatever follows the frame —
-/// divergence #29. The port refuses it; nothing is handed to the C.
+/// An echo request body addressed to the oracle, declaring `declared` bytes of
+/// payload and carrying `carried`.
+fn lying_probe(declared: u16, carried: usize) -> PingInput {
+    let mut body = vec![0u8; EchoRequest::HEADER_LEN + carried];
+    body[8..10].copy_from_slice(&0xBEEFu16.to_le_bytes());
+    body[12..14].copy_from_slice(&declared.to_le_bytes());
+    for (i, byte) in body[EchoRequest::HEADER_LEN..].iter_mut().enumerate() {
+        *byte = i as u8 ^ 0x5A;
+    }
+    let mut probe = input(Target::ThisNode, 1, false, b"");
+    probe.decode_probe = body;
+    probe
+}
+
+/// A saturated `payload_len` on a header-only body is the shape that had
+/// `bcmp_process_ping_request` echo up to 1460 bytes of whatever followed the
+/// frame — divergence #29. Since bm_core `c77daa8` the C drops it, as the port
+/// always has, and neither answers.
 #[test]
 fn a_saturated_payload_length_is_refused_rather_than_trusted() {
-    let mut body = vec![0u8; EchoRequest::HEADER_LEN];
-    body[12..14].copy_from_slice(&u16::MAX.to_le_bytes());
-    assert!(EchoRequest::decode(&body).is_err());
-    assert!(EchoReply::decode(&body).is_err());
+    let probe = lying_probe(u16::MAX, 0);
+    assert!(EchoRequest::decode(&probe.decode_probe).is_err());
+    assert!(EchoReply::decode(&probe.decode_probe).is_err());
+    check_probe_request(&probe);
+}
+
+/// One byte more than the request carries is already past the frame.
+#[test]
+fn a_request_declaring_one_byte_more_than_it_carries_is_answered_by_nobody() {
+    for carried in [0, 1, 16, 200] {
+        let probe = lying_probe(carried as u16 + 1, carried);
+        assert!(EchoRequest::decode(&probe.decode_probe).is_err());
+        check_probe_request(&probe);
+    }
+}
+
+/// Declaring less than it carries is not an error on either side: the reply
+/// echoes the declared payload and drops the rest. The port answers, so the
+/// comparison requires the C's reply, byte for byte.
+#[test]
+fn a_request_declaring_less_than_it_carries_is_answered_with_what_it_declared() {
+    for (declared, carried) in [(0, 1), (3, 8), (100, 200)] {
+        let probe = lying_probe(declared, carried);
+        let request = EchoRequest::decode(&probe.decode_probe).expect("fits");
+        assert_eq!(request.payload.len(), usize::from(declared));
+        check_probe_request(&probe);
+    }
+}
+
+/// Too short for the fixed fields: the C now checks this before reading
+/// `payload_len` at all.
+#[test]
+fn a_body_too_short_for_the_fixed_fields_is_answered_by_nobody() {
+    for len in 0..EchoRequest::HEADER_LEN {
+        let mut probe = input(Target::ThisNode, 1, false, b"");
+        probe.decode_probe = vec![0; len];
+        assert!(EchoRequest::decode(&probe.decode_probe).is_err());
+        check_probe_request(&probe);
+    }
 }
 
 #[test]
