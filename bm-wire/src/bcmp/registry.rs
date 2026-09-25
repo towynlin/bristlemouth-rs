@@ -25,15 +25,25 @@
 //! # Callbacks become return values
 //!
 //! The C stores a `BcmpSequencedRequestCb` per request and invokes it twice
-//! over: with the reply's payload when one arrives, and **with `NULL` when the
-//! request times out**. A caller that does not test for the null payload
-//! dereferences it.
+//! over: with the reply when one arrives, and **with nothing when the request
+//! times out** — a `NULL` payload for a `payload` callback, a zeroed
+//! `BcmpProcessData` for a `full` one. A request serialised with neither gets
+//! `cfg->process` as its `full` callback, so the type's own processor sees the
+//! zeroed data on a timeout too.
 //!
 //! The port has no callback to store. A matched reply comes back as
-//! [`Delivery::SequencedReply`] and an expiry as a call to `on_tick`'s
-//! `timed_out`, so the two cannot be confused. Where the C falls back to
-//! `cfg->process` because the stored callback was null, the port's caller does
-//! the same by not handling the entry it was handed.
+//! [`Delivery::SequencedReply`] and an expiry as [`Expiry::TimedOut`] from
+//! [`Registry::on_tick`], so the two cannot be confused. Where the C falls
+//! back to `cfg->process`, the port's caller does the same by not handling
+//! the entry it was handed.
+//!
+//! # Retries
+//!
+//! A request is not given up on at its first expiry. `timer_traverse_cb`
+//! re-sends the stored frame and restamps the request, up to
+//! [`PACKET_RETRY_COUNT`] times, and only then times it out. The port reports
+//! each re-send as [`Expiry::Retry`]; the frame is the caller's to keep and
+//! transmit, since this module has none.
 //!
 //! # Time
 //!
@@ -53,11 +63,22 @@ pub const DEFAULT_MESSAGE_TIMEOUT_MS: u32 = 24;
 /// `packet.c:12`.
 ///
 /// The sweep is the only thing that ever expires a request, so this — not
-/// [`DEFAULT_MESSAGE_TIMEOUT_MS`] — sets the granularity. A request survives
-/// until the first sweep that lands more than [`DEFAULT_MESSAGE_TIMEOUT_MS`]
-/// after it was sent, which is between 25 ms and 174 ms depending on where it
-/// fell in the sweep's phase. Divergence #22 has the measurement.
+/// [`DEFAULT_MESSAGE_TIMEOUT_MS`] — sets the granularity. A request first
+/// expires on the first sweep at least [`DEFAULT_MESSAGE_TIMEOUT_MS`] after it
+/// was sent, which is between 24 ms and 173 ms depending on where it fell in
+/// the sweep's phase, and times out [`PACKET_RETRY_COUNT`] sweeps after that.
+/// Divergence #22 has the measurement.
 pub const MESSAGE_TIMER_EXPIRY_PERIOD_MS: u32 = 150;
+
+/// How many times an unanswered request is re-sent before it times out,
+/// `packet_retry_count` in `bcmp/packet.h`.
+///
+/// Each re-send happens on a sweep, and restamps the request with the sweep's
+/// time. [`DEFAULT_MESSAGE_TIMEOUT_MS`] is shorter than
+/// [`MESSAGE_TIMER_EXPIRY_PERIOD_MS`], so every sweep after the first expiry
+/// finds the request expired again: three re-sends on three consecutive
+/// sweeps, and the timeout on the fourth.
+pub const PACKET_RETRY_COUNT: u8 = 3;
 
 /// How a message type is sequenced, mirroring `BcmpPacketCfg` minus its
 /// `process` function pointer.
@@ -117,24 +138,39 @@ pub struct PendingRequest {
     /// How long it may go unanswered, always [`DEFAULT_MESSAGE_TIMEOUT_MS`] as
     /// the C calls it.
     pub timeout_ms: u32,
+    /// How many times it has been re-sent, `BcmpRequestElement::retries`.
+    /// Counts up to [`PACKET_RETRY_COUNT`].
+    pub retries: u8,
 }
 
 impl PendingRequest {
     /// Whether this request has outlived its timeout at `now_ms`.
     ///
-    /// The C is `bm_ticks_to_ms(bm_get_tick_count()) - element->timestamp_ms >
-    /// element->timeout_ms`: an unsigned 32-bit subtraction, and a *strict*
-    /// comparison, so a request is still live at exactly `timeout_ms` and dies
-    /// one millisecond later. Note that this is not
-    /// [`time_remaining`][crate::util::time_remaining], which the rest of
-    /// bm_core uses for the same job: that one casts to `int32_t` and so
-    /// treats a clock that has gone backwards as "not yet". Here a `now_ms`
-    /// before `timestamp_ms` wraps to a huge difference and the request
-    /// expires immediately.
+    /// The C keeps a request while `ms - element->timestamp_ms <
+    /// element->timeout_ms`: an unsigned 32-bit subtraction, so a request is
+    /// still live one millisecond before `timeout_ms` and expired *at* it.
+    /// Note that this is not [`time_remaining`][crate::util::time_remaining],
+    /// which the rest of bm_core uses for the same job: that one casts to
+    /// `int32_t` and so treats a clock that has gone backwards as "not yet".
+    /// Here a `now_ms` before `timestamp_ms` wraps to a huge difference and
+    /// the request expires immediately.
     #[must_use]
     pub const fn expired_at(&self, now_ms: u32) -> bool {
-        now_ms.wrapping_sub(self.timestamp_ms) > self.timeout_ms
+        now_ms.wrapping_sub(self.timestamp_ms) >= self.timeout_ms
     }
+}
+
+/// What a sweep did to an expired request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expiry {
+    /// Re-sent and restamped: `PACKET.cb.send(element->buf)`. The request is
+    /// still outstanding, with [`PendingRequest::retries`] counting this one
+    /// and [`PendingRequest::timestamp_ms`] set to the sweep's time. The
+    /// caller owes the network the same frame again.
+    Retry(PendingRequest),
+    /// Given up on and removed, after [`PACKET_RETRY_COUNT`] re-sends: the C's
+    /// callback with a null payload or zeroed data.
+    TimedOut(PendingRequest),
 }
 
 /// Why the registry refused.
@@ -169,7 +205,7 @@ pub struct Outgoing {
     pub seq_num: u32,
     /// Whether an outstanding request was recorded, so that a reply carrying
     /// `seq_num` will come back as [`Delivery::SequencedReply`] and a silent
-    /// peer will be reported to `on_tick`'s `timed_out`.
+    /// peer will be reported from [`Registry::on_tick`].
     ///
     /// False for replies and unsequenced messages — and also for a request the
     /// pending table had no room for. The C's equivalent is a failed
@@ -257,6 +293,7 @@ impl<const TYPES: usize, const PENDING: usize> Registry<TYPES, PENDING> {
                 seq_num: 0,
                 timestamp_ms: 0,
                 timeout_ms: 0,
+                retries: 0,
             }; PENDING],
             pending_len: 0,
             message_count: sequence_count,
@@ -374,6 +411,7 @@ impl<const TYPES: usize, const PENDING: usize> Registry<TYPES, PENDING> {
                 seq_num,
                 timestamp_ms: now_ms,
                 timeout_ms: DEFAULT_MESSAGE_TIMEOUT_MS,
+                retries: 0,
             };
             self.pending_len += 1;
         }
@@ -406,46 +444,55 @@ impl<const TYPES: usize, const PENDING: usize> Registry<TYPES, PENDING> {
         Delivery::SequencedReply(request)
     }
 
-    /// Run the expiry sweep if it is due, reporting every request that has
-    /// timed out.
+    /// Run the expiry sweep if it is due, reporting every expired request.
     ///
     /// This is `sequence_list_timer_callback`, phase and all. The C arms a
     /// 150 ms auto-reload timer in `packet_init` and sweeps only when it
     /// fires, so a request does not expire at [`DEFAULT_MESSAGE_TIMEOUT_MS`] —
-    /// it expires at the first sweep more than that many milliseconds after it
-    /// was sent. Reproducing the phase is what makes the port time out the
-    /// same requests at the same moments as a C node; see divergence #22.
+    /// it expires at the first sweep at least that many milliseconds after it
+    /// was sent. Reproducing the phase is what makes the port retry and time
+    /// out the same requests at the same moments as a C node; see divergence
+    /// #22.
     ///
-    /// `timed_out` is the `cb(NULL)` path: each request is reported once, in
-    /// list order, and is gone by the time the next one is reported.
+    /// Each expired request is reported once per sweep, in list order: as
+    /// [`Expiry::Retry`] for its first [`PACKET_RETRY_COUNT`] expiries, then
+    /// as [`Expiry::TimedOut`], by which time it is gone.
     ///
     /// Call it as often as you like — nothing happens between sweeps — and at
     /// least once per [`MESSAGE_TIMER_EXPIRY_PERIOD_MS`].
-    pub fn on_tick(&mut self, now_ms: u32, timed_out: impl FnMut(&PendingRequest)) {
+    pub fn on_tick(&mut self, now_ms: u32, expired: impl FnMut(Expiry)) {
         if (now_ms.wrapping_sub(self.next_sweep_ms) as i32) < 0 {
             return;
         }
         // Catching up on missed sweeps costs nothing: they would all run at
-        // this same `now_ms`, and the first one takes everything the rest
-        // would have. Advancing the phase by whole periods is what keeps the
-        // port firing on the C's schedule rather than on its own.
+        // this same `now_ms`, and the first one does everything the rest
+        // would have — a request it retries is restamped with `now_ms`, which
+        // the rest would find unexpired. Advancing the phase by whole periods
+        // is what keeps the port firing on the C's schedule rather than on its
+        // own.
         let missed = now_ms.wrapping_sub(self.next_sweep_ms) / MESSAGE_TIMER_EXPIRY_PERIOD_MS;
         self.next_sweep_ms = self
             .next_sweep_ms
             .wrapping_add(MESSAGE_TIMER_EXPIRY_PERIOD_MS.wrapping_mul(missed.wrapping_add(1)));
-        self.sweep(now_ms, timed_out);
+        self.sweep(now_ms, expired);
     }
 
     /// One pass of `ll_traverse(&PACKET.sequence_list, timer_traverse_cb)`.
-    fn sweep(&mut self, now_ms: u32, mut timed_out: impl FnMut(&PendingRequest)) {
+    fn sweep(&mut self, now_ms: u32, mut expired: impl FnMut(Expiry)) {
         let mut index = 0;
         while index < self.pending_len {
-            if self.pending[index].expired_at(now_ms) {
-                let request = self.pending[index];
-                timed_out(&request);
-                self.remove_pending(index);
-            } else {
+            let request = &mut self.pending[index];
+            if !request.expired_at(now_ms) {
                 index += 1;
+            } else if request.retries < PACKET_RETRY_COUNT {
+                request.retries += 1;
+                request.timestamp_ms = now_ms;
+                expired(Expiry::Retry(*request));
+                index += 1;
+            } else {
+                let request = *request;
+                self.remove_pending(index);
+                expired(Expiry::TimedOut(request));
             }
         }
     }
@@ -473,27 +520,68 @@ mod tests {
         registry
     }
 
-    /// What a sweep reported. An array rather than a `Vec`, because these
-    /// tests run with `std` off as well as on.
+    /// What a sweep reported: sequence numbers, retried or timed out. Arrays
+    /// rather than `Vec`s, because these tests run with `std` off as well as
+    /// on.
     #[derive(Default)]
     struct Expired {
-        seq_nums: [u32; 8],
-        len: usize,
+        retried: [u32; 8],
+        retried_len: usize,
+        timed_out: [u32; 8],
+        timed_out_len: usize,
     }
 
     impl Expired {
-        fn as_slice(&self) -> &[u32] {
-            &self.seq_nums[..self.len]
+        fn retried(&self) -> &[u32] {
+            &self.retried[..self.retried_len]
+        }
+
+        fn timed_out(&self) -> &[u32] {
+            &self.timed_out[..self.timed_out_len]
+        }
+
+        fn is_empty(&self) -> bool {
+            self.retried_len == 0 && self.timed_out_len == 0
         }
     }
 
-    fn expired(registry: &mut Registry<8, 8>, now_ms: u32) -> Expired {
+    fn expired<const T: usize, const P: usize>(
+        registry: &mut Registry<T, P>,
+        now_ms: u32,
+    ) -> Expired {
         let mut out = Expired::default();
-        registry.on_tick(now_ms, |request| {
-            out.seq_nums[out.len] = request.seq_num;
-            out.len += 1;
+        registry.on_tick(now_ms, |expiry| match expiry {
+            Expiry::Retry(request) => {
+                out.retried[out.retried_len] = request.seq_num;
+                out.retried_len += 1;
+            }
+            Expiry::TimedOut(request) => {
+                out.timed_out[out.timed_out_len] = request.seq_num;
+                out.timed_out_len += 1;
+            }
         });
         out
+    }
+
+    /// Sweep until the one outstanding request times out, returning the
+    /// millisecond it did. Asserts it is retried on each of the
+    /// [`PACKET_RETRY_COUNT`] sweeps before.
+    fn time_out_by_sweeps(registry: &mut Registry<8, 8>, first_expiry_ms: u32) -> u32 {
+        let seq = registry.pending().next().expect("one outstanding").seq_num;
+        for retry in 1..=PACKET_RETRY_COUNT {
+            let now = first_expiry_ms + MESSAGE_TIMER_EXPIRY_PERIOD_MS * u32::from(retry - 1);
+            let out = expired(registry, now);
+            assert_eq!(out.retried(), [seq], "retry {retry} at {now} ms");
+            assert!(out.timed_out().is_empty());
+            assert_eq!(registry.pending().next().unwrap().retries, retry);
+            assert_eq!(registry.pending().next().unwrap().timestamp_ms, now);
+        }
+        let now = first_expiry_ms + MESSAGE_TIMER_EXPIRY_PERIOD_MS * u32::from(PACKET_RETRY_COUNT);
+        let out = expired(registry, now);
+        assert!(out.retried().is_empty());
+        assert_eq!(out.timed_out(), [seq]);
+        assert_eq!(registry.pending_len(), 0);
+        now
     }
 
     /// bm_core's own `Packet.sequence_request` asserts the header's sequence
@@ -614,65 +702,93 @@ mod tests {
     }
 
     #[test]
-    fn a_request_is_still_live_at_its_timeout_and_dead_one_millisecond_later() {
+    fn a_request_is_live_one_millisecond_before_its_timeout_and_expired_at_it() {
         let request = PendingRequest {
             message_type: REQUEST,
             seq_num: 0,
             timestamp_ms: 1000,
             timeout_ms: DEFAULT_MESSAGE_TIMEOUT_MS,
+            retries: 0,
         };
-        assert!(!request.expired_at(1000 + DEFAULT_MESSAGE_TIMEOUT_MS));
-        assert!(request.expired_at(1000 + DEFAULT_MESSAGE_TIMEOUT_MS + 1));
+        assert!(!request.expired_at(1000 + DEFAULT_MESSAGE_TIMEOUT_MS - 1));
+        assert!(request.expired_at(1000 + DEFAULT_MESSAGE_TIMEOUT_MS));
         // The C's subtraction is unsigned, so a clock that goes backwards
         // expires everything rather than waiting.
         assert!(request.expired_at(999));
     }
 
     /// The sweep, not the timeout, is what expires a request: nothing happens
-    /// between the 150 ms firings.
+    /// between the 150 ms firings. The first expiry is a retry.
     #[test]
     fn expiry_lands_on_the_sweep_rather_than_on_the_timeout() {
         let mut registry = registry();
-        let seq = registry.on_serialize(0, REQUEST, 0).unwrap().seq_num;
+        registry.on_serialize(0, REQUEST, 0).unwrap();
 
         for now in [24, 25, 100, 149] {
             assert!(
-                expired(&mut registry, now).as_slice().is_empty(),
+                expired(&mut registry, now).is_empty(),
                 "no sweep is due at {now} ms, so nothing can expire"
             );
         }
-        assert_eq!(expired(&mut registry, 150).as_slice(), [seq]);
-        assert_eq!(registry.pending_len(), 0);
-        assert!(
-            expired(&mut registry, 300).as_slice().is_empty(),
-            "and only once"
-        );
+        assert_eq!(time_out_by_sweeps(&mut registry, 150), 600);
+        assert!(expired(&mut registry, 750).is_empty(), "and only once");
     }
 
-    /// The effective timeout is 150 ms for a request sent at time zero, but it
-    /// depends entirely on where the request falls in the sweep's phase.
+    /// A retry restamps the request with the sweep's time, and a second sweep
+    /// at that same time finds it unexpired. That is what makes collapsing
+    /// missed sweeps into one safe.
     #[test]
-    fn the_effective_timeout_ranges_from_25_to_174_milliseconds() {
+    fn a_second_sweep_at_the_same_instant_does_nothing() {
+        let mut registry = registry();
+        let seq = registry.on_serialize(0, REQUEST, 0).unwrap().seq_num;
+        assert_eq!(expired(&mut registry, 150).retried(), [seq]);
+        let request = *registry.pending().next().unwrap();
+        assert!(!request.expired_at(150));
+    }
+
+    /// The first expiry is at 150 ms for a request sent at time zero, but it
+    /// depends entirely on where the request falls in the sweep's phase. The
+    /// timeout is always [`PACKET_RETRY_COUNT`] sweeps after it.
+    #[test]
+    fn the_first_expiry_ranges_from_24_to_173_milliseconds() {
         for sent_at in 0..300u32 {
             let mut registry = registry();
             registry.on_serialize(sent_at, REQUEST, 0).unwrap();
 
-            let mut expired_at = None;
+            let mut first_expiry = None;
             for now in sent_at..sent_at + 400 {
-                registry.on_tick(now, |_| expired_at = Some(now));
-                if expired_at.is_some() {
+                registry.on_tick(now, |expiry| {
+                    assert!(matches!(expiry, Expiry::Retry(_)));
+                    first_expiry = Some(now);
+                });
+                if first_expiry.is_some() {
                     break;
                 }
             }
-            let lifetime = expired_at.expect("everything expires eventually") - sent_at;
+            let first_expiry = first_expiry.expect("everything expires eventually");
+            let lifetime = first_expiry - sent_at;
             assert!(
-                (25..=174).contains(&lifetime),
-                "sent at {sent_at} ms, expired after {lifetime} ms"
+                (24..=173).contains(&lifetime),
+                "sent at {sent_at} ms, first expired after {lifetime} ms"
             );
-            // The sweep that takes it is the first multiple of 150 that is
-            // more than 24 ms away.
-            let sweep = (sent_at + 25).div_ceil(150) * 150;
-            assert_eq!(expired_at, Some(sweep));
+            // The sweep that takes it is the first multiple of 150 that is at
+            // least 24 ms away.
+            assert_eq!(first_expiry, (sent_at + 24).div_ceil(150) * 150);
+
+            // `time_out_by_sweeps` starts with a retry; this one has had it.
+            let mut timed_out = None;
+            for retry in 1..=PACKET_RETRY_COUNT {
+                let now = first_expiry + MESSAGE_TIMER_EXPIRY_PERIOD_MS * u32::from(retry);
+                registry.on_tick(now, |expiry| {
+                    if let Expiry::TimedOut(_) = expiry {
+                        timed_out = Some(now);
+                    }
+                });
+            }
+            assert_eq!(
+                timed_out,
+                Some(first_expiry + MESSAGE_TIMER_EXPIRY_PERIOD_MS * u32::from(PACKET_RETRY_COUNT))
+            );
         }
     }
 
@@ -687,23 +803,34 @@ mod tests {
         // Sent late enough that the 150 ms sweep does not reach it.
         let young = registry.on_serialize(130, REQUEST, 0).unwrap().seq_num;
 
-        assert_eq!(expired(&mut registry, 150).as_slice(), old);
+        assert_eq!(expired(&mut registry, 150).retried(), old);
+        assert_eq!(registry.pending_len(), 4);
+        let out = expired(&mut registry, 300);
+        assert_eq!(out.retried(), [old[0], old[1], old[2], young]);
+        expired(&mut registry, 450);
+        let out = expired(&mut registry, 600);
+        assert_eq!(out.timed_out(), old);
+        assert_eq!(out.retried(), [young]);
         assert_eq!(registry.pending_len(), 1);
-        assert_eq!(registry.pending().next().unwrap().seq_num, young);
-        assert_eq!(expired(&mut registry, 300).as_slice(), [young]);
+        assert_eq!(expired(&mut registry, 750).timed_out(), [young]);
     }
 
     #[test]
     fn a_missed_sweep_does_not_shift_the_phase() {
         let mut registry = registry();
-        // No tick at all until well past several sweeps.
+        // No tick at all until well past several sweeps: the sweeps it missed
+        // collapse into one, so this is the first retry, not the timeout.
         let seq = registry.on_serialize(0, REQUEST, 0).unwrap().seq_num;
-        assert_eq!(expired(&mut registry, 1000).as_slice(), [seq]);
+        assert_eq!(expired(&mut registry, 1000).retried(), [seq]);
+        assert!(matches!(
+            registry.on_received(REPLY, seq),
+            Delivery::SequencedReply(_)
+        ));
 
         // The next sweep is still on the C's grid: 1050, not 1150.
         let seq = registry.on_serialize(1000, REQUEST, 0).unwrap().seq_num;
-        assert!(expired(&mut registry, 1049).as_slice().is_empty());
-        assert_eq!(expired(&mut registry, 1050).as_slice(), [seq]);
+        assert!(expired(&mut registry, 1049).is_empty());
+        assert_eq!(expired(&mut registry, 1050).retried(), [seq]);
     }
 
     #[test]
@@ -711,8 +838,44 @@ mod tests {
         let mut registry: Registry<8, 8> = Registry::started_at(1000);
         registry.add(REQUEST, PacketCfg::REQUEST).unwrap();
         let seq = registry.on_serialize(1000, REQUEST, 0).unwrap().seq_num;
-        assert!(expired(&mut registry, 1149).as_slice().is_empty());
-        assert_eq!(expired(&mut registry, 1150).as_slice(), [seq]);
+        assert!(expired(&mut registry, 1149).is_empty());
+        assert_eq!(expired(&mut registry, 1150).retried(), [seq]);
+    }
+
+    /// bm_core's own `Packet.sequence_request` advances the clock by
+    /// `UINT16_MAX` before each of `packet_retry_count` timer callbacks and
+    /// expects exactly one `send_packet` from each, then none from the next,
+    /// which invokes the timeout instead.
+    #[test]
+    fn the_gtest_retries_three_times_then_times_out() {
+        let mut registry = registry();
+        let seq = registry.on_serialize(0, REQUEST, 0).unwrap().seq_num;
+        let mut now = 0u32;
+        for _ in 0..3 {
+            now += u32::from(u16::MAX);
+            let out = expired(&mut registry, now);
+            assert_eq!(out.retried(), [seq], "one send per timer callback");
+            assert!(out.timed_out().is_empty());
+        }
+        now += u32::from(u16::MAX);
+        let out = expired(&mut registry, now);
+        assert!(out.retried().is_empty(), "should not send again");
+        assert_eq!(out.timed_out(), [seq]);
+    }
+
+    /// A reply that arrives between retries still matches: a retry does not
+    /// change the sequence number.
+    #[test]
+    fn a_retried_request_is_still_answered_by_its_reply() {
+        let mut registry = registry();
+        let seq = registry.on_serialize(0, REQUEST, 0).unwrap().seq_num;
+        assert_eq!(expired(&mut registry, 150).retried(), [seq]);
+        assert_eq!(expired(&mut registry, 300).retried(), [seq]);
+        match registry.on_received(REPLY, seq) {
+            Delivery::SequencedReply(request) => assert_eq!(request.retries, 2),
+            other => panic!("expected the request back, got {other:?}"),
+        }
+        assert!(expired(&mut registry, 450).is_empty());
     }
 
     #[test]

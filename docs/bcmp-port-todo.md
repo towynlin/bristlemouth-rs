@@ -387,9 +387,12 @@ Flags, from the positional initializers at `config.c:789-835`:
   more than one key walks off the end. Confirm the exact consequence against
   the oracle and record it.
 - Messages not addressed to this node are forwarded.
-- Divergence #22 applies here first and hardest: a sequenced request's real
-  timeout is anywhere from 25 ms to 174 ms, and these ten messages are the only
-  ones in bm_core that use it.
+- Divergence #22 applies here first and hardest: a sequenced request is first
+  retried anywhere from 24 ms to 173 ms after it is sent and times out three
+  sweeps (450 ms) later, and these ten messages are the only ones in bm_core
+  that use it. `bm_stack::Node` already re-sends and times out tracked
+  requests; the card registers the types and handles `Event::Reply` and
+  `Event::Timeout`.
 
 **Test coverage to expect.** `config_test.cpp` has two cases — `decode` and
 `ClearPartitionRequest`. Eight of the ten messages have no C test at all, so

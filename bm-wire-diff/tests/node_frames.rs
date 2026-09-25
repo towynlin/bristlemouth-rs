@@ -415,6 +415,13 @@ fn our_device_info_request_is_byte_identical_to_the_c() {
 /// `static` inside `serialize` with nothing that resets it, so a second such
 /// test would have to say where the C had got to. Card C3, which ports config,
 /// is where that will matter.
+///
+/// Nothing answers, so the test then walks the clock a millisecond at a time
+/// until both sides have given up: every re-send `timer_traverse_cb` puts on
+/// the wire must be one [`Node::next_retransmission`] hands back at the same
+/// millisecond, byte for byte on every port. It also leaves the C's sequence
+/// list empty, which the other tests here need — a request still held would
+/// be re-sent into their captures.
 #[test]
 fn our_sequenced_request_carries_the_number_the_c_would_have_given_it() {
     let _guard = oracle();
@@ -445,7 +452,7 @@ fn our_sequenced_request_carries_the_number_the_c_would_have_given_it() {
                     body.as_mut_ptr(),
                     body.len() as u16,
                     0,
-                    None,
+                    bm_wire_sys::BcmpSequencedRequestCb::default(),
                 ),
                 bm_wire_sys::BmErr_BmOK
             );
@@ -480,4 +487,58 @@ fn our_sequenced_request_carries_the_number_the_c_would_have_given_it() {
         3,
         "and all three are waiting for a reply, as the C's sequence list is"
     );
+
+    let mut resends = 0usize;
+    let mut timeouts = Vec::new();
+    let start = unsafe { bm_wire_sys::bm_shim_tick_count() };
+    // Four sweeps is the whole life of a request; a fifth and sixth show
+    // nothing is left.
+    for _ in 0..6 * bm_stack::node::EXPIRY_PERIOD_MS {
+        unsafe { bm_wire_sys::bm_shim_advance_ticks(1) };
+        pump_until_quiet();
+        let captured = drain();
+        let now_ms = unsafe { bm_wire_sys::bm_shim_tick_count() };
+
+        node.on_expiry(now_ms, |event| {
+            if let bm_stack::Event::Timeout { request } = event {
+                timeouts.push((now_ms, request.seq_num));
+            }
+        });
+        let mut ours = Vec::new();
+        while let Some(outbound) = node.next_retransmission() {
+            ours.push(outbound.frame().to_vec());
+        }
+
+        assert_eq!(
+            captured.len(),
+            ours.len() * usize::from(NUM_PORTS),
+            "at {now_ms} ms the C sent {} frames and the port re-sent {} requests",
+            captured.len(),
+            ours.len()
+        );
+        for (index, (c_copies, frame)) in captured
+            .chunks(usize::from(NUM_PORTS))
+            .zip(ours)
+            .enumerate()
+        {
+            compare_stamped(&format!("re-send {index} at {now_ms} ms"), c_copies, frame);
+        }
+        resends += captured.len() / usize::from(NUM_PORTS);
+    }
+
+    assert_eq!(resends, 3 * 3, "three requests, three re-sends each");
+    assert_eq!(
+        timeouts.len(),
+        3,
+        "and then all three time out: {timeouts:?}"
+    );
+    assert!(
+        timeouts.iter().all(|(at, _)| *at == timeouts[0].0),
+        "on the same sweep: {timeouts:?}"
+    );
+    assert!(
+        timeouts[0].0 - start > 3 * bm_stack::node::EXPIRY_PERIOD_MS,
+        "after the third re-send: {timeouts:?}"
+    );
+    assert_eq!(node.registry().pending_len(), 0);
 }

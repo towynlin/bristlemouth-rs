@@ -28,13 +28,17 @@
 //!
 //! # What accumulates, and what does not
 //!
-//! Three things in the C outlive a single run, and all three are handled
+//! Four things in the C outlive a single run, and all four are handled
 //! rather than ignored:
 //!
 //! * the **sequence list** would grow, so [`check`] ends every run by
-//!   advancing the clock past the expiry sweep and asserting the list is
-//!   empty. That is what lets this target run in-process instead of needing
-//!   `-fork=1`.
+//!   sweeping until every request has been retried and timed out, and
+//!   asserting the list is empty. That is what lets this target run in-process
+//!   instead of needing `-fork=1`.
+//! * each outstanding request holds a **reference to its frame**, which
+//!   `timer_traverse_cb` re-sends on a retry. The comparator owns the frames,
+//!   counts the C's references to them, and asserts every one has been let go
+//!   by the end of the run.
 //! * `message_count` never resets, so the comparator mirrors it in
 //!   `RESUME` and starts each fresh [`Registry`] from where the C is.
 //! * the **expiry timer's phase** never resets either: it was armed at tick 0
@@ -55,6 +59,7 @@
 //! a relaxed assertion**: every step the comparator does perform is compared
 //! in full.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -62,7 +67,8 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 
 use bm_wire::bcmp::header::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET};
 use bm_wire::bcmp::registry::{
-    Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, PacketCfg, Registry, RegistryError,
+    Delivery, Expiry, MESSAGE_TIMER_EXPIRY_PERIOD_MS, PACKET_RETRY_COUNT, PacketCfg, Registry,
+    RegistryError,
 };
 use bm_wire::bcmp::{BcmpHeader, MessageType, tx};
 use bm_wire::frame::{
@@ -168,6 +174,89 @@ unsafe extern "C" fn get_checksum(payload: *mut c_void, size: u32) -> u16 {
     }
 }
 
+/// The frames handed to `serialize`, keyed by address, with how many
+/// references each has.
+///
+/// The comparator holds one reference while it serialises a frame. `serialize`
+/// takes another through `increment` when it records a request, and
+/// `sequence_list_remove_message` and `timer_traverse_cb` give it back through
+/// `decrement`. A frame is freed at zero, so a re-send of a frame the C had let
+/// go would be caught by [`resend`] rather than read freed memory.
+static FRAMES: Mutex<Option<HashMap<usize, Held>>> = Mutex::new(None);
+
+struct Held {
+    frame: Box<[u8]>,
+    refs: u32,
+}
+
+fn frames() -> MutexGuard<'static, Option<HashMap<usize, Held>>> {
+    FRAMES.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Hand a frame to the C's side of the comparator, holding one reference.
+fn adopt(frame: Vec<u8>) -> *mut u8 {
+    let mut frame = frame.into_boxed_slice();
+    let ptr = frame.as_mut_ptr();
+    frames()
+        .get_or_insert_with(HashMap::new)
+        .insert(ptr as usize, Held { frame, refs: 1 });
+    ptr
+}
+
+/// A copy of a frame the C may still hold.
+fn frame_at(ptr: *mut u8) -> Vec<u8> {
+    frames()
+        .as_ref()
+        .and_then(|frames| frames.get(&(ptr as usize)))
+        .map(|held| held.frame.to_vec())
+        .expect("a frame the comparator handed out")
+}
+
+/// Drop a reference, freeing the frame at zero.
+fn release(ptr: *mut u8) {
+    let mut frames = frames();
+    let frames = frames.get_or_insert_with(HashMap::new);
+    let held = frames
+        .get_mut(&(ptr as usize))
+        .expect("the C released a frame it was never given");
+    held.refs -= 1;
+    if held.refs == 0 {
+        frames.remove(&(ptr as usize));
+    }
+}
+
+unsafe extern "C" fn increment(payload: *mut c_void) {
+    let mut frames = frames();
+    frames
+        .get_or_insert_with(HashMap::new)
+        .get_mut(&(payload as usize))
+        .expect("the C held a frame it was never given")
+        .refs += 1;
+}
+
+unsafe extern "C" fn decrement(payload: *mut c_void) {
+    release(payload.cast());
+}
+
+/// `PACKET.cb.send(element->buf)`: a retry. Recorded by the sequence number in
+/// the frame's own header, which is what makes it the retry of one request
+/// rather than another.
+unsafe extern "C" fn resend(payload: *mut c_void) -> bm_wire_sys::BmErr {
+    let frame = {
+        let frames = frames();
+        let held = frames
+            .as_ref()
+            .and_then(|frames| frames.get(&(payload as usize)))
+            .expect("the C re-sent a frame it had already released");
+        held.frame.to_vec()
+    };
+    let header = BcmpHeader::decode(&frame[BCMP_HEADER_OFFSET..]).expect("a serialised frame");
+    push_event(Event::Resent {
+        seq_num: header.seq_num,
+    });
+    bm_wire_sys::BmErr_BmOK
+}
+
 /// Something the C called back about, in the order it happened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -188,18 +277,27 @@ pub enum Event {
         /// The reply's body.
         payload: Vec<u8>,
     },
-    /// A request's `BcmpSequencedRequestCb` ran with `NULL`: it timed out.
+    /// A request's callback ran with nothing: it timed out.
     TimedOut {
         /// Which [`Step::Send`] issued the request.
         slot: u8,
+    },
+    /// `cfg->process` ran with zeroed data: a request sent without a callback
+    /// timed out. The zeroed data says nothing about which one; the port's
+    /// side knows.
+    ProcessTimedOut,
+    /// A request was re-sent from its held frame.
+    Resent {
+        /// The sequence number in the re-sent frame's header.
+        seq_num: u32,
     },
 }
 
 static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
 
-/// How many bytes the next sequenced callback should copy out of the payload
-/// it is handed. The C's `BcmpSequencedRequestCb` takes a bare `uint8_t *`
-/// with no length, so the length has to come from the comparator.
+/// How many bytes the next `payload` callback should copy out of the payload
+/// it is handed. That form takes a bare `uint8_t *` with no length, so the
+/// length has to come from the comparator.
 static PAYLOAD_LEN: Mutex<usize> = Mutex::new(0);
 
 fn push_event(event: Event) {
@@ -210,7 +308,16 @@ fn take_events() -> Vec<Event> {
     std::mem::take(&mut *EVENTS.lock().unwrap_or_else(|p| p.into_inner()))
 }
 
+/// `packet_timeout_occurred`, which is `static inline` in `packet.h`.
+fn timed_out(data: &bm_wire_sys::BcmpProcessData) -> bool {
+    data.header.is_null() && data.payload.is_null() && data.src.is_null() && data.dst.is_null()
+}
+
 unsafe extern "C" fn record_process(data: bm_wire_sys::BcmpProcessData) -> bm_wire_sys::BmErr {
+    if timed_out(&data) {
+        push_event(Event::ProcessTimedOut);
+        return bm_wire_sys::BmErr_BmETIMEDOUT;
+    }
     let (message_type, seq_num, payload) = unsafe {
         let header = std::slice::from_raw_parts(data.header.cast::<u8>(), BCMP_HEADER_LEN);
         let header = BcmpHeader::decode(header).expect("13 bytes is a header");
@@ -228,14 +335,15 @@ unsafe extern "C" fn record_process(data: bm_wire_sys::BcmpProcessData) -> bm_wi
     bm_wire_sys::BmErr_BmOK
 }
 
-/// A `BcmpSequencedRequestCb` that knows which request it belongs to.
+/// A `payload` callback that knows which request it belongs to.
 ///
 /// The C's signature carries no context, so the only way to tell one
 /// request's callback from another's is to hand each request a different
 /// function. One per possible [`Step::Send`] in a script.
-unsafe fn record_sequenced(slot: u8, payload: *mut u8) -> bm_wire_sys::BmErr {
+unsafe fn record_payload(slot: u8, payload: *mut u8) -> bm_wire_sys::BmErr {
     if payload.is_null() {
-        // `timer_traverse_cb` calls `element->cb(NULL)`: this is the timeout.
+        // `invoke_cb(element->cb, (BcmpProcessData){0})` hands a `payload`
+        // callback the zeroed payload pointer: this is the timeout.
         push_event(Event::TimedOut { slot });
     } else {
         let len = *PAYLOAD_LEN.lock().unwrap_or_else(|p| p.into_inner());
@@ -245,23 +353,53 @@ unsafe fn record_sequenced(slot: u8, payload: *mut u8) -> bm_wire_sys::BmErr {
     bm_wire_sys::BmErr_BmOK
 }
 
+/// A `full` callback that knows which request it belongs to. It sees the
+/// length, so it needs no help from [`PAYLOAD_LEN`].
+unsafe fn record_full(slot: u8, data: bm_wire_sys::BcmpProcessData) -> bm_wire_sys::BmErr {
+    if timed_out(&data) {
+        push_event(Event::TimedOut { slot });
+    } else {
+        let payload = unsafe { std::slice::from_raw_parts(data.payload, data.size as usize) };
+        push_event(Event::Reply {
+            slot,
+            payload: payload.to_vec(),
+        });
+    }
+    bm_wire_sys::BmErr_BmOK
+}
+
 macro_rules! sequenced_callbacks {
-    ($($name:ident => $slot:literal),* $(,)?) => {
+    ($($payload:ident, $full:ident => $slot:literal),* $(,)?) => {
         $(
-            unsafe extern "C" fn $name(payload: *mut u8) -> bm_wire_sys::BmErr {
-                unsafe { record_sequenced($slot, payload) }
+            unsafe extern "C" fn $payload(payload: *mut u8) -> bm_wire_sys::BmErr {
+                unsafe { record_payload($slot, payload) }
+            }
+            unsafe extern "C" fn $full(data: bm_wire_sys::BcmpProcessData) -> bm_wire_sys::BmErr {
+                unsafe { record_full($slot, data) }
             }
         )*
-        /// One callback per script slot; see [`record_sequenced`].
-        static CALLBACKS: &[bm_wire_sys::BcmpSequencedRequestCb] = &[$(Some($name)),*];
+        /// One callback per script slot. Even slots get the legacy `payload`
+        /// form, which `bcmp/config.c` uses, and odd slots the `full` form
+        /// `packet.h` recommends, so both of `invoke_cb`'s paths are compared.
+        static CALLBACKS: &[bm_wire_sys::BcmpSequencedRequestCb] = &[$(
+            if $slot % 2 == 0 {
+                bm_wire_sys::BcmpSequencedRequestCb { full: None, payload: Some($payload) }
+            } else {
+                bm_wire_sys::BcmpSequencedRequestCb { full: Some($full), payload: None }
+            }
+        ),*];
     };
 }
 
 sequenced_callbacks!(
-    cb00 => 0, cb01 => 1, cb02 => 2, cb03 => 3, cb04 => 4, cb05 => 5, cb06 => 6, cb07 => 7,
-    cb08 => 8, cb09 => 9, cb10 => 10, cb11 => 11, cb12 => 12, cb13 => 13, cb14 => 14, cb15 => 15,
-    cb16 => 16, cb17 => 17, cb18 => 18, cb19 => 19, cb20 => 20, cb21 => 21, cb22 => 22, cb23 => 23,
-    cb24 => 24, cb25 => 25, cb26 => 26, cb27 => 27, cb28 => 28, cb29 => 29, cb30 => 30, cb31 => 31,
+    cb00, full00 => 0, cb01, full01 => 1, cb02, full02 => 2, cb03, full03 => 3,
+    cb04, full04 => 4, cb05, full05 => 5, cb06, full06 => 6, cb07, full07 => 7,
+    cb08, full08 => 8, cb09, full09 => 9, cb10, full10 => 10, cb11, full11 => 11,
+    cb12, full12 => 12, cb13, full13 => 13, cb14, full14 => 14, cb15, full15 => 15,
+    cb16, full16 => 16, cb17, full17 => 17, cb18, full18 => 18, cb19, full19 => 19,
+    cb20, full20 => 20, cb21, full21 => 21, cb22, full22 => 22, cb23, full23 => 23,
+    cb24, full24 => 24, cb25, full25 => 25, cb26, full26 => 26, cb27, full27 => 27,
+    cb28, full28 => 28, cb29, full29 => 29, cb30, full30 => 30, cb31, full31 => 31,
 );
 
 /// The C state that outlives a run, mirrored independently of the code under
@@ -305,12 +443,15 @@ fn oracle() -> MutexGuard<'static, ()> {
     let lock = ORACLE.get_or_init(|| {
         unsafe {
             assert_eq!(
-                bm_wire_sys::packet_init(
-                    Some(get_src_ip),
-                    Some(get_dst_ip),
-                    Some(get_data),
-                    Some(get_checksum),
-                ),
+                bm_wire_sys::packet_init(bm_wire_sys::BcmpPacketCb {
+                    src_ip: Some(get_src_ip),
+                    dst_ip: Some(get_dst_ip),
+                    data: Some(get_data),
+                    checksum: Some(get_checksum),
+                    increment: Some(increment),
+                    decrement: Some(decrement),
+                    send: Some(resend),
+                }),
                 bm_wire_sys::BmErr_BmOK,
                 "packet_init"
             );
@@ -365,8 +506,9 @@ pub enum Step {
         type_index: u8,
         /// The number a reply type echoes; ignored for anything else.
         reply_seq_num: u32,
-        /// Whether the request is given a `BcmpSequencedRequestCb`. The C
-        /// tolerates a null one and falls back to `cfg->process` on the reply.
+        /// Whether the request is given a callback. Without one, `serialize`
+        /// stores `cfg->process` in its place, which then sees the reply, or
+        /// zeroed data on a timeout.
         with_callback: bool,
         /// Body length, capped at [`MAX_BODY`].
         body_len: u8,
@@ -593,8 +735,10 @@ pub fn check(input: &RegistryInput) {
                 }
 
                 let body = body_for(index, usize::from(body_len));
-                let mut frame_c = blank_frame(body.len());
-                let mut frame_rs = frame_c.clone();
+                // The C may keep this one for re-sending, so the comparator
+                // owns it and counts the C's references.
+                let frame_c = adopt(blank_frame(body.len()));
+                let mut frame_rs = blank_frame(body.len());
                 let mut body_c = body.clone();
 
                 let callback = if with_callback && makes_a_request {
@@ -604,11 +748,11 @@ pub fn check(input: &RegistryInput) {
                     );
                     CALLBACKS[next_slot]
                 } else {
-                    None
+                    bm_wire_sys::BcmpSequencedRequestCb::default()
                 };
                 let err = unsafe {
                     bm_wire_sys::serialize(
-                        frame_c.as_mut_ptr().cast(),
+                        frame_c.cast(),
                         body_c.as_mut_ptr().cast(),
                         body_c.len() as u32,
                         u32::from(ty.0),
@@ -665,7 +809,9 @@ pub fn check(input: &RegistryInput) {
                     }
                     Err(other) => panic!("step {index} ({step:?}): the port failed with {other}"),
                 }
-                assert_frames_eq(&frame_c, &frame_rs, index, step);
+                assert_frames_eq(&frame_at(frame_c), &frame_rs, index, step);
+                // `bcmp_tx`'s `bm_ip_tx_cleanup`: the sender's reference goes.
+                release(frame_c);
                 Vec::new()
             }
 
@@ -778,11 +924,11 @@ pub fn check(input: &RegistryInput) {
 }
 
 /// Run the port's expiry sweep at `now_ms` and translate what it reports into
-/// the callbacks the C should have made.
+/// what the C should have done, in the C's list order.
 ///
-/// `timer_traverse_cb` invokes the callback only when the request has one, so
-/// a request sent without one expires silently — the port reports it either
-/// way, because it has no callback to test.
+/// A retry is `PACKET.cb.send`. A timeout goes to the request's callback, or
+/// — for a request sent without one — to `cfg->process` with zeroed data,
+/// because `serialize` stored `cfg->process` as its `full` callback.
 fn sweep(
     registry: &mut Registry<TYPE_CAPACITY, PENDING_CAPACITY>,
     slots: &mut Vec<Slot>,
@@ -791,44 +937,59 @@ fn sweep(
     index: usize,
 ) -> Vec<Event> {
     let mut expired = Vec::new();
-    registry.on_tick(now_ms, |request| expired.push(request.seq_num));
+    registry.on_tick(now_ms, |expiry| expired.push(expiry));
 
     let mut events = Vec::new();
-    for seq_num in expired {
-        let position = slots
-            .iter()
-            .position(|held| held.seq_num == seq_num)
-            .unwrap_or_else(|| panic!("step {index}: a request nothing sent expired"));
-        let held = slots.remove(position);
-        links.remove(position);
-        if held.with_callback {
-            events.push(Event::TimedOut { slot: held.slot });
+    for expiry in expired {
+        match expiry {
+            Expiry::Retry(request) => events.push(Event::Resent {
+                seq_num: request.seq_num,
+            }),
+            Expiry::TimedOut(request) => {
+                let position = slots
+                    .iter()
+                    .position(|held| held.seq_num == request.seq_num)
+                    .unwrap_or_else(|| panic!("step {index}: a request nothing sent expired"));
+                let held = slots.remove(position);
+                links.remove(position);
+                events.push(if held.with_callback {
+                    Event::TimedOut { slot: held.slot }
+                } else {
+                    Event::ProcessTimedOut
+                });
+            }
         }
     }
     events
 }
 
-/// Run the clock forward until nothing is outstanding on either side.
+/// Run the clock forward, one sweep at a time, until nothing is outstanding on
+/// either side.
 ///
 /// This is what keeps the target in-process: the C's `sequence_list` is the
 /// one thing here that would otherwise grow without bound across a fuzz run.
+/// One sweep at a time, because the shim fires every sweep a long advance
+/// skipped at the same tick, and a request retried on the first of those is
+/// not expired again on the rest: each retry needs a sweep of its own.
 fn drain(
     registry: &mut Registry<TYPE_CAPACITY, PENDING_CAPACITY>,
     slots: &mut Vec<Slot>,
     links: &mut LinkModel,
     resume: &mut Resume,
 ) {
-    // Two full sweep periods clear anything, wherever it fell in the phase.
-    unsafe { bm_wire_sys::bm_shim_advance_ticks(2 * MESSAGE_TIMER_EXPIRY_PERIOD_MS) };
-    let now = tick_count();
-    resume.advance_timer(now);
-    let expected = sweep(registry, slots, links, now, usize::MAX);
+    // The first sweep a request can expire on, then one per retry.
+    for _ in 0..=u32::from(PACKET_RETRY_COUNT) + 1 {
+        unsafe { bm_wire_sys::bm_shim_advance_ticks(MESSAGE_TIMER_EXPIRY_PERIOD_MS) };
+        let now = tick_count();
+        resume.advance_timer(now);
+        let expected = sweep(registry, slots, links, now, usize::MAX);
 
-    let seen = take_events();
-    assert_eq!(
-        seen, expected,
-        "draining: the C's timeouts diverged from the port's"
-    );
+        let seen = take_events();
+        assert_eq!(
+            seen, expected,
+            "draining: the C's retries and timeouts diverged from the port's"
+        );
+    }
     assert_eq!(
         registry.pending_len(),
         0,
@@ -836,15 +997,19 @@ fn drain(
     );
     assert!(slots.is_empty(), "draining: unaccounted requests {slots:?}");
 
-    // And nothing is left to fire: if the C still held entries, the next sweep
+    // And nothing is left to fire: if the C still held entries, a later sweep
     // would report them.
-    unsafe { bm_wire_sys::bm_shim_advance_ticks(2 * MESSAGE_TIMER_EXPIRY_PERIOD_MS) };
-    resume.advance_timer(tick_count());
+    for _ in 0..=u32::from(PACKET_RETRY_COUNT) {
+        unsafe { bm_wire_sys::bm_shim_advance_ticks(MESSAGE_TIMER_EXPIRY_PERIOD_MS) };
+        resume.advance_timer(tick_count());
+    }
     let stragglers = take_events();
     assert!(
         stragglers.is_empty(),
         "draining: the C's sequence list still held {stragglers:?}"
     );
+    let held = frames().as_ref().map_or(0, HashMap::len);
+    assert_eq!(held, 0, "draining: the C still holds {held} frames");
 }
 
 fn assert_frames_eq(c: &[u8], rs: &[u8], index: usize, step: &Step) {

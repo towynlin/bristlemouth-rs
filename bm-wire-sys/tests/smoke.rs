@@ -231,6 +231,14 @@ unsafe extern "C" fn get_dst(payload: *mut std::ffi::c_void) -> *mut BmIpAddr {
 unsafe extern "C" fn zero_checksum(_payload: *mut std::ffi::c_void, _size: u32) -> u16 {
     0
 }
+// `packet_init` requires all seven accessors. The last three hold and re-send
+// a sequenced request's buffer, and a heartbeat is not one.
+unsafe extern "C" fn no_reference(_payload: *mut std::ffi::c_void) {
+    unreachable!("a heartbeat is never held for retries");
+}
+unsafe extern "C" fn no_send(_payload: *mut std::ffi::c_void) -> BmErr {
+    unreachable!("a heartbeat is never retried");
+}
 
 static HEARTBEATS_SEEN: Mutex<Vec<BcmpHeartbeat>> = Mutex::new(Vec::new());
 
@@ -256,12 +264,15 @@ fn packet_serializes_and_dispatches_a_heartbeat() {
 
     unsafe {
         assert_eq!(
-            packet_init(
-                Some(get_src),
-                Some(get_dst),
-                Some(get_data),
-                Some(zero_checksum)
-            ),
+            packet_init(BcmpPacketCb {
+                src_ip: Some(get_src),
+                dst_ip: Some(get_dst),
+                data: Some(get_data),
+                checksum: Some(zero_checksum),
+                increment: Some(no_reference),
+                decrement: Some(no_reference),
+                send: Some(no_send),
+            }),
             BmErr_BmOK
         );
         let mut cfg = BcmpPacketCfg {
@@ -282,7 +293,7 @@ fn packet_serializes_and_dispatches_a_heartbeat() {
                 size_of::<BcmpHeartbeat>() as u32,
                 BcmpMessageType_BcmpHeartbeatMessage,
                 0,
-                None,
+                BcmpSequencedRequestCb::default(),
             ),
             BmErr_BmOK
         );

@@ -18,17 +18,19 @@ Status values:
 - **benign** — technically undefined, but every real toolchain produces the
   intended value and the port produces it by construction.
 - **c-only** — a defect in state or an API `bm-wire` has no counterpart for.
+- **fixed upstream** — bm_core has repaired it, the submodule includes the
+  fix, and the port and the C agree. The entry is kept as the record.
 
 ## Recommended upstream priority
 
-Four to fix first, in this order.
+Three to fix first, in this order. #29, previously first, is fixed in
+bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm_core/pull/165)).
 
 | Rank | # | Why now |
 |---|---|---|
-| 1 | [#29](#29-bcmppingc-echoes-and-compares-an-unchecked-payload_len) | Remote memory disclosure. One unauthenticated frame from any node on the link makes a node transmit up to 1460 bytes of adjacent heap to a multicast address. No prior state needed. The fix is one comparison against `data.size`, already in the struct. |
-| 2 | [#12](#12-the-egress-port-checksum-patch-drops-the-end-around-carry) | Live frame loss on deployed hardware: ~1 BCMP frame in 40 000 leaves a two-port node with a checksum the far end rejects. Ports M1 and M2 raised the rate from theoretical to routine, and config/DFU bodies will raise it further. The fix is additive — a fixed node is strictly more interoperable. |
-| 3 | [#20](#20-ll_remove-leaves-lltail-pointing-at-a-freed-node) | Was a runner-up on reading; card M3 made it a measured remote write. `cargo fuzz run info` reaches the use-after-free in `ll_item_add` from three unauthenticated frames, because `INFO_REQUEST_LIST` is removed from out of insertion order on keys the sender chooses. Two lines to fix, but it needs a maintainer who can confirm the list invariants. |
-| 4 | [#14](#14-device-info-and-neighbour-table-replies-are-parsed-with-unchecked-lengths) | Same class as #29 in two more parsers, reachable by any node on the link, and `topology.c`'s length also wraps in `uint16_t`. Not wire-visible to fix. |
+| 1 | [#12](#12-the-egress-port-checksum-patch-drops-the-end-around-carry) | Live frame loss on deployed hardware: ~1 BCMP frame in 40 000 leaves a two-port node with a checksum the far end rejects. Ports M1 and M2 raised the rate from theoretical to routine, and config/DFU bodies will raise it further. The fix is additive — a fixed node is strictly more interoperable. |
+| 2 | [#20](#20-ll_remove-leaves-lltail-pointing-at-a-freed-node) | Was a runner-up on reading; card M3 made it a measured remote write. `cargo fuzz run info` reaches the use-after-free in `ll_item_add` from three unauthenticated frames, because `INFO_REQUEST_LIST` is removed from out of insertion order on keys the sender chooses. Two lines to fix, but it needs a maintainer who can confirm the list invariants. |
+| 3 | [#14](#14-device-info-and-neighbour-table-replies-are-parsed-with-unchecked-lengths) | Same class as #29, fixed the same way, in two more parsers, reachable by any node on the link, and `topology.c`'s length also wraps in `uint16_t`. Not wire-visible to fix. |
 
 ## Index
 
@@ -55,14 +57,14 @@ Four to fix first, in this order.
 | 19 | `INFO_REQUEST_LIST` grows without de-duplication or expiry | c-only | reading |
 | 20 | `ll_remove` leaves `LL::tail` pointing at a freed node | domain-limited | reading, then hit by `cargo fuzz run info` |
 | 21 | A sequenced reply is matched on its sequence number alone | replicated | reading, confirmed differentially |
-| 22 | A sequenced request's timeout is the 150 ms sweep, not the 24 ms constant | replicated | reading, then measured |
+| 22 | A sequenced request's timeout is the 150 ms sweep, not the 24 ms constant | replicated | reading, then measured; retries re-measured at `c77daa8` |
 | 23 | `bcmp_ll_forward` replaces the originator's source address with the forwarder's | replicated | reading, confirmed differentially |
 | 24 | A forwarded frame's multicast MAC carries the egress port | replicated | reading, confirmed differentially |
 | 25 | `bcmp_ll_forward` writes its new checksum into the frame it forwards | c-only | reading |
 | 26 | `bcmp_ll_forward` reports a forward with nowhere to go as `BmEINVAL` | replicated | reading |
 | 27 | A system-time `target_node_id` of zero is a broadcast for `0x12`, a dead letter for `0x10`/`0x11` | replicated | reading, confirmed differentially |
 | 28 | A forwarded global-multicast message goes out twice, the second time link-local | replicated | reading, confirmed differentially |
-| 29 | `bcmp/ping.c` echoes and compares an unchecked `payload_len` | domain-limited | reading |
+| 29 | `bcmp/ping.c` echoes and compares an unchecked `payload_len` | fixed upstream (`c77daa8`) | reading; fix confirmed differentially |
 | 30 | A ping reply is matched on 16 bits of node id and the payload, nothing else | replicated | reading |
 | 31 | `bcmp_send_ping_reply` echoes a `seq_num` that `serialize` discards | replicated | reading, confirmed differentially |
 | 32 | `bcmp/ping.c` reports the result of a ping to nobody, and never forgets one | c-only | reading |
@@ -710,7 +712,8 @@ from under it.
 
 `bcmp/config.c` is exposed on `packet.c`'s `sequence_list` for the same reason:
 it is the only module issuing sequenced requests, and it issues several
-concurrently.
+concurrently. Since bm_core `61e75ed` (retries) an unanswered request stays on
+the list for three sweeps longer, which widens the window.
 
 **domain-limited.** `bm-wire-diff/src/ll.rs`'s `LinkModel` tracks which of the
 C's `previous` pointers are stale and declines the append that would be
@@ -727,10 +730,10 @@ it again. `process_received_message` looks the entry up by number:
 
 ```c
       if (cfg->sequenced_reply && !cfg->sequenced_request) {
-        request_message = sequence_list_find_message(data.header->seq_num);
+        if (sequence_list_claim_message(data.header->seq_num, &cb) == BmOK) {
 ```
 
-`sequence_list_find_message` is an id lookup, so any reply type whose sequence
+`sequence_list_claim_message` is an id lookup, so any reply type whose sequence
 number matches an outstanding request consumes it and invokes its callback with
 a payload of a different shape — a `BcmpConfigValue` can answer a
 `BcmpNeighborProtoRequest`.
@@ -758,45 +761,53 @@ needs the registry to record which request type each reply type answers.
 
 ## 22. A sequenced request's timeout is the sweep period, not the timeout
 
-`bcmp/packet.c`:
+`bcmp/packet.c` and `bcmp/packet.h`:
 
 ```c
 #define default_message_timeout_ms 24
 #define message_timer_expiry_period_ms 150
+#define packet_retry_count 3
 ```
 
 Every sequenced request is stamped with the first. Nothing consults it except
 `timer_traverse_cb`, which runs only from `sequence_list_timer_callback`, which
 runs only when the 150 ms auto-reload timer fires. The 24 ms is a threshold
-applied on a 150 ms grid, so a request gets neither number:
+applied on a 150 ms grid. A request is kept while `ms - timestamp_ms <
+timeout_ms`; the first sweep that finds it expired re-sends it and restamps it,
+and so do the next two, since each is 150 ms later. The fourth times it out.
 
-| Sent at | Expired at | Lived for |
-|---|---|---|
-| 125 ms (25 before a sweep) | 150 ms | **25 ms** |
-| 0 ms (on a sweep) | 150 ms | 150 ms |
-| 126 ms (24 before a sweep) | 300 ms | **174 ms** |
+| Sent at | First expiry | After | Timed out at |
+|---|---|---|---|
+| 126 ms (24 before a sweep) | 150 ms | **24 ms** | 600 ms |
+| 0 ms (on a sweep) | 150 ms | 150 ms | 600 ms |
+| 127 ms (23 before a sweep) | 300 ms | **173 ms** | 750 ms |
 
-One millisecond of phase is the difference between 25 ms and 174 ms, for
-identical traffic. The nominal 24 ms is the one value a request can never get,
-because the comparison is strict.
+One millisecond of phase is the difference between a first retry after 24 ms
+and one after 173 ms, for identical traffic. Before bm_core `61e75ed` there
+were no retries, the comparison was strict (`>`), and the range was 25 ms to
+174 ms to the timeout itself.
 
 Measured rather than inferred: `the_effective_timeout_across_the_whole_phase`
-in `bm-wire-diff/tests/registry.rs` walks the clock a millisecond at a time
-against the real timer in the shim, and
-`the_effective_timeout_ranges_from_25_to_174_milliseconds` in `bm-wire`'s unit
+and `the_timeout_boundary_from_both_sides` in `bm-wire-diff/tests/registry.rs`
+walk the clock against the real timer in the shim, and
+`the_first_expiry_ranges_from_24_to_173_milliseconds` in `bm-wire`'s unit
 tests asserts the shape.
 
 Card C3 is where it matters: `bcmp/config.c` is the only module issuing
-sequenced requests, and a config get whose reply arrives in the wrong part of
-the phase is reported to the application as a failure (`cb(NULL)`) and then
-delivered again as an unsolicited `BcmpConfigValue`.
+sequenced requests, and a config get whose reply arrives after the fourth
+sweep is reported to the application as a failure and then delivered again as
+an unsolicited `BcmpConfigValue`.
 
 `Registry::on_tick` carries the sweep's phase and only sweeps when one is due,
-so the port times out the same requests at the same instants. Sweeping on every
-tick instead fails six of the comparator's tests. `bm_stack::Node::on_expiry`
-is `sequence_list_timer_callback`, driven from a ticker of `EXPIRY_PERIOD_MS`
-separate from the heartbeat ticker; see
-`an_unanswered_request_dies_on_the_sweep_rather_than_on_its_timeout` and
+so the port retries and times out the same requests at the same instants,
+reporting `Expiry::Retry` and `Expiry::TimedOut`. Sweeping on every tick
+instead fails six of the comparator's tests. `bm_stack::Node::on_expiry` is
+`sequence_list_timer_callback`, driven from a ticker of `EXPIRY_PERIOD_MS`
+separate from the heartbeat ticker, and `Node::next_retransmission` hands back
+the re-sends; `our_sequenced_request_carries_the_number_the_c_would_have_given_it`
+in `bm-wire-diff/tests/node_frames.rs` compares them byte for byte against
+the frames the C re-sends. See also
+`an_unanswered_request_is_retried_on_the_sweep_rather_than_at_its_timeout` and
 `a_reply_that_arrives_after_the_timeout_is_reported_twice` in
 `bm-stack/tests/node.rs`.
 
@@ -1069,12 +1080,25 @@ Here the declared length must equal what this node last pinged with, so the read
 is bounded by the node's own choice — but it is still a read of `payload_len`
 bytes from a frame that may carry none of them.
 
-**domain-limited.** `bm_wire::bcmp::ping`'s decoders validate the declared
-length against the buffer and return `BmWireError::Truncated`;
-`bm-wire-diff/src/ping.rs` never injects a request whose `payload_len` is not
-what it carries, and its `decode_probe` bytes never reach the C.
+**fixed upstream** in bm_core `c77daa8`
+([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm_core/pull/165)).
+Both processors now return `BmEBADMSG` unless `data.size` holds the fixed
+fields and the declared payload, testing the first before reading
+`payload_len`. A request declaring less than it carries is still answered,
+with the declared payload.
 
-The fix is one comparison against `data.size`, which is already in the struct.
+`bm_wire::bcmp::ping`'s decoders always did the same, returning
+`BmWireError::Truncated`. `bm-wire-diff/src/ping.rs` now injects its
+`decode_probe` bytes into the C as an echo request body, so malformed requests
+are compared rather than excluded. Against `f06b3b4`, the commit before the
+fix, five tests in `bm-wire-diff/tests/ping.rs` fail with the C answering a
+request the port declined:
+
+- `a_saturated_payload_length_is_refused_rather_than_trusted`
+- `a_request_declaring_one_byte_more_than_it_carries_is_answered_by_nobody`
+- `a_body_too_short_for_the_fixed_fields_is_answered_by_nobody`
+- `the_decoders_survive_arbitrary_bytes`
+- `every_committed_seed_still_agrees_with_the_c`
 
 ## 30. A ping reply is matched on sixteen bits of node id and the payload, and nothing else
 

@@ -89,6 +89,17 @@ unsafe extern "C" fn get_checksum(payload: *mut c_void, size: u32) -> u16 {
     }
 }
 
+// `packet_init` requires all seven accessors. The last three hold and re-send
+// a sequenced request's buffer, and nothing registered here is a request.
+
+unsafe extern "C" fn no_reference(_payload: *mut c_void) {
+    unreachable!("nothing here is a sequenced request, so no buffer is held");
+}
+
+unsafe extern "C" fn no_send(_payload: *mut c_void) -> bm_wire_sys::BmErr {
+    unreachable!("nothing here is a sequenced request, so nothing is retried");
+}
+
 /// What the C's process callback saw, copied out so the frame can be inspected
 /// afterwards without aliasing it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,12 +173,15 @@ fn oracle() -> MutexGuard<'static, ()> {
     let lock = ORACLE.get_or_init(|| {
         unsafe {
             assert_eq!(
-                bm_wire_sys::packet_init(
-                    Some(get_src_ip),
-                    Some(get_dst_ip),
-                    Some(get_data),
-                    Some(get_checksum),
-                ),
+                bm_wire_sys::packet_init(bm_wire_sys::BcmpPacketCb {
+                    src_ip: Some(get_src_ip),
+                    dst_ip: Some(get_dst_ip),
+                    data: Some(get_data),
+                    checksum: Some(get_checksum),
+                    increment: Some(no_reference),
+                    decrement: Some(no_reference),
+                    send: Some(no_send),
+                }),
                 bm_wire_sys::BmErr_BmOK,
                 "packet_init"
             );
@@ -338,7 +352,7 @@ pub fn check_serialize(input: &BcmpInput) {
             body.len() as u32,
             u32::from(ty.0),
             input.seq_num,
-            None,
+            bm_wire_sys::BcmpSequencedRequestCb::default(),
         )
     };
     assert_eq!(

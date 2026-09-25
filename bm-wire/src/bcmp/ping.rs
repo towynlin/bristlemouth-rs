@@ -15,15 +15,13 @@
 //! node's id and casts the request buffer to a `BcmpEchoReply` in place;
 //! [`EchoRequest::into_reply`] is that cast, with the substitution explicit.
 //!
-//! # Lengths are checked here and nowhere in the C
+//! # Lengths are checked against what arrived
 //!
-//! `bcmp_process_ping_request` echoes `sizeof(BcmpEchoReply) + payload_len`
-//! bytes out of the received frame, and `bcmp_process_ping_reply` `memcmp`s
-//! `payload_len` of them, in both cases taking the length from the frame and
-//! never comparing it against `BcmpProcessData.size`, which is right there.
-//! [`EchoRequest::decode`] and [`EchoReply::decode`] validate it against the
-//! buffer instead. See divergence #29: a domain limit, not a reproduced
-//! behaviour, because there is no defined C behaviour to reproduce.
+//! [`EchoRequest::decode`] and [`EchoReply::decode`] refuse a body whose
+//! declared `payload_len` runs past it, and ignore bytes after the declared
+//! payload. Since bm_core `c77daa8` both of `bcmp/ping.c`'s processors do the
+//! same against `BcmpProcessData.size`, returning `BmEBADMSG`. Before it they
+//! did not check, which was divergence #29.
 
 use crate::BmWireError;
 
