@@ -23,6 +23,7 @@ pub mod bcmp;
 pub mod bcmp_messages;
 pub mod cbor;
 pub mod checksum;
+pub mod configuration;
 pub mod crc;
 pub mod forward;
 pub mod info;

@@ -11,8 +11,11 @@
 //! # Shape
 //!
 //! * [`port`] holds the seams an integrator fills — a port-aware PHY, the
-//!   node's identity and its real-time clock — as traits rather than
-//!   link-time symbols, so a test and the firmware can have different ones.
+//!   node's identity, its real-time clock and its config storage — as traits
+//!   rather than link-time symbols, so a test and the firmware can have
+//!   different ones.
+//! * [`config`] loads and saves [`bm_wire::configuration::ConfigStore`]
+//!   through [`port::ConfigStorage`].
 //! * [`node::Node`] is the protocol. Its three receive/timer entry points are
 //!   synchronous and take the current time, so they are testable without an
 //!   executor.
@@ -24,10 +27,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod config;
 #[cfg(feature = "mock")]
 pub mod mock;
 pub mod node;
 pub mod port;
 
 pub use node::{Event, MTU, Node, Outbound, Owed, Reflood, deliver, transmit};
-pub use port::{Egress, Identity, NoRtc, Phy, Rtc, RtcTimeAndDate, SoftRtc};
+pub use port::{
+    ConfigStorage, Egress, Identity, NoRtc, Phy, RamConfigStorage, Rtc, RtcTimeAndDate, SoftRtc,
+};

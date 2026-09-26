@@ -16,7 +16,7 @@
 //! |---|---|
 //! | Encoded bytes, for every value shape `bcmp/configuration.c` stores | Buffer-overflow behaviour: cbor2 fails the write, tinycbor keeps counting and reports a shortfall. Neither is visible on the wire. |
 //! | The head of one decoded item: kind, argument, and whether the length is known | Container item counts: tinycbor's encoder tracks them and cbor2's does not, by design. |
-//! | Definite-length string bodies | Indefinite-length string *reassembly*, which cbor2 leaves to the caller without `alloc`. C2 needs a helper; see `docs/bcmp-port-todo.md`. |
+//! | Definite-length string bodies | Indefinite-length string *reassembly*, which cbor2 leaves to the caller without `alloc`. `bm_wire::configuration::copy_string` does it by hand, and `crate::configuration` compares it. |
 //!
 //! # The two places they disagree
 //!

@@ -31,6 +31,17 @@ test = false
 doc = false
 bench = false
 
+# `configuration.c`'s `CONFIGS` and the shim's flash are process-global, and
+# `check` resets both through `config_init` at the start of every iteration,
+# so a crash leaves nothing the next iteration does not undo. Nothing else in
+# this process touches them.
+[[bin]]
+name = "configuration"
+path = "fuzz_targets/configuration.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "time_remaining"
 path = "fuzz_targets/time_remaining.rs"
