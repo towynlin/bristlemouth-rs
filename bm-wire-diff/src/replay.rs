@@ -67,6 +67,9 @@ pub fn replay_target(target: &str) -> usize {
                 crate::cbor::check(i);
             }),
             "crc" => replay_one::<crate::crc::CrcInput, _>(&bytes, crate::crc::check),
+            "configuration" => replay_one::<crate::configuration::ConfigInput, _>(&bytes, |i| {
+                crate::configuration::check(i);
+            }),
             "l2_policy" => replay_one::<crate::l2_policy::L2PolicyInput, _>(&bytes, |i| {
                 crate::l2_policy::check(i);
             }),
@@ -139,6 +142,7 @@ pub const TARGETS: &[&str] = &[
     "bcmp",
     "cbor",
     "checksum",
+    "configuration",
     "crc",
     "date_time",
     "l2_policy",

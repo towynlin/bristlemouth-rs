@@ -10,7 +10,8 @@ neighbour table (`0x08`/`0x09`, both halves), resource discovery
 plus the wire engine under them (`bcmp::tx::serialize`, `bcmp::rx::accept`, L2
 egress stamping, the link-local RX policy, the two forwarding paths in
 `bcmp::forward`) and three state machines, `bm-wire/src/neighbor.rs`,
-`bm-wire/src/bcmp/registry.rs` and `bm-wire/src/bcmp/resource.rs`.
+`bm-wire/src/bcmp/registry.rs` and `bm-wire/src/bcmp/resource.rs`, plus the
+local config store, `bm-wire/src/configuration.rs`.
 `MessageType` names all 45 of bm_core's constants; fourteen body structs have a
 codec. CBOR, which the config chain needs, is the `cbor2` crate rather than a
 port; `bm-wire/src/cbor.rs` holds only the one deviation from its defaults
@@ -26,15 +27,14 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| Local config store | `bcmp/configuration.c` | 845 | C2 |
 | Config over BCMP `0xA0`–`0xA9` | `bcmp/config.c` | 857 | C3 |
 | DFU message codecs `0xD0`–`0xD9` | `bcmp/dfu_message_structs.h` | — | D1 |
 | DFU core HFSM | `bcmp/dfu_core.c` | 689 | D2 |
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-C2 and D1 are unblocked and may run in parallel. C3 needs C2. D2 needs D1; D3
-and D4 each need D2.
+C3 and D1 are unblocked and may run in parallel. D2 needs D1; D3 and D4 each
+need D2.
 
 ---
 
@@ -154,7 +154,7 @@ cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 On a crash: `cargo fuzz tmin <target> <artifact>`, then drop the minimized file
 into `bm-wire/fuzz/seeds/<target>/`.
 
-### What the landed cards (M1, M2, M3, M4, M5, C1) left for the rest
+### What the landed cards (M1, M2, M3, M4, M5, C1, C2) left for the rest
 
 - **Forwarding machinery is built.** `bm_stack::Owed::forward` is the decision,
   as a `Reflood` — a byte range within the received frame plus the ingress port,
@@ -249,8 +249,8 @@ into `bm-wire/fuzz/seeds/<target>/`.
   pool, a process-global `Model` that the port's table is rebuilt from at the
   start of each seed, and a comparison that asserts *agreement* rather than any
   particular state — so every test in `tests/resource.rs` is order-independent,
-  and has to be. C2's config store is the next card with state that outlives a
-  seed.
+  and has to be. C2's config store resets through `config_init` instead; see
+  below.
 - **The oracle's stack is not a blank slate.** `bm_shim_stack_init` brings
   `metrics_service_init` up, which calls `bm_sub` and so leaves
   `<node id>/metrics/req` in `SUB_LIST` before any comparator runs. Read a
@@ -292,12 +292,10 @@ into `bm-wire/fuzz/seeds/<target>/`.
   So the `services_cbor_as_map` retry loop has no direct analogue — size the
   buffer with `cbor2::ser::serialized_size` (available without `alloc`), and
   count map pairs yourself or the header will lie.
-- **Indefinite-length string reassembly is the caller's job.**
-  `Decoder::bytes_body`/`text_body` need `alloc`. A `ConfigSet` body can carry
-  a chunked string, so C2 needs a loop over `pull()` that accumulates into a
-  fixed buffer, and it is the first thing worth a comparator of its own —
-  `bm-wire-diff/src/cbor.rs` proves head agreement and definite-length bodies,
-  not reassembly.
+- **Indefinite-length string reassembly is done, by hand.**
+  `bm_wire::configuration::copy_string` is tinycbor's `iterate_string_chunks`,
+  including the chunks it copies before failing (divergence #49). It does not
+  use cbor2, whose string readers need `alloc`.
 - **What the comparator proves is byte agreement, not behaviour agreement.**
   cbor2 and tinycbor are different libraries and are not expected to make the
   same judgements; `bm-wire-diff/src/cbor.rs` asserts they emit identical
@@ -319,6 +317,42 @@ into `bm-wire/fuzz/seeds/<target>/`.
   and the timeout callback. `Model` in `bm-wire-diff/src/neighbor_table.rs` is
   the comparator's belief about the statics behind them, asserted against both
   sides on every step.
+- **The config store is a byte image, and C3 should keep it one.**
+  `bm_wire::configuration::ConfigPartition` holds the packed `ConfigPartition`
+  struct and edits it where the C does, because stale bytes past `numKeys`,
+  past a NUL and past a short value all reach flash and the CRC. Its methods
+  are the C's functions (`set_cbor` is `set_config_cbor`, ...); `ConfigStore`
+  is `CONFIGS`.
+- **Pick the layout.** The image's layout is the compiler's (divergence #44):
+  `Layout::LP64` for the oracle, `Layout::ARM_EABI_GCC` for a dev kit whose C
+  firmware was built with `arm-none-eabi-gcc`'s defaults. A node never sends
+  the image, so C3 is unaffected on the wire; a firmware inheriting a C node's
+  flash is not.
+- **`bcmp/config.c` passes keys with no NUL.** `set_config_cbor` gets
+  `msg->keyAndData`, so the stored `key_buf` carries the value's first bytes
+  (divergence #45). `Key::with_len(key_and_data, key_length)` reproduces it;
+  `Key::new(key)` does not.
+- **A `ConfigValue` reply carries the whole 50-byte slot.** `get_config_cbor`
+  returns it stale tail and all, and `ConfigPartition::get_cbor` does too
+  (divergence #49).
+- **At 50 keys a `ConfigSet` still overwrites** — `set_config_cbor` looks the
+  key up before checking the count; the typed setters do not (divergence #46).
+- **`CONFIGS` resets through its own front door.** `config_init` does not touch
+  `needs_commit`, so `bm-wire-diff/src/configuration.rs` saves any uncommitted
+  partition, writes zeros to the shim's flash, then calls `config_init`, at the
+  start of every script. The RAM image is readable through
+  `get_stored_keys`, whose pointer is 9 bytes into the partition. C3's
+  stack binary can do the same.
+- **`bm_config_*` is the third integrator seam with no oracle.**
+  `bm_stack::port::ConfigStorage` is the trait and `RamConfigStorage` the
+  RAM implementation; both sides of the comparator are handed the same bytes.
+  Never pass `restart = true` to `save_config` in a comparator: the shim's
+  `bm_config_reset` clears every partition, `RamConfigStorage::reset` does
+  nothing, and on hardware it reboots. `config.c` commits with `restart =
+  true`, so C3 has to decide what that means in a stack test.
+- **#42's uninitialised read needs a crafted image.** A CRC-valid image can
+  put unparseable bytes in a listed key's slot (divergence #48 domain); no
+  other route to a `get_config_cbor` failure for a listed key was found.
 
 ---
 
@@ -332,30 +366,9 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 
 # The config chain
 
-## C2 — the local config store
-
-**Blocked by:** nothing; C1 has landed.
-
-**C source.** `bcmp/configuration.c` (845 LoC) — not a wire module. Typed
-get/set for `UINT32`, `INT32`, `FLOAT`, `STR`, `BYTES`, `ARRAY`; a partition
-header with a CRC32; commit/save; `remove_key`; `clear_partition`. Limits from
-`configuration.h`: `MAX_NUM_KV` 50, `MAX_KEY_LEN_BYTES` 32,
-`MAX_CONFIG_BUFFER_SIZE_BYTES` 50, `CONFIG_VERSION` 0.
-
-**New port seam.** Config storage in `bm-stack/src/port.rs`, matching
-`bm_configs_generic.h`'s `bm_config_read`/`bm_config_write`/`bm_config_reset`.
-
-**Gold vectors.** `configuration_test.cpp`'s literal hex is a 10-byte payload
-being stored, not an expected encoding. Pin the CRC32 and partition-header
-layout instead, with expected bytes derived from the oracle.
-
-**Done when.** A partition written by the Rust store is byte-identical to one
-written by the C for the same key sequence, CRC included, and both reject the
-same corrupt images.
-
 ## C3 — config over BCMP, `0xA0`–`0xA9`
 
-**Blocked by:** C2. The re-flood these messages need is
+**Blocked by:** nothing; C2 has landed. The re-flood these messages need is
 `bm_stack::Node::forward_link_local`, which exists.
 
 **C source.** `bcmp/config.c` (857 LoC), one handler

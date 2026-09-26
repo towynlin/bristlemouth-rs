@@ -29,6 +29,7 @@ pub mod addr;
 pub mod bcmp;
 pub mod cbor;
 pub mod checksum;
+pub mod configuration;
 pub mod crc;
 pub mod frame;
 pub mod l2;

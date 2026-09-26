@@ -79,6 +79,12 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 41 | `cbor_value_get_int64` overflows on the one negative integer it cannot hold | c-only | reading, confirmed differentially |
 | 42 | `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read | c-only | reading |
 | 43 | bm_core reads only the 5-byte float encoding, so a preferred-serialization float is unreadable to it | replicated | reading, confirmed differentially |
+| 44 | The saved config partition's layout is the compiler's | replicated | reading, measured |
+| 45 | Storing a config key ignores `key_len`; looking one up stops at a NUL | replicated | reading, confirmed differentially |
+| 46 | A refused config set still writes; the typed setters and `set_config_cbor` disagree about a full partition | replicated | reading, confirmed differentially |
+| 47 | A config partition that fails to load keeps the bytes it failed with | replicated | reading, confirmed differentially |
+| 48 | A config image whose CRC checks may claim up to 255 keys | domain-limited | reading |
+| 49 | `set_config_cbor` checks only the first item's head, and `get_config_cbor` returns the whole slot | replicated | reading, confirmed differentially |
 
 ---
 
@@ -1658,7 +1664,10 @@ calls it.
 
 Reachable from the wire once card C3 lands: a `ConfigSet` (`0xA2`) body is
 stored verbatim by `set_config_cbor`, which accepts it as `INT32`, and
-`get_config_int32` then reads it with this function.
+`get_config_int` then reads it with this function.
+`bm_wire::configuration::ConfigPartition::get_int` wraps, giving `-1` after
+the narrowing to `int32_t`; `bm-wire-diff/src/configuration.rs` does not call
+the C on that one value.
 
 **c-only.** `cbor2` reports a negative integer as `Header::Negative(u64)` —
 the encoded argument, not the represented value — so the narrowing is the
@@ -1708,8 +1717,12 @@ was folded into the condition.
 `get_config_cbor` failing for a key that `get_stored_keys` just listed needs
 the stored `valueBuffer` not to preparse, which `set_config_cbor` and the five
 typed setters all prevent — so no wire-reachable path was established here. A
-partition loaded from NVM is trusted on its CRC32 alone, which is the place to
-look; card C2 owns that.
+partition loaded from NVM is trusted on its CRC32 alone, and that is the one
+path: a CRC-valid image can hold any bytes in a listed key's slot (#48).
+Card C2 found no other — a key `get_stored_keys` lists is always found again
+by `get_config_cbor` with its own `key_buf` and `key_len`, the 31-byte
+truncation of #45 included, since `strncmp` then compares `key_buf` with
+itself.
 
 **A partition holding any `ARRAY` value cannot be published at all**, from the
 same function. The `ARRAY` case writes into the map behind the encoder's back:
@@ -1802,3 +1815,181 @@ already does — bm_core does not compile `cborparser_float.c`, so that would
 have to be added to the build too. Wire-visible and additive: a fixed node
 reads floats a deployed node rejects, and nothing that works today stops
 working.
+
+## 44. The saved config partition's layout is the compiler's
+
+`bcmp/configuration.h`:
+
+```c
+typedef struct {
+  char key_buf[MAX_KEY_LEN_BYTES];
+  size_t key_len;
+  ConfigDataTypes value_type;
+} __attribute__((packed, aligned(1))) ConfigKey;
+```
+
+`save_config` writes the packed `ConfigPartition` — a 9-byte header, 50 of
+these and 50 value slots of 50 bytes — to flash as it is in memory, and
+`config_init` reads it back the same way. `size_t` and the enum's width are
+the ABI's:
+
+| Toolchain | `size_t` | enum | `ConfigKey` | Image |
+|---|---|---|---|---|
+| gcc/clang, x86-64 or AArch64 Linux (`bm_sbc`, this repo's oracle) | 8 | 4 | 44 | 4709 |
+| `arm-none-eabi-gcc` (short enums by default) | 4 | 1 | 37 | 4359 |
+| clang `--target=arm-none-eabi`, or gcc `-fno-short-enums` | 4 | 4 | 40 | 4509 |
+
+The LP64 and clang rows were measured with `_Static_assert`; the gcc row is
+gcc's AAPCS default, which rustc's thumb targets also follow (a `repr(C)` enum
+is one byte there — checked). The CRC covers the bytes, not their meaning, so
+an image carried across toolchains verifies and is then misread.
+
+**replicated.** `bm_wire::configuration::Layout` carries both widths;
+`Layout::LP64` and `Layout::ARM_EABI_GCC` are named, `Layout::new(4, 4)` is
+the third row. A Rust node must use the layout of the firmware whose flash it
+inherits. `the_image_the_oracle_saves` pins the LP64 bytes and CRC.
+
+Fix upstream with fixed-width fields (`uint32_t key_len`, `uint8_t
+value_type`) and a `CONFIG_VERSION` bump so old images are recognised and
+migrated. Changes the flash format, not the wire.
+
+## 45. Storing a config key ignores `key_len`; looking one up stops at a NUL
+
+`bcmp/configuration.c` stores a key with
+
+```c
+snprintf(config_partition->keys[*key_idx].key_buf,
+         sizeof(config_partition->keys[*key_idx].key_buf), "%s", key)
+```
+
+and finds one with `keys[i].key_len == len && strncmp(key, keys[i].key_buf,
+len) == 0`. The first reads `key` to a NUL, whatever `key_len` says; the
+second stops at a NUL in either string. Three consequences:
+
+1. **A 32-byte key can be stored and never found.** `MAX_KEY_LEN_BYTES` is 32,
+   so it passes the length check, but `snprintf` keeps 31 bytes and a NUL
+   while `key_len` records 32. The lookup then compares the key's 32nd byte
+   with that NUL and fails, so every set of the same key appends a new entry
+   until the partition holds 50, and every get fails.
+2. **`bcmp/config.c` passes keys with no NUL.** `set_config_cbor(...,
+   (const char *)msg->keyAndData, msg->key_length, ...)` points at the key
+   with the CBOR value directly after it, so `key_buf` receives the key and
+   then the value's bytes up to the first NUL or 31 bytes. The lookup still
+   works, since it compares only `key_len` bytes; the extra bytes are saved to
+   flash. If the value has no NUL and the message ends first, `snprintf`
+   reads past the message.
+3. **Keys that differ after an embedded NUL are the same key.** `is_key_valid`
+   accepts `\0`, so `"ab\0c"` and `"ab\0d"`, both with `key_len` 4, find
+   each other.
+
+**replicated.** `bm_wire::configuration::Key` carries the bytes at the
+pointer and `key_len` separately, reads past its end as NUL, and stores and
+compares as the C does. `bm-wire-diff/src/configuration.rs` confirms each
+case: `a_32_byte_key_appends_on_every_set`, `a_key_followed_by_its_value`,
+`keys_that_differ_after_a_nul_are_one_key`.
+
+Fix upstream by copying exactly `key_len` bytes with `memcpy` and rejecting
+`key_len >= MAX_KEY_LEN_BYTES` (or dropping the terminator), and by rejecting
+`\0` in `is_key_valid`. Changes which keys a node accepts from the wire.
+
+## 46. A refused config set still writes; the typed setters and `set_config_cbor` disagree about a full partition
+
+Three things `bcmp/configuration.c` does in the order shown:
+
+| Step | Where | Consequence |
+|---|---|---|
+| Write the key into slot `numKeys` before the value is encoded or classified | `prepare_cbor_encoder:90`, `set_config_cbor:603` | A refused set of a new key leaves its name in the unused slot, and the next save writes it to flash |
+| Encode a string's head, then fail on its body | tinycbor `encode_string`, via `set_config_string` and `set_config_buffer` | For an existing key the old value's first bytes become the new head: the set returns false, `needs_commit` stays false, and the stored value is now a string claiming more bytes than its slot has |
+| Check `numKeys >= MAX_NUM_KV` before looking the key up | `prepare_cbor_encoder:80` | At 50 keys the typed setters refuse to overwrite an existing key; `set_config_cbor` looks up first and overwrites it |
+
+The second is data loss behind a false return: after `set_config_string(k,
+"hello")` then a 60-byte `set_config_string(k, ...)`, `get_config_string(k)`
+fails and `get_value_size(k)` reports 60. Only `set_config_string` and
+`set_config_buffer` reach it; `ConfigSet` goes through `set_config_cbor`,
+which refuses an oversized value before writing.
+
+**replicated.** `ConfigPartition::set_typed` and `set_cbor` keep the C's order;
+`push_string` writes the head before testing the body.
+`an_oversized_string_overwrites_the_head_of_the_old_value` and
+`a_full_partition` confirm it differentially.
+
+Fix upstream by encoding into a scratch buffer and committing key and value
+only on success, and by moving the full-partition test after the lookup in
+`prepare_cbor_encoder`. Not wire-visible, except that a full partition's keys
+become settable by `set_config_uint` and friends.
+
+## 47. A config partition that fails to load keeps the bytes it failed with
+
+`config_init` reads the whole image into RAM, then checks its CRC. On a
+mismatch it sets `numKeys = 0` and `version = CONFIG_VERSION` and leaves
+everything else — the stale CRC, every key and every value of the image it
+just rejected. The partition behaves as empty, and the next `save_config`
+writes the rejected keys and values back out under a fresh CRC, where they sit
+in slots past `numKeys`. `bm_config_read` failing is the same, with whatever
+the integrator's read left in the buffer.
+
+Two neighbours: `config_init` does not touch `needs_commit`, so a partition
+changed before a reload still reports it; and `save_config` writes the new CRC
+into the RAM header before `bm_config_write` runs, so a failed write leaves it
+there.
+
+**replicated.** `ConfigPartition::load_with` reads in place and resets only
+those two header fields. `a_corrupt_image_survives_in_ram` confirms it, and
+the fuzzer's `Corrupt` and `Reload` steps compare the RAM images byte for
+byte after every load.
+
+Fix upstream by zeroing the partition (as `clear_partition` does) when the
+load fails. Not wire-visible.
+
+## 48. A config image whose CRC checks may claim up to 255 keys
+
+`load_and_verify_nvm_config` checks the CRC and nothing else, so `numKeys` can
+be anything up to 255. `find_key_idx` then walks `keys[0..numKeys]`: slots
+from 50 on overlay the value array and, from about 232 on (LP64), run past the
+10 KiB `ram_buffer` into the next partition's — or, for the hardware
+partition, past `CONFIGS`. A key found at such an index is written by
+`set_config_cbor` at `values[idx]`, further out still. The typed setters are
+safe only because they refuse at `numKeys >= MAX_NUM_KV`.
+
+A CRC-valid image needs someone to write it: flash corruption that happens to
+match, or firmware with a different `MAX_NUM_KV`.
+
+**domain-limited.** `ConfigPartition::load_with` refuses such an image and
+takes the failed-load path of #47. The comparator never presents one:
+`Op::FixCrc` clamps `numKeys` to 50 before computing the CRC.
+`an_image_claiming_more_than_50_keys_is_refused` pins the port's side.
+
+Fix upstream by rejecting `numKeys > MAX_NUM_KV` in
+`load_and_verify_nvm_config`. Not wire-visible.
+
+## 49. `set_config_cbor` checks only the first item's head, and `get_config_cbor` returns the whole slot
+
+`set_config_cbor` accepts a value if `cbor_parser_init` accepts it and
+`cbor_type_to_config` classifies it. `cbor_parser_init` reads one head, so:
+
+- a string whose head claims more bytes than the value holds (`78 40 61`) is
+  stored as `STR`; `get_config_string` then fails and `get_value_size`
+  reports 64;
+- bytes after the first item are stored with it;
+- the `memcpy` copies `value_len` bytes and leaves the rest of the 50-byte
+  slot as the previous value had it.
+
+`get_config_cbor` then hands back all 50 bytes regardless, and fails unless
+the caller's buffer holds 50 — `bcmp/config.c` sends that whole slot in a
+`ConfigValue` (`0xA1`). It also tests `value_len == 0`, the pointer, after
+dereferencing it (noted under #42).
+
+Chunked strings are copied chunk by chunk as tinycbor's
+`iterate_string_chunks` reads them, so a `get_config_string` that fails on a
+malformed later chunk has already written the earlier ones to the caller's
+buffer, and one that runs out of room sets `*value_len` to the full length.
+
+**replicated.** `bm_wire::configuration::Head::parse` is `preparse_value` and
+`copy_string` is `iterate_string_chunks`, partial copies included; the
+comparator compares the caller's buffer and `*value_len` on failure as well as
+success. `chunked_strings` and `cbor_get_set` pin the cases above.
+
+Fix upstream with `cbor_value_validate` (or a full `cbor_value_advance`
+checking the item ends at `value_len`) in `set_config_cbor`, and by storing
+the value's length so `get_config_cbor` can return only that. The second is
+wire-visible: `ConfigValue` bodies would shrink to the value.

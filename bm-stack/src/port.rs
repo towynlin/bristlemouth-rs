@@ -6,10 +6,11 @@
 //! traits, so a node is generic over them and a mock is another
 //! implementation.
 //!
-//! Only the seams the ported exchanges need are here. Configuration storage
-//! and the DFU flash slot arrive with the code that uses them.
+//! Only the seams the ported exchanges need are here. The DFU flash slot
+//! arrives with the code that uses it.
 
 use bm_wire::bcmp::DeviceInfo;
+use bm_wire::configuration::{MAX_IMAGE_LEN, Partition};
 use bm_wire::util::{date_time_from_utc, utc_from_date_time};
 
 /// Where a frame should go.
@@ -260,6 +261,105 @@ impl Rtc for SoftRtc {
         self.reading = Some(*time_and_date);
         true
     }
+}
+
+/// Non-volatile storage for the config partitions, `bcmp/bm_configs_generic.h`.
+///
+/// bm_core declares `bm_config_read`, `bm_config_write` and `bm_config_reset`
+/// and defines none of them, so there is no oracle for this seam: the
+/// harness gives the Rust store and the C the same bytes and compares what
+/// each does with them. `configuration.c` always reads and writes one whole
+/// image at offset 0, with a timeout of
+/// [`bm_wire::configuration::CONFIG_LOAD_TIMEOUT_MS`].
+pub trait ConfigStorage {
+    /// `bm_config_read`: fill `buf` from `offset` in `partition`. Whatever is
+    /// written to `buf` stays there even if this returns `false`, and the
+    /// store then treats the partition as unloadable.
+    fn read(&mut self, partition: Partition, offset: u32, buf: &mut [u8], timeout_ms: u32) -> bool;
+
+    /// `bm_config_write`: store `buf` at `offset` in `partition`.
+    fn write(&mut self, partition: Partition, offset: u32, buf: &[u8], timeout_ms: u32) -> bool;
+
+    /// `bm_config_reset`, which bm_core documents as "reset the processor"
+    /// and calls after a save that asked for a restart, so the saved
+    /// configuration takes effect. On hardware it does not return.
+    fn reset(&mut self);
+}
+
+/// Config partitions kept in RAM.
+///
+/// What bm-wire-sys's shim does, minus its `bm_config_reset`, which clears
+/// every partition; here [`ConfigStorage::reset`] does nothing, since there is
+/// no processor to reset. Contents are zero until written, and are lost with
+/// the value.
+#[derive(Clone)]
+pub struct RamConfigStorage {
+    partitions: [[u8; MAX_IMAGE_LEN]; 3],
+}
+
+impl core::fmt::Debug for RamConfigStorage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RamConfigStorage").finish_non_exhaustive()
+    }
+}
+
+impl Default for RamConfigStorage {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RamConfigStorage {
+    /// Three zeroed partitions.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            partitions: [[0; MAX_IMAGE_LEN]; 3],
+        }
+    }
+
+    /// One partition's bytes.
+    #[must_use]
+    pub fn bytes(&self, partition: Partition) -> &[u8] {
+        &self.partitions[partition as usize]
+    }
+
+    /// One partition's bytes, mutably — for corrupting an image in a test.
+    pub fn bytes_mut(&mut self, partition: Partition) -> &mut [u8] {
+        &mut self.partitions[partition as usize]
+    }
+
+    fn range(offset: u32, len: usize) -> Option<core::ops::Range<usize>> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len)?;
+        (end <= MAX_IMAGE_LEN).then_some(start..end)
+    }
+}
+
+impl ConfigStorage for RamConfigStorage {
+    fn read(
+        &mut self,
+        partition: Partition,
+        offset: u32,
+        buf: &mut [u8],
+        _timeout_ms: u32,
+    ) -> bool {
+        let Some(range) = Self::range(offset, buf.len()) else {
+            return false;
+        };
+        buf.copy_from_slice(&self.partitions[partition as usize][range]);
+        true
+    }
+
+    fn write(&mut self, partition: Partition, offset: u32, buf: &[u8], _timeout_ms: u32) -> bool {
+        let Some(range) = Self::range(offset, buf.len()) else {
+            return false;
+        };
+        self.partitions[partition as usize][range].copy_from_slice(buf);
+        true
+    }
+
+    fn reset(&mut self) {}
 }
 
 #[cfg(test)]

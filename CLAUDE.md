@@ -51,8 +51,10 @@ A cargo workspace.
 - `bm-stack/` — the node. `no_std`, no `alloc` (except behind the test-only
   `mock` feature), and the only crate that knows about time or I/O.
   - `src/port.rs` — the seams bm_core leaves to the integrator, as traits
-    rather than link-time symbols. Config storage and the DFU flash slot are
-    still to come.
+    rather than link-time symbols. The DFU flash slot is still to come.
+  - `src/config.rs` — `config_init` and `save_config`, the two functions of
+    `bcmp/configuration.c` that touch storage; the store itself is
+    `bm_wire::configuration`.
   - `src/node.rs` — `Node::on_frame`, `on_tick` and `on_expiry` are
     synchronous and take the current time; `Node::run` is the only async code.
     Each has a `_with` twin that reports `Event`s. The two timers are
