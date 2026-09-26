@@ -97,6 +97,12 @@
 //! node.
 
 use bm_wire::addr;
+use bm_wire::bcmp::config::{
+    ConfigClearRequest, ConfigClearResponse, ConfigCommit, ConfigDeleteRequest,
+    ConfigDeleteResponse, ConfigGet, ConfigHeader, ConfigPartitionRequest, ConfigSet,
+    ConfigStatusRequest, ConfigValue, MAX_KEY_LEN, MAX_VALUE_LEN, encode_status_response,
+    status_response_len,
+};
 use bm_wire::bcmp::info::{
     CACHED_STRING_BYTES, CachedInfo, DeviceInfoReply, DeviceInfoRequest, InfoCache,
     InfoRequestKind, InfoRequests,
@@ -116,6 +122,7 @@ use bm_wire::bcmp::resource::{
 };
 use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, Heartbeat, MessageType, forward, rx, tx};
+use bm_wire::configuration::{Key, Partition};
 use bm_wire::frame::{
     ETHERNET_DESTINATION_OFFSET, ETHERNET_SRC_OFFSET, ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET,
     IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET, IPV6_HOP_LIMIT_OFFSET,
@@ -129,6 +136,7 @@ use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::util::BmIpAddr;
 use bm_wire::{BmWireError, addr::MAC_LEN};
 
+use crate::config::{Configuration, NoConfig};
 use crate::port::{Egress, Identity, NoRtc, Phy, Rtc, RtcTimeAndDate};
 
 /// Largest frame the node will build or accept.
@@ -714,6 +722,7 @@ pub struct Node<
     const RESOURCES: usize = RESOURCES_DEFAULT,
     const RESOURCE_NAME: usize = RESOURCE_NAME_BYTES,
     const RESOURCE_REQUESTS: usize = RESOURCE_REQUESTS_DEFAULT,
+    C = NoConfig,
 > {
     identity: I,
     rtc: R,
@@ -735,6 +744,8 @@ pub struct Node<
     /// `RESOURCE_REQUEST_LIST`, which correlates the `0x0B`s that come back.
     resources: ResourceTable<RESOURCES, RESOURCE_NAME>,
     resource_requests: ResourceRequests<RESOURCE_REQUESTS>,
+    /// `CONFIGS` and its flash, which `0xA0`–`0xA9` read and write.
+    config: C,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -767,37 +778,84 @@ impl<
         RESOURCES,
         RESOURCE_NAME,
         RESOURCE_REQUESTS,
+        NoConfig,
     >
 {
-    /// A node with an empty neighbour table, at time zero.
+    /// A node with no config store, an empty neighbour table, at time zero.
+    ///
+    /// [`Node::with_config`] with [`NoConfig`]: config messages for other
+    /// nodes are still forwarded, and none addressed to this one is answered.
+    pub fn new(identity: I, rtc: R, port_count: u8) -> Self {
+        Self::with_config(identity, rtc, NoConfig, port_count)
+    }
+}
+
+impl<
+    I: Identity,
+    R: Rtc,
+    const NEIGHBORS: usize,
+    const PENDING: usize,
+    const PING_PAYLOAD: usize,
+    const INFO_REQUESTS: usize,
+    const INFO_STRINGS: usize,
+    const RESOURCES: usize,
+    const RESOURCE_NAME: usize,
+    const RESOURCE_REQUESTS: usize,
+    C: Configuration,
+>
+    Node<
+        I,
+        R,
+        NEIGHBORS,
+        PENDING,
+        PING_PAYLOAD,
+        INFO_REQUESTS,
+        INFO_STRINGS,
+        RESOURCES,
+        RESOURCE_NAME,
+        RESOURCE_REQUESTS,
+        C,
+    >
+{
+    /// A node answering config messages from `config`, with an empty
+    /// neighbour table, at time zero.
     ///
     /// The registry comes up holding what `bcmp_init` registers for the ported
     /// modules, with the expiry sweep phased from zero — where
     /// [`Node::on_tick`]'s uptime clock starts.
-    pub fn new(identity: I, rtc: R, port_count: u8) -> Self {
+    pub fn with_config(identity: I, rtc: R, config: C, port_count: u8) -> Self {
         let mut registry = Registry::new();
-        // heartbeat.c, ping.c, time.c, neighbors.c, info.c and
+        // heartbeat.c, ping.c, time.c, config.c, neighbors.c, info.c and
         // resource_discovery.c, in the order `bcmp_init` calls their inits --
-        // minus dfu_core.c and config.c, which are unported. Every one of them
-        // is `{false, false}`: outside `bcmp/config.c`, nothing in bm_core is
-        // sequenced at all, so all of this rides on the wire with a sequence
-        // number of zero.
-        for message_type in [
-            MessageType::HEARTBEAT,
-            MessageType::ECHO_REQUEST,
-            MessageType::ECHO_REPLY,
-            MessageType::SYSTEM_TIME_REQUEST,
-            MessageType::SYSTEM_TIME_RESPONSE,
-            MessageType::SYSTEM_TIME_SET,
-            MessageType::NEIGHBOR_TABLE_REQUEST,
-            MessageType::NEIGHBOR_TABLE_REPLY,
-            MessageType::DEVICE_INFO_REQUEST,
-            MessageType::DEVICE_INFO_REPLY,
-            MessageType::RESOURCE_TABLE_REQUEST,
-            MessageType::RESOURCE_TABLE_REPLY,
+        // minus dfu_core.c, which is unported. Only config.c's are sequenced:
+        // everything else rides on the wire with a sequence number of zero.
+        for (message_type, cfg) in [
+            (MessageType::HEARTBEAT, PacketCfg::UNSEQUENCED),
+            (MessageType::ECHO_REQUEST, PacketCfg::UNSEQUENCED),
+            (MessageType::ECHO_REPLY, PacketCfg::UNSEQUENCED),
+            (MessageType::SYSTEM_TIME_REQUEST, PacketCfg::UNSEQUENCED),
+            (MessageType::SYSTEM_TIME_RESPONSE, PacketCfg::UNSEQUENCED),
+            (MessageType::SYSTEM_TIME_SET, PacketCfg::UNSEQUENCED),
+            // `bcmp_config_init`, in its `packet_add` order.
+            (MessageType::CONFIG_GET, PacketCfg::REQUEST),
+            (MessageType::CONFIG_SET, PacketCfg::REQUEST),
+            (MessageType::CONFIG_COMMIT, PacketCfg::UNSEQUENCED),
+            (MessageType::CONFIG_STATUS_REQUEST, PacketCfg::REQUEST),
+            (MessageType::CONFIG_STATUS_RESPONSE, PacketCfg::REPLY),
+            (MessageType::CONFIG_DELETE_REQUEST, PacketCfg::REQUEST),
+            (MessageType::CONFIG_DELETE_RESPONSE, PacketCfg::REPLY),
+            (MessageType::CONFIG_CLEAR_REQUEST, PacketCfg::REQUEST),
+            (MessageType::CONFIG_CLEAR_RESPONSE, PacketCfg::REPLY),
+            (MessageType::CONFIG_VALUE, PacketCfg::REPLY),
+            (MessageType::NEIGHBOR_TABLE_REQUEST, PacketCfg::UNSEQUENCED),
+            (MessageType::NEIGHBOR_TABLE_REPLY, PacketCfg::UNSEQUENCED),
+            (MessageType::DEVICE_INFO_REQUEST, PacketCfg::UNSEQUENCED),
+            (MessageType::DEVICE_INFO_REPLY, PacketCfg::UNSEQUENCED),
+            (MessageType::RESOURCE_TABLE_REQUEST, PacketCfg::UNSEQUENCED),
+            (MessageType::RESOURCE_TABLE_REPLY, PacketCfg::UNSEQUENCED),
         ] {
-            // Cannot fail: MESSAGE_TYPES is far larger than this list.
-            let _ = registry.add(message_type, PacketCfg::UNSEQUENCED);
+            // Cannot fail: MESSAGE_TYPES is larger than this list.
+            let _ = registry.add(message_type, cfg);
         }
         Self {
             identity,
@@ -811,6 +869,7 @@ impl<
             table_requests: TableRequests::new(),
             resources: ResourceTable::new(),
             resource_requests: ResourceRequests::new(),
+            config,
             port_count,
             link_mask: 0,
             tx: [0u8; MTU],
@@ -1242,9 +1301,212 @@ impl<
                 let time_reply = self.process_system_time(now_ms, message_type, received.payload);
                 return (time_reply, None);
             }
+            MessageType::CONFIG_GET
+            | MessageType::CONFIG_VALUE
+            | MessageType::CONFIG_SET
+            | MessageType::CONFIG_COMMIT
+            | MessageType::CONFIG_STATUS_REQUEST
+            | MessageType::CONFIG_STATUS_RESPONSE
+            | MessageType::CONFIG_DELETE_REQUEST
+            | MessageType::CONFIG_DELETE_RESPONSE
+            | MessageType::CONFIG_CLEAR_REQUEST
+            | MessageType::CONFIG_CLEAR_RESPONSE => {
+                // `bcmp_process_config_message` reads the 16-byte header
+                // without consulting `data.size` (divergence #51).
+                let Ok(header) = ConfigHeader::decode(received.payload) else {
+                    return (None, None);
+                };
+                if !header.is_for(self.identity.node_id()) {
+                    // `should_forward`. Zero is not a broadcast here: it is
+                    // forwarded like any other node's id.
+                    return (
+                        None,
+                        Some(Reflood {
+                            start: BCMP_HEADER_OFFSET,
+                            end: BCMP_HEADER_OFFSET + BCMP_HEADER_LEN + received.payload.len(),
+                            ingress_port: received.ingress_port,
+                        }),
+                    );
+                }
+                let config_reply = self.process_config(
+                    now_ms,
+                    message_type,
+                    header.source_node_id,
+                    seq_num,
+                    received.payload,
+                );
+                return (config_reply, None);
+            }
             _ => None,
         };
         (reply, None)
+    }
+
+    /// The `switch` in `bcmp_process_config_message`, for a message addressed
+    /// to this node.
+    ///
+    /// Every answer goes to `FF02::1`, names `source_node_id` as its target
+    /// and echoes the request's `seq_num`, which `serialize` keeps because the
+    /// four answer types are registered `sequenced_reply`.
+    ///
+    /// The echoed number is truncated to sixteen bits: every handler in
+    /// `bcmp/config.c` takes the `seq_num` as a `uint16_t`, so a request whose
+    /// number exceeds `0xFFFF` is answered with only its low half
+    /// (divergence #53).
+    ///
+    /// A partition byte of 3 or more indexes `CONFIGS` out of bounds in every
+    /// arm but the clear request's (divergence #50). Here such a message is
+    /// answered only where the C checks: a clear request, with `success`
+    /// false. The four answer types, when they match no outstanding request,
+    /// are only logged by the C, and here produce nothing beyond the
+    /// [`Event::Message`] already reported.
+    fn process_config<'s>(
+        &'s mut self,
+        now_ms: u32,
+        message_type: MessageType,
+        source_node_id: u64,
+        seq_num: u32,
+        payload: &[u8],
+    ) -> Option<Outbound<'s>> {
+        // `config.c`'s handlers and response builders take a `uint16_t`
+        // seq_num, so the echoed number is the request's low sixteen bits.
+        let seq_num = u32::from(seq_num as u16);
+        let header = ConfigHeader {
+            target_node_id: source_node_id,
+            source_node_id: self.identity.node_id(),
+        };
+        match message_type {
+            MessageType::CONFIG_GET => {
+                let get = ConfigGet::decode(payload).ok()?;
+                let partition = Partition::from_u8(get.partition)?;
+                let mut slot = [0u8; MAX_VALUE_LEN];
+                let len = self
+                    .config
+                    .store()?
+                    .partition(partition)
+                    .get_cbor(Key::new(get.key), &mut slot)?;
+                let value = ConfigValue {
+                    header,
+                    partition: get.partition,
+                    data: &slot[..len],
+                };
+                self.send_multicast(
+                    now_ms,
+                    MessageType::CONFIG_VALUE,
+                    seq_num,
+                    value.len(),
+                    |_, buf| value.encode(buf),
+                )
+            }
+            MessageType::CONFIG_SET => {
+                let set = ConfigSet::decode(payload).ok()?;
+                if set.data.len() > MAX_VALUE_LEN || set.data.is_empty() {
+                    return None;
+                }
+                let partition = Partition::from_u8(set.partition)?;
+                // `set_config_cbor` is handed `keyAndData`, and stores the key
+                // with `snprintf("%s")`: it reads on through the value and
+                // whatever follows it to the first NUL (divergence #45).
+                let key_text = &payload[ConfigSet::HEAD_LEN..];
+                let stored = self
+                    .config
+                    .store_mut()?
+                    .partition_mut(partition)
+                    .set_cbor(Key::with_len(key_text, set.key.len()), set.data);
+                if !stored {
+                    return None;
+                }
+                // The answer carries the value that was sent, not the slot.
+                let value = ConfigValue {
+                    header,
+                    partition: set.partition,
+                    data: set.data,
+                };
+                self.send_multicast(
+                    now_ms,
+                    MessageType::CONFIG_VALUE,
+                    seq_num,
+                    value.len(),
+                    |_, buf| value.encode(buf),
+                )
+            }
+            MessageType::CONFIG_COMMIT => {
+                let commit = ConfigCommit::decode(payload).ok()?;
+                let partition = Partition::from_u8(commit.partition)?;
+                // `save_config(partition, true)`. Nothing is sent either way.
+                self.config.commit(partition);
+                None
+            }
+            MessageType::CONFIG_STATUS_REQUEST => {
+                let request = ConfigStatusRequest::decode(payload).ok()?;
+                let partition = Partition::from_u8(request.partition)?;
+                // Over `bcmp_max_payload_size_bytes` the C sends nothing.
+                let len = status_response_len(self.config.store()?.partition(partition))?;
+                self.send_multicast(
+                    now_ms,
+                    MessageType::CONFIG_STATUS_RESPONSE,
+                    seq_num,
+                    len,
+                    |config, buf| {
+                        let store = config.store().ok_or(BmWireError::Invalid)?;
+                        encode_status_response(
+                            buf,
+                            header,
+                            request.partition,
+                            store.partition(partition),
+                        )
+                    },
+                )
+            }
+            MessageType::CONFIG_DELETE_REQUEST => {
+                let request = ConfigDeleteRequest::decode(payload).ok()?;
+                let partition = Partition::from_u8(request.partition)?;
+                let success = self
+                    .config
+                    .store_mut()?
+                    .partition_mut(partition)
+                    .remove_key(Key::new(request.key));
+                let response = ConfigDeleteResponse {
+                    header,
+                    success,
+                    partition: request.partition,
+                    key: request.key,
+                };
+                self.send_multicast(
+                    now_ms,
+                    MessageType::CONFIG_DELETE_RESPONSE,
+                    seq_num,
+                    response.len(),
+                    |_, buf| response.encode(buf),
+                )
+            }
+            MessageType::CONFIG_CLEAR_REQUEST => {
+                let request = ConfigClearRequest::decode(payload).ok()?;
+                let store = self.config.store_mut()?;
+                // `clear_partition` is the one place `config.c`'s partition
+                // byte is range-checked, and the answer reports the check.
+                let success = match Partition::from_u8(request.partition) {
+                    Some(partition) => {
+                        store.partition_mut(partition).clear();
+                        true
+                    }
+                    None => false,
+                };
+                let response = ConfigClearResponse {
+                    header,
+                    success,
+                    partition: request.partition,
+                };
+                self.send_multicast(
+                    now_ms,
+                    MessageType::CONFIG_CLEAR_RESPONSE,
+                    seq_num,
+                    ConfigClearResponse::LEN,
+                    |_, buf| response.encode(buf),
+                )
+            }
+            _ => None,
+        }
     }
 
     /// The `switch` in `bcmp_time_process_time_message`, for a message this
@@ -1450,15 +1712,46 @@ impl<
         body: &[u8],
         reply_seq_num: u32,
     ) -> Option<Outbound<'_>> {
+        self.send_with(
+            now_ms,
+            dst,
+            message_type,
+            reply_seq_num,
+            body.len(),
+            |_, buf| {
+                buf.get_mut(..body.len())
+                    .ok_or(BmWireError::Truncated)?
+                    .copy_from_slice(body);
+                Ok(body.len())
+            },
+        )
+    }
+
+    /// [`Node::send`] for a body of `body_len` bytes that `encode` writes
+    /// straight into the transmit buffer, with the node's [`Configuration`]
+    /// to read from.
+    fn send_with(
+        &mut self,
+        now_ms: u32,
+        dst: &BmIpAddr,
+        message_type: MessageType,
+        reply_seq_num: u32,
+        body_len: usize,
+        encode: impl FnOnce(&C, &mut [u8]) -> Result<usize, BmWireError>,
+    ) -> Option<Outbound<'_>> {
         let end = MIN_FRAME_WITH_ADDRESSES
             .checked_add(BCMP_HEADER_LEN)?
-            .checked_add(body.len())?;
+            .checked_add(body_len)?;
         if end > MTU {
             return None;
         }
         let stamp = self.outgoing(now_ms, message_type, reply_seq_num)?;
         let Self {
-            identity, tx, held, ..
+            identity,
+            tx,
+            held,
+            config,
+            ..
         } = self;
         build_outbound(
             tx,
@@ -1467,12 +1760,27 @@ impl<
             dst,
             message_type,
             stamp,
-            |buf| {
-                buf.get_mut(..body.len())
-                    .ok_or(BmWireError::Truncated)?
-                    .copy_from_slice(body);
-                Ok(body.len())
-            },
+            |buf| encode(config, buf),
+        )
+    }
+
+    /// [`Node::send_with`] to `FF02::1`, which is where every `bcmp_tx` in
+    /// `bcmp/config.c` sends.
+    fn send_multicast(
+        &mut self,
+        now_ms: u32,
+        message_type: MessageType,
+        reply_seq_num: u32,
+        body_len: usize,
+        encode: impl FnOnce(&C, &mut [u8]) -> Result<usize, BmWireError>,
+    ) -> Option<Outbound<'_>> {
+        self.send_with(
+            now_ms,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            message_type,
+            reply_seq_num,
+            body_len,
+            encode,
         )
     }
 
@@ -1833,6 +2141,189 @@ impl<
             &BmIpAddr::LINK_LOCAL_MULTICAST,
             MessageType::RESOURCE_TABLE_REQUEST,
             &body,
+        )
+    }
+
+    /// The config store this node answers from, and its storage.
+    pub fn config(&self) -> &C {
+        &self.config
+    }
+
+    /// The same, mutably, for an application that edits its own
+    /// configuration.
+    pub fn config_mut(&mut self) -> &mut C {
+        &mut self.config
+    }
+
+    /// Ask `target_node_id` for the value stored under `key` —
+    /// `bcmp_config_get`.
+    ///
+    /// Sequenced: the answer, a [`MessageType::CONFIG_VALUE`] carrying the
+    /// whole 50-byte slot, arrives as [`Event::Reply`], and silence as
+    /// [`Event::Timeout`]. That is the C with a `reply_cb`; see
+    /// [`Node::config_set`] for what differs without one.
+    ///
+    /// `None` without sending for a key over [`MAX_KEY_LEN`] bytes, as in the
+    /// C.
+    pub fn config_get(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        partition: Partition,
+        key: &[u8],
+    ) -> Option<Outbound<'_>> {
+        if key.len() > MAX_KEY_LEN {
+            return None;
+        }
+        let get = ConfigGet {
+            header: self.config_header(target_node_id),
+            partition: partition as u8,
+            key,
+        };
+        self.send_multicast(now_ms, MessageType::CONFIG_GET, 0, get.len(), |_, buf| {
+            get.encode(buf)
+        })
+    }
+
+    /// Store `value`, which should be one CBOR item, under `key` on
+    /// `target_node_id` — `bcmp_config_set`.
+    ///
+    /// Answered with a [`MessageType::CONFIG_VALUE`] echoing `value`, as
+    /// [`Event::Reply`]. The target refuses silently a value over
+    /// [`MAX_VALUE_LEN`] bytes or one `set_config_cbor` will not classify;
+    /// the request then times out.
+    ///
+    /// Every config request here is the C called **with** a `reply_cb`. A C
+    /// caller passing `NULL` instead gets `cfg->process` as its callback
+    /// (`serialize` substitutes it), so a matched reply addressed to another
+    /// node is re-flooded rather than reported. There is no counterpart here.
+    ///
+    /// `None` without sending for a key over [`MAX_KEY_LEN`] bytes.
+    pub fn config_set(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        partition: Partition,
+        key: &[u8],
+        value: &[u8],
+    ) -> Option<Outbound<'_>> {
+        if key.len() > MAX_KEY_LEN {
+            return None;
+        }
+        let set = ConfigSet {
+            header: self.config_header(target_node_id),
+            partition: partition as u8,
+            key,
+            data: value,
+        };
+        self.send_multicast(now_ms, MessageType::CONFIG_SET, 0, set.len(), |_, buf| {
+            set.encode(buf)
+        })
+    }
+
+    /// Ask `target_node_id` to save `partition` and restart —
+    /// `bcmp_config_commit`. Unsequenced and unanswered.
+    pub fn config_commit(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        partition: Partition,
+    ) -> Option<Outbound<'_>> {
+        self.config_partition_request(
+            now_ms,
+            MessageType::CONFIG_COMMIT,
+            target_node_id,
+            partition,
+        )
+    }
+
+    /// Ask `target_node_id` which keys `partition` holds —
+    /// `bcmp_config_status_request`. The answer is a
+    /// [`MessageType::CONFIG_STATUS_RESPONSE`], as [`Event::Reply`];
+    /// [`bm_wire::bcmp::config::ConfigStatusResponse::keys`] reads it.
+    pub fn config_status_request(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        partition: Partition,
+    ) -> Option<Outbound<'_>> {
+        self.config_partition_request(
+            now_ms,
+            MessageType::CONFIG_STATUS_REQUEST,
+            target_node_id,
+            partition,
+        )
+    }
+
+    /// Ask `target_node_id` to delete `key` from `partition` —
+    /// `bcmp_config_del_key`. Answered with a
+    /// [`MessageType::CONFIG_DELETE_RESPONSE`], as [`Event::Reply`].
+    ///
+    /// The C does not bound the key, and writes its length into a byte: a
+    /// 300-byte key goes out with a `key_length` of 44 and all 300 bytes
+    /// after it (divergence #51). Here a key over 255 bytes is not sent.
+    pub fn config_delete_key(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        partition: Partition,
+        key: &[u8],
+    ) -> Option<Outbound<'_>> {
+        let request = ConfigDeleteRequest {
+            header: self.config_header(target_node_id),
+            partition: partition as u8,
+            key,
+        };
+        self.send_multicast(
+            now_ms,
+            MessageType::CONFIG_DELETE_REQUEST,
+            0,
+            request.len(),
+            |_, buf| request.encode(buf),
+        )
+    }
+
+    /// Ask `target_node_id` to clear `partition` —
+    /// `bcmp_config_clear_partition`. Answered with a
+    /// [`MessageType::CONFIG_CLEAR_RESPONSE`], as [`Event::Reply`].
+    pub fn config_clear_partition(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        partition: Partition,
+    ) -> Option<Outbound<'_>> {
+        self.config_partition_request(
+            now_ms,
+            MessageType::CONFIG_CLEAR_REQUEST,
+            target_node_id,
+            partition,
+        )
+    }
+
+    fn config_header(&self, target_node_id: u64) -> ConfigHeader {
+        ConfigHeader {
+            target_node_id,
+            source_node_id: self.identity.node_id(),
+        }
+    }
+
+    fn config_partition_request(
+        &mut self,
+        now_ms: u32,
+        message_type: MessageType,
+        target_node_id: u64,
+        partition: Partition,
+    ) -> Option<Outbound<'_>> {
+        let request = ConfigPartitionRequest {
+            header: self.config_header(target_node_id),
+            partition: partition as u8,
+        };
+        self.send_multicast(
+            now_ms,
+            message_type,
+            0,
+            ConfigPartitionRequest::LEN,
+            |_, buf| request.encode(buf),
         )
     }
 
@@ -2293,6 +2784,7 @@ impl<
     const RESOURCES: usize,
     const RESOURCE_NAME: usize,
     const RESOURCE_REQUESTS: usize,
+    C: Configuration,
 >
     Node<
         I,
@@ -2305,6 +2797,7 @@ impl<
         RESOURCES,
         RESOURCE_NAME,
         RESOURCE_REQUESTS,
+        C,
     >
 {
     /// Run the node until the PHY fails, discarding every [`Event`].

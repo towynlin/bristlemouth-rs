@@ -3,8 +3,12 @@
 //!
 //! Everything else in that file is [`bm_wire::configuration`], which holds the
 //! partitions and knows nothing of flash.
+//!
+//! [`Configuration`] is how a [`crate::Node`] reaches a store to answer the
+//! config messages `0xA0`–`0xA9`: [`Config`] is a store with its storage,
+//! [`NoConfig`] is none.
 
-use bm_wire::configuration::{CONFIG_LOAD_TIMEOUT_MS, ConfigStore, Partition};
+use bm_wire::configuration::{CONFIG_LOAD_TIMEOUT_MS, ConfigStore, Layout, Partition};
 
 use crate::port::ConfigStorage;
 
@@ -41,6 +45,86 @@ pub fn save_config<S: ConfigStorage>(
     }
     part.mark_saved();
     true
+}
+
+/// The store a node answers config messages from, and the save a
+/// `ConfigCommit` asks for.
+pub trait Configuration {
+    /// `CONFIGS`, or `None` for a node that keeps no configuration.
+    fn store(&self) -> Option<&ConfigStore>;
+
+    /// The same, mutably.
+    fn store_mut(&mut self) -> Option<&mut ConfigStore>;
+
+    /// `save_config(partition, true)`, which is what `bcmp/config.c` calls for
+    /// a `ConfigCommit`: seal, write, then [`ConfigStorage::reset`]. Returns
+    /// whether the write succeeded.
+    fn commit(&mut self, partition: Partition) -> bool;
+}
+
+/// No configuration. A node built with this forwards config messages for
+/// other nodes and answers none addressed to it; a C node always has a store.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoConfig;
+
+impl Configuration for NoConfig {
+    fn store(&self) -> Option<&ConfigStore> {
+        None
+    }
+
+    fn store_mut(&mut self) -> Option<&mut ConfigStore> {
+        None
+    }
+
+    fn commit(&mut self, _partition: Partition) -> bool {
+        false
+    }
+}
+
+/// A config store and the storage it loads from and saves to.
+#[derive(Debug, Clone)]
+pub struct Config<S> {
+    /// `CONFIGS`.
+    pub store: ConfigStore,
+    /// `bm_config_*`.
+    pub storage: S,
+}
+
+impl<S: ConfigStorage> Config<S> {
+    /// [`config_init`] from `storage` into a store of `layout`.
+    pub fn load(layout: Layout, mut storage: S) -> Self {
+        let mut store = ConfigStore::new(layout);
+        config_init(&mut store, &mut storage);
+        Self { store, storage }
+    }
+}
+
+impl<S: ConfigStorage> Configuration for Config<S> {
+    fn store(&self) -> Option<&ConfigStore> {
+        Some(&self.store)
+    }
+
+    fn store_mut(&mut self) -> Option<&mut ConfigStore> {
+        Some(&mut self.store)
+    }
+
+    fn commit(&mut self, partition: Partition) -> bool {
+        save_config(&mut self.store, partition, &mut self.storage, true)
+    }
+}
+
+impl<T: Configuration + ?Sized> Configuration for &mut T {
+    fn store(&self) -> Option<&ConfigStore> {
+        (**self).store()
+    }
+
+    fn store_mut(&mut self) -> Option<&mut ConfigStore> {
+        (**self).store_mut()
+    }
+
+    fn commit(&mut self, partition: Partition) -> bool {
+        (**self).commit(partition)
+    }
 }
 
 #[cfg(test)]

@@ -110,6 +110,9 @@ pub fn replay_target(target: &str) -> usize {
             "time" => replay_one::<crate::time::TimeInput, _>(&bytes, |i| {
                 crate::time::check(i);
             }),
+            "config" => replay_one::<crate::config::ConfigInput, _>(&bytes, |i| {
+                crate::config::check(i);
+            }),
             "checksum" => replay_one::<crate::checksum::ChecksumInput, _>(&bytes, |i| {
                 crate::checksum::check(i);
             }),
@@ -161,6 +164,7 @@ pub const TARGETS: &[&str] = &[
 /// binary, not from the library test binary that walks [`TARGETS`].
 pub const STACK_TARGETS: &[&str] = &[
     "bcmp_messages",
+    "config",
     "forward",
     "info",
     "l2_egress",

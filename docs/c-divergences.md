@@ -85,6 +85,10 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 47 | A config partition that fails to load keeps the bytes it failed with | replicated | reading, confirmed differentially |
 | 48 | A config image whose CRC checks may claim up to 255 keys | domain-limited | reading |
 | 49 | `set_config_cbor` checks only the first item's head, and `get_config_cbor` returns the whole slot | replicated | reading, confirmed differentially |
+| 50 | `bcmp_process_config_message` indexes `CONFIGS` with an unchecked partition byte | domain-limited | reading |
+| 51 | `bcmp_process_config_message` reads message bodies without checking `data.size` | domain-limited | reading |
+| 52 | `bcmp_config_decode_value` writes its NUL one byte past a full buffer | domain-limited | reading |
+| 53 | Config replies echo only the low 16 bits of the request's sequence number | replicated | reading, then hit by `cargo fuzz run config` |
 
 ---
 
@@ -1993,3 +1997,96 @@ Fix upstream with `cbor_value_validate` (or a full `cbor_value_advance`
 checking the item ends at `value_len`) in `set_config_cbor`, and by storing
 the value's length so `get_config_cbor` can return only that. The second is
 wire-visible: `ConfigValue` bodies would shrink to the value.
+
+## 50. `bcmp_process_config_message` indexes `CONFIGS` with an unchecked partition byte
+
+Every config message carries a `partition` byte from the wire. The handlers
+pass it straight to `configuration.c`, which indexes
+`CONFIGS[partition]` — an array of `BM_CFG_PARTITION_COUNT` (3) — with no range
+check in `get_config_cbor`, `set_config_cbor`, `get_stored_keys`, `remove_key`
+or `save_config`. A `ConfigGet`, `ConfigSet`, `ConfigCommit`,
+`ConfigStatusRequest` or `ConfigDeleteRequest` naming partition 3 or more reads,
+and for a set or delete writes, past the end of `CONFIGS`. Only
+`clear_partition` checks `partition < BM_CFG_PARTITION_COUNT`, so the clear
+request is the one type that answers an out-of-range partition rather than
+running off the array.
+
+**domain-limited.** `bm_wire::configuration::Partition::from_u8` returns `None`
+past 2, and every handler in `bm_stack::Node` that would index the store stops
+there; only the clear request acts on the byte, reporting `success == false`.
+The comparator keeps the partition byte in range for the five types that index
+`CONFIGS` unchecked (`ConfigInput::clamp_to_domain`) and lets the clear request
+carry any byte; `a_clear_checks_the_partition_byte` in
+`bm-wire-diff/tests/config.rs` pins the clear case.
+
+Fix upstream by checking `partition < BM_CFG_PARTITION_COUNT` in each entry
+point of `configuration.c`, as `clear_partition` already does.
+
+## 51. `bcmp_process_config_message` reads message bodies without checking `data.size`
+
+`bcmp_process_config_message` casts `data.payload` to the message struct and
+reads its fixed fields, and then the variable ones by their declared lengths,
+without consulting `data.size` — the same shape as divergence #14 in a fresh
+set of parsers. A `ConfigGet` shorter than its header, or one whose
+`key_length` runs past the frame, is read out of bounds; a `ConfigSet` reads
+`key_length + data_length` bytes past its header wherever the frame ends; the
+status-response receive loop walks `num_keys` entries with no bound on the body
+(its per-entry advance is correct — see
+`bm_wire::bcmp::config::ConfigStatusResponse::keys` and divergence #45 for the
+`snprintf` over-read of the key itself).
+
+**domain-limited.** The decoders in `bm_wire::bcmp::config` refuse a body
+shorter than its declared fields with `BmWireError::Truncated`. The comparator
+sends only well-formed, exactly-sized bodies, so the C never reads out of
+bounds; the decoders' bound checks are pinned by their unit tests instead.
+
+Fix upstream by validating `data.size` against each message's declared lengths
+before reading, as the fix for #14 does for the reply parsers.
+
+## 52. `bcmp_config_decode_value` writes its NUL one byte past a full buffer
+
+`bcmp_config_decode_value`'s `STR` case copies the text with
+`cbor_value_copy_text_string`, which sets `*buf_length` to the length copied,
+and then writes `p[*buf_length] = '\0'`. The overflow guard is
+`if (*buf_length > init_length) break;`, which admits the equal case: a string
+exactly as long as the caller's buffer fills it and then writes the terminator
+at `p[buf_len]`, one byte past the end.
+
+**domain-limited.** `bm_wire::bcmp::config::decode_value` appends the NUL only
+when the buffer has room after a complete copy, so a string that exactly fills
+the buffer is returned without a terminator and nothing is written past the
+end. `decode_value_follows_the_c_for_each_type` in `bm-wire/src/bcmp/config.rs`
+pins the boundary; the function is not driven differentially, because it shares
+the cbor-getter surface whose own divergences (#40, #41) are pinned in
+`bm-wire-diff/src/cbor.rs` and `configuration.rs`.
+
+Fix upstream by rejecting a string whose length equals the buffer's, or by
+copying into a buffer one byte larger.
+
+
+## 53. Config replies echo only the low 16 bits of the request's sequence number
+
+The BCMP header's `seq_num` is a `uint32_t` on the wire, and `packet.c`
+serialises a `sequenced_reply` by copying the request's number into it whole.
+But every handler and response builder in `bcmp/config.c` takes the number as a
+`uint16_t`: `bcmp_config_process_config_get_msg`,
+`bcmp_config_process_config_set_msg`,
+`bcmp_config_process_status_request_msg`, `bcmp_process_del_request_message`,
+`bcmp_process_clear_request_message` and the `bcmp_config_*_response`,
+`bcmp_config_send_value` and `bcmp_config_status_response` they call. A request
+whose `seq_num` exceeds `0xFFFF` is answered with only its low 16 bits.
+
+The counter that feeds it, `serialize`'s `message_count`, is a 32-bit global
+incrementing once per sequenced request, so a node that has issued more than
+65535 config requests, or a peer that sends a crafted request, reaches it.
+
+**replicated.** `bm_stack::Node::process_config` truncates the echoed number to
+16 bits before building any reply.
+`a_reply_echoes_only_the_low_sixteen_bits_of_the_sequence_number` in
+`bm-wire-diff/tests/config.rs` reads it off the wire, and `cargo fuzz run
+config` reaches it from a single request.
+
+Fix upstream by widening the `seq_num` parameters in `bcmp/config.c` to
+`uint32_t`. Wire-visible: `packet.c` matches a reply on the number it stored,
+so today a reply to a request numbered above `0xFFFF` carries a number that
+matches no outstanding request, and a fixed node's reply would.

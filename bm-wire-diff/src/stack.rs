@@ -327,6 +327,41 @@ pub fn node_with_clock(rtc: SoftRtc) -> Node<OracleIdentity, SoftRtc, 4> {
     node
 }
 
+/// A `bm-stack` node with the oracle's identity and a config store, for
+/// comparing the config exchange.
+///
+/// The type [`node_with_config`] returns: a node whose const parameters are
+/// [`Node`]'s defaults, made explicit because naming the config parameter
+/// requires naming every parameter before it.
+pub type ConfigNode = Node<
+    OracleIdentity,
+    SoftRtc,
+    4,
+    4,
+    { bm_stack::node::PING_PAYLOAD_BYTES },
+    { bm_stack::node::INFO_REQUESTS_DEFAULT },
+    { bm_wire::bcmp::info::CACHED_STRING_BYTES },
+    { bm_stack::node::RESOURCES_DEFAULT },
+    { bm_wire::bcmp::resource::RESOURCE_NAME_BYTES },
+    { bm_stack::node::RESOURCE_REQUESTS_DEFAULT },
+    bm_stack::Config<bm_stack::RamConfigStorage>,
+>;
+
+/// A `bm-stack` node with the oracle's identity and a config store, for
+/// comparing the config exchange.
+///
+/// The store and its flash are the caller's, seeded to match the oracle's
+/// `CONFIGS` before the comparison. The oracle brings its store up empty, so a
+/// comparator seeds both the same way; [`crate::config`] is the caller.
+#[must_use]
+pub fn node_with_config(config: bm_stack::Config<bm_stack::RamConfigStorage>) -> ConfigNode {
+    let mut node = Node::with_config(OracleIdentity, SoftRtc::new(), config, NUM_PORTS);
+    for port in 1..=NUM_PORTS {
+        node.set_link_up(port, true);
+    }
+    node
+}
+
 /// Set the oracle's RTC, and hand back a [`SoftRtc`] reading the same thing.
 ///
 /// `bm_rtc_set` and `bm_rtc_get` are integrator hooks: bm_core declares them

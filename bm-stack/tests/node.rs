@@ -762,12 +762,12 @@ fn seen(event: Event<'_>) -> Seen {
 const REQUEST_TYPE: MessageType = MessageType::CONFIG_GET;
 const REPLY_TYPE: MessageType = MessageType::CONFIG_VALUE;
 
-/// A node that also knows the two config types, registered with the flags
-/// `bcmp_config_init` gives them.
+/// A node knowing the two config types. [`Node::new`] registers them with the
+/// flags `bcmp_config_init` gives them.
 fn requesting_node() -> Node<TestIdentity, SoftRtc, 4> {
-    let mut node = node();
-    node.register(REQUEST_TYPE, PacketCfg::REQUEST).unwrap();
-    node.register(REPLY_TYPE, PacketCfg::REPLY).unwrap();
+    let node = node();
+    assert_eq!(node.registry().cfg(REQUEST_TYPE), Some(PacketCfg::REQUEST));
+    assert_eq!(node.registry().cfg(REPLY_TYPE), Some(PacketCfg::REPLY));
     node
 }
 
@@ -782,9 +782,15 @@ fn sent_header(outbound: &bm_stack::Outbound<'_>) -> bm_wire::bcmp::BcmpHeader {
 #[test]
 fn a_message_of_an_unregistered_type_is_never_sent() {
     let mut node = node();
+    // Declared in `messages.h`, registered by nothing.
     assert!(
-        node.request(0, &BmIpAddr::LINK_LOCAL_MULTICAST, REQUEST_TYPE, &[1, 2, 3])
-            .is_none(),
+        node.request(
+            0,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            MessageType::NET_STATE_REQUEST,
+            &[1, 2, 3]
+        )
+        .is_none(),
         "serialize returns BmENODEV and bcmp_tx transmits nothing"
     );
     assert_eq!(node.registry().pending_len(), 0);
