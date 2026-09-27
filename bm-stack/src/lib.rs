@@ -15,7 +15,8 @@
 //!   rather than link-time symbols, so a test and the firmware can have
 //!   different ones.
 //! * [`config`] loads and saves [`bm_wire::configuration::ConfigStore`]
-//!   through [`port::ConfigStorage`].
+//!   through [`port::ConfigStorage`], and [`config::Configuration`] is how a
+//!   node reaches it.
 //! * [`node::Node`] is the protocol. Its three receive/timer entry points are
 //!   synchronous and take the current time, so they are testable without an
 //!   executor.
@@ -33,6 +34,7 @@ pub mod mock;
 pub mod node;
 pub mod port;
 
+pub use config::{Config, Configuration, NoConfig};
 pub use node::{Event, MTU, Node, Outbound, Owed, Reflood, deliver, transmit};
 pub use port::{
     ConfigStorage, Egress, Identity, NoRtc, Phy, RamConfigStorage, Rtc, RtcTimeAndDate, SoftRtc,

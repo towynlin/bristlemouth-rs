@@ -45,8 +45,8 @@ use bm_wire::configuration::{
 use bm_wire::crc::crc32_ieee;
 
 /// The oracle is built for the host.
-const LAYOUT: Layout = Layout::LP64;
-const IMAGE_LEN: usize = LAYOUT.image_len();
+pub(crate) const LAYOUT: Layout = Layout::LP64;
+pub(crate) const IMAGE_LEN: usize = LAYOUT.image_len();
 
 /// Serialises every call into `configuration.c` and the shim's flash.
 static LOCK: Mutex<()> = Mutex::new(());
@@ -232,7 +232,7 @@ fn partition(u: &mut Unstructured<'_>) -> Result<Partition> {
     })
 }
 
-fn bounded_bytes(u: &mut Unstructured<'_>, max: usize) -> Result<Vec<u8>> {
+pub(crate) fn bounded_bytes(u: &mut Unstructured<'_>, max: usize) -> Result<Vec<u8>> {
     let len = u.int_in_range(0..=max)?;
     let mut bytes = vec![0u8; len];
     u.fill_buffer(&mut bytes)?;
@@ -241,7 +241,7 @@ fn bounded_bytes(u: &mut Unstructured<'_>, max: usize) -> Result<Vec<u8>> {
 
 /// A `set_config_cbor` value: raw bytes, or something shaped like a string,
 /// a chunked string, a scalar or a container head, with trailing bytes.
-fn cbor_value(u: &mut Unstructured<'_>) -> Result<Vec<u8>> {
+pub(crate) fn cbor_value(u: &mut Unstructured<'_>) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     match u.int_in_range(0u8..=4)? {
         0 => return bounded_bytes(u, 52),
@@ -327,12 +327,12 @@ struct Pair {
     flash: RamConfigStorage,
 }
 
-fn c_partition(p: Partition) -> bm_wire_sys::BmConfigPartition {
+pub(crate) fn c_partition(p: Partition) -> bm_wire_sys::BmConfigPartition {
     p as bm_wire_sys::BmConfigPartition
 }
 
 /// The C's RAM image for `p`.
-fn c_image(p: Partition) -> Vec<u8> {
+pub(crate) fn c_image(p: Partition) -> Vec<u8> {
     let mut n = 0u8;
     // SAFETY: `get_stored_keys` returns `&CONFIGS[p].ram_buffer[HEADER_LEN]`,
     // a buffer of 10 KiB of which the `ConfigPartition` is the first
@@ -345,7 +345,7 @@ fn c_image(p: Partition) -> Vec<u8> {
 }
 
 /// The shim's flash image for `p`.
-fn c_flash(p: Partition) -> Vec<u8> {
+pub(crate) fn c_flash(p: Partition) -> Vec<u8> {
     let mut buf = vec![0u8; IMAGE_LEN];
     // SAFETY: `buf` is live and IMAGE_LEN long.
     let ok =
@@ -354,7 +354,7 @@ fn c_flash(p: Partition) -> Vec<u8> {
     buf
 }
 
-fn c_write_flash(p: Partition, image: &mut [u8]) {
+pub(crate) fn c_write_flash(p: Partition, image: &mut [u8]) {
     // SAFETY: `image` is live and its length is passed with it.
     let ok = unsafe {
         bm_wire_sys::bm_config_write(c_partition(p), 0, image.as_mut_ptr(), image.len(), 0)
@@ -362,12 +362,12 @@ fn c_write_flash(p: Partition, image: &mut [u8]) {
     assert!(ok);
 }
 
-fn c_needs_commit(p: Partition) -> bool {
+pub(crate) fn c_needs_commit(p: Partition) -> bool {
     // SAFETY: a plain read of a flag.
     unsafe { bm_wire_sys::needs_commit(c_partition(p)) }
 }
 
-fn c_config_init() {
+pub(crate) fn c_config_init() {
     // SAFETY: loads each partition from the shim's flash into `CONFIGS`.
     unsafe { bm_wire_sys::config_init() };
 }

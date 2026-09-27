@@ -6,14 +6,16 @@ one agent each.
 `bm-wire` carries six of BCMP's exchanges — heartbeat (`0x01`), echo
 (`0x02`/`0x03`, both halves), device info (`0x04`/`0x05`, both halves),
 neighbour table (`0x08`/`0x09`, both halves), resource discovery
-(`0x0A`/`0x0B`, both halves) and system time (`0x10`–`0x12`, both halves) —
-plus the wire engine under them (`bcmp::tx::serialize`, `bcmp::rx::accept`, L2
-egress stamping, the link-local RX policy, the two forwarding paths in
-`bcmp::forward`) and three state machines, `bm-wire/src/neighbor.rs`,
-`bm-wire/src/bcmp/registry.rs` and `bm-wire/src/bcmp/resource.rs`, plus the
-local config store, `bm-wire/src/configuration.rs`.
-`MessageType` names all 45 of bm_core's constants; fourteen body structs have a
-codec. CBOR, which the config chain needs, is the `cbor2` crate rather than a
+(`0x0A`/`0x0B`, both halves), system time (`0x10`–`0x12`, both halves) and
+config (`0xA0`–`0xA9`, all ten) — plus the wire engine under them
+(`bcmp::tx::serialize`, `bcmp::rx::accept`, L2 egress stamping, the link-local
+RX policy, the two forwarding paths in `bcmp::forward`) and three state
+machines, `bm-wire/src/neighbor.rs`, `bm-wire/src/bcmp/registry.rs` and
+`bm-wire/src/bcmp/resource.rs`, plus the local config store,
+`bm-wire/src/configuration.rs`, and the config message codecs,
+`bm-wire/src/bcmp/config.rs`.
+`MessageType` names all 45 of bm_core's constants; twenty-four body structs have
+a codec. CBOR, which the config chain needs, is the `cbor2` crate rather than a
 port; `bm-wire/src/cbor.rs` holds only the one deviation from its defaults
 that bm_core requires.
 
@@ -27,14 +29,12 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| Config over BCMP `0xA0`–`0xA9` | `bcmp/config.c` | 857 | C3 |
 | DFU message codecs `0xD0`–`0xD9` | `bcmp/dfu_message_structs.h` | — | D1 |
 | DFU core HFSM | `bcmp/dfu_core.c` | 689 | D2 |
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-C3 and D1 are unblocked and may run in parallel. D2 needs D1; D3 and D4 each
-need D2.
+D1 is unblocked. D2 needs D1; D3 and D4 each need D2.
 
 ---
 
@@ -123,7 +123,9 @@ run in-process instead of in fork mode.
 `BcmpPacketCfg::sequenced_request`. Its ten registrations at `config.c:789-835`
 use positional initializers `{sequenced_reply, sequenced_request, process}`.
 **Registering any of them in `bcmp.rs` would break the in-process property**, so
-card C3 must live in a stack-target binary of its own.
+C3 lives in a stack-target binary of its own (`bm-wire-diff/tests/config.rs`),
+where the oracle's own `bcmp_config_init` registers them and the comparator
+never issues a sequenced request through `bcmp.rs`.
 
 One sequenced request already exists outside it:
 `our_sequenced_request_carries_the_number_the_c_would_have_given_it` in
@@ -154,7 +156,7 @@ cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 On a crash: `cargo fuzz tmin <target> <artifact>`, then drop the minimized file
 into `bm-wire/fuzz/seeds/<target>/`.
 
-### What the landed cards (M1, M2, M3, M4, M5, C1, C2) left for the rest
+### What the landed cards (M1, M2, M3, M4, M5, C1, C2, C3) left for the rest
 
 - **Forwarding machinery is built.** `bm_stack::Owed::forward` is the decision,
   as a `Reflood` — a byte range within the received frame plus the ingress port,
@@ -353,6 +355,35 @@ into `bm-wire/fuzz/seeds/<target>/`.
 - **#42's uninitialised read needs a crafted image.** A CRC-valid image can
   put unparseable bytes in a listed key's slot (divergence #48 domain); no
   other route to a `get_config_cbor` failure for a listed key was found.
+- **The config exchange is ported (C3).** `bm-wire/src/bcmp/config.rs` has the
+  ten codecs plus `decode_value` and `encode_status_response`;
+  `bm_stack::Node::with_config` answers `0xA0`–`0xA9` from a
+  `bm_stack::Configuration`, and its requester functions
+  (`Node::config_get` and siblings) issue them. `bm-wire-diff/src/config.rs`
+  drives the whole thing through the oracle stack, seeding both stores the same
+  way; `bm-wire-diff/tests/config.rs` is its binary and its seeds are in
+  `replay::STACK_TARGETS`. DFU forwards exactly as config does.
+- **Config is the only sequenced exchange, and `Node::new` registers it.** Its
+  five requests are `PacketCfg::REQUEST`, its four answers `PacketCfg::REPLY`,
+  `0xA3` neither. So a `bm-stack` node already carries them; a card does not
+  re-register them, and the sequenced retry/timeout of divergence #22 is now
+  reachable in ordinary operation, not just from a borrowed type.
+- **A stack comparator that seeds `CONFIGS` NUL-terminates keys for the C.**
+  The C setters take a `const char *` and `snprintf("%s")` it; a bare Rust slice
+  over-reads past the key into stack memory. `Seed::apply_c` in
+  `bm-wire-diff/src/config.rs` appends a NUL. This is only for seeding through
+  the C API directly; a key that arrives over the wire carries its own bytes and
+  the over-read past it is divergence #45.
+- **`restart = true` is honoured in the stack test, and its flash is not
+  compared.** `bcmp/config.c`'s commit calls `save_config(partition, true)`;
+  `bm_stack::Config::commit` does the same. The shim's `bm_config_reset` then
+  zeros every partition's flash while `RamConfigStorage::reset` does nothing, so
+  `bm-wire-diff/src/config.rs` compares the RAM images and `needs_commit` after
+  a commit but skips the flash — an integrator-seam difference, not a wire one.
+- **The config partition byte and body lengths are unchecked in the C**
+  (divergences #50, #51). `Partition::from_u8` bounds the first and the codecs
+  bound the second; the comparator keeps the partition in range for every type
+  but the clear request, which is the one that checks it.
 
 ---
 
@@ -361,56 +392,6 @@ into `bm-wire/fuzz/seeds/<target>/`.
 Each card gives: the C source, the Rust to create, the comparator and fuzz
 target, any new port seam, the C quirks to reproduce, what blocks it, and what
 "done" means.
-
----
-
-# The config chain
-
-## C3 — config over BCMP, `0xA0`–`0xA9`
-
-**Blocked by:** nothing; C2 has landed. The re-flood these messages need is
-`bm_stack::Node::forward_link_local`, which exists.
-
-**C source.** `bcmp/config.c` (857 LoC), one handler
-(`bcmp_process_config_message`) for all ten types.
-
-**Read the sequence-list hazard above before starting.** C3 gets its own binary
-under `bm-wire-diff/tests/` and its seeds go in `replay::STACK_TARGETS`.
-
-Flags, from the positional initializers at `config.c:789-835`:
-
-| Type | Value | `sequenced_reply` | `sequenced_request` |
-|---|---|---|---|
-| ConfigGet | `0xA0` | false | **true** |
-| ConfigValue | `0xA1` | **true** | false |
-| ConfigSet | `0xA2` | false | **true** |
-| ConfigCommit | `0xA3` | false | false |
-| ConfigStatusRequest | `0xA4` | false | **true** |
-| ConfigStatusResponse | `0xA5` | **true** | false |
-| ConfigDeleteRequest | `0xA6` | false | **true** |
-| ConfigDeleteResponse | `0xA7` | **true** | false |
-| ConfigClearRequest | `0xA8` | false | **true** |
-| ConfigClearResponse | `0xA9` | **true** | false |
-
-**Quirks to reproduce.**
-
-- `config.c:741` does `key += key->key_length + sizeof(BmConfigStatusKeyData)`
-  on a **typed** `BmConfigStatusKeyData *`, so the advance is scaled by the
-  struct size rather than being a byte offset. Any status response carrying
-  more than one key walks off the end. Confirm the exact consequence against
-  the oracle and record it.
-- Messages not addressed to this node are forwarded.
-- Divergence #22 applies here first and hardest: a sequenced request is first
-  retried anywhere from 24 ms to 173 ms after it is sent and times out three
-  sweeps (450 ms) later, and these ten messages are the only ones in bm_core
-  that use it. `bm_stack::Node` already re-sends and times out tracked
-  requests; the card registers the types and handles `Event::Reply` and
-  `Event::Timeout`.
-
-**Test coverage to expect.** `config_test.cpp` has two cases — `decode` and
-`ClearPartitionRequest`. Eight of the ten messages have no C test at all, so
-the comparator is the only thing standing between this port and a silent
-divergence.
 
 ---
 

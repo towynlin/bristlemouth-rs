@@ -15,8 +15,9 @@
 //! message out the other ports, which `bcmp/time.c`, `bcmp/config.c` and
 //! `bcmp/dfu_core.c` all do for anything not addressed to this node.
 //!
-//! The message bodies each have a module of their own — [`heartbeat`],
-//! [`info`], [`neighbors`], [`ping`], [`resource`] — and are codecs only. What
+//! The message bodies each have a module of their own — [`config`],
+//! [`heartbeat`], [`info`], [`neighbors`], [`ping`], [`resource`] — and are
+//! codecs only. What
 //! a node *does* with one is `bm-stack`'s business. The exceptions are
 //! [`info::InfoRequests`], [`info::InfoCache`], [`neighbors::TableRequests`],
 //! [`resource::ResourceTable`] and [`resource::ResourceRequests`], which are
@@ -24,6 +25,7 @@
 //! the same reason [`registry`] is: each correlates its own replies, because
 //! `packet.c` does not.
 
+pub mod config;
 pub mod forward;
 pub mod header;
 pub mod heartbeat;
