@@ -16,10 +16,10 @@ dependencies = [
  "bm-wire",
  "critical-section",
  "embassy-net-adin1110",
+ "embassy-net-driver-channel",
  "embassy-time",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
- "xarxa-driver",
 ]
 
 [[package]]
