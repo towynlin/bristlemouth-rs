@@ -1,8 +1,9 @@
 //! `dfu_test.cpp`'s state sequences, as far as the core decides them.
 //!
 //! bm_core's goldens drive `bm_dfu_test_set_dfu_event_and_run_sm` through the
-//! real client and host. Those are D3 and D4; here [`StandIn`] makes the calls
-//! into the core that `dfu_client.c` and `dfu_host.c` make at the same step,
+//! real client and host. Those are `dfu_client`'s tests and card D4; here
+//! [`StandIn`] makes the calls into the core that `dfu_client.c` and
+//! `dfu_host.c` make at the same step,
 //! so every state enum asserted below is the golden's, and each test names the
 //! golden it follows. What the roles decide for themselves (the SHA check, the
 //! chunk count, the retry limits) is not tested here.
@@ -48,6 +49,39 @@ impl Effects for Recorder {
     fn update_finished(&mut self, success: bool, err: DfuErr, node_id: u64) {
         self.0.push(Fx::Finished(success, err, node_id));
     }
+    fn flash_open(&mut self) -> bool {
+        unreachable!("the stand-in roles touch no flash")
+    }
+    fn flash_close(&mut self) -> bool {
+        unreachable!("the stand-in roles touch no flash")
+    }
+    fn flash_size(&mut self) -> u32 {
+        unreachable!("the stand-in roles touch no flash")
+    }
+    fn flash_erase(&mut self, _offset: u32, _len: u32) -> bool {
+        unreachable!("the stand-in roles touch no flash")
+    }
+    fn flash_write(&mut self, _offset: u32, _data: &[u8]) -> bool {
+        unreachable!("the stand-in roles touch no flash")
+    }
+    fn set_confirmed(&mut self) {
+        unreachable!("the stand-in roles do not boot")
+    }
+    fn set_pending_and_reset(&mut self) {
+        unreachable!("the stand-in roles do not boot")
+    }
+    fn fail_update_and_reset(&mut self) {
+        unreachable!("the stand-in roles do not boot")
+    }
+    fn git_sha(&self) -> u32 {
+        0
+    }
+    fn config(&mut self) -> Option<&mut crate::configuration::ConfigStore> {
+        None
+    }
+    fn commit_config(&mut self, _partition: crate::configuration::Partition) -> bool {
+        false
+    }
 }
 
 impl Recorder {
@@ -89,7 +123,7 @@ struct StandIn {
 }
 
 impl Roles for StandIn {
-    fn entry(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects, _now_ms: u32) {
+    fn entry(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects) {
         self.calls.push(Call::Entry(state));
         match state {
             // s_client_receiving_entry
@@ -113,7 +147,7 @@ impl Roles for StandIn {
         }
     }
 
-    fn run(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects, _now_ms: u32) {
+    fn run(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects) {
         let kind = core.current_event().kind;
         self.calls.push(Call::Run(state, kind));
         match (state, kind) {
@@ -144,16 +178,11 @@ impl Roles for StandIn {
         }
     }
 
-    fn exit(&mut self, state: State, _core: &mut Core, _fx: &mut dyn Effects, _now_ms: u32) {
+    fn exit(&mut self, state: State, _core: &mut Core, _fx: &mut dyn Effects) {
         self.calls.push(Call::Exit(state));
     }
 
-    fn client_process_update_request(
-        &mut self,
-        core: &mut Core,
-        fx: &mut dyn Effects,
-        _now_ms: u32,
-    ) {
+    fn client_process_update_request(&mut self, core: &mut Core, fx: &mut dyn Effects) {
         self.calls.push(Call::UpdateRequest);
         // The accepting branch of bm_dfu_client_process_update_request.
         if let Some(DfuMessage::Start(start)) = core.current_event().message_body() {
@@ -728,4 +757,49 @@ fn reboot_info_is_the_packed_layout() {
     );
     assert_eq!(RebootInfo::decode(&buf), Ok(info));
     assert_eq!(RebootInfo::decode(&buf[..17]), Err(BmWireError::Truncated));
+}
+
+/// Timers post in deadline order, ties in creation order, once each.
+#[test]
+fn timers_fire_in_deadline_order_then_creation_order() {
+    let mut dfu = dfu();
+    dfu.pop();
+    dfu.poll(100);
+    dfu.core_mut().start_timer(Timer::Ack); // 10_100
+    dfu.poll(8_100);
+    dfu.core_mut().start_timer(Timer::Chunk); // 10_100
+    assert_eq!(dfu.next_deadline(), Some(10_100));
+    dfu.poll(20_000);
+    let queued: Vec<_> = dfu.core().queue().iter().map(|e| e.kind).collect();
+    assert_eq!(queued, [EventType::ChunkTimeout, EventType::AckTimeout]);
+    assert_eq!(dfu.next_deadline(), None);
+
+    dfu.core_mut().start_timer(Timer::Ack); // 30_000
+    dfu.core_mut().delay(1_000);
+    dfu.core_mut().start_timer(Timer::Chunk); // 23_000
+    dfu.poll(40_000);
+    let queued: Vec<_> = dfu.core().queue().iter().skip(2).map(|e| e.kind).collect();
+    assert_eq!(
+        queued,
+        [EventType::ChunkTimeout, EventType::AckTimeout],
+        "the later-started, earlier-due timer first"
+    );
+}
+
+/// The clock only moves forward, across the wrap, and a delay moves it
+/// past what the caller last said.
+#[test]
+fn the_clock_does_not_go_back() {
+    let mut dfu = dfu();
+    dfu.poll(u32::MAX - 5);
+    dfu.core_mut().delay(10);
+    assert_eq!(dfu.core().now(), 4);
+    dfu.poll(u32::MAX);
+    assert_eq!(dfu.core().now(), 4, "behind the delay");
+    dfu.core_mut().start_timer(Timer::Chunk);
+    assert_eq!(dfu.next_deadline(), Some(2_004));
+    dfu.poll(2_003);
+    assert_eq!(dfu.core().queue().len(), 1, "only InitSuccess");
+    dfu.poll(2_004);
+    assert_eq!(dfu.core().queue().len(), 2);
 }

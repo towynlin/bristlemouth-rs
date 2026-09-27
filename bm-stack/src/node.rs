@@ -19,7 +19,7 @@
 //! link-local *message* as a fresh frame per port rather than relaying the
 //! received bytes. A `0x10`, `0x11` or `0x12` naming another node comes back
 //! as [`Owed::forward`], which [`Node::reflood`] turns into one frame per
-//! other port. Config and DFU will use the same path.
+//! other port. Config and DFU use the same path.
 //!
 //! # Requests and replies
 //!
@@ -87,6 +87,14 @@
 //! ping overwrites the first's expectations as it does in the C. The verdict
 //! arrives as [`Event::EchoReply`], which bm_core reports to nobody.
 //!
+//! # DFU runs beside the rest
+//!
+//! bm_core runs DFU on a task of its own. A DFU frame addressed to this node
+//! is queued by [`Node::on_frame`] and run by [`Node::next_dfu_transmission`],
+//! which [`Node::run`] drains after everything else; one for another node
+//! arriving link-local is re-flooded as config's are. The node is a DFU
+//! client only; the host role is card D4's.
+//!
 //! # Two timers, not one
 //!
 //! The 10-second heartbeat timer is [`Node::on_tick`]; `packet.c`'s 150 ms
@@ -103,6 +111,7 @@ use bm_wire::bcmp::config::{
     ConfigStatusRequest, ConfigValue, MAX_KEY_LEN, MAX_VALUE_LEN, encode_status_response,
     status_response_len,
 };
+use bm_wire::bcmp::dfu::DfuAddress;
 use bm_wire::bcmp::info::{
     CACHED_STRING_BYTES, CachedInfo, DeviceInfoReply, DeviceInfoRequest, InfoCache,
     InfoRequestKind, InfoRequests,
@@ -137,7 +146,8 @@ use bm_wire::util::BmIpAddr;
 use bm_wire::{BmWireError, addr::MAC_LEN};
 
 use crate::config::{Configuration, NoConfig};
-use crate::port::{Egress, Identity, NoRtc, Phy, Rtc, RtcTimeAndDate};
+use crate::dfu::NodeDfu;
+use crate::port::{DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy, Rtc, RtcTimeAndDate};
 
 /// Largest frame the node will build or accept.
 ///
@@ -153,11 +163,12 @@ pub const HOP_LIMIT: u8 = 64;
 
 /// How many message types a node's registry holds.
 ///
-/// bm_core registers thirty across the eight modules `bcmp_init` brings up,
-/// each calling `packet_add` once per type it handles. This is that with room
-/// to spare; [`Node::register`] reports [`RegistryError::Full`] past it.
-/// bm_core has no such ceiling — its registry is a `bm_malloc`'d list.
-pub const MESSAGE_TYPES: usize = 32;
+/// bm_core registers thirty-three across the eight modules `bcmp_init` brings
+/// up, each calling `packet_add` once per type it handles and `bm_dfu_init`
+/// `0xD9` twice (divergence #56). This is that with room to spare;
+/// [`Node::register`] reports [`RegistryError::Full`] past it. bm_core has no
+/// such ceiling — its registry is a `bm_malloc`'d list.
+pub const MESSAGE_TYPES: usize = 40;
 
 /// How often [`Node::on_expiry`] must be called, `message_timer_expiry_period_ms`.
 ///
@@ -723,6 +734,7 @@ pub struct Node<
     const RESOURCE_NAME: usize = RESOURCE_NAME_BYTES,
     const RESOURCE_REQUESTS: usize = RESOURCE_REQUESTS_DEFAULT,
     C = NoConfig,
+    D = NoDfu,
 > {
     identity: I,
     rtc: R,
@@ -746,6 +758,8 @@ pub struct Node<
     resource_requests: ResourceRequests<RESOURCE_REQUESTS>,
     /// `CONFIGS` and its flash, which `0xA0`–`0xA9` read and write.
     config: C,
+    /// `dfu_core.c` and `dfu_client.c`, their update slot and no-init RAM.
+    dfu: NodeDfu<D>,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -779,6 +793,7 @@ impl<
         RESOURCE_NAME,
         RESOURCE_REQUESTS,
         NoConfig,
+        NoDfu,
     >
 {
     /// A node with no config store, an empty neighbour table, at time zero.
@@ -815,20 +830,63 @@ impl<
         RESOURCE_NAME,
         RESOURCE_REQUESTS,
         C,
+        NoDfu,
     >
 {
     /// A node answering config messages from `config`, with an empty
     /// neighbour table, at time zero.
     ///
+    /// [`Node::with_dfu`] with [`NoDfu`]: DFU messages for other nodes are
+    /// forwarded, and an update request is refused with
+    /// `BmDfuErrFlashAccess`.
+    pub fn with_config(identity: I, rtc: R, config: C, port_count: u8) -> Self {
+        Self::with_dfu(identity, rtc, config, NoDfu, port_count)
+    }
+}
+
+impl<
+    I: Identity,
+    R: Rtc,
+    const NEIGHBORS: usize,
+    const PENDING: usize,
+    const PING_PAYLOAD: usize,
+    const INFO_REQUESTS: usize,
+    const INFO_STRINGS: usize,
+    const RESOURCES: usize,
+    const RESOURCE_NAME: usize,
+    const RESOURCE_REQUESTS: usize,
+    C: Configuration,
+    D: DfuSlot + NoInitRam,
+>
+    Node<
+        I,
+        R,
+        NEIGHBORS,
+        PENDING,
+        PING_PAYLOAD,
+        INFO_REQUESTS,
+        INFO_STRINGS,
+        RESOURCES,
+        RESOURCE_NAME,
+        RESOURCE_REQUESTS,
+        C,
+        D,
+    >
+{
+    /// A node answering config messages from `config` and DFU requests
+    /// into `dfu`, with an empty neighbour table, at time zero.
+    ///
     /// The registry comes up holding what `bcmp_init` registers for the ported
     /// modules, with the expiry sweep phased from zero — where
-    /// [`Node::on_tick`]'s uptime clock starts.
-    pub fn with_config(identity: I, rtc: R, config: C, port_count: u8) -> Self {
+    /// [`Node::on_tick`]'s uptime clock starts. The DFU machine comes up in
+    /// `Init` with the reboot info [`NoInitRam::load`] returns, and moves on
+    /// from it at the first [`Node::next_dfu_transmission`].
+    pub fn with_dfu(identity: I, rtc: R, config: C, dfu: D, port_count: u8) -> Self {
         let mut registry = Registry::new();
-        // heartbeat.c, ping.c, time.c, config.c, neighbors.c, info.c and
-        // resource_discovery.c, in the order `bcmp_init` calls their inits --
-        // minus dfu_core.c, which is unported. Only config.c's are sequenced:
-        // everything else rides on the wire with a sequence number of zero.
+        // heartbeat.c, ping.c, time.c, dfu_core.c, config.c, neighbors.c,
+        // info.c and resource_discovery.c, in the order `bcmp_init` calls
+        // their inits. Only config.c's are sequenced: everything else rides on
+        // the wire with a sequence number of zero.
         for (message_type, cfg) in [
             (MessageType::HEARTBEAT, PacketCfg::UNSEQUENCED),
             (MessageType::ECHO_REQUEST, PacketCfg::UNSEQUENCED),
@@ -836,6 +894,19 @@ impl<
             (MessageType::SYSTEM_TIME_REQUEST, PacketCfg::UNSEQUENCED),
             (MessageType::SYSTEM_TIME_RESPONSE, PacketCfg::UNSEQUENCED),
             (MessageType::SYSTEM_TIME_SET, PacketCfg::UNSEQUENCED),
+            // `bm_dfu_init`, in its `packet_add` order, `0xD9` twice
+            // (divergence #56).
+            (MessageType::DFU_START, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_PAYLOAD_REQ, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_PAYLOAD, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_END, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_ACK, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_ABORT, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_HEARTBEAT, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_REBOOT_REQ, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_REBOOT, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_BOOT_COMPLETE, PacketCfg::UNSEQUENCED),
+            (MessageType::DFU_BOOT_COMPLETE, PacketCfg::UNSEQUENCED),
             // `bcmp_config_init`, in its `packet_add` order.
             (MessageType::CONFIG_GET, PacketCfg::REQUEST),
             (MessageType::CONFIG_SET, PacketCfg::REQUEST),
@@ -857,6 +928,7 @@ impl<
             // Cannot fail: MESSAGE_TYPES is larger than this list.
             let _ = registry.add(message_type, cfg);
         }
+        let dfu = NodeDfu::new(identity.node_id(), dfu);
         Self {
             identity,
             rtc,
@@ -870,6 +942,7 @@ impl<
             resources: ResourceTable::new(),
             resource_requests: ResourceRequests::new(),
             config,
+            dfu,
             port_count,
             link_mask: 0,
             tx: [0u8; MTU],
@@ -1336,6 +1409,40 @@ impl<
                     received.payload,
                 );
                 return (config_reply, None);
+            }
+            MessageType::DFU_START
+            | MessageType::DFU_PAYLOAD_REQ
+            | MessageType::DFU_PAYLOAD
+            | MessageType::DFU_END
+            | MessageType::DFU_ACK
+            | MessageType::DFU_ABORT
+            | MessageType::DFU_HEARTBEAT
+            | MessageType::DFU_REBOOT_REQ
+            | MessageType::DFU_REBOOT
+            | MessageType::DFU_BOOT_COMPLETE => {
+                // `dfu_copy_and_process_message`, which reads the address
+                // without consulting `data.size` (divergence #55).
+                let Ok(address) = DfuAddress::of_body(received.payload) else {
+                    return (None, None);
+                };
+                if address.dst_node_id == self.identity.node_id() {
+                    // `bm_dfu_process_message`. The machine runs from
+                    // `next_dfu_transmission`, as the C's runs on its own
+                    // task.
+                    let _ = self.dfu.on_message(received.payload);
+                    return (None, None);
+                }
+                if !reply_to.is_link_local_multicast() {
+                    return (None, None);
+                }
+                return (
+                    None,
+                    Some(Reflood {
+                        start: BCMP_HEADER_OFFSET,
+                        end: BCMP_HEADER_OFFSET + BCMP_HEADER_LEN + received.payload.len(),
+                        ingress_port: received.ingress_port,
+                    }),
+                );
             }
             _ => None,
         };
@@ -2067,6 +2174,49 @@ impl<
         self.table_requests.remaining_ms(now_ms)
     }
 
+    /// The DFU machine, its update slot and no-init RAM.
+    pub fn dfu(&self) -> &NodeDfu<D> {
+        &self.dfu
+    }
+
+    /// The same, mutably.
+    pub fn dfu_mut(&mut self) -> &mut NodeDfu<D> {
+        &mut self.dfu
+    }
+
+    /// Milliseconds until a DFU timer is due — the client's chunk timer — or
+    /// `None` when none is running. Zero if one is overdue.
+    #[must_use]
+    pub fn dfu_remaining_ms(&self, now_ms: u32) -> Option<u32> {
+        let left = self.dfu.next_deadline()?.wrapping_sub(now_ms);
+        Some(if (left as i32) < 0 { 0 } else { left })
+    }
+
+    /// The next frame DFU owes the network, or `None` once the machine has
+    /// nothing left to run.
+    ///
+    /// This is `bm_dfu_event_thread`: it posts any timer due by `now_ms`,
+    /// runs queued events until one sends something, and frames that as
+    /// `bcmp_tx` to `ff03::1` does. Call it until it returns `None` after
+    /// anything that may have queued an event — a received DFU frame, or a
+    /// timer [`Node::dfu_remaining_ms`] said was due — and once at start-up,
+    /// when the machine leaves `Init`. A reset the client asks for is made
+    /// from here, after the frames sent before it.
+    ///
+    /// Also `None`, leaving the rest queued, if the body's type has been
+    /// unregistered.
+    pub fn next_dfu_transmission(&mut self, now_ms: u32) -> Option<Outbound<'_>> {
+        let git_sha = self.identity.device_info().git_sha;
+        let (message_type, len, body) = self.dfu.next_body(now_ms, &mut self.config, git_sha)?;
+        self.send(
+            now_ms,
+            &BmIpAddr::GLOBAL_MULTICAST,
+            message_type,
+            &body[..len],
+            0,
+        )
+    }
+
     /// Advertise a resource — `bcmp_resource_discovery_add_resource`.
     ///
     /// `bm_stack` has no publish/subscribe layer, so nothing calls this by
@@ -2785,6 +2935,7 @@ impl<
     const RESOURCE_NAME: usize,
     const RESOURCE_REQUESTS: usize,
     C: Configuration,
+    D: DfuSlot + NoInitRam,
 >
     Node<
         I,
@@ -2798,6 +2949,7 @@ impl<
         RESOURCE_NAME,
         RESOURCE_REQUESTS,
         C,
+        D,
     >
 {
     /// Run the node until the PHY fails, discarding every [`Event`].
@@ -2839,6 +2991,20 @@ impl<
             let Some(outbound) = self.forward_link_local(egress_port, reflood.bcmp(frame)) else {
                 continue;
             };
+            transmit(phy, outbound, port_count).await?;
+        }
+        Ok(())
+    }
+
+    /// Put everything DFU owes on the wire — the frames
+    /// [`Node::next_dfu_transmission`] hands out.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the PHY returns. A failure abandons the frame it was sending.
+    pub async fn transmit_dfu<P: Phy>(&mut self, phy: &mut P, now_ms: u32) -> Result<(), P::Error> {
+        let port_count = self.port_count;
+        while let Some(outbound) = self.next_dfu_transmission(now_ms) {
             transmit(phy, outbound, port_count).await?;
         }
         Ok(())
@@ -2888,6 +3054,11 @@ impl<
         let mut rx = [0u8; MTU];
         let port_count = self.port_count;
 
+        // `bm_dfu_init` queued `InitSuccess`; the DFU task runs it first.
+        if let Err(error) = self.transmit_dfu(phy, 0).await {
+            return error;
+        }
+
         loop {
             // Cheap: the driver keeps this as an array it updates when it
             // services a PHY interrupt, so this is a read, not a transfer.
@@ -2902,11 +3073,19 @@ impl<
                 started.elapsed().as_millis() as u32
             };
 
-            // `NEIGHBOR_TIMER`: a one-shot armed by the request rather than a
-            // ticker, so it gets an arm of its own that waits exactly as long
-            // as the request has left. Nothing outstanding means nothing to
-            // wait for, and the other three arms are the only way out.
-            let neighbor_wait = self.neighbor_request_remaining_ms(uptime_ms(()));
+            // `NEIGHBOR_TIMER` and the DFU chunk timer: one-shots armed by
+            // what they time rather than tickers, so they share an arm that
+            // waits exactly as long as the sooner has left. Nothing running
+            // means nothing to wait for, and the other three arms are the
+            // only way out.
+            let now = uptime_ms(());
+            let neighbor_wait = match (
+                self.neighbor_request_remaining_ms(now),
+                self.dfu_remaining_ms(now),
+            ) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             let neighbor_timer = async move {
                 match neighbor_wait {
                     Some(ms) => Timer::after(Duration::from_millis(u64::from(ms))).await,
@@ -2960,6 +3139,11 @@ impl<
                     let now = uptime_ms(());
                     self.on_neighbor_request_timer(now, &mut events);
                 }
+            }
+            // Whatever woke the loop may have queued a DFU event or brought a
+            // DFU timer due.
+            if let Err(error) = self.transmit_dfu(phy, uptime_ms(())).await {
+                return error;
             }
         }
     }

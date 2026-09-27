@@ -41,7 +41,11 @@ and its behaviour differs from an RTOS deliberately:
   `bm_shim_tx_pop` can drain it; `bm_shim_rx_inject` pushes bytes up the path
   the ADIN2111 driver would. That is the wire boundary and the fuzz entry point.
 - **NVM, RTC and DFU flash are RAM.** Plain buffers, cleared by
-  `bm_shim_generic_reset`.
+  `bm_shim_generic_reset`. The DFU slot is 256 KiB. Every slot operation, boot
+  hook (`bm_dfu_client_set_confirmed`, `_set_pending_and_reset`,
+  `_fail_update_and_reset`) and `bm_config_reset` is counted
+  (`bm_shim_dfu_counts`), none of them resets anything, and
+  `bm_shim_dfu_set_faults` makes open, erase or write fail.
 - **Leak-visible.** Every allocation is plain `malloc`, so ASan and
   LeakSanitizer see the whole graph.
 

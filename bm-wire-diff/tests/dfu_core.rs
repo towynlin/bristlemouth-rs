@@ -1,5 +1,5 @@
-//! The DFU core state machine, compared against `bcmp/dfu_core.c` in bm_core's
-//! live stack.
+//! The DFU core state machine and client, compared against `bcmp/dfu_core.c`
+//! and `bcmp/dfu_client.c` in bm_core's live stack.
 //!
 //! Its own binary because `bm_wire_diff::dfu_core` brings the stack up, whose
 //! `bcmp_init` runs `bm_dfu_init`; see `bm_wire_diff::stack`. Each test is a script for
@@ -9,7 +9,7 @@
 
 use bm_wire::bcmp::dfu_core::{DfuErr, EVENT_QUEUE_LEN, EventType, State};
 use bm_wire_diff::dfu_core::{
-    CoreState, DfuCoreInput, FrameType, Image, NodeRef, Sender, Step, check, reset,
+    CoreState, DfuCoreInput, FrameType, Image, NodeRef, Pair, Sender, Step, TestImage, check, reset,
 };
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
 
@@ -243,4 +243,296 @@ fn the_c_host_adopts_a_clients_fatal_nack() {
     assert!(!refused, "no update can start");
     drop(pair);
     let _ = reset();
+}
+
+/// A 5000-byte image in 1000-byte chunks, from [`NodeRef::Peer`].
+const OFFERED: TestImage = TestImage {
+    len: 5000,
+    huge: false,
+    chunk_size: 1000,
+    seed: 0x5a,
+    crc_ok: true,
+    own_sha: false,
+    force: false,
+    major: 2,
+    minor: 3,
+};
+
+fn offer(pair: &mut Pair, image: TestImage) {
+    pair.apply(&Step::Offer {
+        src: NodeRef::Peer,
+        image,
+    });
+    pair.apply(&Step::RunAll);
+}
+
+fn serve(pair: &mut Pair) {
+    pair.apply(&Step::Serve {
+        src: NodeRef::Peer,
+        short_by: 0,
+    });
+    pair.apply(&Step::RunAll);
+}
+
+/// `client_golden` end to end: offer, five chunks, validation, the reboot
+/// request, the host's reboot, activation. The slot's bytes, the reboot info
+/// and every frame are compared at each step.
+#[test]
+fn a_whole_transfer_agrees_with_the_c_client() {
+    let mut pair = reset();
+    offer(&mut pair, OFFERED);
+    assert_eq!(pair.c.state(), State::ClientReceiving);
+    for _ in 0..5 {
+        serve(&mut pair);
+    }
+    assert_eq!(pair.c.state(), State::ClientRebootReq);
+    pair.apply(&message(8, NodeRef::Peer, &[]));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::ClientActivating);
+    assert_eq!(pair.fx.counts.pending_and_reset, 1);
+    assert_eq!(pair.fx.counts.writes, 3, "two whole pages and the rest");
+}
+
+/// `client_validate_fail`, both halves: a CRC one off, then an image one
+/// chunk short of its size.
+#[test]
+fn a_bad_crc_and_a_short_image_fail_validation() {
+    let mut pair = reset();
+    offer(
+        &mut pair,
+        TestImage {
+            crc_ok: false,
+            ..OFFERED
+        },
+    );
+    for _ in 0..5 {
+        serve(&mut pair);
+    }
+    assert_eq!(pair.c.state(), State::Idle);
+    assert_eq!(pair.rust.core().error(), DfuErr::BAD_CRC);
+
+    offer(&mut pair, OFFERED);
+    for _ in 0..4 {
+        serve(&mut pair);
+    }
+    pair.apply(&Step::Serve {
+        src: NodeRef::Peer,
+        short_by: 1,
+    });
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.rust.core().error(), DfuErr::MISMATCH_LEN);
+}
+
+/// `client_reject_same_sha`, `client_force_update`, `chunks_too_big`, and an
+/// image the 256 KiB slot cannot hold.
+#[test]
+fn offers_the_client_refuses() {
+    let mut pair = reset();
+    let own = TestImage {
+        own_sha: true,
+        ..OFFERED
+    };
+    offer(&mut pair, own);
+    assert_eq!(pair.c.state(), State::Idle);
+    offer(&mut pair, TestImage { force: true, ..own });
+    assert_eq!(pair.c.state(), State::ClientReceiving);
+
+    drop(pair);
+    let mut pair = reset();
+    offer(
+        &mut pair,
+        TestImage {
+            chunk_size: 1025,
+            ..OFFERED
+        },
+    );
+    assert_eq!(pair.rust.core().error(), DfuErr::CHUNK_SIZE);
+
+    drop(pair);
+    let mut pair = reset();
+    offer(
+        &mut pair,
+        TestImage {
+            huge: true,
+            ..OFFERED
+        },
+    );
+    assert_eq!(pair.c.state(), State::Idle);
+    assert_eq!(pair.fx.counts.opens, 1);
+    assert_eq!(pair.fx.counts.closes, 0, "left open");
+}
+
+/// `client_recv_fail`, on the clock: five unanswered chunk requests two
+/// seconds apart, then the abort.
+#[test]
+fn the_chunk_timer_gives_up_after_five_timeouts() {
+    let mut pair = reset();
+    offer(&mut pair, OFFERED);
+    for _ in 0..5 {
+        pair.apply(&Step::Advance(2_000));
+        pair.apply(&Step::RunAll);
+    }
+    assert_eq!(pair.c.state(), State::Idle);
+    assert_eq!(pair.rust.core().error(), DfuErr::TIMEOUT);
+}
+
+/// `client_reboot_req_fail`, on the clock.
+#[test]
+fn the_reboot_request_gives_up_after_five_timeouts() {
+    let mut pair = reset();
+    offer(&mut pair, OFFERED);
+    for _ in 0..5 {
+        serve(&mut pair);
+    }
+    assert_eq!(pair.c.state(), State::ClientRebootReq);
+    for _ in 0..5 {
+        pair.apply(&Step::Advance(2_000));
+        pair.apply(&Step::RunAll);
+    }
+    assert_eq!(pair.c.state(), State::Idle);
+}
+
+/// `client_resync_host`, and divergence #62: a second offer mid-transfer
+/// restarts it from chunk zero, still against the first offer's image.
+#[test]
+fn a_second_offer_restarts_against_the_first_image() {
+    let mut pair = reset();
+    offer(&mut pair, OFFERED);
+    serve(&mut pair);
+    serve(&mut pair);
+    offer(
+        &mut pair,
+        TestImage {
+            len: 1000,
+            ..OFFERED
+        },
+    );
+    assert_eq!(pair.rust.roles().client.current_chunk(), 0);
+    assert_eq!(pair.rust.roles().client.num_chunks(), 5, "not 1");
+}
+
+/// `bm_dfu_client_flash_area_open`, `_erase` and `_write` failing, and
+/// divergence #63's request after a failed write.
+#[test]
+fn slot_failures_agree_with_the_c() {
+    for (open, erase) in [(true, false), (false, true)] {
+        let mut pair = reset();
+        pair.apply(&Step::Faults {
+            open,
+            erase,
+            write: false,
+        });
+        offer(&mut pair, OFFERED);
+        assert_eq!(pair.c.state(), State::Error, "fatal");
+        assert_eq!(pair.rust.core().error(), DfuErr::FLASH_ACCESS);
+    }
+
+    let mut pair = reset();
+    offer(&mut pair, OFFERED);
+    // Two 1000-byte chunks fill no page; the third writes one.
+    serve(&mut pair);
+    serve(&mut pair);
+    pair.apply(&Step::Faults {
+        open: false,
+        erase: false,
+        write: true,
+    });
+    pair.apply(&Step::Serve {
+        src: NodeRef::Peer,
+        short_by: 0,
+    });
+    pair.apply(&Step::Run);
+    assert_eq!(pair.c.state(), State::Error);
+    assert_eq!(pair.rust.core().error(), DfuErr::BM_FRAME);
+    assert!(
+        pair.rust
+            .core()
+            .timer_deadline(bm_wire::bcmp::dfu_core::Timer::Chunk)
+            .is_some(),
+        "re-armed in Error"
+    );
+}
+
+fn boot_into(pair: &mut Pair, magic: bool, own_sha: bool) {
+    pair.apply(&Step::SetRebootInfo {
+        magic,
+        major: 2,
+        minor: 3,
+        host: NodeRef::Peer,
+        own_sha,
+    });
+    pair.apply(&Step::SetPending(CoreState::Init));
+    pair.apply(&Step::Run);
+    pair.apply(&Step::Post(EventType::InitSuccess as u8));
+    pair.apply(&Step::Run);
+}
+
+/// `client_golden_image_has_updated`: booted into the new image, the client
+/// reports and the host's END confirms it.
+#[test]
+fn a_rebooted_client_confirms_on_the_hosts_end() {
+    let mut pair = reset();
+    boot_into(&mut pair, true, true);
+    assert_eq!(pair.c.state(), State::ClientRebootDone);
+    pair.apply(&message(3, NodeRef::Peer, &[1, 0]));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::Idle);
+    assert_eq!(pair.fx.counts.confirmed, 1);
+}
+
+/// `reboot_done_fail`: the wrong image fails at once; the right one after
+/// five unanswered boot-completes.
+#[test]
+fn a_rebooted_client_fails_the_update() {
+    let mut pair = reset();
+    boot_into(&mut pair, true, false);
+    assert_eq!(pair.fx.counts.fail_and_reset, 1);
+
+    drop(pair);
+    let mut pair = reset();
+    boot_into(&mut pair, true, true);
+    for _ in 0..5 {
+        pair.apply(&Step::Advance(2_000));
+        pair.apply(&Step::RunAll);
+    }
+    assert_eq!(pair.fx.counts.fail_and_reset, 1);
+}
+
+/// `client_confirm_skip`, through the real config store: `dfu_confirm` of
+/// zero confirms without the host and commits `dfu_confirm` back to 1.
+#[test]
+fn dfu_confirm_zero_skips_the_host() {
+    let mut pair = reset();
+    pair.apply(&Step::SetConfirm(0));
+    boot_into(&mut pair, true, true);
+    assert_eq!(pair.fx.counts.confirmed, 1);
+    assert_eq!(pair.fx.counts.config_resets, 1);
+    pair.apply(&Step::SetConfirm(1));
+}
+
+/// A chunk timer left running into Idle fires inside the next offer's
+/// 10 ms `bm_delay`, and its timeout is then run as a retry.
+#[test]
+fn a_stale_chunk_timer_fires_inside_the_offers_delay() {
+    let mut pair = reset();
+    offer(&mut pair, OFFERED);
+    pair.apply(&Step::SetPending(CoreState::Idle));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::Idle);
+    pair.apply(&Step::Advance(1_995));
+    offer(&mut pair, OFFERED);
+    assert_eq!(pair.rust.roles().client.retries(), 1);
+}
+
+/// The host's ACK timer, armed by every `BeginHost`, posts its timeout ten
+/// seconds later even after the machine has left `HostReqUpdate`.
+#[test]
+fn the_host_ack_timer_outlives_its_state() {
+    let mut pair = reset();
+    pair.apply(&Step::Advance(10_000));
+    assert_eq!(
+        pair.rust.core().queue().iter().next().map(|e| e.kind),
+        Some(EventType::AckTimeout)
+    );
+    pair.apply(&Step::RunAll);
 }

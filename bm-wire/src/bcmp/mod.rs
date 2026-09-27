@@ -30,6 +30,7 @@
 
 pub mod config;
 pub mod dfu;
+pub mod dfu_client;
 pub mod dfu_core;
 pub mod forward;
 pub mod header;

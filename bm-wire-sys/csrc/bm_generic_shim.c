@@ -24,6 +24,8 @@ static struct {
   RtcTimeAndDate rtc;
   bool rtc_set;
   uint8_t flash[DFU_FLASH_BYTES];
+  BmShimDfuFaults faults;
+  BmShimDfuCounts counts;
 } CTX;
 
 void bm_shim_generic_reset(void) { memset(&CTX, 0, sizeof(CTX)); }
@@ -58,7 +60,10 @@ bool bm_config_write(BmConfigPartition partition, uint32_t offset,
   return true;
 }
 
-void bm_config_reset(void) { memset(CTX.partitions, 0, sizeof(CTX.partitions)); }
+void bm_config_reset(void) {
+  memset(CTX.partitions, 0, sizeof(CTX.partitions));
+  CTX.counts.config_resets++;
+}
 
 // ---------------------------------------------------------------------------
 // RTC — a settable value, never the host clock
@@ -102,12 +107,38 @@ uint64_t bm_rtc_get_micro_seconds(RtcTimeAndDate *time_and_date) {
 // except the functions below.
 static const void *const FLASH_AREA = (const void *)&CTX.flash;
 
-BmErr bm_dfu_client_set_confirmed(void) { return BmOK; }
-BmErr bm_dfu_client_set_pending_and_reset(void) { return BmOK; }
-BmErr bm_dfu_client_fail_update_and_reset(void) { return BmOK; }
+void bm_shim_dfu_set_faults(BmShimDfuFaults faults) { CTX.faults = faults; }
+
+void bm_shim_dfu_counts(BmShimDfuCounts *out) {
+  if (out) {
+    *out = CTX.counts;
+  }
+}
+
+const uint8_t *bm_shim_dfu_flash(uint32_t *len) {
+  if (len) {
+    *len = DFU_FLASH_BYTES;
+  }
+  return CTX.flash;
+}
+
+// The three boot hooks reset the processor on hardware. Here they only count.
+BmErr bm_dfu_client_set_confirmed(void) {
+  CTX.counts.confirmed++;
+  return BmOK;
+}
+BmErr bm_dfu_client_set_pending_and_reset(void) {
+  CTX.counts.pending_and_reset++;
+  return BmOK;
+}
+BmErr bm_dfu_client_fail_update_and_reset(void) {
+  CTX.counts.fail_and_reset++;
+  return BmOK;
+}
 
 BmErr bm_dfu_client_flash_area_open(const void **flash_area) {
-  if (!flash_area) {
+  CTX.counts.opens++;
+  if (!flash_area || CTX.faults.open) {
     return BmEINVAL;
   }
   *flash_area = FLASH_AREA;
@@ -115,12 +146,14 @@ BmErr bm_dfu_client_flash_area_open(const void **flash_area) {
 }
 
 BmErr bm_dfu_client_flash_area_close(const void *flash_area) {
+  CTX.counts.closes++;
   return flash_area == FLASH_AREA ? BmOK : BmEINVAL;
 }
 
 BmErr bm_dfu_client_flash_area_write(const void *flash_area, uint32_t off,
                                      const void *src, uint32_t len) {
-  if (flash_area != FLASH_AREA || !src ||
+  CTX.counts.writes++;
+  if (flash_area != FLASH_AREA || !src || CTX.faults.write ||
       (uint64_t)off + len > DFU_FLASH_BYTES) {
     return BmEINVAL;
   }
@@ -130,7 +163,9 @@ BmErr bm_dfu_client_flash_area_write(const void *flash_area, uint32_t off,
 
 BmErr bm_dfu_client_flash_area_erase(const void *flash_area, uint32_t off,
                                      uint32_t len) {
-  if (flash_area != FLASH_AREA || (uint64_t)off + len > DFU_FLASH_BYTES) {
+  CTX.counts.erases++;
+  if (flash_area != FLASH_AREA || CTX.faults.erase ||
+      (uint64_t)off + len > DFU_FLASH_BYTES) {
     return BmEINVAL;
   }
   memset(&CTX.flash[off], 0xFF, len); // erased flash reads as ones

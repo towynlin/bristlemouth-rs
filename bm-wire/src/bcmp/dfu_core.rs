@@ -27,6 +27,18 @@
 //! | `bm_dfu_set_pending_state_change`, `bm_dfu_set_error`, `bm_dfu_get_current_event` | [`Core`] methods |
 //! | `client_update_reboot_info` | [`RebootInfo`], held in [`Core`] |
 //! | `bcmp_tx`, the finish callback, `bm_dfu_core_lpm_peripheral_*` | [`Effects`] |
+//! | the client's and host's `BmTimer`s, `bm_delay` | [`Timer`], [`Core::start_timer`], [`Core::delay`], [`Dfu::poll`] |
+//! | `bm_dfu_generic.h`, `git_sha`, the config store | [`Effects`] |
+//!
+//! # Time
+//!
+//! The C's timers run on the RTOS timer task and post an event when they fire;
+//! `bm_delay` blocks the DFU task while they do. [`Core`] keeps the timers as
+//! deadlines against a clock the caller advances: [`Dfu::poll`] and
+//! [`Dfu::step`] move it to `now_ms` and post every timer that has come due,
+//! and [`Core::delay`] moves it on by the delay mid-run, posting any that
+//! come due inside it. Nothing waits. Timers come due in deadline order, ties
+//! in [`Timer`] order, which is the order `bm_dfu_init` creates them in.
 //!
 //! `dfu_copy_and_process_message`'s other half — forwarding a message for
 //! another node when it arrived link-local — is `bm-stack`'s, as it is for
@@ -52,6 +64,7 @@ use crate::bcmp::dfu::{
     DFU_MAX_CHUNK_SIZE, DfuAddress, DfuChunkRequest, DfuMessage, DfuResult, DfuStart, ImgInfo,
 };
 use crate::bcmp::header::BCMP_HEADER_LEN;
+use crate::configuration::{ConfigStore, Partition};
 use crate::frame::MIN_FRAME_WITH_ADDRESSES;
 use crate::{BmWireError, bcmp::MessageType};
 
@@ -235,6 +248,43 @@ impl DfuErr {
     #[must_use]
     pub fn is_fatal(self) -> bool {
         self.0 >= Self::FLASH_ACCESS.0
+    }
+}
+
+/// The DFU timers, in the order `bm_dfu_client_init` and `bm_dfu_host_init`
+/// create them. All are one-shot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Timer {
+    /// `CLIENT_CTX.chunk_timer`: [`EventType::ChunkTimeout`] after
+    /// `bm_dfu_client_chunk_timeout_ms`.
+    Chunk,
+    /// `host_ctx.ack_timer`: [`EventType::AckTimeout`] after
+    /// `bm_dfu_host_ack_timeout_ms`.
+    Ack,
+}
+
+impl Timer {
+    /// Both, in creation order.
+    pub const ALL: [Self; 2] = [Self::Chunk, Self::Ack];
+
+    /// The period it is created with.
+    #[must_use]
+    pub const fn period_ms(self) -> u32 {
+        match self {
+            // `bm_dfu_client_chunk_timeout_ms`, dfu_client.h.
+            Self::Chunk => 2_000,
+            // `bm_dfu_host_ack_timeout_ms`, dfu_host.h.
+            Self::Ack => 10_000,
+        }
+    }
+
+    /// The event its handler posts.
+    #[must_use]
+    pub const fn event(self) -> EventType {
+        match self {
+            Self::Chunk => EventType::ChunkTimeout,
+            Self::Ack => EventType::AckTimeout,
+        }
     }
 }
 
@@ -437,6 +487,35 @@ pub trait Effects {
     /// The `UpdateFinishCb` given to `bm_dfu_initiate_update`, called only if
     /// one was given.
     fn update_finished(&mut self, success: bool, err: DfuErr, node_id: u64);
+
+    /// `bm_dfu_client_flash_area_open`: open the update slot. The C keeps the
+    /// handle it returns; here the implementation keeps it.
+    fn flash_open(&mut self) -> bool;
+    /// `bm_dfu_client_flash_area_close`. The client ignores the result.
+    fn flash_close(&mut self) -> bool;
+    /// `bm_dfu_client_flash_area_get_size`.
+    fn flash_size(&mut self) -> u32;
+    /// `bm_dfu_client_flash_area_erase`.
+    fn flash_erase(&mut self, offset: u32, len: u32) -> bool;
+    /// `bm_dfu_client_flash_area_write`.
+    fn flash_write(&mut self, offset: u32, data: &[u8]) -> bool;
+    /// `bm_dfu_client_set_confirmed`: mark the running image good.
+    fn set_confirmed(&mut self);
+    /// `bm_dfu_client_set_pending_and_reset`: mark the received image to be
+    /// tried on the next boot, and reset. Does not return on hardware.
+    fn set_pending_and_reset(&mut self);
+    /// `bm_dfu_client_fail_update_and_reset`: revert to the previous image,
+    /// and reset. Does not return on hardware.
+    fn fail_update_and_reset(&mut self);
+    /// `git_sha()`: the running image's SHA, which a `0xD0` is compared with.
+    fn git_sha(&self) -> u32;
+    /// `CONFIGS`, where the client keeps `dfu_confirm`, or `None` for a node
+    /// without one. Every `get_config_*` then fails and every `set_config_*`
+    /// refuses.
+    fn config(&mut self) -> Option<&mut ConfigStore>;
+    /// `save_config(partition, true)`: seal, write, then reset. Does not
+    /// return on hardware.
+    fn commit_config(&mut self, partition: Partition) -> bool;
 }
 
 /// The client and host states, which `dfu_client.c` and `dfu_host.c` supply.
@@ -447,19 +526,19 @@ pub trait Effects {
 /// queue events and request state changes through, as the C files call back
 /// into `dfu_core.c`.
 ///
-/// `now_ms` is the caller's clock, passed through for the roles' timers; the
-/// core keeps none.
+/// Timers and `bm_delay` are the [`Core`]'s, since a delay in one role fires
+/// the other's timers too.
 pub trait Roles {
     /// `on_state_entry` for a client or host state.
-    fn entry(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects, now_ms: u32);
+    fn entry(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects);
     /// `run` for a client or host state.
-    fn run(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects, now_ms: u32);
+    fn run(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects);
     /// `on_state_exit` for a client or host state. Only
     /// [`State::HostUpdate`] has one in the C.
-    fn exit(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects, now_ms: u32);
+    fn exit(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects);
     /// `bm_dfu_client_process_update_request`: a `0xD0` run in
     /// [`State::Idle`].
-    fn client_process_update_request(&mut self, core: &mut Core, fx: &mut dyn Effects, now_ms: u32);
+    fn client_process_update_request(&mut self, core: &mut Core, fx: &mut dyn Effects);
     /// `bm_dfu_host_set_params`: a [`EventType::BeginHost`] run in
     /// [`State::Idle`], before the change to [`State::HostReqUpdate`].
     fn host_set_params(&mut self, notify: bool, timeout_ms: u32);
@@ -572,6 +651,10 @@ pub struct Core {
     internal: bool,
     queue: EventQueue,
     reboot_info: RebootInfo,
+    /// The time last passed in, plus any delays since. `None` until then.
+    clock: Option<u32>,
+    /// Deadline per [`Timer`], `None` when stopped.
+    timers: [Option<u32>; Timer::ALL.len()],
 }
 
 impl Core {
@@ -665,6 +748,75 @@ impl Core {
         &mut self.reboot_info
     }
 
+    /// The machine's clock: the last `now_ms` it was given, plus any
+    /// [`Self::delay`] since. Zero before the first.
+    #[must_use]
+    pub fn now(&self) -> u32 {
+        self.clock.unwrap_or(0)
+    }
+
+    /// `bm_timer_start`: (re)arm `timer` for its period from [`Self::now`].
+    pub fn start_timer(&mut self, timer: Timer) {
+        self.timers[timer as usize] = Some(self.now().wrapping_add(timer.period_ms()));
+    }
+
+    /// `bm_timer_stop`.
+    pub fn stop_timer(&mut self, timer: Timer) {
+        self.timers[timer as usize] = None;
+    }
+
+    /// When `timer` fires, if it is running.
+    #[must_use]
+    pub fn timer_deadline(&self, timer: Timer) -> Option<u32> {
+        self.timers[timer as usize]
+    }
+
+    /// `bm_delay(ms)`: the clock moves on, and any timer that comes due
+    /// meanwhile posts its event.
+    pub fn delay(&mut self, ms: u32) {
+        let now = self.now().wrapping_add(ms);
+        self.clock = Some(now);
+        self.fire_due();
+    }
+
+    /// Move the clock to `now_ms` unless it is already past it, then fire
+    /// what is due.
+    fn advance_to(&mut self, now_ms: u32) {
+        let ahead = self
+            .clock
+            .is_some_and(|clock| (now_ms.wrapping_sub(clock) as i32) < 0);
+        if !ahead {
+            self.clock = Some(now_ms);
+        }
+        self.fire_due();
+    }
+
+    /// Post each due timer's event, earliest deadline first, ties in
+    /// [`Timer`] order. A post that finds the queue full is lost, as the C's
+    /// handlers only log it.
+    fn fire_due(&mut self) {
+        let now = self.now();
+        while let Some(timer) = Timer::ALL
+            .into_iter()
+            .filter(|t| self.timers[*t as usize].is_some_and(|d| (now.wrapping_sub(d) as i32) >= 0))
+            .min_by_key(|t| self.timers[*t as usize].map(|d| d.wrapping_sub(now) as i32))
+        {
+            self.timers[timer as usize] = None;
+            let _ = self.queue.push(Event::bare(timer.event()));
+        }
+    }
+
+    /// The earliest running timer's deadline.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<u32> {
+        let now = self.now();
+        self.timers
+            .iter()
+            .flatten()
+            .min_by_key(|d| d.wrapping_sub(now) as i32)
+            .copied()
+    }
+
     fn address_to(&self, dst_node_id: u64) -> DfuAddress {
         DfuAddress {
             src_node_id: self.self_node_id,
@@ -732,6 +884,8 @@ impl<R: Roles> Dfu<R> {
                 internal: false,
                 queue,
                 reboot_info,
+                clock: None,
+                timers: [None; Timer::ALL.len()],
             },
             roles,
         }
@@ -849,10 +1003,24 @@ impl<R: Roles> Dfu<R> {
         true
     }
 
-    /// One iteration of `bm_dfu_event_thread`: take the oldest event and run
-    /// the machine with it. Returns the event's type, or `None` if the queue
-    /// was empty and nothing ran.
+    /// Move the clock to `now_ms` and post the event of every timer that has
+    /// come due — what the RTOS timer task does while the DFU task waits.
+    pub fn poll(&mut self, now_ms: u32) {
+        self.core.advance_to(now_ms);
+    }
+
+    /// The earliest running timer's deadline: when [`Self::poll`] next has
+    /// something to do.
+    #[must_use]
+    pub fn next_deadline(&self) -> Option<u32> {
+        self.core.next_deadline()
+    }
+
+    /// One iteration of `bm_dfu_event_thread`: [`Self::poll`], then take the
+    /// oldest event and run the machine with it. Returns the event's type, or
+    /// `None` if the queue was empty and nothing ran.
     pub fn step(&mut self, fx: &mut dyn Effects, now_ms: u32) -> Option<EventType> {
+        self.poll(now_ms);
         let event = self.pop()?;
         let kind = event.kind;
         self.run_event(event, fx, now_ms);
@@ -868,30 +1036,34 @@ impl<R: Roles> Dfu<R> {
     /// Run the machine once with `event`, bypassing the queue:
     /// `bm_dfu_test_set_dfu_event_and_run_sm`, which bm_core's `dfu_test.cpp`
     /// drives.
+    ///
+    /// The clock moves to `now_ms` first, which may post timer events behind
+    /// the queue.
     pub fn run_event(&mut self, event: Event, fx: &mut dyn Effects, now_ms: u32) {
+        self.poll(now_ms);
         self.core.current = event;
-        self.lib_sm_run(fx, now_ms);
+        self.lib_sm_run(fx);
         self.core.current = Event::NONE;
     }
 
     /// `lib_sm_run` with `bm_dfu_check_transitions`: run the state, then take
     /// a pending change. A change to the state already current is taken
     /// without exit or entry, as the C compares state pointers.
-    fn lib_sm_run(&mut self, fx: &mut dyn Effects, now_ms: u32) {
+    fn lib_sm_run(&mut self, fx: &mut dyn Effects) {
         let state = self.core.state;
-        self.run_state(state, fx, now_ms);
+        self.run_state(state, fx);
         let Some(next) = self.core.pending.take() else {
             return;
         };
         if next == state {
             return;
         }
-        self.exit_state(state, fx, now_ms);
+        self.exit_state(state, fx);
         self.core.state = next;
-        self.enter_state(next, fx, now_ms);
+        self.enter_state(next, fx);
     }
 
-    fn run_state(&mut self, state: State, fx: &mut dyn Effects, now_ms: u32) {
+    fn run_state(&mut self, state: State, fx: &mut dyn Effects) {
         let core = &mut self.core;
         match state {
             // s_init_run
@@ -908,7 +1080,7 @@ impl<R: Roles> Dfu<R> {
             // s_idle_run
             State::Idle => match core.current.kind {
                 EventType::ReceivedUpdateRequest => {
-                    self.roles.client_process_update_request(core, fx, now_ms);
+                    self.roles.client_process_update_request(core, fx);
                 }
                 EventType::BeginHost => {
                     // Only `initiate_update` queues a `BeginHost`, always with
@@ -924,11 +1096,11 @@ impl<R: Roles> Dfu<R> {
             },
             // s_error_run
             State::Error => {}
-            _ => self.roles.run(state, core, fx, now_ms),
+            _ => self.roles.run(state, core, fx),
         }
     }
 
-    fn enter_state(&mut self, state: State, fx: &mut dyn Effects, now_ms: u32) {
+    fn enter_state(&mut self, state: State, fx: &mut dyn Effects) {
         let core = &mut self.core;
         match state {
             State::Init => {}
@@ -947,16 +1119,16 @@ impl<R: Roles> Dfu<R> {
                     core.set_pending_state_change(State::Idle);
                 }
             }
-            _ => self.roles.entry(state, core, fx, now_ms),
+            _ => self.roles.entry(state, core, fx),
         }
     }
 
-    fn exit_state(&mut self, state: State, fx: &mut dyn Effects, now_ms: u32) {
+    fn exit_state(&mut self, state: State, fx: &mut dyn Effects) {
         match state {
             State::Init | State::Error => {}
             // s_idle_exit
             State::Idle => fx.lpm_peripheral_active(),
-            _ => self.roles.exit(state, &mut self.core, fx, now_ms),
+            _ => self.roles.exit(state, &mut self.core, fx),
         }
     }
 }

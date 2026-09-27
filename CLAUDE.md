@@ -51,7 +51,10 @@ A cargo workspace.
 - `bm-stack/` — the node. `no_std`, no `alloc` (except behind the test-only
   `mock` feature), and the only crate that knows about time or I/O.
   - `src/port.rs` — the seams bm_core leaves to the integrator, as traits
-    rather than link-time symbols. The DFU flash slot is still to come.
+    rather than link-time symbols, including the DFU update slot and the
+    no-init RAM that carries an update across a reset.
+  - `src/dfu.rs` — the DFU client on a node: the machine, its outbox, and
+    the resets it asks for.
   - `src/config.rs` — `config_init` and `save_config`, the two functions of
     `bcmp/configuration.c` that touch storage; the store itself is
     `bm_wire::configuration`.
@@ -59,7 +62,8 @@ A cargo workspace.
     synchronous and take the current time; `Node::run` is the only async code.
     Each has a `_with` twin that reports `Event`s. The two timers are
     bm_core's: the 10 s heartbeat and `packet.c`'s 150 ms expiry sweep, which
-    must not be put on a grid of the port's own (divergence #22).
+    must not be put on a grid of the port's own (divergence #22). DFU runs
+    from `next_dfu_transmission`, as bm_core's runs on its own task.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
 - `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
   SPI, on the per-port frame I/O of

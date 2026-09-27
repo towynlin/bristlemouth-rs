@@ -8,9 +8,10 @@ one agent each.
 neighbour table (`0x08`/`0x09`, both halves), resource discovery
 (`0x0A`/`0x0B`, both halves), system time (`0x10`–`0x12`, both halves) and
 config (`0xA0`–`0xA9`, all ten) — plus the DFU body codecs (`0xD0`–`0xD9`,
-`bm-wire/src/bcmp/dfu.rs`) and the DFU core state machine over them
-(`bm-wire/src/bcmp/dfu_core.rs`), with no client or host yet and no `bm-stack`
-node running it, and the wire engine under them
+`bm-wire/src/bcmp/dfu.rs`), the DFU core state machine over them
+(`bm-wire/src/bcmp/dfu_core.rs`) and its client
+(`bm-wire/src/bcmp/dfu_client.rs`), which a `bm-stack` node runs, with no host
+yet, and the wire engine under them
 (`bcmp::tx::serialize`, `bcmp::rx::accept`, L2 egress stamping, the link-local
 RX policy, the two forwarding paths in `bcmp::forward`) and three state
 machines, `bm-wire/src/neighbor.rs`, `bm-wire/src/bcmp/registry.rs` and
@@ -33,10 +34,9 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-D3 and D4 are unblocked, and independent of each other.
+D4 is unblocked.
 
 ---
 
@@ -91,8 +91,10 @@ Literal byte arrays exist in five test files, mostly as inputs:
 traces, not byte vectors: they build `BcmpDfuStart` structs in memory and assert
 state enums. They prove nothing about the wire encoding. D2 lifted the steps
 the core decides into `bm-wire/src/bcmp/dfu_core/tests.rs`, with stand-in roles
-making the calls the C roles make; the steps the client and host decide are
-D3's and D4's to lift.
+making the calls the C roles make; D3 lifted the client's into
+`bm-wire/src/bcmp/dfu_client/tests.rs`, where `client_golden`'s `crc16` of
+0x2fdf over 2048 bytes of 0xa5 is the one image checksum bm_core asserts. The
+host's steps are D4's to lift.
 
 Ground truth for every encoding below comes from running the compiled oracle.
 Say so in the card's writeup rather than quietly skipping step 4.
@@ -160,7 +162,7 @@ cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 On a crash: `cargo fuzz tmin <target> <artifact>`, then drop the minimized file
 into `bm-wire/fuzz/seeds/<target>/`.
 
-### What the landed cards (M1, M2, M3, M4, M5, C1, C2, C3, D1, D2) left for the rest
+### What the landed cards (M1, M2, M3, M4, M5, C1, C2, C3, D1, D2, D3) left for the rest
 
 - **Forwarding machinery is built.** `bm_stack::Owed::forward` is the decision,
   as a `Reflood` — a byte range within the received frame plus the ingress port,
@@ -399,27 +401,38 @@ into `bm-wire/fuzz/seeds/<target>/`.
 - **DFU reads bodies without checking their length** (divergence #55). The
   decoders refuse short bodies; a stack comparator must send only
   well-formed ones, and a chunk whose `payload_length` fits the frame.
-- **`chunk_size` zero divides by zero in the client** (divergence #57). D3
-  decides what the port does and keeps the comparator's `chunk_size`
-  non-zero.
+- **`chunk_size` zero divides by zero in the client** (divergence #57). The
+  client gives Cortex-M's `UDIV`-by-zero result; the comparator sends the C 1
+  instead. The host does not check for zero either, and D4 decides what its
+  port does.
 - **`bm_dfu_init` registers `0xD9` twice** (divergence #56). The second entry is
   shadowed; a node mirroring the registration needs eleven registry slots.
 - **The four `dfu_core.c` senders are compared as frames** in
   `bm-wire-diff/tests/dfu_core.rs`; `bcmp_init` runs `bm_dfu_init`, which sets
-  `dfu_ctx.self_node_id`. The client's and host's own senders
-  (`bm_dfu_client_abort`, `bm_dfu_host_send_chunk`, ...) are not yet.
+  `dfu_ctx.self_node_id`. So are the client's own (`bm_dfu_client_abort`,
+  the reboot request, the boot-complete); the host's (`bm_dfu_host_send_chunk`,
+  `bm_dfu_host_send_reboot`, ...) are not yet.
 - **The DFU core is ported (D2).** `bm_wire::bcmp::dfu_core::Dfu` is
   `dfu_core.c`: the queue, `lib_sm_run`'s run-then-transition order, `Init`,
   `Idle`, `Error`, and the four senders (now compared as frames). The seven
-  client and host states are a `Roles` implementation, which D3 and D4 each
-  supply half of; a node running both needs one type implementing `Roles` that
-  dispatches on the state. `Roles` gets the `Core` for everything the C files
-  call back into `dfu_core.c` (`current_event`, `set_pending_state_change`,
-  `set_error`, `post` for timers, `reboot_info_mut`, the senders).
-- **Timers post events; they do not run the machine.** The client's chunk
-  timer and the host's ack and update timers `bm_queue_send` an event;
-  `Core::post` is that. The host's heartbeat timer is the exception: it calls
-  `bm_dfu_send_heartbeat` directly from the timer callback.
+  client and host states are a `Roles` implementation. `Client` implements it
+  for a client-only node; `bm_wire_diff::dfu_core::Both` is the pattern for a
+  node running both, dispatching on the state. `Roles` gets the `Core` for
+  everything the C files call back into `dfu_core.c` (`current_event`,
+  `set_pending_state_change`, `set_error`, the timers, `delay`,
+  `reboot_info_mut`, the senders).
+- **Timers are the core's, and post events.** `Core::start_timer`,
+  `stop_timer` and `delay` (`bm_delay`) run against a clock `Dfu::poll` and
+  `Dfu::step` advance; a due timer posts its event behind the queue, deadline
+  order first, ties in `Timer` order (creation order). `Timer` has the chunk
+  and ACK timers; D4 adds the update timer, and the heartbeat timer, whose
+  callback sends `bm_dfu_send_heartbeat` through `timer_callback_handler`
+  rather than posting. A delay fires every role's timers, not only the
+  caller's, which is why they live in the core.
+- **`s_host_req_update_entry` arms the ACK timer and nothing in domain stops
+  it.** It fires `AckTimeout` ten seconds later wherever the machine is —
+  harmless in Idle — and `reset` leaves it armed on both sides.
+  `the_host_ack_timer_outlives_its_state` pins it.
 - **Events are checked at queue time and run later.** `Dfu::on_message` is
   `bm_dfu_process_message`, which validates the source against the state the
   machine is in *when the message arrives*. A pending change is taken after
@@ -429,18 +442,32 @@ into `bm-wire/fuzz/seeds/<target>/`.
   drives `dfu_core.c` through `bm_dfu_test_set_dfu_event_and_run_sm`, one event
   at a time, and empties the C queue around every pump so the DFU task never
   runs one itself. It discards, on both sides, any event that would reach the
-  client or host (`in_domain`); D3 and D4 each widen `in_domain` and replace
-  `ReqUpdateOnly` with their role. `reset` returns both machines to Idle
-  through the public API at the start of every script, and must keep doing so
-  for whatever the roles add. `bcmp_init` already runs `bm_dfu_init` when
-  `stack::oracle` brings the stack up; calling it again leaks the first queue
-  and starts a second DFU task, which is what the fuzzer's first run found.
+  host beyond `HostReqUpdate`'s entry (`in_domain`); D4 widens `in_domain` and
+  replaces `ReqUpdateOnly` in `Both` with its role. `reset` returns both
+  machines to Idle through the public API at the start of every script,
+  fires any stale timer by advancing the C clock past the longest period, and
+  must keep doing so for whatever the host adds. `bcmp_init` already runs
+  `bm_dfu_init` when `stack::oracle` brings the stack up; calling it again
+  leaks the first queue and starts a second DFU task, which is what the
+  fuzzer's first run found.
+- **`Step::Offer` and `Step::Serve` carry whole transfers.** A `TestImage`'s
+  bytes derive from a seed, `Serve` sends the chunk the client last asked for,
+  and `Step::Advance` stops at each port deadline so two timers due in one
+  step fire in deadline order rather than the shim's creation order.
+  `in_domain_body` pads every body to what the C reads (#55). D4's host side
+  wants the mirror image: a scripted client.
+- **The slot, the boot hooks and `bm_config_reset` are seams with no
+  oracle.** `csrc/bm_generic_shim.c` counts every call and refuses what
+  `bm_shim_dfu_set_faults` names; the comparator's `Recorded` is the same in
+  Rust, and compares counts and the 256 KiB slot byte for byte after every
+  step. `bm_dfu_host_get_chunk` reads the same buffer, so D4 can serve an
+  image the client wrote.
 - **The C test accessors are bound.** `build.rs` now passes `-DENABLE_TESTING`
   to bindgen, so `bm_dfu_test_get_sm_ctx`, `bm_dfu_test_set_dfu_event_and_run_sm`
   and `bm_dfu_test_set_client_fa` are callable.
 - **The error state's callback is the host's** (divergence #58): whichever role
-  fails, `s_error_entry` calls the last host update's finish callback. D3 must
-  not "fix" this on the client side.
+  fails, `s_error_entry` calls the last host update's finish callback. The
+  client does not "fix" this, and D4 must not either.
 - **The host stores a peer's `err_code` as its own error** (divergence #59),
   and 14 or more wedges DFU until reboot. `the_c_host_adopts_a_clients_fatal_nack`
   shows it in the C host; D4 has to reproduce it.
@@ -449,16 +476,23 @@ into `bm-wire/fuzz/seeds/<target>/`.
   while `internal` is set. D4 decides how the port holds externally supplied
   image data, and whether that domain limit can go.
 - **`client_update_reboot_info` is `Core::reboot_info`.** `Dfu::new` takes what
-  no-init RAM held; `s_idle_entry` zeroes it. The integrator writing it back
-  to no-init RAM is D3's seam. `RebootInfo::encode` is the packed C layout,
-  which a C image and a Rust image must share to hand an update across.
-- **`bm-stack` does not run DFU yet.** `Node::new` does not register the ten
-  types (22 of its 32 registry slots are used; DFU needs 10, or 11 to mirror
-  divergence #56), so a `bm-stack` node neither answers nor forwards DFU. The
-  comparator registers them on its own node to build frames. Whoever lands the
-  first role wires `Dfu` into `Node`, including
-  `dfu_copy_and_process_message`'s forward of a link-local message for another
-  node.
+  no-init RAM held; `s_idle_entry` zeroes it. `bm_stack::port::NoInitRam` is
+  the seam that keeps it across a reset; `bm_stack::dfu::NodeDfu` stores it
+  whenever it changes and before any reset the client asks for.
+  `RebootInfo::encode` is the packed C layout, which a C image and a Rust
+  image must share to hand an update across.
+- **`bm-stack` runs DFU as a client.** `Node::with_dfu` takes a
+  `DfuSlot + NoInitRam`; `Node::new` and `with_config` use `NoDfu`, whose slot
+  will not open. All eleven registrations are made (33 of 40 slots).
+  `Node::on_frame` queues a DFU body for this node and re-floods one for
+  another node that arrived link-local; `Node::next_dfu_transmission` runs the
+  machine, as the DFU task does, and `Node::run` drains it after every wake
+  and waits on its chunk timer. Its outbox holds 35-byte bodies, enough for
+  everything the client and core send; D4's chunks need more. Nothing exposes
+  `Dfu::initiate_update` yet, and `Effects::update_finished` goes nowhere.
+- **The client's quirks are #62–#66.** None changes how D4 is built, but
+  #62 and #63 are what a C client does to a host that resends a start or
+  keeps serving after a failed write.
 ---
 
 ## Card format
@@ -472,27 +506,7 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 # DFU
 
 1832 LoC across three files, the heaviest state in bm_core. Split three ways;
-the core (D2) has landed.
-
-## D3 — the DFU client
-
-**Blocked by:** nothing.
-
-**C source.** `dfu_client.c` (661 LoC). State in `DfuClientCtx`: `image_size`,
-`num_chunks`, `crc16` and `running_crc16`, a 2048-byte `img_page_buf` with
-`img_page_byte_counter` and `img_flash_offset`, `chunk_retry_num` (max 5,
-`bm_dfu_max_chunk_retries`), `current_chunk`, a 2000 ms `chunk_timer`
-(`bm_dfu_client_chunk_timeout_ms`), the flash area handle and the host node id.
-It persists `dfu_confirm` through the config store and keeps
-`client_update_reboot_info` in no-init RAM behind magic `0xBADC0FFE`.
-
-**New port seam.** The DFU flash slot in `bm-stack/src/port.rs`, matching
-`bm_dfu_generic.h`'s flash-area open/write/erase/close. `bm-wire`'s `crc.rs`
-already has `crc16_ccitt` and is currently unused — this is its first consumer.
-
-**Note.** The no-init-RAM reboot handshake is a hardware seam the mock cannot
-fully model. Express it as a trait with an explicit "survives reboot" contract
-and document what the mock does instead.
+the core (D2) and the client (D3) have landed.
 
 ## D4 — the DFU host
 

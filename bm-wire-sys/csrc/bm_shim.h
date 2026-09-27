@@ -25,10 +25,39 @@ extern "C" {
 // without one are listed in README.md as a per-iteration hazard.
 void bm_shim_reset(void);
 
-// Clears only the RAM standing in for NVM, the RTC, and the DFU flash slot.
+// Clears only the RAM standing in for NVM, the RTC, the DFU flash slot, and
+// the DFU faults and counts below.
 // bm_shim_reset calls this; it is exposed so a test can wipe storage without
 // tearing down queues and timers.
 void bm_shim_generic_reset(void);
+
+// --- the DFU update slot and boot hooks (bm_dfu_generic.h) ---
+
+// Operations to refuse from now on. Refused calls are still counted.
+typedef struct {
+  bool open;
+  bool erase;
+  bool write;
+} BmShimDfuFaults;
+void bm_shim_dfu_set_faults(BmShimDfuFaults faults);
+
+// Calls made since the last bm_shim_generic_reset, including refused ones.
+// `config_resets` counts bm_config_reset, which save_config calls when asked
+// to restart.
+typedef struct {
+  uint32_t opens;
+  uint32_t closes;
+  uint32_t erases;
+  uint32_t writes;
+  uint32_t confirmed;
+  uint32_t pending_and_reset;
+  uint32_t fail_and_reset;
+  uint32_t config_resets;
+} BmShimDfuCounts;
+void bm_shim_dfu_counts(BmShimDfuCounts *out);
+
+// The RAM standing in for the update slot, and its size.
+const uint8_t *bm_shim_dfu_flash(uint32_t *len);
 
 // bm_debug output. Silent by default so fuzzing is not I/O bound.
 void bm_shim_set_debug(bool on);
