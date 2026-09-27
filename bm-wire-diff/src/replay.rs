@@ -67,6 +67,9 @@ pub fn replay_target(target: &str) -> usize {
                 crate::cbor::check(i);
             }),
             "crc" => replay_one::<crate::crc::CrcInput, _>(&bytes, crate::crc::check),
+            "dfu_codec" => {
+                replay_one::<crate::dfu_codec::DfuCodecInput, _>(&bytes, crate::dfu_codec::check)
+            }
             "configuration" => replay_one::<crate::configuration::ConfigInput, _>(&bytes, |i| {
                 crate::configuration::check(i);
             }),
@@ -148,6 +151,7 @@ pub const TARGETS: &[&str] = &[
     "configuration",
     "crc",
     "date_time",
+    "dfu_codec",
     "l2_policy",
     "strnlen",
     "time_remaining",

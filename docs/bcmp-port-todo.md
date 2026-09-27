@@ -7,7 +7,8 @@ one agent each.
 (`0x02`/`0x03`, both halves), device info (`0x04`/`0x05`, both halves),
 neighbour table (`0x08`/`0x09`, both halves), resource discovery
 (`0x0A`/`0x0B`, both halves), system time (`0x10`–`0x12`, both halves) and
-config (`0xA0`–`0xA9`, all ten) — plus the wire engine under them
+config (`0xA0`–`0xA9`, all ten) — plus the DFU body codecs (`0xD0`–`0xD9`,
+`bm-wire/src/bcmp/dfu.rs`) with nothing yet sending or answering them, and the wire engine under them
 (`bcmp::tx::serialize`, `bcmp::rx::accept`, L2 egress stamping, the link-local
 RX policy, the two forwarding paths in `bcmp::forward`) and three state
 machines, `bm-wire/src/neighbor.rs`, `bm-wire/src/bcmp/registry.rs` and
@@ -15,9 +16,10 @@ machines, `bm-wire/src/neighbor.rs`, `bm-wire/src/bcmp/registry.rs` and
 `bm-wire/src/configuration.rs`, and the config message codecs,
 `bm-wire/src/bcmp/config.rs`.
 `MessageType` names all 45 of bm_core's constants; twenty-four body structs have
-a codec. CBOR, which the config chain needs, is the `cbor2` crate rather than a
-port; `bm-wire/src/cbor.rs` holds only the one deviation from its defaults
-that bm_core requires.
+a codec, and the ten DFU bodies share one, `DfuMessage`. CBOR, which the
+config chain needs, is the `cbor2` crate rather than a port;
+`bm-wire/src/cbor.rs` holds only the one deviation from its defaults that
+bm_core requires.
 
 `bm_stack::Node` drives that registry: `Node::register` is `packet_add`,
 `Node::request` is `bcmp_tx`, and `bm_stack::Event` is where a reply, a timeout
@@ -29,12 +31,11 @@ Everything below is absent from Rust — no files, no stubs, no `TODO` markers.
 
 | Area | C source | LoC | Card |
 |---|---|---|---|
-| DFU message codecs `0xD0`–`0xD9` | `bcmp/dfu_message_structs.h` | — | D1 |
 | DFU core HFSM | `bcmp/dfu_core.c` | 689 | D2 |
 | DFU client | `bcmp/dfu_client.c` | 661 | D3 |
 | DFU host | `bcmp/dfu_host.c` | 482 | D4 |
 
-D1 is unblocked. D2 needs D1; D3 and D4 each need D2.
+D2 is unblocked. D3 and D4 each need D2.
 
 ---
 
@@ -156,7 +157,7 @@ cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 On a crash: `cargo fuzz tmin <target> <artifact>`, then drop the minimized file
 into `bm-wire/fuzz/seeds/<target>/`.
 
-### What the landed cards (M1, M2, M3, M4, M5, C1, C2, C3) left for the rest
+### What the landed cards (M1, M2, M3, M4, M5, C1, C2, C3, D1) left for the rest
 
 - **Forwarding machinery is built.** `bm_stack::Owed::forward` is the decision,
   as a `Reflood` — a byte range within the received frame plus the ingress port,
@@ -385,6 +386,27 @@ into `bm-wire/fuzz/seeds/<target>/`.
   bound the second; the comparator keeps the partition in range for every type
   but the clear request, which is the one that checks it.
 
+- **The DFU codecs are ported (D1).** `bm_wire::bcmp::dfu::DfuMessage` is all
+  ten bodies. `decode` dispatches on the body's `frame_type` byte, as
+  `bm_dfu_process_message` does, not on the BCMP header type (divergence #54);
+  D2 must do the same. `DfuAddress::of_body` is the read
+  `dfu_copy_and_process_message` makes before it looks at the type, for the
+  process-or-forward decision. `DfuAddress` is source first, and has no
+  broadcast: only an exact `dst_node_id` match is acted on.
+- **DFU reads bodies without checking their length** (divergence #55). The
+  decoders refuse short bodies; a stack comparator must send only
+  well-formed ones, and a chunk whose `payload_length` fits the frame.
+- **`chunk_size` zero divides by zero in the client** (divergence #57). D3
+  decides what the port does and keeps the comparator's `chunk_size`
+  non-zero.
+- **`bm_dfu_init` registers `0xD9` twice** (divergence #56). The second entry is
+  shadowed; a node mirroring the registration needs eleven registry slots.
+- **The DFU senders build bodies from the C struct, and D1's comparator
+  compares against those structs, not against a sender.**
+  `bm_dfu_send_ack`, `bm_dfu_req_next_chunk`, `bm_dfu_update_end` and
+  `bm_dfu_send_heartbeat` are public but read `dfu_ctx.self_node_id`, which only
+  `bm_dfu_init` sets, and `bm_dfu_init` starts the DFU task. D2's stack binary
+  is where their frames get compared.
 ---
 
 ## Card format
@@ -397,29 +419,11 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 
 # DFU
 
-1832 LoC across three files, the heaviest state in bm_core. Split four ways.
-
-## D1 — DFU message codecs, `0xD0`–`0xD9`
-
-**Blocked by:** nothing.
-
-**C source.** `bcmp/dfu_message_structs.h` (73 LoC) — `BmDfuImgInfo`,
-`BmDfuFrameHeader`/`BmDfuFrame`, `BmDfuEventAddress`, `BmDfuEventChunkRequest`,
-`BmDfuEventImageChunk`, `BmDfuEventResult`, `BmDfuEventImgInfo` — plus the ten
-`BcmpDfu*` wrappers in `bcmp/messages.h`. Pure wire format, no state.
-
-**Quirk to record.** `dfu_core.c:621` and `dfu_core.c:623` both call
-`packet_add` for type `0xD9`, once as `BcmpDFUBootCompleteMessage` and once as
-its alias `BcmpDFULastMessageMessage`, leaving a duplicate entry in the registry
-list. Check what the duplicate does to dispatch.
-
-**Done when.** All ten codecs round-trip against the oracle under a `dfu_codec`
-fuzz target. `bm_dfu_max_chunk_size` is 1024, so the comparator's body bound
-must accommodate it.
+1832 LoC across three files, the heaviest state in bm_core. Split three ways.
 
 ## D2 — the DFU core state machine
 
-**Blocked by:** D1.
+**Blocked by:** nothing.
 
 **C source.** `dfu_core.c` (689 LoC): `LibSmContext` over the 10 states of
 `BmDfuHfsmStates`, 15 `BmDfuEvtType` event types, a 5-deep event queue and its

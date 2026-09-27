@@ -250,3 +250,13 @@ path = "fuzz_targets/config.rs"
 test = false
 doc = false
 bench = false
+
+# Pure: the C side is `bm_wire_sys`'s packed struct mirrors, no shim state.
+# A full-size chunk needs `-max_len` above 1024, which the committed
+# `max-chunk` seed already sets.
+[[bin]]
+name = "dfu_codec"
+path = "fuzz_targets/dfu_codec.rs"
+test = false
+doc = false
+bench = false
