@@ -36,7 +36,7 @@ features = ["tc6", "packetmeta-id"]
 # and rev the driver uses, or there would be two incompatible `PacketBuf`s.
 [dependencies.xarxa-driver]
 git = "https://github.com/embassy-rs/xarxa"
-rev = "e5bc1b0408773f804f8d165257f34c3a11ae0181"
+rev = "7dd74474e337a7175c3ec48dabb0504a32e255dc"
 features = ["async", "packetmeta-id"]
 
 # bm-stack depends on released embassy-time and embassy-futures; the driver

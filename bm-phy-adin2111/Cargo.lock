@@ -19,7 +19,7 @@ dependencies = [
  "embassy-time",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
- "xarxa-driver 0.1.0 (git+https://github.com/embassy-rs/xarxa?rev=e5bc1b0408773f804f8d165257f34c3a11ae0181)",
+ "xarxa-driver",
 ]
 
 [[package]]
@@ -100,7 +100,7 @@ dependencies = [
  "embedded-hal-async",
  "embedded-hal-bus",
  "heapless",
- "xarxa-driver 0.1.0 (git+https://github.com/embassy-rs/xarxa?rev=7dd74474e337a7175c3ec48dabb0504a32e255dc)",
+ "xarxa-driver",
 ]
 
 [[package]]
@@ -110,7 +110,7 @@ source = "git+https://github.com/embassy-rs/embassy?branch=main#728bd5fd40e82f08
 dependencies = [
  "embassy-futures",
  "embassy-sync",
- "xarxa-driver 0.1.0 (git+https://github.com/embassy-rs/xarxa?rev=7dd74474e337a7175c3ec48dabb0504a32e255dc)",
+ "xarxa-driver",
 ]
 
 [[package]]
@@ -371,15 +371,6 @@ checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 name = "xarxa-driver"
 version = "0.1.0"
 source = "git+https://github.com/embassy-rs/xarxa?rev=7dd74474e337a7175c3ec48dabb0504a32e255dc#7dd74474e337a7175c3ec48dabb0504a32e255dc"
-dependencies = [
- "critical-section",
- "document-features",
-]
-
-[[package]]
-name = "xarxa-driver"
-version = "0.1.0"
-source = "git+https://github.com/embassy-rs/xarxa?rev=e5bc1b0408773f804f8d165257f34c3a11ae0181#e5bc1b0408773f804f8d165257f34c3a11ae0181"
 dependencies = [
  "critical-section",
  "document-features",
