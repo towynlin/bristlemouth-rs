@@ -15,6 +15,9 @@
 //! message out the other ports, which `bcmp/time.c`, `bcmp/config.c` and
 //! `bcmp/dfu_core.c` all do for anything not addressed to this node.
 //!
+//! [`dfu_core`] is `bcmp/dfu_core.c`'s state machine, sans-io, over the
+//! [`dfu`] codecs.
+//!
 //! The message bodies each have a module of their own — [`config`], [`dfu`],
 //! [`heartbeat`], [`info`], [`neighbors`], [`ping`], [`resource`] — and are
 //! codecs only. What
@@ -27,6 +30,7 @@
 
 pub mod config;
 pub mod dfu;
+pub mod dfu_core;
 pub mod forward;
 pub mod header;
 pub mod heartbeat;

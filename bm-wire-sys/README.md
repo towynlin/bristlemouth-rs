@@ -141,6 +141,9 @@ again, that block is what fails to link.
 The define is otherwise narrow: only `network/bm_linux.c`, `bcmp/dfu_core.c`,
 `bcmp/dfu_client.c` and `bcmp/dfu.h` consult it, and in the DFU files it only
 adds test accessors.
+bindgen is given it too, so `dfu.h` declares those accessors
+(`bm_dfu_test_get_sm_ctx`, `bm_dfu_test_set_dfu_event_and_run_sm`,
+`bm_dfu_test_set_client_fa`) and they are bound.
 
 `middleware/bm_mavlink.c` compiles as its own unit so that
 `-Wno-address-of-packed-member`, which the mavlink headers need, is not

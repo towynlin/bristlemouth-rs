@@ -93,6 +93,10 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 55 | DFU bodies are read without checking `data.size` | domain-limited | reading |
 | 56 | `bm_dfu_init` registers `0xD9` twice | replicated | reading |
 | 57 | A DFU start with `chunk_size` zero divides by zero on the client | domain-limited | reading |
+| 58 | The DFU error state reports every failure to the last host update's callback | replicated | reading, confirmed differentially |
+| 59 | A host adopts its client's error code, and a code of 14 or more stops DFU until reboot | replicated | reading, confirmed differentially and against the C host |
+| 60 | A second `bm_dfu_initiate_update` before the first runs is accepted and lost | replicated | reading, confirmed differentially |
+| 61 | A non-internal host update leaks its stream buffer unless it reaches `HostUpdate` | c-only | LeakSanitizer, via `cargo fuzz run dfu_core` |
 
 ---
 
@@ -2176,3 +2180,99 @@ behaviour and must keep the comparator's `chunk_size` non-zero.
 
 Fix upstream by rejecting `chunk_size == 0` in both
 `bm_dfu_client_process_update_request` and `bm_dfu_initiate_update`.
+
+## 58. The DFU error state reports every failure to the last host update's callback
+
+`s_idle_run` stores a `BeginHost`'s `finish_cb` in `dfu_ctx.update_finish_callback`
+and its destination in `dfu_ctx.client_node_id`. Only the next `BeginHost` replaces them.
+`s_error_entry` calls the callback, if set, with `(false, dfu_ctx.error,
+dfu_ctx.client_node_id)` on every entry into `BmDfuStateError` — including
+entries from the client states, and entries long after that host update
+finished.
+
+So an application that started a host update with a callback is later told
+that the same update failed, with the same client id, whenever this node fails
+an update *as a client* (chunk timeout, bad CRC, ...) before it next hosts
+one.
+
+**replicated.** `bm_wire::bcmp::dfu_core::Core::notify` and `client_node_id`
+persist the same way. Pinned against the C by
+`every_later_error_is_reported_to_the_last_hosts_callback` in
+`bm-wire-diff/tests/dfu_core.rs`, and in `bm-wire` by
+`a_client_error_is_reported_to_the_last_hosts_callback`.
+
+Fix upstream by clearing `update_finish_callback` when a host update ends, or
+by calling it only from the host states.
+
+## 59. A host adopts its client's error code, and a code of 14 or more stops DFU until reboot
+
+`s_error_entry` returns to Idle only if `dfu_ctx.error < BmDfuErrFlashAccess`
+(14); anything else is treated as a fatal local flash fault and the machine
+stays in `BmDfuStateError`, where `s_error_run` does nothing.
+`bm_dfu_initiate_update` then refuses every request with `BmDfuErrInProgress`
+until the node reboots.
+
+The host sets that error from the wire. `s_host_req_update_run` passes a
+failed ACK's `err_code` to `bm_dfu_host_transition_to_error`, and
+`s_host_req_update_run` and `s_host_update_run` do the same with an abort's.
+The byte is cast to `BmDfuErr` unchecked, so any of 14–255 is "fatal".
+
+Two routes reach it:
+
+- A real client whose flash fails: `bm_dfu_client_process_update_request`
+  NACKs with `BmDfuErrFlashAccess` when `bm_dfu_client_flash_area_open` or
+  `_erase` fails. The client's fault disables DFU on the **host**.
+- Any node on the link: the only check on the sender is that the body's
+  `src_node_id` equals the client being updated, and that field is not
+  authenticated.
+
+**replicated.** `bm_wire::bcmp::dfu_core::DfuErr` is a byte and
+`DfuErr::is_fatal` is the C's comparison. Pinned by `a_fatal_error_is_permanent`
+(core) and `the_c_host_adopts_a_clients_fatal_nack` (the C's `dfu_host.c` taking
+a NACK carrying 14) in `bm-wire-diff/tests/dfu_core.rs`. D4 has to reproduce
+the host half.
+
+Fix upstream by mapping a received `err_code` to a non-fatal host error
+(`BmDfuErrAborted`, or a new "client failed" value) instead of casting it.
+
+## 60. A second `bm_dfu_initiate_update` before the first runs is accepted and lost
+
+`bm_dfu_initiate_update` checks for `BmDfuStateIdle` when it is called, on
+the caller's task, then queues a `BeginHost` for the DFU task. Two calls before
+the DFU task runs both pass the check and both return `true`. The first
+`BeginHost` moves the machine to `BmDfuStateHostReqUpdate`; the second is run
+there, and `s_host_req_update_run` ignores it. Its finish callback is never
+called.
+
+`dfu_ctx.internal` is written by each call that queues an event, so the
+update that runs uses the **second** call's `internal`: whether the host reads
+the image from `bm_dfu_host_get_chunk` or from `bm_dfu_host_queue_data`.
+
+**replicated.** `bm_wire::bcmp::dfu_core::Dfu::initiate_update` checks and
+writes the same way. Pinned by `a_second_initiate_is_accepted_and_lost` in
+`bm-wire-diff/tests/dfu_core.rs` and
+`a_second_initiate_before_the_first_runs_is_accepted_and_lost` in `bm-wire`.
+
+Fix upstream by moving the Idle check and the `internal` write into
+`s_idle_run`'s `BeginHost` branch, and reporting `BmDfuErrInProgress` from
+the other states' run functions.
+
+## 61. A non-internal host update leaks its stream buffer unless it reaches `HostUpdate`
+
+When `bm_dfu_internal()` is false, `s_host_req_update_entry` sets
+`host_ctx.data_queue = bm_stream_buffer_create(chunk_size)`, overwriting any
+previous value. The only `bm_stream_buffer_delete` is in `s_host_update_exit`.
+An update that leaves `BmDfuStateHostReqUpdate` any other way — ACK timeout
+after two retries, a NACK, an abort — leaks the buffer: `chunk_size` bytes plus
+the stream buffer's own allocation, per attempt. A host retrying an update to
+an unreachable client loses up to about 1 KiB of heap each time.
+
+Found by LeakSanitizer on `cargo fuzz run dfu_core`'s second run, with a
+`BeginHost` run with `internal` false followed by a forced change to Error.
+
+**c-only.** `bm-wire` holds no heap. D4 decides how the port stores
+externally supplied image data. `bm-wire-diff/src/dfu_core.rs` treats a
+non-internal `BeginHost` as out of domain so the fuzzer can run.
+
+Fix upstream by deleting `data_queue` in `bm_dfu_host_transition_to_error`,
+or by creating it in `s_host_update_entry` instead.

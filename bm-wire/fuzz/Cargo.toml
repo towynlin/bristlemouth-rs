@@ -260,3 +260,10 @@ path = "fuzz_targets/dfu_codec.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dfu_core"
+path = "fuzz_targets/dfu_core.rs"
+test = false
+doc = false
+bench = false
