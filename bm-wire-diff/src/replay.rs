@@ -67,6 +67,9 @@ pub fn replay_target(target: &str) -> usize {
                 crate::cbor::check(i);
             }),
             "crc" => replay_one::<crate::crc::CrcInput, _>(&bytes, crate::crc::check),
+            "dfu_core" => replay_one::<crate::dfu_core::DfuCoreInput, _>(&bytes, |i| {
+                crate::dfu_core::check(i);
+            }),
             "dfu_codec" => {
                 replay_one::<crate::dfu_codec::DfuCodecInput, _>(&bytes, crate::dfu_codec::check)
             }
@@ -169,6 +172,7 @@ pub const TARGETS: &[&str] = &[
 pub const STACK_TARGETS: &[&str] = &[
     "bcmp_messages",
     "config",
+    "dfu_core",
     "forward",
     "info",
     "l2_egress",

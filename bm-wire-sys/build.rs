@@ -168,7 +168,11 @@ fn main() {
         // `static inline`, which bindgen otherwise drops. They are endianness
         // code, which is exactly what a differential test should cover.
         .wrap_static_fns(true)
-        .wrap_static_fns_path(out.join("static_fns"));
+        .wrap_static_fns_path(out.join("static_fns"))
+        // As the C build defines it, so that dfu.h declares the test accessors
+        // dfu_core.c defines: bm_dfu_test_get_sm_ctx and
+        // bm_dfu_test_set_dfu_event_and_run_sm.
+        .clang_arg("-DENABLE_TESTING");
 
     let guarded_roots = guarded_header_tree(&module_dirs, &out.join("guarded"));
     for inc in &guarded_roots {
