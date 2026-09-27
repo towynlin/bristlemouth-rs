@@ -91,9 +91,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "cbor2"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86756b93a81474930c7edc4e4fab45b9cd197a50bc9775ae01450d4f621788a3"
+checksum = "ddf90b4df9f396c3b5dad07dcdaf0627f2b8ae533ea9be9937f9d6b8713cb888"
 dependencies = [
  "serde",
 ]
