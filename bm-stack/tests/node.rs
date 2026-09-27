@@ -24,9 +24,25 @@ use bm_wire::neighbor::HEARTBEAT_PERIOD_S;
 use bm_wire::util::BmIpAddr;
 use embassy_futures::block_on;
 
+use std::sync::{Mutex, MutexGuard};
+
 const NODE_ID: u64 = 0xC0FF_EE00_1234_5678;
 const PEER_ID: u64 = 0x0000_0000_55AA_0011;
 const PORTS: u8 = 2;
+
+/// Serialises the tests that drive [`bm_stack::Node::run`].
+///
+/// `embassy_time::MockDriver` is a process-global singleton: `run` reads and
+/// [`bm_stack::mock::MockPhy`] advances one shared clock, so two such tests in
+/// parallel see each other's time and race. Every loop-driving test takes this
+/// first; the synchronous tests do not touch the driver and need not.
+static CLOCK: Mutex<()> = Mutex::new(());
+
+/// Take the [`CLOCK`] lock, ignoring a previous holder's panic — a poisoned
+/// lock still serialises, and the clock is relative to each run's start.
+fn clock_lock() -> MutexGuard<'static, ()> {
+    CLOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 struct TestIdentity;
 
@@ -345,6 +361,8 @@ fn a_global_multicast_frame_goes_out_once_unstamped() {
 /// heartbeat on schedule.
 #[test]
 fn the_run_loop_answers_and_heartbeats() {
+    // Serialised against the other loop tests: the mock clock is global.
+    let _clock = clock_lock();
     let mut node = node();
     let mut phy = MockPhy::new(
         PORTS,
@@ -1136,6 +1154,8 @@ fn an_oversized_request_is_refused_before_it_is_recorded() {
 /// ten-second heartbeat.
 #[test]
 fn the_run_loop_retries_then_times_out_an_unanswered_request() {
+    // Serialised against the other loop tests: the mock clock is global.
+    let _clock = clock_lock();
     let mut node = requesting_node();
     let mut phy = MockPhy::new(
         PORTS,
@@ -1844,6 +1864,8 @@ fn the_requests_we_issue_carry_what_the_c_puts_in_them() {
 /// without anything synchronous being driven by hand.
 #[test]
 fn the_run_loop_answers_a_time_request() {
+    // Serialised against the other loop tests: the mock clock is global.
+    let _clock = clock_lock();
     let request = time_frame(MessageType::SYSTEM_TIME_REQUEST, NODE_ID, 0);
     let mut phy = MockPhy::new(
         PORTS,
@@ -2440,6 +2462,8 @@ fn a_second_request_replaces_the_first() {
 /// heartbeat or to let the expiry sweep be what fires it.
 #[test]
 fn the_run_loop_times_out_a_neighbour_table_request() {
+    // Serialised against the other loop tests: the mock clock is global.
+    let _clock = clock_lock();
     let mut node = node();
     let mut phy = MockPhy::new(
         PORTS,
@@ -2822,6 +2846,8 @@ fn an_unregistered_resource_reply_is_dropped_before_it_is_matched() {
 /// The whole loop: a `0x0A` arrives on the PHY and a `0x0B` goes back out.
 #[test]
 fn the_run_loop_answers_a_resource_request() {
+    // Serialised against the other loop tests: the mock clock is global.
+    let _clock = clock_lock();
     let mut phy = MockPhy::new(
         PORTS,
         vec![Script::Receive {
