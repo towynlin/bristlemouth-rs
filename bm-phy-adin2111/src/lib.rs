@@ -45,10 +45,10 @@ use embassy_net_adin1110::{
     Device, PACKET_ID_ALL_PORTS, PACKET_ID_PORT_MASK, PACKET_ID_PORT1, PACKET_ID_PORT2, PortLinks,
     TxPort, new_tc6,
 };
+use embassy_net_driver_channel::driver::{Driver, PacketBuf};
 use embedded_hal_1::digital::OutputPin;
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::spi::SpiDevice;
-use xarxa_driver::{Driver, PacketBuf};
 
 /// Re-exported from the driver: a caller needs `State` to declare the storage
 /// [`new`] borrows, and `Runner` and `Tc6` to name the type of the task it has

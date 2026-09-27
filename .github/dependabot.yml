@@ -1,9 +1,9 @@
 # Weekly, grouped, and one entry per workspace -- the fuzz crate and the PHY
 # are not reachable from the root lockfile.
 #
-# The PHY's embassy and xarxa dependencies are git-pinned deliberately (see
-# bm-phy-adin2111/Cargo.toml); dependabot leaves those alone, so following
-# embassy main stays a manual `cargo update -p embassy-net-adin1110`.
+# The PHY follows embassy main by git branch (see bm-phy-adin2111/Cargo.toml);
+# dependabot bumps the locked commit. xarxa-driver is reached through
+# embassy-net-driver-channel's re-export, so its rev moves with embassy.
 version: 2
 updates:
   - package-ecosystem: cargo

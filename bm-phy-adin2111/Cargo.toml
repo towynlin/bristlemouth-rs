@@ -32,12 +32,14 @@ branch = "main"
 default-features = false
 features = ["tc6", "packetmeta-id"]
 
-# The packet type the driver and this crate exchange. Must be the same source
-# and rev the driver uses, or there would be two incompatible `PacketBuf`s.
-[dependencies.xarxa-driver]
-git = "https://github.com/embassy-rs/xarxa"
-rev = "e5bc1b0408773f804f8d165257f34c3a11ae0181"
-features = ["async", "packetmeta-id"]
+# The packet type the driver and this crate exchange, reached through
+# `embassy_net_driver_channel::driver` (a re-export of `xarxa-driver`). Same
+# git source as the driver's own dependency, so Cargo resolves one crate and
+# the xarxa rev is whatever embassy main pins. The driver's `packetmeta-id`
+# feature enables `xarxa-driver/packetmeta-id`.
+[dependencies.embassy-net-driver-channel]
+git = "https://github.com/embassy-rs/embassy"
+branch = "main"
 
 # bm-stack depends on released embassy-time and embassy-futures; the driver
 # above brings the git ones. Only one crate may claim `links = "embassy-time"`,
