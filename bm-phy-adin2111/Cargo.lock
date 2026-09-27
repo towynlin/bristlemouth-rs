@@ -19,7 +19,7 @@ dependencies = [
  "embassy-time",
  "embedded-hal 1.0.0",
  "embedded-hal-async",
- "xarxa-driver",
+ "xarxa-driver 0.1.0 (git+https://github.com/embassy-rs/xarxa?rev=e5bc1b0408773f804f8d165257f34c3a11ae0181)",
 ]
 
 [[package]]
@@ -77,7 +77,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor-timer-queue"
 version = "0.1.1"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#ac7ae43a0f981c73ebac76303fb1e4d6bd046ff3"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#728bd5fd40e82f088c49acf6e4c2872a6d0ff10d"
 dependencies = [
  "unitrait",
 ]
@@ -85,12 +85,12 @@ dependencies = [
 [[package]]
 name = "embassy-futures"
 version = "0.1.2"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#ac7ae43a0f981c73ebac76303fb1e4d6bd046ff3"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#728bd5fd40e82f088c49acf6e4c2872a6d0ff10d"
 
 [[package]]
 name = "embassy-net-adin1110"
 version = "0.4.0"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#ac7ae43a0f981c73ebac76303fb1e4d6bd046ff3"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#728bd5fd40e82f088c49acf6e4c2872a6d0ff10d"
 dependencies = [
  "bitfield",
  "embassy-futures",
@@ -100,23 +100,23 @@ dependencies = [
  "embedded-hal-async",
  "embedded-hal-bus",
  "heapless",
- "xarxa-driver",
+ "xarxa-driver 0.1.0 (git+https://github.com/embassy-rs/xarxa?rev=7dd74474e337a7175c3ec48dabb0504a32e255dc)",
 ]
 
 [[package]]
 name = "embassy-net-driver-channel"
 version = "0.4.0"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#ac7ae43a0f981c73ebac76303fb1e4d6bd046ff3"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#728bd5fd40e82f088c49acf6e4c2872a6d0ff10d"
 dependencies = [
  "embassy-futures",
  "embassy-sync",
- "xarxa-driver",
+ "xarxa-driver 0.1.0 (git+https://github.com/embassy-rs/xarxa?rev=7dd74474e337a7175c3ec48dabb0504a32e255dc)",
 ]
 
 [[package]]
 name = "embassy-sync"
 version = "0.8.0"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#ac7ae43a0f981c73ebac76303fb1e4d6bd046ff3"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#728bd5fd40e82f088c49acf6e4c2872a6d0ff10d"
 dependencies = [
  "cfg-if",
  "critical-section",
@@ -129,7 +129,7 @@ dependencies = [
 [[package]]
 name = "embassy-time"
 version = "0.5.1"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#ac7ae43a0f981c73ebac76303fb1e4d6bd046ff3"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#728bd5fd40e82f088c49acf6e4c2872a6d0ff10d"
 dependencies = [
  "cfg-if",
  "critical-section",
@@ -145,7 +145,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-driver"
 version = "0.2.2"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#ac7ae43a0f981c73ebac76303fb1e4d6bd046ff3"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#728bd5fd40e82f088c49acf6e4c2872a6d0ff10d"
 dependencies = [
  "document-features",
 ]
@@ -153,7 +153,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-queue-utils"
 version = "0.3.2"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#ac7ae43a0f981c73ebac76303fb1e4d6bd046ff3"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#728bd5fd40e82f088c49acf6e4c2872a6d0ff10d"
 dependencies = [
  "embassy-executor-timer-queue",
  "heapless",
@@ -366,6 +366,15 @@ name = "void"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
+
+[[package]]
+name = "xarxa-driver"
+version = "0.1.0"
+source = "git+https://github.com/embassy-rs/xarxa?rev=7dd74474e337a7175c3ec48dabb0504a32e255dc#7dd74474e337a7175c3ec48dabb0504a32e255dc"
+dependencies = [
+ "critical-section",
+ "document-features",
+]
 
 [[package]]
 name = "xarxa-driver"
