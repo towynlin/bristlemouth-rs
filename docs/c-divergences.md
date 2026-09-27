@@ -89,6 +89,10 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 51 | `bcmp_process_config_message` reads message bodies without checking `data.size` | domain-limited | reading |
 | 52 | `bcmp_config_decode_value` writes its NUL one byte past a full buffer | domain-limited | reading |
 | 53 | Config replies echo only the low 16 bits of the request's sequence number | replicated | reading, then hit by `cargo fuzz run config` |
+| 54 | DFU dispatches on the body's `frame_type`, not the header type, and leaks a body whose byte it does not know | replicated | reading |
+| 55 | DFU bodies are read without checking `data.size` | domain-limited | reading |
+| 56 | `bm_dfu_init` registers `0xD9` twice | replicated | reading |
+| 57 | A DFU start with `chunk_size` zero divides by zero on the client | domain-limited | reading |
 
 ---
 
@@ -2090,3 +2094,85 @@ Fix upstream by widening the `seq_num` parameters in `bcmp/config.c` to
 `uint32_t`. Wire-visible: `packet.c` matches a reply on the number it stored,
 so today a reply to a request numbered above `0xFFFF` carries a number that
 matches no outstanding request, and a fixed node's reply would.
+
+
+## 54. DFU dispatches on the body's `frame_type`, not the header type, and leaks a body whose byte it does not know
+
+Every DFU body starts with `BmDfuFrameHeader.frame_type`, a copy of the low
+byte of the BCMP header's type. `bm_dfu_init` registers all ten types with the
+same handler, so `packet.c`'s dispatch on the header type decides nothing, and
+`bm_dfu_process_message` then switches on `frame->header.frame_type`. A frame
+whose header says `0xD0` and whose body byte says `0xD4` is handled as an ack.
+
+A body byte outside `0xD0`–`0xD9` reaches the `default:` branch, which logs
+and returns without `bm_free(buf)`. `dfu_copy_and_process_message` allocated
+`buf` (`data.size` bytes) for it, so each such frame addressed to the node
+leaks its body. Every other drop path in the function frees.
+
+**replicated** for the dispatch: `bm_wire::bcmp::dfu::DfuMessage::decode`
+chooses the variant from the body byte and refuses an unknown one with
+`BmWireError::Invalid`. The leak has no counterpart. D2's integration must
+dispatch on the decoded body, not on the header type.
+`bm-wire-diff/src/dfu_codec.rs` checks every body byte against the C's switch.
+
+Fix upstream by freeing `buf` in the `default:` case, and either dispatching on
+`data.header->type` or rejecting a body whose byte disagrees with it.
+
+## 55. DFU bodies are read without checking `data.size`
+
+`dfu_copy_and_process_message` reads `BmDfuEventAddress` at offset 1 of the
+body, and `bm_dfu_process_message` reads it again, before anything consults
+`data.size`; a body shorter than 17 bytes is read out of bounds. The state
+handlers then cast the copied body to the full struct for its type.
+`s_client_receiving_run` bounds a chunk's `payload_length` by
+`bm_dfu_max_chunk_size` only, not by the body, then runs `crc16_ccitt` over
+and copies that many bytes — up to 1024 past a body that carried none. Same
+shape as #14 and #51.
+
+**domain-limited.** `DfuMessage::decode` and `DfuAddress::of_body` refuse a
+body shorter than its fields, or a chunk declaring more than arrived, with
+`BmWireError::Truncated`. The `dfu_codec` comparator reads the C struct only
+when the body holds it, and otherwise asserts the port refuses.
+
+Fix upstream by checking `data.size` against `sizeof` the type's struct in
+`dfu_copy_and_process_message`, and a chunk's `payload_length` against the
+bytes after it.
+
+## 56. `bm_dfu_init` registers `0xD9` twice
+
+`dfu_core.c:621` registers `BcmpDFUBootCompleteMessage` and `dfu_core.c:623`
+registers `BcmpDFULastMessageMessage`, its alias in `messages.h`, both with
+`process_dfu_message`. `packet_add` appends without checking, so the packet
+list holds two `0xD9` entries. `ll_get_item` returns the first, so dispatch is
+unchanged and the second is unreachable. It costs one list item, and a single
+`packet_remove(0xD9)` would uncover the duplicate rather than unregister the
+type. Nothing in bm_core removes a DFU type.
+
+**replicated.** `bm_wire::bcmp::registry::Registry::add` accepts duplicates and
+`cfg` returns the first, pinned by
+`a_duplicate_registration_is_shadowed_by_the_first`. A `bm-stack` node that
+registers DFU as `bm_dfu_init` does needs eleven registry slots for ten types.
+
+Fix upstream by deleting the second `packet_add`.
+
+## 57. A DFU start with `chunk_size` zero divides by zero on the client
+
+`bm_dfu_client_process_update_request` rejects a `chunk_size` above
+`bm_dfu_max_chunk_size` and then computes `image_size % chunk_size` and
+`image_size / chunk_size`. Zero is not rejected. One `0xD0` addressed to an
+idle client, carrying a `gitSHA` different from the client's or
+`BM_DFU_IMG_INFO_FORCE_UPDATE` as `filter_key`, reaches the division. The
+host side does not check for zero either: `bm_dfu_initiate_update` bounds
+`chunk_size` from above only.
+
+On a host build this is undefined behaviour. On a Cortex-M33 with
+`CCR.DIV_0_TRP` clear, `UDIV` returns 0, which would make `num_chunks` 1 for
+a non-zero `image_size` and 0 otherwise; with the trap set it is a
+UsageFault. What the dev kit firmware does was not measured.
+
+**domain-limited.** The codec carries zero unchanged
+(`bm_wire::bcmp::dfu::ImgInfo::chunk_size`). D3 decides the client's
+behaviour and must keep the comparator's `chunk_size` non-zero.
+
+Fix upstream by rejecting `chunk_size == 0` in both
+`bm_dfu_client_process_update_request` and `bm_dfu_initiate_update`.

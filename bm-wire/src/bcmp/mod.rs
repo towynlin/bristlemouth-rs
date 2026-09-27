@@ -15,7 +15,7 @@
 //! message out the other ports, which `bcmp/time.c`, `bcmp/config.c` and
 //! `bcmp/dfu_core.c` all do for anything not addressed to this node.
 //!
-//! The message bodies each have a module of their own — [`config`],
+//! The message bodies each have a module of their own — [`config`], [`dfu`],
 //! [`heartbeat`], [`info`], [`neighbors`], [`ping`], [`resource`] — and are
 //! codecs only. What
 //! a node *does* with one is `bm-stack`'s business. The exceptions are
@@ -26,6 +26,7 @@
 //! `packet.c` does not.
 
 pub mod config;
+pub mod dfu;
 pub mod forward;
 pub mod header;
 pub mod heartbeat;
@@ -38,6 +39,10 @@ pub mod rx;
 pub mod time;
 pub mod tx;
 
+pub use dfu::{
+    DFU_MAX_CHUNK_SIZE, DfuAddress, DfuChunk, DfuChunkRequest, DfuMessage, DfuResult, DfuStart,
+    IMG_INFO_FORCE_UPDATE, ImgInfo,
+};
 pub use forward::{
     apply_port_specific_destination, egress_ports, ll_forward_is_a_no_op,
     port_specific_destination, serialize_forwarded,

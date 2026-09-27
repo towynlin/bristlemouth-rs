@@ -26,6 +26,7 @@ pub mod checksum;
 pub mod config;
 pub mod configuration;
 pub mod crc;
+pub mod dfu_codec;
 pub mod forward;
 pub mod info;
 pub mod l2_egress;
