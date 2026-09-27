@@ -404,7 +404,8 @@ pub enum Step {
         image: TestImage,
     },
     /// The chunk of the last offered image that the client last asked for,
-    /// from `src`, `short_by` bytes short. Nothing if nothing was offered.
+    /// from `src`, `short_by` bytes short, and cut to what one frame carries.
+    /// Nothing if nothing was offered.
     Serve {
         /// Sender.
         src: NodeRef,
@@ -1246,6 +1247,9 @@ impl Pair {
                     let end = start.saturating_add(chunk).min(size);
                     let mut payload = image.bytes(start..end);
                     payload.truncate(payload.len().saturating_sub(usize::from(*short_by)));
+                    // A `chunk_size` over what one frame carries cannot be
+                    // served whole.
+                    payload.truncate(MAX_EVENT_BODY_LEN - DfuMessage::WITH_TWO_BYTES_LEN);
                     let message = DfuMessage::Payload(bm_wire::bcmp::dfu::DfuChunk {
                         addresses: DfuAddress {
                             src_node_id: src.id(),
