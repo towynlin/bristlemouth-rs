@@ -95,6 +95,9 @@ jobs:
       # The differential tests and every committed fuzz seed.
       - name: Workspace
         run: cargo test --workspace --locked
+      # `cargo test` builds examples but does not run them; this one asserts.
+      - name: bm-stack example
+        run: cargo run -p bm-stack --example hello_node --locked
       # bm-wire on its own, with `std` off, the way firmware gets it. The
       # workspace run above always has it on, through bm-wire-diff.
       - name: bm-wire, default features

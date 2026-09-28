@@ -70,6 +70,9 @@ A cargo workspace.
     application in a task of its own: owned `Command`s in, owned
     `Notification`s out, run by `ChannelApp`, an `App`.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
+  - `examples/hello_node.rs` — a node on the mock PHY through the public API
+    only: a scripted neighbour, an `App` that pings it. Panics on a wrong
+    outcome, so CI runs it.
 - `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
   SPI, on the per-port frame I/O of
   [embassy-rs/embassy#7024](https://github.com/embassy-rs/embassy/pull/7024),
@@ -146,6 +149,7 @@ As above, plus:
 
 ```
 cargo test                                                 # workspace, incl. differential tests
+cargo run -p bm-stack --example hello_node                 # the public API, end to end
 cargo build -p bm-wire --target thumbv7em-none-eabihf      # proves no_std, alloc-free
 cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Cortex-M33
 cargo build -p bm-stack --target thumbv8m.main-none-eabihf
