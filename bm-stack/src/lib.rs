@@ -11,12 +11,15 @@
 //! # Shape
 //!
 //! * [`port`] holds the seams an integrator fills — a port-aware PHY, the
-//!   node's identity, its real-time clock and its config storage — as traits
+//!   node's identity, its real-time clock, its config storage, and the DFU
+//!   update slot and no-init RAM — as traits
 //!   rather than link-time symbols, so a test and the firmware can have
 //!   different ones.
 //! * [`config`] loads and saves [`bm_wire::configuration::ConfigStore`]
 //!   through [`port::ConfigStorage`], and [`config::Configuration`] is how a
 //!   node reaches it.
+//! * [`dfu`] is the DFU client on a node, over [`port::DfuSlot`] and
+//!   [`port::NoInitRam`].
 //! * [`node::Node`] is the protocol. Its three receive/timer entry points are
 //!   synchronous and take the current time, so they are testable without an
 //!   executor.
@@ -29,6 +32,7 @@
 #![warn(missing_docs)]
 
 pub mod config;
+pub mod dfu;
 #[cfg(feature = "mock")]
 pub mod mock;
 pub mod node;
@@ -37,5 +41,6 @@ pub mod port;
 pub use config::{Config, Configuration, NoConfig};
 pub use node::{Event, MTU, Node, Outbound, Owed, Reflood, deliver, transmit};
 pub use port::{
-    ConfigStorage, Egress, Identity, NoRtc, Phy, RamConfigStorage, Rtc, RtcTimeAndDate, SoftRtc,
+    BootRequests, ConfigStorage, DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy,
+    RamConfigStorage, RamDfuSlot, Rtc, RtcTimeAndDate, SoftRtc,
 };

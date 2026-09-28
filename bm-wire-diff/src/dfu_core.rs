@@ -26,31 +26,49 @@
 //! `bm_dfu_test_set_dfu_event_and_run_sm`, and the queue is emptied around
 //! every pump so the task finds nothing to take.
 //!
-//! # Input domain: the core, and one step of the host
+//! # Input domain: the core, the client, and one step of the host
 //!
-//! The client and host are cards D3 and D4. Until they land, an event that
-//! would reach their logic is **discarded on both sides** at the moment it
-//! would run, rather than run:
+//! The client (`dfu_client.c`) is [`Client`]. The host is card D4. Until it
+//! lands, an event that would reach its logic is **discarded on both sides**
+//! at the moment it would run, rather than run:
 //!
-//! * a `ReceivedUpdateRequest` in `Idle` (`bm_dfu_client_process_update_request`);
 //! * an `AckReceived`, `AckTimeout` or `Abort` in `HostReqUpdate`;
 //! * a `BeginHost` in `Idle` while `bm_dfu_internal()` is false:
 //!   `s_host_req_update_entry` then creates a stream buffer that only
 //!   `HostUpdate`'s exit frees, so leaving `HostReqUpdate` any other way leaks
 //!   it (divergence #61) and LeakSanitizer stops the fuzzer.
 //!
-//! What remains is `Init`, `Idle`, `Error` and entry into `HostReqUpdate`,
-//! whose C (`s_host_req_update_entry`) sends the `0xD0` it was given and
-//! records the client — [`ReqUpdateOnly`] does exactly that, and nothing else.
-//! Every other event `s_host_req_update_run` ignores. That is enough to reach
-//! the finish callback, the fatal error and the stale `BeginHost` of
-//! divergences #58–#60 in the C.
+//! Entry into `HostReqUpdate` is in domain: its C (`s_host_req_update_entry`)
+//! sends the `0xD0` it was given, records the client and arms the ACK timer —
+//! [`ReqUpdateOnly`] does exactly that. Every other event
+//! `s_host_req_update_run` ignores.
 //!
 //! [`Step::Post`] never posts a bare `BeginHost`: `s_idle_run` would
-//! dereference its NULL buffer. Bodies are at least `frame_type` plus an
-//! address, which is all `bm_dfu_process_message` reads (divergence #55).
-//! [`Step::SetPending`] is limited to `Init`, `Idle` and `Error`: entering
-//! `HostReqUpdate` on a message event would read the message as a start.
+//! dereference its NULL buffer. [`Step::SetPending`] is limited to `Init`,
+//! `Idle` and `Error`: entering a client or host state on an arbitrary event
+//! would read it as a start.
+//!
+//! Every body sent is first made one the C reads only within
+//! ([`in_domain_body`]): at least `frame_type` plus an address, a `0xD0`
+//! padded to a whole start, a `0xD2` padded to its declared chunk when that is
+//! 1024 bytes or fewer (divergence #55). A `0xD0` with `chunk_size` zero has
+//! it set to 1, since the C divides by it (divergence #57).
+//!
+//! # Seams with no oracle
+//!
+//! The update slot, the boot hooks and `bm_config_reset` are integrator seams
+//! (`bm_dfu_generic.h`, `bm_configs_generic.h`). `csrc/bm_generic_shim.c`
+//! implements them in RAM, counts every call, and refuses the operations
+//! [`Step::Faults`] names. [`Recorded`] is the same semantics on the Rust side.
+//! What is compared is the calls made and the slot's bytes, not the seam.
+//!
+//! # Time
+//!
+//! [`Step::Advance`] moves the C's virtual clock, stopping at each deadline
+//! the port reports so that two timers due in one step fire in deadline
+//! order, as they would under an RTOS; the shim alone would fire them in
+//! creation order. Every run is given the C's tick as `now_ms`, read before
+//! the C runs, since the C's `bm_delay` moves it.
 //!
 //! # Process state
 //!
@@ -58,8 +76,17 @@
 //! once per process, and nothing undoes it, so every script
 //! starts with [`reset`], which drives both machines through the same public
 //! calls to the same state: `Idle`, error zero, `internal` false, no finish
-//! callback and client id zero, queue empty. The last two are only reachable
-//! by running a `BeginHost` with them, so the reset does.
+//! callback and client id zero, queue empty, no timer but the ACK timer the
+//! reset's own `BeginHost` arms. The finish callback and client id are only
+//! reachable by running a `BeginHost` with them, so the reset does; stale
+//! timers are fired by advancing the C's clock past the longest period and
+//! discarding what they post.
+//!
+//! `CLIENT_CTX` cannot be reset and is not read: every way into a client
+//! state sets the host id, and every other field is set on entry before it
+//! is read. The slot's bytes and `dfu_confirm` are carried over into the
+//! Rust side instead, and the shim's call counts are taken relative to the
+//! reset.
 //!
 //! This module brings the stack up and so must not share a process with
 //! [`crate::bcmp`] — see [`crate::stack`].
@@ -67,16 +94,19 @@
 use std::sync::{Mutex, MutexGuard};
 
 use arbitrary::Arbitrary;
-use bm_wire::bcmp::dfu::{DfuAddress, DfuMessage, DfuStart, ImgInfo};
+use bm_wire::bcmp::MessageType;
+use bm_wire::bcmp::dfu::{DFU_MAX_CHUNK_SIZE, DfuAddress, DfuMessage, DfuStart, ImgInfo};
+use bm_wire::bcmp::dfu_client::{Client, DFU_CONFIRM_KEY};
 use bm_wire::bcmp::dfu_core::{
-    Accepted, Core, Dfu, DfuErr, EVENT_QUEUE_LEN, Effects, Event, EventData, EventType, HostStart,
-    MAX_EVENT_BODY_LEN, RebootInfo, Roles, State,
+    Accepted, Core, DFU_REBOOT_MAGIC, Dfu, DfuErr, EVENT_QUEUE_LEN, Effects, Event, EventData,
+    EventType, HostStart, MAX_EVENT_BODY_LEN, RebootInfo, Roles, State, Timer,
 };
-use bm_wire::bcmp::{MessageType, PacketCfg};
+use bm_wire::configuration::{ConfigStore, Key, Layout, Partition};
+use bm_wire::crc::crc16_ccitt;
 use bm_wire::util::BmIpAddr;
 use bm_wire_sys as sys;
 
-use crate::stack::{self, NODE_ID};
+use crate::stack::{self, GIT_SHA, NODE_ID};
 
 /// A peer's node id.
 pub const PEER: u64 = 0xbeef_beef_daad_baad;
@@ -231,6 +261,101 @@ impl Image {
     }
 }
 
+/// An image a [`Step::Offer`] offers and [`Step::Serve`] then sends, with
+/// bytes derived from `seed` so a script can carry a whole transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Arbitrary)]
+pub struct TestImage {
+    /// `image_size`, plus 256 KiB if `huge` — the shim's slot is 256 KiB, so
+    /// that is refused as too large.
+    pub len: u16,
+    /// See `len`.
+    pub huge: bool,
+    /// `chunk_size`; zero is sent as 1 (divergence #57), over 1024 is refused
+    /// by the client.
+    pub chunk_size: u16,
+    /// Seeds the bytes.
+    pub seed: u8,
+    /// Whether `crc16` is the bytes' CRC, or one off it.
+    pub crc_ok: bool,
+    /// Whether `gitSHA` is the node's own, which the client refuses unless
+    /// `force`.
+    pub own_sha: bool,
+    /// `filter_key` is `BM_DFU_IMG_INFO_FORCE_UPDATE`.
+    pub force: bool,
+    /// `major_ver`.
+    pub major: u8,
+    /// `minor_ver`.
+    pub minor: u8,
+}
+
+impl TestImage {
+    fn image_size(self) -> u32 {
+        u32::from(self.len) + if self.huge { 256 * 1024 } else { 0 }
+    }
+
+    fn chunk_size(self) -> u16 {
+        self.chunk_size.max(1)
+    }
+
+    /// Byte `i` of the image.
+    fn byte(self, i: u32) -> u8 {
+        (i.wrapping_mul(0x9E37_79B1) >> 24) as u8 ^ self.seed
+    }
+
+    fn bytes(self, range: std::ops::Range<u32>) -> Vec<u8> {
+        range.map(|i| self.byte(i)).collect()
+    }
+
+    fn info(self) -> ImgInfo {
+        let crc = crc16_ccitt(0, &self.bytes(0..self.image_size()));
+        ImgInfo {
+            image_size: self.image_size(),
+            chunk_size: self.chunk_size(),
+            crc16: if self.crc_ok { crc } else { crc ^ 1 },
+            major_ver: self.major,
+            minor_ver: self.minor,
+            filter_key: if self.force {
+                bm_wire::bcmp::dfu::IMG_INFO_FORCE_UPDATE
+            } else {
+                0
+            },
+            git_sha: if self.own_sha { GIT_SHA } else { !GIT_SHA },
+        }
+    }
+}
+
+/// Make `body` one the C reads only within, for what the port's states read.
+/// See the module docs.
+#[must_use]
+pub fn in_domain_body(mut body: Vec<u8>) -> Vec<u8> {
+    let min = |body: &mut Vec<u8>, len: usize| {
+        if body.len() < len {
+            body.resize(len, 0);
+        }
+    };
+    min(&mut body, DfuMessage::MIN_LEN);
+    match body[0] {
+        0xD0 => {
+            min(&mut body, DfuMessage::START_LEN);
+            // `chunk_size`, after the address and `image_size`.
+            let at = DfuMessage::MIN_LEN + 4;
+            if body[at..at + 2] == [0, 0] {
+                body[at] = 1;
+            }
+        }
+        0xD2 => {
+            min(&mut body, DfuMessage::WITH_TWO_BYTES_LEN);
+            let at = DfuMessage::MIN_LEN;
+            let declared = usize::from(u16::from_le_bytes([body[at], body[at + 1]]));
+            if declared <= DFU_MAX_CHUNK_SIZE {
+                min(&mut body, DfuMessage::WITH_TWO_BYTES_LEN + declared);
+            }
+        }
+        _ => {}
+    }
+    body
+}
+
 /// One thing done to both machines.
 #[derive(Debug, Clone, PartialEq, Eq, Arbitrary)]
 pub enum Step {
@@ -271,6 +396,48 @@ pub enum Step {
     RunAll,
     /// One of the senders.
     Send(Sender),
+    /// A well-formed `0xD0` for `image`, from `src` to this node.
+    Offer {
+        /// Sender.
+        src: NodeRef,
+        /// What is offered.
+        image: TestImage,
+    },
+    /// The chunk of the last offered image that the client last asked for,
+    /// from `src`, `short_by` bytes short, and cut to what one frame carries.
+    /// Nothing if nothing was offered.
+    Serve {
+        /// Sender.
+        src: NodeRef,
+        /// Bytes cut from the end.
+        short_by: u8,
+    },
+    /// Advance the clock by this many milliseconds.
+    Advance(u16),
+    /// Write `client_update_reboot_info`, as a reboot would leave it.
+    SetRebootInfo {
+        /// `magic` is `DFU_REBOOT_MAGIC`.
+        magic: bool,
+        /// `major`.
+        major: u8,
+        /// `minor`.
+        minor: u8,
+        /// `host_node_id`.
+        host: NodeRef,
+        /// `gitSHA` is the node's own.
+        own_sha: bool,
+    },
+    /// Refuse these slot operations from now on.
+    Faults {
+        /// `bm_dfu_client_flash_area_open`.
+        open: bool,
+        /// `bm_dfu_client_flash_area_erase`.
+        erase: bool,
+        /// `bm_dfu_client_flash_area_write`.
+        write: bool,
+    },
+    /// `set_config_uint` of `dfu_confirm`.
+    SetConfirm(u32),
 }
 
 impl Step {
@@ -280,7 +447,7 @@ impl Step {
         body.extend_from_slice(&dst.id().to_le_bytes());
         let room = MAX_EVENT_BODY_LEN - body.len();
         body.extend_from_slice(&tail[..tail.len().min(room)]);
-        body
+        in_domain_body(body)
     }
 }
 
@@ -327,31 +494,28 @@ const DFU_TYPES: [MessageType; 10] = [
 #[must_use]
 pub fn in_domain(state: State, kind: EventType, internal: bool) -> bool {
     match state {
-        State::Init | State::Error => true,
-        State::Idle => match kind {
-            EventType::ReceivedUpdateRequest => false,
-            // A non-internal host leaks its stream buffer on leaving
-            // HostReqUpdate (divergence #61).
-            EventType::BeginHost => internal,
-            _ => true,
-        },
+        // A non-internal host leaks its stream buffer on leaving
+        // HostReqUpdate (divergence #61).
+        State::Idle => kind != EventType::BeginHost || internal,
         State::HostReqUpdate => !matches!(
             kind,
             EventType::AckReceived | EventType::AckTimeout | EventType::Abort
         ),
-        _ => false,
+        State::HostUpdate => false,
+        _ => true,
     }
 }
 
-/// The roles, as far as the domain reaches: `s_host_req_update_entry`'s send
-/// and the client id it records, and `bm_dfu_host_client_node_valid`.
+/// The host, as far as the domain reaches: `s_host_req_update_entry`'s send,
+/// the client id it records and the ACK timer it arms, and
+/// `bm_dfu_host_client_node_valid`.
 #[derive(Debug, Default)]
 pub struct ReqUpdateOnly {
     client_node_id: u64,
 }
 
-impl Roles for ReqUpdateOnly {
-    fn entry(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects, _now_ms: u32) {
+impl ReqUpdateOnly {
+    fn entry(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects) {
         assert_eq!(state, State::HostReqUpdate, "out of domain");
         // `s_host_req_update_entry` returns early without a buffer.
         if let EventData::HostStart(start) = core.current_event().data {
@@ -363,47 +527,154 @@ impl Roles for ReqUpdateOnly {
                 },
                 img_info: start.start.img_info,
             }));
+            core.start_timer(Timer::Ack);
+        }
+    }
+}
+
+/// The client and [`ReqUpdateOnly`], dispatched on the state as `dfu_states`
+/// does.
+#[derive(Debug, Default)]
+pub struct Both {
+    /// `dfu_client.c`.
+    pub client: Client,
+    /// `dfu_host.c`, in domain.
+    pub host: ReqUpdateOnly,
+}
+
+impl Roles for Both {
+    fn entry(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects) {
+        if state.is_client() {
+            self.client.entry(state, core, fx);
+        } else {
+            self.host.entry(state, core, fx);
         }
     }
 
-    fn run(&mut self, state: State, core: &mut Core, _fx: &mut dyn Effects, _now_ms: u32) {
+    fn run(&mut self, state: State, core: &mut Core, fx: &mut dyn Effects) {
         assert!(
             in_domain(state, core.current_event().kind, core.internal()),
             "out of domain"
         );
+        if state.is_client() {
+            self.client.run(state, core, fx);
+        }
     }
 
-    fn exit(&mut self, state: State, _core: &mut Core, _fx: &mut dyn Effects, _now_ms: u32) {
-        assert_eq!(state, State::HostReqUpdate, "out of domain");
+    fn exit(&mut self, state: State, _core: &mut Core, _fx: &mut dyn Effects) {
+        assert_ne!(state, State::HostUpdate, "out of domain");
     }
 
-    fn client_process_update_request(
-        &mut self,
-        _core: &mut Core,
-        _fx: &mut dyn Effects,
-        _now_ms: u32,
-    ) {
-        unreachable!("out of domain");
+    fn client_process_update_request(&mut self, core: &mut Core, fx: &mut dyn Effects) {
+        self.client.process_update_request(core, fx);
     }
 
     fn host_set_params(&mut self, _notify: bool, _timeout_ms: u32) {}
 
-    fn client_host_node_valid(&self, _node_id: u64) -> bool {
-        unreachable!("no client state is in domain");
+    fn client_host_node_valid(&self, node_id: u64) -> bool {
+        self.client.host_node_valid(node_id)
     }
 
     fn host_client_node_valid(&self, node_id: u64) -> bool {
-        self.client_node_id == node_id
+        self.host.client_node_id == node_id
     }
 }
 
-/// What the Rust machine did outside itself.
-#[derive(Debug, Default)]
+/// Calls to the slot and boot hooks, as `BmShimDfuCounts` counts them.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Counts {
+    /// `bm_dfu_client_flash_area_open`.
+    pub opens: u32,
+    /// `_close`.
+    pub closes: u32,
+    /// `_erase`.
+    pub erases: u32,
+    /// `_write`.
+    pub writes: u32,
+    /// `bm_dfu_client_set_confirmed`.
+    pub confirmed: u32,
+    /// `bm_dfu_client_set_pending_and_reset`.
+    pub pending_and_reset: u32,
+    /// `bm_dfu_client_fail_update_and_reset`.
+    pub fail_and_reset: u32,
+    /// `bm_config_reset`.
+    pub config_resets: u32,
+}
+
+impl Counts {
+    fn from_c(c: sys::BmShimDfuCounts) -> Self {
+        Self {
+            opens: c.opens,
+            closes: c.closes,
+            erases: c.erases,
+            writes: c.writes,
+            confirmed: c.confirmed,
+            pending_and_reset: c.pending_and_reset,
+            fail_and_reset: c.fail_and_reset,
+            config_resets: c.config_resets,
+        }
+    }
+
+    fn since(self, base: Self) -> Self {
+        Self {
+            opens: self.opens - base.opens,
+            closes: self.closes - base.closes,
+            erases: self.erases - base.erases,
+            writes: self.writes - base.writes,
+            confirmed: self.confirmed - base.confirmed,
+            pending_and_reset: self.pending_and_reset - base.pending_and_reset,
+            fail_and_reset: self.fail_and_reset - base.fail_and_reset,
+            config_resets: self.config_resets - base.config_resets,
+        }
+    }
+}
+
+/// What the Rust machine did outside itself, and the seams it did it
+/// through: `csrc/bm_generic_shim.c`'s semantics, in Rust.
 pub struct Recorded {
     /// Bodies sent, with their type.
     pub sent: Vec<(MessageType, Vec<u8>)>,
     /// `update_finished` calls.
     pub finished: Vec<(bool, u8, u64)>,
+    /// The slot.
+    pub flash: Vec<u8>,
+    /// Operations refused.
+    pub faults: sys::BmShimDfuFaults,
+    /// Calls made.
+    pub counts: Counts,
+    /// `CONFIGS`.
+    pub config: ConfigStore,
+}
+
+impl Default for Recorded {
+    fn default() -> Self {
+        Self {
+            sent: Vec::new(),
+            finished: Vec::new(),
+            flash: Vec::new(),
+            faults: sys::BmShimDfuFaults::default(),
+            counts: Counts::default(),
+            config: ConfigStore::new(Layout::LP64),
+        }
+    }
+}
+
+impl std::fmt::Debug for Recorded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Recorded")
+            .field("sent", &self.sent)
+            .field("finished", &self.finished)
+            .field("counts", &self.counts)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Recorded {
+    fn range(&self, offset: u32, len: usize) -> Option<std::ops::Range<usize>> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len)?;
+        (end <= self.flash.len()).then_some(start..end)
+    }
 }
 
 impl Effects for Recorded {
@@ -416,6 +687,61 @@ impl Effects for Recorded {
     fn lpm_peripheral_inactive(&mut self) {}
     fn update_finished(&mut self, success: bool, err: DfuErr, node_id: u64) {
         self.finished.push((success, err.0, node_id));
+    }
+    fn flash_open(&mut self) -> bool {
+        self.counts.opens += 1;
+        !self.faults.open
+    }
+    fn flash_close(&mut self) -> bool {
+        self.counts.closes += 1;
+        true
+    }
+    fn flash_size(&mut self) -> u32 {
+        u32::try_from(self.flash.len()).expect("256 KiB")
+    }
+    fn flash_erase(&mut self, offset: u32, len: u32) -> bool {
+        self.counts.erases += 1;
+        match self.range(offset, len as usize) {
+            Some(range) if !self.faults.erase => {
+                self.flash[range].fill(0xFF);
+                true
+            }
+            _ => false,
+        }
+    }
+    fn flash_write(&mut self, offset: u32, data: &[u8]) -> bool {
+        self.counts.writes += 1;
+        match self.range(offset, data.len()) {
+            Some(range) if !self.faults.write => {
+                self.flash[range].copy_from_slice(data);
+                true
+            }
+            _ => false,
+        }
+    }
+    fn set_confirmed(&mut self) {
+        self.counts.confirmed += 1;
+    }
+    fn set_pending_and_reset(&mut self) {
+        self.counts.pending_and_reset += 1;
+    }
+    fn fail_update_and_reset(&mut self) {
+        self.counts.fail_and_reset += 1;
+    }
+    fn git_sha(&self) -> u32 {
+        GIT_SHA
+    }
+    fn config(&mut self) -> Option<&mut ConfigStore> {
+        Some(&mut self.config)
+    }
+    fn commit_config(&mut self, partition: Partition) -> bool {
+        // `save_config`'s write always succeeds in the shim; then
+        // `bm_config_reset`, which it counts.
+        let part = self.config.partition_mut(partition);
+        let _ = part.seal();
+        part.mark_saved();
+        self.counts.config_resets += 1;
+        true
     }
 }
 
@@ -470,6 +796,12 @@ impl Oracle {
         }
     }
 
+    fn discard_queue(&self) {
+        while let Some(evt) = self.take() {
+            Self::free(evt);
+        }
+    }
+
     /// Everything queued, oldest first, left in place.
     #[must_use]
     pub fn queued(&self) -> Vec<Event> {
@@ -490,12 +822,16 @@ impl Oracle {
     }
 
     /// Pump the stack with the DFU queue emptied, so its task runs nothing,
-    /// and return what was transmitted.
+    /// and return the DFU frames transmitted. Everything else the stack sends
+    /// — heartbeats, once time moves — is dropped.
     #[must_use]
     pub fn pump_and_drain(&self) -> Vec<(u8, Vec<u8>)> {
         let raw = self.hide();
         stack::pump_until_quiet();
-        let frames = stack::drain();
+        let frames = stack::drain()
+            .into_iter()
+            .filter(|(_, frame)| stack::captured_message_type(frame).is_some_and(is_dfu))
+            .collect();
         self.restore(raw);
         frames
     }
@@ -510,6 +846,56 @@ impl Oracle {
             Self::free(evt);
         }
     }
+
+    /// The shim's clock.
+    #[must_use]
+    pub fn now(&self) -> u32 {
+        stack::tick_count()
+    }
+
+    /// `bm_shim_advance_ticks`.
+    pub fn advance(&self, ms: u32) {
+        unsafe { sys::bm_shim_advance_ticks(ms) };
+    }
+
+    /// The slot and boot-hook calls the shim has counted.
+    #[must_use]
+    pub fn counts(&self) -> Counts {
+        let mut c = sys::BmShimDfuCounts::default();
+        unsafe { sys::bm_shim_dfu_counts(&raw mut c) };
+        Counts::from_c(c)
+    }
+
+    /// The shim's slot.
+    #[must_use]
+    pub fn flash(&self) -> &'static [u8] {
+        let mut len = 0u32;
+        let ptr = unsafe { sys::bm_shim_dfu_flash(&raw mut len) };
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+    }
+
+    /// `get_config_uint(SYSTEM, "dfu_confirm")`.
+    #[must_use]
+    pub fn confirm(&self) -> Option<u32> {
+        let mut value = 0u32;
+        unsafe {
+            sys::get_config_uint(
+                sys::BmConfigPartition_BM_CFG_PARTITION_SYSTEM,
+                C_DFU_CONFIRM_KEY.as_ptr().cast(),
+                DFU_CONFIRM_KEY.len(),
+                &raw mut value,
+            )
+        }
+        .then_some(value)
+    }
+}
+
+/// [`DFU_CONFIRM_KEY`] NUL-terminated for the C, whose setters
+/// `snprintf("%s")` the key whatever length they are given.
+const C_DFU_CONFIRM_KEY: &[u8] = b"dfu_confirm\0";
+
+fn is_dfu(t: MessageType) -> bool {
+    DFU_TYPES.contains(&t)
 }
 
 /// A C queue entry as the Rust [`Event`] it should equal.
@@ -550,6 +936,9 @@ pub struct Model {
     /// `host_ctx.client_node_id`: set on every entry into `HostReqUpdate`
     /// with a start.
     pub host_client_node_id: u64,
+    /// `CLIENT_CTX.host_node_id`, from the port, which the comparison of
+    /// everything else vouches for.
+    pub client_host_node_id: u64,
 }
 
 impl Model {
@@ -558,7 +947,14 @@ impl Model {
         if address.dst_node_id != NODE_ID {
             return Accepted::NotForUs;
         }
-        if state.is_host() && address.src_node_id != self.host_client_node_id {
+        let peer = if state.is_host() {
+            Some(self.host_client_node_id)
+        } else if state.is_client() {
+            Some(self.client_host_node_id)
+        } else {
+            None
+        };
+        if peer.is_some_and(|peer| address.src_node_id != peer) {
             return Accepted::WrongPeer;
         }
         let Some(kind) = EventType::for_frame_type(body[0]) else {
@@ -574,10 +970,6 @@ impl Model {
 /// The frames a `bm-stack` node puts on the wire for `sent`, in order.
 fn rust_frames(sent: &[(MessageType, Vec<u8>)]) -> Vec<(u8, Vec<u8>)> {
     let mut node = stack::node();
-    for t in DFU_TYPES {
-        // Node::new registers 22 types; MESSAGE_TYPES is 32.
-        node.register(t, PacketCfg::UNSEQUENCED).expect("room");
-    }
     let mut frames = Vec::new();
     for (message_type, body) in sent {
         let outbound = node
@@ -595,11 +987,18 @@ pub struct Pair {
     /// The C.
     pub c: Oracle,
     /// The port.
-    pub rust: Dfu<ReqUpdateOnly>,
-    /// What the port did outside itself since the last [`Pair::compare`].
+    pub rust: Dfu<Both>,
+    /// What the port did outside itself since the last [`Pair::compare`],
+    /// and its seams.
     pub fx: Recorded,
     /// The comparator's model of the C's `host_ctx`.
     pub model: Model,
+    /// The C's counts at the reset.
+    base: Counts,
+    /// The last [`Step::Offer`]'s image.
+    image: Option<TestImage>,
+    /// The chunk the client last asked for.
+    requested: u16,
 }
 
 /// Bring the oracle up and drive both machines to the same state. See the
@@ -608,36 +1007,51 @@ pub struct Pair {
 pub fn reset() -> Pair {
     let guard = oracle();
     let c = Oracle(());
-    let mut rust = Dfu::new(NODE_ID, RebootInfo::default(), ReqUpdateOnly::default());
-    let mut fx = Recorded::default();
+    unsafe { sys::bm_shim_dfu_set_faults(sys::BmShimDfuFaults::default()) };
 
-    while let Some(evt) = c.take() {
-        Oracle::free(evt);
+    // Every DFU timer is one-shot; past the longest period, all have fired.
+    c.advance(Timer::Ack.period_ms() + 1);
+    c.discard_queue();
+    let _ = c.pump_and_drain();
+
+    let mut fx = Recorded {
+        flash: c.flash().to_vec(),
+        ..Recorded::default()
+    };
+    if let Some(value) = c.confirm() {
+        let key = Key::new(DFU_CONFIRM_KEY);
+        let sys_part = fx.config.partition_mut(Partition::System);
+        assert!(sys_part.set_uint(key, value));
+        sys_part.mark_saved();
     }
+    let mut rust = Dfu::new(NODE_ID, RebootInfo::default(), Both::default());
     while rust.pop().is_some() {}
 
     unsafe {
         sys::bm_dfu_set_error(0);
         sys::bm_dfu_set_pending_state_change(State::Idle as u8);
     }
+    let now = c.now();
     c.run(true);
     rust.core_mut().set_pending_state_change(State::Idle);
-    rust.step(&mut fx, 0);
+    rust.step(&mut fx, now);
 
     // A BeginHost with no callback and client zero, then back to Idle. It is
     // `internal`, so the C host allocates no stream buffer (divergence #61).
     let image = sys::BmDfuImgInfo::default();
     assert!(unsafe { sys::bm_dfu_initiate_update(image, 0, None, 0, true) });
     assert!(rust.initiate_update(&mut fx, ImgInfo::default(), 0, false, 0, true));
+    let now = c.now();
     c.run(true);
-    rust.step(&mut fx, 0);
+    rust.step(&mut fx, now);
     unsafe { sys::bm_dfu_set_pending_state_change(State::Idle as u8) };
     rust.core_mut().set_pending_state_change(State::Idle);
+    let now = c.now();
     while let Some(evt) = c.take() {
         unsafe { sys::bm_dfu_test_set_dfu_event_and_run_sm(evt) };
         Oracle::free(evt);
     }
-    while rust.step(&mut fx, 0).is_some() {}
+    while rust.step(&mut fx, now).is_some() {}
 
     // Then a second, discarded unrun, to leave `internal` false.
     assert!(unsafe { sys::bm_dfu_initiate_update(image, 0, None, 0, false) });
@@ -647,12 +1061,17 @@ pub fn reset() -> Pair {
 
     let _ = c.pump_and_drain();
     take_c_finished();
+    fx.sent.clear();
+    fx.finished.clear();
     let mut pair = Pair {
         _guard: guard,
+        base: c.counts(),
         c,
         rust,
-        fx: Recorded::default(),
+        fx,
         model: Model::default(),
+        image: None,
+        requested: 0,
     };
     pair.compare(true);
     assert_eq!(pair.rust.state(), State::Idle);
@@ -699,8 +1118,28 @@ impl Pair {
             std::mem::take(&mut self.fx.finished),
             "finish callbacks"
         );
+        assert_eq!(
+            self.c.counts().since(self.base),
+            self.fx.counts,
+            "slot and boot-hook calls"
+        );
+        assert!(self.c.flash() == self.fx.flash.as_slice(), "slot contents");
+        let key = Key::new(DFU_CONFIRM_KEY);
+        assert_eq!(
+            self.c.confirm(),
+            self.fx.config.partition(Partition::System).get_uint(key),
+            "dfu_confirm"
+        );
+        self.model.client_host_node_id = self.rust.roles().client.host_node_id();
         if pump {
             let sent = std::mem::take(&mut self.fx.sent);
+            for (t, body) in &sent {
+                if *t == MessageType::DFU_PAYLOAD_REQ
+                    && let Ok(DfuMessage::PayloadReq(req)) = DfuMessage::decode(body)
+                {
+                    self.requested = req.seq_num;
+                }
+            }
             assert_eq!(self.c.pump_and_drain(), rust_frames(&sent), "frames");
         } else {
             assert!(self.fx.sent.is_empty(), "sent without a pump to compare");
@@ -708,6 +1147,7 @@ impl Pair {
     }
 
     fn run_one(&mut self) {
+        let now = self.c.now();
         let Some(head) = self.rust.core().queue().iter().next().map(|e| e.kind) else {
             self.c.run(true);
             return;
@@ -723,9 +1163,51 @@ impl Pair {
             {
                 self.model.host_client_node_id = start.start.addresses.dst_node_id;
             }
-            self.rust.step(&mut self.fx, 0);
+            self.rust.step(&mut self.fx, now);
         } else {
             self.rust.pop();
+        }
+    }
+
+    /// Hand `body` to both, checking the port's verdict against [`Model`].
+    fn deliver(&mut self, body: &[u8]) {
+        let before = self.rust.core().queue().len();
+        let expected = self.model.verdict(self.rust.state(), before, body);
+        let verdict = self.rust.on_message(body);
+        assert_eq!(verdict, expected, "the model of bm_dfu_process_message");
+
+        let c_before = self.c.queued().len();
+        let buf = unsafe { sys::bm_malloc(body.len()) }.cast::<u8>();
+        assert!(!buf.is_null());
+        unsafe {
+            std::ptr::copy_nonoverlapping(body.as_ptr(), buf, body.len());
+            sys::bm_dfu_process_message(buf, body.len());
+        }
+        let grew = self.c.queued().len() > c_before;
+        assert_eq!(grew, matches!(verdict, Accepted::Queued(_)), "queued");
+        if !grew && verdict == Accepted::UnknownType {
+            // Divergence #54: the C drops it without freeing.
+            unsafe { sys::bm_free(buf.cast()) };
+        }
+    }
+
+    /// Move both clocks on by `ms`, stopping at each of the port's deadlines.
+    fn advance(&mut self, ms: u32) {
+        let target = self.c.now().wrapping_add(ms);
+        loop {
+            let now = self.c.now();
+            let left = target.wrapping_sub(now);
+            let step = self
+                .rust
+                .next_deadline()
+                .map(|d| d.wrapping_sub(now))
+                .filter(|d| (1..=left).contains(d))
+                .unwrap_or(left);
+            self.c.advance(step);
+            self.rust.poll(self.c.now());
+            if step == left {
+                return;
+            }
         }
     }
 
@@ -742,25 +1224,42 @@ impl Pair {
                 src,
                 dst,
                 tail,
-            } => {
-                let body = Step::body(*frame_type, *src, *dst, tail);
-                let before = self.rust.core().queue().len();
-                let expected = self.model.verdict(self.rust.state(), before, &body);
-                let verdict = self.rust.on_message(&body);
-                assert_eq!(verdict, expected, "the model of bm_dfu_process_message");
-
-                let c_before = self.c.queued().len();
-                let buf = unsafe { sys::bm_malloc(body.len()) }.cast::<u8>();
-                assert!(!buf.is_null());
-                unsafe {
-                    std::ptr::copy_nonoverlapping(body.as_ptr(), buf, body.len());
-                    sys::bm_dfu_process_message(buf, body.len());
-                }
-                let grew = self.c.queued().len() > c_before;
-                assert_eq!(grew, matches!(verdict, Accepted::Queued(_)), "queued");
-                if !grew && verdict == Accepted::UnknownType {
-                    // Divergence #54: the C drops it without freeing.
-                    unsafe { sys::bm_free(buf.cast()) };
+            } => self.deliver(&Step::body(*frame_type, *src, *dst, tail)),
+            Step::Offer { src, image } => {
+                self.image = Some(*image);
+                let mut body = vec![0u8; DfuMessage::START_LEN];
+                DfuMessage::Start(DfuStart {
+                    addresses: DfuAddress {
+                        src_node_id: src.id(),
+                        dst_node_id: NODE_ID,
+                    },
+                    img_info: image.info(),
+                })
+                .encode(&mut body)
+                .expect("sized");
+                self.deliver(&body);
+            }
+            Step::Serve { src, short_by } => {
+                if let Some(image) = self.image {
+                    let size = image.image_size();
+                    let chunk = u32::from(image.chunk_size());
+                    let start = u32::from(self.requested).saturating_mul(chunk).min(size);
+                    let end = start.saturating_add(chunk).min(size);
+                    let mut payload = image.bytes(start..end);
+                    payload.truncate(payload.len().saturating_sub(usize::from(*short_by)));
+                    // A `chunk_size` over what one frame carries cannot be
+                    // served whole.
+                    payload.truncate(MAX_EVENT_BODY_LEN - DfuMessage::WITH_TWO_BYTES_LEN);
+                    let message = DfuMessage::Payload(bm_wire::bcmp::dfu::DfuChunk {
+                        addresses: DfuAddress {
+                            src_node_id: src.id(),
+                            dst_node_id: NODE_ID,
+                        },
+                        payload: &payload,
+                    });
+                    let mut body = vec![0u8; message.encoded_len()];
+                    message.encode(&mut body).expect("sized");
+                    self.deliver(&body);
                 }
             }
             Step::Initiate {
@@ -845,6 +1344,60 @@ impl Pair {
                     }
                 }
                 pump = true;
+            }
+            Step::Advance(ms) => {
+                self.advance(u32::from(*ms));
+                pump = true;
+            }
+            Step::SetRebootInfo {
+                magic,
+                major,
+                minor,
+                host,
+                own_sha,
+            } => {
+                let info = RebootInfo {
+                    magic: if *magic { DFU_REBOOT_MAGIC } else { 0 },
+                    major: *major,
+                    minor: *minor,
+                    host_node_id: host.id(),
+                    git_sha: if *own_sha { GIT_SHA } else { !GIT_SHA },
+                };
+                unsafe {
+                    sys::client_update_reboot_info = sys::ReboootClientUpdateInfo {
+                        magic: info.magic,
+                        major: info.major,
+                        minor: info.minor,
+                        host_node_id: info.host_node_id,
+                        gitSHA: info.git_sha,
+                    };
+                }
+                *self.rust.core_mut().reboot_info_mut() = info;
+            }
+            Step::Faults { open, erase, write } => {
+                let faults = sys::BmShimDfuFaults {
+                    open: *open,
+                    erase: *erase,
+                    write: *write,
+                };
+                unsafe { sys::bm_shim_dfu_set_faults(faults) };
+                self.fx.faults = faults;
+            }
+            Step::SetConfirm(value) => {
+                let c = unsafe {
+                    sys::set_config_uint(
+                        sys::BmConfigPartition_BM_CFG_PARTITION_SYSTEM,
+                        C_DFU_CONFIRM_KEY.as_ptr().cast(),
+                        DFU_CONFIRM_KEY.len(),
+                        *value,
+                    )
+                };
+                let rust = self
+                    .fx
+                    .config
+                    .partition_mut(Partition::System)
+                    .set_uint(Key::new(DFU_CONFIRM_KEY), *value);
+                assert_eq!(c, rust, "set_config_uint");
             }
         }
         self.compare(pump);

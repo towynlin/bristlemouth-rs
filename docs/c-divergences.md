@@ -97,6 +97,11 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 59 | A host adopts its client's error code, and a code of 14 or more stops DFU until reboot | replicated | reading, confirmed differentially and against the C host |
 | 60 | A second `bm_dfu_initiate_update` before the first runs is accepted and lost | replicated | reading, confirmed differentially |
 | 61 | A non-internal host update leaks its stream buffer unless it reaches `HostUpdate` | c-only | LeakSanitizer, via `cargo fuzz run dfu_core` |
+| 62 | A DFU start during a transfer restarts it against the first start's image | replicated | reading, confirmed differentially |
+| 63 | A failed chunk write still requests the next chunk, and on the last chunk is reported as a length mismatch | replicated | reading, confirmed differentially |
+| 64 | A client refusing an image as too large leaves the update slot open | replicated | reading, confirmed differentially |
+| 65 | A rebooted client confirms its image on any `0xD3` from the host, whatever its `success` byte | replicated | reading, confirmed differentially |
+| 66 | A client's chunk count is 16 bits | replicated | reading |
 
 ---
 
@@ -2175,8 +2180,11 @@ a non-zero `image_size` and 0 otherwise; with the trap set it is a
 UsageFault. What the dev kit firmware does was not measured.
 
 **domain-limited.** The codec carries zero unchanged
-(`bm_wire::bcmp::dfu::ImgInfo::chunk_size`). D3 decides the client's
-behaviour and must keep the comparator's `chunk_size` non-zero.
+(`bm_wire::bcmp::dfu::ImgInfo::chunk_size`). `bm_wire::bcmp::dfu_client::Client`
+gives what `UDIV` gives with the trap clear — quotient 0, remainder the
+dividend — so one chunk for a non-empty image, none for an empty one; pinned by
+`chunk_size_zero_is_one_chunk`. `bm_wire_diff::dfu_core::in_domain_body` sends
+the C a `chunk_size` of 1 in place of 0.
 
 Fix upstream by rejecting `chunk_size == 0` in both
 `bm_dfu_client_process_update_request` and `bm_dfu_initiate_update`.
@@ -2276,3 +2284,98 @@ non-internal `BeginHost` as out of domain so the fuzzer can run.
 
 Fix upstream by deleting `data_queue` in `bm_dfu_host_transition_to_error`,
 or by creating it in `s_host_update_entry` instead.
+
+## 62. A DFU start during a transfer restarts it against the first start's image
+
+`s_client_receiving_run` answers a `DfuEventReceivedUpdateRequest` (a `0xD0`
+from the host) by ACKing, zeroing `current_chunk`, the page buffer count, the
+flash offset and the running CRC, and asking for chunk 0 again. It does not
+read the new `0xD0`: `image_size`, `num_chunks` and `crc16` stay those of the
+start that began the transfer, and the slot is not erased again. The comment
+says this is for a host that lost the first ACK, which resends the same start;
+a host that resends a *different* image mid-transfer has it received and
+validated against the old one.
+
+The rewrite from offset 0 lands on pages already programmed. The shim's RAM
+slot accepts that; flash that must be erased before it is programmed would
+not, and the update would fail with `BmDfuErrBmFrame` (#63's path). What the
+dev kit's slot does was not measured.
+
+**replicated.** `bm_wire::bcmp::dfu_client::Client` restarts the same way.
+Pinned by `a_resync_keeps_the_first_images_size_and_crc` in `bm-wire` and
+`a_second_offer_restarts_against_the_first_image` in
+`bm-wire-diff/tests/dfu_core.rs`.
+
+Fix upstream by re-reading the image info and re-erasing, or by NACKing a
+start whose image info differs from the one in progress.
+
+## 63. A failed chunk write still requests the next chunk, and on the last chunk is reported as a length mismatch
+
+When `bm_dfu_process_payload` fails a page write, `s_client_receiving_run`
+calls `bm_dfu_client_transition_to_error(BmDfuErrBmFrame)` — which stops the
+chunk timer and sets a pending change to `Error` — and then carries on:
+`current_chunk++`, then either `bm_dfu_req_next_chunk` and `bm_timer_start`,
+or, on the last chunk, `bm_dfu_process_end` and a pending change to
+`ClientValidating`, which replaces the one to `Error`.
+
+So:
+
+- The host receives a chunk request from a client about to enter `Error`, and
+  the chunk timer is left running into `Error` and then `Idle`, where its
+  timeout is ignored — or run as a retry by the next transfer if one starts
+  within two seconds.
+- On the last chunk the client validates instead, finds `image_size` ahead of
+  the flash offset the failed write did not advance, and reports
+  `BmDfuErrMismatchLen` with a `0xD3`, overwriting `BmDfuErrBmFrame`.
+
+`bm_dfu_process_payload` also returns before copying the part of the chunk
+that belongs to the next page, so those bytes are lost either way.
+
+**replicated.** Pinned by `a_failed_write_still_requests_the_next_chunk` and
+`a_failed_write_on_the_last_chunk_goes_to_validating` in `bm-wire`, and
+`slot_failures_agree_with_the_c` against the C, through the shim's write fault.
+
+Fix upstream by returning from `s_client_receiving_run` after the transition
+to error.
+
+## 64. A client refusing an image as too large leaves the update slot open
+
+`bm_dfu_client_process_update_request` opens the slot, then NACKs with
+`BmDfuErrTooLarge` if `bm_dfu_client_flash_area_get_size` is not greater than
+`image_size`, and returns without `bm_dfu_client_flash_area_close`. The next
+start opens it again. With MCUboot's `flash_area_open` this is a reference
+count that only goes up. An image exactly the size of the slot is refused too:
+the test is `>`, not `>=`.
+
+**replicated.** The port makes the same seam calls; `offers_the_client_refuses`
+compares the open and close counts with the C's.
+
+Fix upstream by closing the slot before the NACK.
+
+## 65. A rebooted client confirms its image on any `0xD3` from the host, whatever its `success` byte
+
+In `BmDfuStateClientRebootDone`, `s_client_update_done_run` takes any
+`DfuEventUpdateEnd` with a buffer as the host's confirmation: it calls
+`bm_dfu_client_set_confirmed`, answers with a successful `0xD3` and goes idle.
+The `success` and `err_code` bytes of the host's message are not read. The
+only check on the sender is `bm_dfu_client_host_node_valid`, which compares
+the body's unauthenticated `src_node_id` with the host recorded before the
+reboot.
+
+**replicated.** Pinned by `a_rebooted_client_confirms_on_the_hosts_end`, which
+sends `success` 1; the port reads neither byte.
+
+Fix upstream by confirming only on `success`, and failing the update
+otherwise.
+
+## 66. A client's chunk count is 16 bits
+
+`DfuClientCtx::num_chunks` and `current_chunk` are `uint16_t`.
+`bm_dfu_client_process_update_request` computes the chunk count in 32 bits and
+truncates it, so an image of 65 536 chunks or more — 64 MiB at the largest
+chunk size, 64 KiB at a `chunk_size` of 1 — is asked for in the truncated
+count of chunks, and then fails validation with `BmDfuErrMismatchLen`.
+
+**replicated.** `Client` truncates the same way.
+
+Fix upstream by refusing an image whose chunk count exceeds `UINT16_MAX`.

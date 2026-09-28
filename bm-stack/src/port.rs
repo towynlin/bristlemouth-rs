@@ -6,10 +6,10 @@
 //! traits, so a node is generic over them and a mock is another
 //! implementation.
 //!
-//! Only the seams the ported exchanges need are here. The DFU flash slot
-//! arrives with the code that uses it.
+//! Only the seams the ported exchanges need are here.
 
 use bm_wire::bcmp::DeviceInfo;
+use bm_wire::bcmp::dfu_core::RebootInfo;
 use bm_wire::configuration::{MAX_IMAGE_LEN, Partition};
 use bm_wire::util::{date_time_from_utc, utc_from_date_time};
 
@@ -360,6 +360,251 @@ impl ConfigStorage for RamConfigStorage {
     }
 
     fn reset(&mut self) {}
+}
+
+/// The DFU client's update slot and boot hooks: the client half of
+/// `bcmp/bm_dfu_generic.h`, which bm_core declares and leaves to the
+/// integrator (MCUboot's flash-area API on the dev kit).
+///
+/// There is no oracle for this seam. The harness gives the Rust client and
+/// the C the same RAM slot (`bm-wire-sys/csrc/bm_generic_shim.c`, and
+/// [`RamDfuSlot`] here) and compares what each does to it.
+pub trait DfuSlot {
+    /// `bm_dfu_client_flash_area_open`: open the secondary image slot.
+    fn open(&mut self) -> bool;
+    /// `bm_dfu_client_flash_area_close`.
+    fn close(&mut self) -> bool;
+    /// `bm_dfu_client_flash_area_get_size`. An image must be strictly
+    /// smaller.
+    fn size(&mut self) -> u32;
+    /// `bm_dfu_client_flash_area_erase`.
+    fn erase(&mut self, offset: u32, len: u32) -> bool;
+    /// `bm_dfu_client_flash_area_write`. Called with whole 2048-byte pages,
+    /// then once with the remainder.
+    fn write(&mut self, offset: u32, data: &[u8]) -> bool;
+    /// `bm_dfu_client_set_confirmed`: keep the running image.
+    fn set_confirmed(&mut self);
+    /// `bm_dfu_client_set_pending_and_reset`: boot the received image next,
+    /// once, and reset. Should not return.
+    fn set_pending_and_reset(&mut self);
+    /// `bm_dfu_client_fail_update_and_reset`: go back to the previous image
+    /// and reset. Should not return.
+    fn fail_update_and_reset(&mut self);
+}
+
+/// Where `client_update_reboot_info` lives across a reset.
+///
+/// bm_core puts it in a `bm_noinit_ram_attribute` section: RAM the startup
+/// code does not zero, so what the client wrote before
+/// [`DfuSlot::set_pending_and_reset`] is there when the new image boots, and
+/// `s_init_run` reads its magic to resume the update rather than go idle.
+///
+/// **Contract:** what [`Self::store`] was last given before a reset is what
+/// [`Self::load`] returns after it. Power loss may lose it, which reads as no
+/// update in progress. A C image and a Rust image hand an update across only
+/// if both keep it at the same address in
+/// [`RebootInfo::encode`]'s layout.
+pub trait NoInitRam {
+    /// The value at boot.
+    fn load(&mut self) -> RebootInfo;
+    /// Keep `info` until the next boot. Called whenever it changes, and
+    /// before every reset the client asks for.
+    fn store(&mut self, info: &RebootInfo);
+}
+
+/// No update slot. [`DfuSlot::open`] fails, so an update request is NACKed
+/// with `BmDfuErrFlashAccess` and the client stays in its error state until
+/// reboot — what a C node whose `flash_area_open` fails does. Nothing
+/// survives a reset.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoDfu;
+
+impl DfuSlot for NoDfu {
+    fn open(&mut self) -> bool {
+        false
+    }
+    fn close(&mut self) -> bool {
+        false
+    }
+    fn size(&mut self) -> u32 {
+        0
+    }
+    fn erase(&mut self, _offset: u32, _len: u32) -> bool {
+        false
+    }
+    fn write(&mut self, _offset: u32, _data: &[u8]) -> bool {
+        false
+    }
+    fn set_confirmed(&mut self) {}
+    fn set_pending_and_reset(&mut self) {}
+    fn fail_update_and_reset(&mut self) {}
+}
+
+impl NoInitRam for NoDfu {
+    fn load(&mut self) -> RebootInfo {
+        RebootInfo::default()
+    }
+    fn store(&mut self, _info: &RebootInfo) {}
+}
+
+/// What a [`RamDfuSlot`]'s boot hooks were asked to do. Nothing resets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BootRequests {
+    /// [`DfuSlot::set_confirmed`] calls.
+    pub confirmed: u32,
+    /// [`DfuSlot::set_pending_and_reset`] calls.
+    pub pending_and_reset: u32,
+    /// [`DfuSlot::fail_update_and_reset`] calls.
+    pub fail_and_reset: u32,
+}
+
+/// An update slot of `N` bytes in RAM, and no-init RAM that is an ordinary
+/// field.
+///
+/// The shim's semantics: erase fills with `0xFF`, anything out of range
+/// fails, and the boot hooks are counted in [`Self::boot`] rather than
+/// resetting. A reboot is modelled by building a new node from the same
+/// value, whose [`NoInitRam::load`] returns what was last stored — which is
+/// the survives-reset half of the contract and none of the power-loss half.
+#[derive(Clone)]
+pub struct RamDfuSlot<const N: usize> {
+    /// The slot's bytes.
+    pub flash: [u8; N],
+    /// What the boot hooks were asked.
+    pub boot: BootRequests,
+    /// What [`NoInitRam`] holds.
+    pub reboot_info: RebootInfo,
+    /// Whether the slot is open.
+    pub open: bool,
+}
+
+impl<const N: usize> core::fmt::Debug for RamDfuSlot<N> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RamDfuSlot")
+            .field("boot", &self.boot)
+            .field("reboot_info", &self.reboot_info)
+            .field("open", &self.open)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<const N: usize> Default for RamDfuSlot<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize> RamDfuSlot<N> {
+    /// Zeroed, closed, with nothing in no-init RAM.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            flash: [0; N],
+            boot: BootRequests {
+                confirmed: 0,
+                pending_and_reset: 0,
+                fail_and_reset: 0,
+            },
+            reboot_info: RebootInfo {
+                magic: 0,
+                major: 0,
+                minor: 0,
+                host_node_id: 0,
+                git_sha: 0,
+            },
+            open: false,
+        }
+    }
+
+    fn range(offset: u32, len: usize) -> Option<core::ops::Range<usize>> {
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(len)?;
+        (end <= N).then_some(start..end)
+    }
+}
+
+impl<const N: usize> DfuSlot for RamDfuSlot<N> {
+    fn open(&mut self) -> bool {
+        self.open = true;
+        true
+    }
+    fn close(&mut self) -> bool {
+        core::mem::replace(&mut self.open, false)
+    }
+    fn size(&mut self) -> u32 {
+        u32::try_from(N).unwrap_or(u32::MAX)
+    }
+    fn erase(&mut self, offset: u32, len: u32) -> bool {
+        let Some(range) = usize::try_from(len)
+            .ok()
+            .and_then(|len| Self::range(offset, len))
+        else {
+            return false;
+        };
+        self.flash[range].fill(0xFF);
+        true
+    }
+    fn write(&mut self, offset: u32, data: &[u8]) -> bool {
+        let Some(range) = Self::range(offset, data.len()) else {
+            return false;
+        };
+        self.flash[range].copy_from_slice(data);
+        true
+    }
+    fn set_confirmed(&mut self) {
+        self.boot.confirmed += 1;
+    }
+    fn set_pending_and_reset(&mut self) {
+        self.boot.pending_and_reset += 1;
+    }
+    fn fail_update_and_reset(&mut self) {
+        self.boot.fail_and_reset += 1;
+    }
+}
+
+impl<const N: usize> NoInitRam for RamDfuSlot<N> {
+    fn load(&mut self) -> RebootInfo {
+        self.reboot_info
+    }
+    fn store(&mut self, info: &RebootInfo) {
+        self.reboot_info = *info;
+    }
+}
+
+impl<T: DfuSlot + ?Sized> DfuSlot for &mut T {
+    fn open(&mut self) -> bool {
+        (**self).open()
+    }
+    fn close(&mut self) -> bool {
+        (**self).close()
+    }
+    fn size(&mut self) -> u32 {
+        (**self).size()
+    }
+    fn erase(&mut self, offset: u32, len: u32) -> bool {
+        (**self).erase(offset, len)
+    }
+    fn write(&mut self, offset: u32, data: &[u8]) -> bool {
+        (**self).write(offset, data)
+    }
+    fn set_confirmed(&mut self) {
+        (**self).set_confirmed();
+    }
+    fn set_pending_and_reset(&mut self) {
+        (**self).set_pending_and_reset();
+    }
+    fn fail_update_and_reset(&mut self) {
+        (**self).fail_update_and_reset();
+    }
+}
+
+impl<T: NoInitRam + ?Sized> NoInitRam for &mut T {
+    fn load(&mut self) -> RebootInfo {
+        (**self).load()
+    }
+    fn store(&mut self, info: &RebootInfo) {
+        (**self).store(info);
+    }
 }
 
 #[cfg(test)]
