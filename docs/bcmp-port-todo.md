@@ -528,7 +528,7 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
   divergences #14, #35 and #36 all bite: it is the only caller of
   `bcmp_request_neighbor_table` in bm_core.
 - **`middleware/pubsub.c`, `bm_service*.c` and the built-in services** — above
-  the wire.
+  BCMP. Pub/sub, UDP and `spotter.c` are planned in `docs/hello-world-todo.md`.
 - **`bm-phy-adin2111`** — embassy#7024 is merged; `docs/embassy-port-tracking-prompt.md`
   keeps the design record.
 

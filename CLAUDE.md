@@ -93,6 +93,9 @@ A cargo workspace.
 - `docs/c-divergences.md` — the upstream defect list.
 - `docs/bcmp-port-todo.md` — what of BCMP is unported, as dependency-ordered
   task cards. Read its shared contract before starting a card.
+- `docs/hello-world-todo.md` — what stands between the tree and a Rust
+  hello-world app on a dev kit (app seam, UDP, pub/sub, `spotter_log`, board
+  support), as task cards.
 - `docs/embassy-port-tracking-prompt.md` — the brief that produced
   embassy#7024, which made `embassy-net-adin1110` report the ingress port and
   take an egress port per frame. Merged; kept as the record of the design.
