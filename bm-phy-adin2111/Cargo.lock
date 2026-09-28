@@ -28,9 +28,7 @@ version = "0.1.0"
 dependencies = [
  "bm-wire",
  "embassy-futures",
- "embassy-sync",
  "embassy-time",
- "heapless",
 ]
 
 [[package]]

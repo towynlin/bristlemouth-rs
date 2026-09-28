@@ -66,9 +66,11 @@ A cargo workspace.
     from `next_dfu_transmission`, as bm_core's runs on its own task.
   - `src/app.rs` — `App`, application code `Node::run_app` runs in the
     node's loop: a cancel-safe `ready` arm, then `act` with `&mut Node`.
-  - `src/channel.rs` — `Channels`, an `embassy-sync` `NodeHandle` for an
-    application in a task of its own: owned `Command`s in, owned
-    `Notification`s out, run by `ChannelApp`, an `App`.
+  - `src/channel.rs` — behind the `channel` feature: `Channels`, an
+    `embassy-sync` `NodeHandle` for an application in a task of its own:
+    owned `Command`s in, owned `Notification`s out, run by `ChannelApp`, an
+    `App`. Off by default, so a single-task firmware carries neither
+    `embassy-sync` nor `heapless`.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
   - `examples/hello_node.rs` — a node on the mock PHY through the public API
     only: a scripted neighbour, an `App` that pings it. Panics on a wrong

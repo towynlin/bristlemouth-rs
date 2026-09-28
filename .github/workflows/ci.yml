@@ -70,7 +70,7 @@ jobs:
       # The firmware view. The host lint above never compiles this cfg, and
       # bare-metal is where bm-wire and bm-stack actually have to hold up.
       - name: Cortex-M33
-        run: cargo clippy -p bm-wire -p bm-stack --target thumbv8m.main-none-eabihf --locked -- -D warnings
+        run: cargo clippy -p bm-wire -p bm-stack --features bm-stack/channel --target thumbv8m.main-none-eabihf --locked -- -D warnings
 
   test:
     name: test

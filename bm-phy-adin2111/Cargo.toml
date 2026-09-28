@@ -41,8 +41,8 @@ features = ["tc6", "packetmeta-id"]
 git = "https://github.com/embassy-rs/embassy"
 branch = "main"
 
-# bm-stack depends on released embassy-time, embassy-futures and embassy-sync;
-# the driver above brings the git ones. Only one crate may claim
+# bm-stack depends on released embassy-time, embassy-futures and, with its
+# `channel` feature, embassy-sync; the driver above brings the git ones. Only one crate may claim
 # `links = "embassy-time"`, so point everything at the git tree. embassy-sync
 # has no `links`, but two copies would be two unrelated `Channel` types.
 [patch.crates-io]
