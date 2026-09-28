@@ -9,22 +9,15 @@
 //! cargo run -p bm-stack --example hello_node
 //! ```
 //!
-//! The `mock` feature comes from `bm-stack`'s own dev-dependency on itself, as
-//! it does for the integration tests.
+//! Peer frames come from [`bm_stack::mock::frames`]. The `mock` feature comes
+//! from `bm-stack`'s own dev-dependency on itself, as it does for the
+//! integration tests.
 
-use bm_stack::mock::{MockError, MockPhy, Script};
-use bm_stack::node::LINK_LOCAL_PREFIX;
+use bm_stack::mock::{MockError, MockPhy, Script, frames};
 use bm_stack::{App, Event, Identity, Node, Outbound, SoftRtc};
-use bm_wire::addr;
 use bm_wire::bcmp::info::DeviceInfoReply;
 use bm_wire::bcmp::ping::EchoReply;
-use bm_wire::bcmp::{BCMP_HEADER_LEN, DeviceInfo, Heartbeat, MessageType, rx, tx};
-use bm_wire::frame::{
-    ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET,
-    IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
-    MIN_FRAME_WITH_ADDRESSES,
-};
-use bm_wire::neighbor::HEARTBEAT_PERIOD_S;
+use bm_wire::bcmp::{DeviceInfo, rx};
 use bm_wire::util::BmIpAddr;
 use embassy_futures::block_on;
 use embassy_time::{Duration, Ticker};
@@ -97,74 +90,35 @@ impl App<ExampleNode> for Pinger {
     }
 }
 
-/// A BCMP frame from the peer to `dst`.
-fn peer_frame(message_type: MessageType, body: &[u8], dst: BmIpAddr) -> Vec<u8> {
-    let payload_len = BCMP_HEADER_LEN + body.len();
-    let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
-    frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-        .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-    frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-        .copy_from_slice(&u16::try_from(payload_len).unwrap().to_be_bytes());
-    frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-    frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&addr::nodeid_to_ip(LINK_LOCAL_PREFIX, PEER_ID).0);
-    frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&dst.0);
-    tx::serialize(&mut frame, message_type, 0, body).unwrap();
-    frame
-}
-
-fn heartbeat() -> Vec<u8> {
-    let mut body = [0u8; Heartbeat::LEN];
-    Heartbeat {
-        time_since_boot_us: 5_000_000,
-        liveliness_lease_dur_s: HEARTBEAT_PERIOD_S,
-    }
-    .encode(&mut body)
-    .unwrap();
-    peer_frame(
-        MessageType::HEARTBEAT,
-        &body,
-        BmIpAddr::LINK_LOCAL_MULTICAST,
-    )
-}
-
-/// The answer to the info request the heartbeat provokes.
+/// The peer describing itself, in answer to the info request its heartbeat
+/// provokes.
 fn device_info_reply() -> Vec<u8> {
-    let reply = DeviceInfoReply {
-        info: DeviceInfo {
-            node_id: PEER_ID,
-            vendor_id: 0xBEEF,
-            product_id: 0x0002,
-            ..DeviceInfo::default()
+    frames::device_info_reply(
+        PEER_ID,
+        &DeviceInfoReply {
+            info: DeviceInfo {
+                node_id: PEER_ID,
+                vendor_id: 0xBEEF,
+                product_id: 0x0002,
+                ..DeviceInfo::default()
+            },
+            version_string: b"1.0.0",
+            device_name: b"peer",
         },
-        version_string: b"1.0.0",
-        device_name: b"peer",
-    };
-    let mut body = vec![0u8; reply.encoded_len()];
-    reply.encode(&mut body).unwrap();
-    peer_frame(
-        MessageType::DEVICE_INFO_REPLY,
-        &body,
-        BmIpAddr::LINK_LOCAL_MULTICAST,
     )
 }
 
 /// The peer's answer to our first ping: the id is the low 16 bits of our node
 /// id, and the sequence number is the first one.
 fn echo_reply() -> Vec<u8> {
-    let reply = EchoReply {
-        node_id: PEER_ID,
-        id: NODE_ID as u16,
-        seq_num: 0,
-        payload: PING_PAYLOAD,
-    };
-    let mut body = vec![0u8; reply.encoded_len()];
-    reply.encode(&mut body).unwrap();
-    peer_frame(
-        MessageType::ECHO_REPLY,
-        &body,
-        BmIpAddr::LINK_LOCAL_MULTICAST,
+    frames::echo_reply(
+        PEER_ID,
+        &EchoReply {
+            node_id: PEER_ID,
+            id: NODE_ID as u16,
+            seq_num: 0,
+            payload: PING_PAYLOAD,
+        },
     )
 }
 
@@ -176,7 +130,7 @@ fn main() {
     let mut script = vec![
         Script::Receive {
             port: 1,
-            frame: heartbeat(),
+            frame: frames::heartbeat(PEER_ID, 5_000_000),
         },
         Script::Receive {
             port: 1,

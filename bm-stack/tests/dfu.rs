@@ -3,16 +3,14 @@
 //! `bm-wire-diff`; this is the plumbing.
 
 use bm_stack::dfu::DfuFinished;
-use bm_stack::node::LINK_LOCAL_PREFIX;
+use bm_stack::mock::frames;
 use bm_stack::{Event, Identity, NoConfig, NoDfu, Node, Outbound, RamDfuSlot, SoftRtc};
-use bm_wire::addr;
 use bm_wire::bcmp::dfu::{
     DfuAddress, DfuChunk, DfuMessage, DfuResult, DfuStart, IMG_INFO_FORCE_UPDATE, ImgInfo,
 };
 use bm_wire::bcmp::dfu_core::{DFU_REBOOT_MAGIC, DfuErr, RebootInfo, State};
-use bm_wire::bcmp::{BCMP_HEADER_LEN, DeviceInfo, MessageType, rx, tx};
+use bm_wire::bcmp::{DeviceInfo, MessageType, rx};
 use bm_wire::crc::crc16_ccitt;
-use bm_wire::frame::*;
 use bm_wire::util::BmIpAddr;
 
 const NODE_ID: u64 = 0xC0FF_EE00_1234_5678;
@@ -77,19 +75,7 @@ fn frame_to(dst: BmIpAddr, message: &DfuMessage<'_>) -> Vec<u8> {
 fn frame_from(src: u64, dst: BmIpAddr, message: &DfuMessage<'_>) -> Vec<u8> {
     let mut body = vec![0u8; message.encoded_len()];
     message.encode(&mut body).unwrap();
-    let payload_len = BCMP_HEADER_LEN + body.len();
-    let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
-    frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-        .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-    frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-        .copy_from_slice(&(payload_len as u16).to_be_bytes());
-    frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-    frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&addr::nodeid_to_ip(LINK_LOCAL_PREFIX, src).0);
-    frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&dst.0);
-    tx::serialize(&mut frame, message.message_type(), 0, &body).unwrap();
-    frame
+    frames::bcmp(src, dst, message.message_type(), 0, &body)
 }
 
 fn from_host(message: &DfuMessage<'_>) -> Vec<u8> {

@@ -11,6 +11,8 @@
 
 extern crate alloc;
 
+pub mod frames;
+
 use alloc::vec::Vec;
 
 use crate::port::{Egress, Phy};

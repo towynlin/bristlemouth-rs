@@ -72,6 +72,8 @@ A cargo workspace.
     `App`. Off by default, so a single-task firmware carries neither
     `embassy-sync` nor `heapless`.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
+    `src/mock/frames.rs` builds the peer frames a script feeds it; use it
+    rather than a local builder.
   - `examples/hello_node.rs` — a node on the mock PHY through the public API
     only: a scripted neighbour, an `App` that pings it. Panics on a wrong
     outcome, so CI runs it.
