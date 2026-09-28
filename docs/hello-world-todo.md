@@ -25,15 +25,15 @@ bus with a Spotter and a C dev kit:
 |---|---|
 | BCMP: heartbeat, ping, info, neighbours, resources, time, config, DFU | Done (`bm-wire`, `bm_stack::Node`) |
 | PHY for the ADIN2111 | Done (`bm-phy-adin2111`), untested on hardware |
-| Application code running beside `Node::run_with` | **Missing.** `run_with` takes `&mut self` and selects over PHY and timers only; the `events` callback cannot reach the node. An app cannot send anything while the node runs. |
+| Application code running beside the node | Done (card A1): `bm_stack::App`, run by `Node::run_app`. |
 | UDP over IPv6 | **Missing.** `bm-wire/src/frame.rs` has the UDP offsets and `l2::add_egress_port` its checksum patch; nothing builds, accepts or dispatches UDP. `Node::on_frame` relays a UDP frame per `l2_policy` and then drops it in `rx::accept`. |
 | Pub/sub (`middleware/pubsub.c`, `middleware.c`) | **Missing.** Listed out of scope in `bcmp-port-todo.md`. |
 | `spotter_log`, `spotter_tx_data` | **Missing.** |
 | Dev kit board support (MCU HAL, pins, node id, time driver, flash) | **Missing.** No crate targets a board. |
 
 A BCMP-only node — one that heartbeats, is discovered, and answers ping and
-info — can be written today, but only by driving `on_frame`/`on_tick`/
-`on_expiry` by hand, and not yet on a board. It cannot say hello.
+info — can be written today on the mock PHY, but not yet on a board. It cannot
+say hello.
 
 ## The oracle is not the deployed stack for UDP
 
@@ -92,6 +92,24 @@ Options, pick one and say why in the PR:
 Done: a host test on `mock` where an app task sends a ping on its own timer
 while the node runs, and sees the `EchoReply` event. No wire change; no
 comparator.
+
+**Landed** as a variant of the first option without the `Command` enum:
+`bm_stack::App<N>` has a cancel-safe `async fn ready`, polled as the fifth
+`select` arm; when it resolves the loop calls `act(&mut Node, now_ms)`, which
+calls node methods directly and returns at most one `Outbound`. Events go to
+`App::on_event`. `run_with` is `run_app` with an app that never acts. No new
+dependency, and nothing to extend per app-facing call; a firmware wanting a
+separate task makes `ready` receive from its own channel. Test:
+`an_app_pings_on_its_own_timer_and_sees_the_reply` in `bm-stack/tests/node.rs`.
+
+The second option is layered on top: `bm_stack::channel` (`embassy-sync`
+0.8, `heapless` 0.9) gives a task a `NodeHandle` sending `Command`s and
+receiving `Notification`s, and `ChannelApp` is the `App` that serves it.
+Each app-facing call needs a `Command` variant and each event an owned
+`Notification`; only ping has them so far. Notifications are dropped, and
+counted by `ChannelApp::dropped`, when the queue is full, because the node
+never waits on the application. Test:
+`an_app_task_pings_through_a_channel_and_sees_the_reply`.
 
 ## Card E0 — Host example: a BCMP node on the mock PHY
 

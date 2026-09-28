@@ -146,6 +146,7 @@ use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::util::BmIpAddr;
 use bm_wire::{BmWireError, addr::MAC_LEN};
 
+use crate::app::{App, Observer};
 use crate::config::{Configuration, NoConfig};
 use crate::dfu::{DfuFinished, HostRequest, NodeDfu};
 use crate::port::{DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy, Rtc, RtcTimeAndDate};
@@ -3063,15 +3064,7 @@ impl<
 
     /// Run the node until the PHY fails, reporting every [`Event`].
     ///
-    /// Waits on whichever comes first — a frame, the heartbeat tick or the
-    /// expiry sweep — handles it, and transmits anything owed. Both timers are
-    /// bm_core's: `bcmp_heartbeat_s`, which also ages the neighbour table in
-    /// that order, and `packet.c`'s [`EXPIRY_PERIOD_MS`] sweep. Keeping them
-    /// apart is what lets a request time out on the C's grid while heartbeats
-    /// stay ten seconds apart.
-    ///
-    /// Returns rather than panicking when the PHY errors, so the caller can
-    /// decide whether that is fatal. It has no other exit.
+    /// [`Node::run_app`] with an application that never acts.
     ///
     /// # Errors
     ///
@@ -3079,9 +3072,33 @@ impl<
     pub async fn run_with<P: Phy>(
         &mut self,
         phy: &mut P,
-        mut events: impl FnMut(Event<'_>),
+        events: impl FnMut(Event<'_>),
     ) -> P::Error {
-        use embassy_futures::select::{Either4, select4};
+        self.run_app(phy, &mut Observer(events)).await
+    }
+
+    /// Run the node and `app` until the PHY fails.
+    ///
+    /// Waits on whichever comes first — a frame, the heartbeat tick, the
+    /// expiry sweep, a one-shot node timer, or [`App::ready`] — handles it, and
+    /// transmits anything owed. Both periodic timers are bm_core's:
+    /// `bcmp_heartbeat_s`, which also ages the neighbour table in that order,
+    /// and `packet.c`'s [`EXPIRY_PERIOD_MS`] sweep. Keeping them apart is what
+    /// lets a request time out on the C's grid while heartbeats stay ten
+    /// seconds apart.
+    ///
+    /// The application arm is polled last, so a frame or node timer that is
+    /// due at the same time is handled first. Every [`Event`] goes to
+    /// [`App::on_event`].
+    ///
+    /// Returns rather than panicking when the PHY errors, so the caller can
+    /// decide whether that is fatal. It has no other exit.
+    ///
+    /// # Errors
+    ///
+    /// The first error the PHY reports, from either direction.
+    pub async fn run_app<P: Phy, A: App<Self>>(&mut self, phy: &mut P, app: &mut A) -> P::Error {
+        use embassy_futures::select::{Either5, select5};
         use embassy_time::{Duration, Instant, Ticker, Timer};
 
         let started = Instant::now();
@@ -3129,17 +3146,19 @@ impl<
                 }
             };
 
-            match select4(
+            match select5(
                 phy.receive(&mut rx),
                 ticker.next(),
                 expiry.next(),
                 neighbor_timer,
+                app.ready(),
             )
             .await
             {
-                Either4::First(Ok((port, len))) => {
+                Either5::First(Ok((port, len))) => {
                     let now = uptime_ms(());
-                    let owed = self.on_frame_with(now, port, &mut rx[..len], &mut events);
+                    let owed =
+                        self.on_frame_with(now, port, &mut rx[..len], |event| app.on_event(event));
                     // Copied out before `owed` is consumed: the re-flood needs
                     // the frame back, and `deliver` is holding it.
                     let forward = owed.forward;
@@ -3152,10 +3171,10 @@ impl<
                         return error;
                     }
                 }
-                Either4::First(Err(error)) => return error,
-                Either4::Second(()) => {
+                Either5::First(Err(error)) => return error,
+                Either5::Second(()) => {
                     let now = uptime_ms(());
-                    if let Some(outbound) = self.on_tick_with(now, &mut events)
+                    if let Some(outbound) = self.on_tick_with(now, |event| app.on_event(event))
                         && let Err(error) = transmit(phy, outbound, port_count).await
                     {
                         return error;
@@ -3164,16 +3183,24 @@ impl<
                         return error;
                     }
                 }
-                Either4::Third(()) => {
+                Either5::Third(()) => {
                     let now = uptime_ms(());
-                    self.on_expiry(now, &mut events);
+                    self.on_expiry(now, |event| app.on_event(event));
                     if let Err(error) = self.retransmit(phy).await {
                         return error;
                     }
                 }
-                Either4::Fourth(()) => {
+                Either5::Fourth(()) => {
                     let now = uptime_ms(());
-                    self.on_neighbor_request_timer(now, &mut events);
+                    self.on_neighbor_request_timer(now, |event| app.on_event(event));
+                }
+                Either5::Fifth(()) => {
+                    let now = uptime_ms(());
+                    if let Some(outbound) = app.act(self, now)
+                        && let Err(error) = transmit(phy, outbound, port_count).await
+                    {
+                        return error;
+                    }
                 }
             }
             // Whatever woke the loop may have queued a DFU event or brought a
@@ -3182,7 +3209,7 @@ impl<
                 return error;
             }
             while let Some(finished) = self.dfu.take_update_finished() {
-                events(Event::DfuUpdateFinished(finished));
+                app.on_event(Event::DfuUpdateFinished(finished));
             }
         }
     }

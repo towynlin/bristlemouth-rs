@@ -24,6 +24,8 @@
 //!   synchronous and take the current time, so they are testable without an
 //!   executor.
 //! * [`node::Node::run`] joins them, and is the only async code here.
+//!   [`node::Node::run_app`] runs an [`app::App`] in the same loop, which is
+//!   how application code sends while the node runs.
 //! * [`mock`], behind the `mock` feature, is a PHY that replays a script and
 //!   records what was sent.
 
@@ -31,6 +33,8 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod app;
+pub mod channel;
 pub mod config;
 pub mod dfu;
 #[cfg(feature = "mock")]
@@ -38,6 +42,8 @@ pub mod mock;
 pub mod node;
 pub mod port;
 
+pub use app::App;
+pub use channel::{ChannelApp, Channels, Command, NodeHandle, Notification};
 pub use config::{Config, Configuration, NoConfig};
 pub use node::{Event, MTU, Node, Outbound, Owed, Reflood, deliver, transmit};
 pub use port::{

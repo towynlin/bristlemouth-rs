@@ -17,6 +17,8 @@ mock = ["embassy-time/mock-driver"]
 bm-wire = { path = "../bm-wire" }
 embassy-time = "0.5"
 embassy-futures = "0.1"
+embassy-sync = "0.8"
+heapless = { version = "0.9", default-features = false }
 
 [dev-dependencies]
 bm-stack = { path = ".", features = ["mock"] }
@@ -26,3 +28,5 @@ bm-stack = { path = ".", features = ["mock"] }
 # HAL and its executor.
 embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 critical-section = { version = "1", features = ["std"] }
+embassy-sync = "0.8"
+heapless = "0.9"
