@@ -2,8 +2,9 @@
 
 What stands between the current tree and a Rust hello-world app on a
 Bristlemouth dev kit, as dependency-ordered task cards sized for one agent
-each. Same card format and shared contract as `docs/bcmp-port-todo.md`; read
-that file's "The shared contract" first.
+each. This is the active plan. Same card format and shared contract as
+`docs/bcmp-port-todo.md`, which is complete and takes no new cards; read that
+file's "The shared contract" first.
 
 ## Working a card
 
@@ -18,9 +19,8 @@ commit, the last one of the card's branch:
 
 | Section | Edit |
 |---|---|
-| The card | Delete it. Git history is the record; do not leave a "Landed" note. |
-| Where the tree stands | Update the rows the card changed. Cite files and symbols. |
-| What the landed cards left for the rest | Add what a remaining card needs to know: the API shape, a choice made between options, a limit or gap left open. Delete entries no remaining card needs. Keep the heading's card list current. |
+| The card | Delete it. Git history is the record of the work; do not leave a "Landed" note or a list of what was done. |
+| What the landed cards left for the rest | Add what a remaining card needs to know: the API shape, a limit or gap left open, and **the reason for any decision between options**, so no later card reopens it. Delete entries no remaining card needs. Keep the heading's card list current. |
 | Other cards | Remove the card from every **Blocks** and **Blocked by**; write "nothing" where none remain. Fix any text that names it. |
 | Order | Remove it from the graph and the paragraph under it. |
 | Suspected C defects | Confirmed rows: add to `docs/c-divergences.md` with a number, cite the number in the commit message, delete the row. Discarded rows: delete, and say why in the commit message. |
@@ -97,14 +97,19 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
 ## What the landed cards (A1, E0) left for the rest
 
-- **Two ways for application code to reach the node.** Both are tested in
-  `bm-stack/tests/node.rs` under "Application seam".
+- **Two ways for application code to reach the node, and why.** Some
+  applications need a task of their own and some fit in the node's loop, so
+  both exist and the second is opt-in:
 
   | Seam | Shape | Test |
   |---|---|---|
-  | `bm_stack::App<N>`, run by `Node::run_app` | `ready` is the loop's fifth `select` arm and must be cancel-safe; then `act(&mut Node, now_ms)` calls node methods directly and returns at most one `Outbound`; events arrive at `on_event`. `run_with` is `run_app` with an app that never acts. | `an_app_pings_on_its_own_timer_and_sees_the_reply` |
-  | `bm_stack::channel` | A task holds a `NodeHandle`, sends `Command`s and receives owned `Notification`s; `ChannelApp` is the `App` serving it. Costs one loop pass of latency over `App`. | `an_app_task_pings_through_a_channel_and_sees_the_reply` |
+  | `bm_stack::App<N>`, run by `Node::run_app` | `ready` is the loop's fifth `select` arm and must be cancel-safe; then `act(&mut Node, now_ms)` calls node methods directly and returns at most one `Outbound`; events arrive at `on_event`. `run_with` is `run_app` with an app that never acts. No dependency, and nothing to add per app-facing call. | `an_app_pings_on_its_own_timer_and_sees_the_reply` |
+  | `bm_stack::channel`, behind the `channel` feature (`embassy-sync`, `heapless`) | A task holds a `NodeHandle`, sends `Command`s and receives owned `Notification`s; `ChannelApp` is the `App` serving it. Costs one loop pass of latency over `App`. | `an_app_task_pings_through_a_channel_and_sees_the_reply` |
 
+  Rejected: a closure `FnMut(&mut Node, Event)` in place of `FnMut(Event)`,
+  because the app could then act only inside an event and not on a timer of
+  its own. Both tests are in `bm-stack/tests/node.rs` under "Application
+  seam".
 - **The channel covers ping only.** Each new app-facing call (P2's publish and
   subscribe, S1's `spotter_log`) needs a `Command` variant, and each new event
   an owned `Notification`. A full notification queue drops, counted by
@@ -112,6 +117,9 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 - **The mock clock is process-global.** A test or example driving
   `Node::run*` on `MockPhy` holds `tests/node.rs`'s `CLOCK` lock or runs in a
   process of its own.
+- **Scripted peer frames come from `bm_stack::mock::frames`.** U2, P2 and S1
+  add their UDP, publication and `spotter_log` builders there rather than in
+  a test file.
 - **`bm-stack/examples/hello_node.rs` is the host twin of E1.** P2 and S1 can
   extend it with a publish, a subscription the scripted neighbour publishes
   to, and a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
