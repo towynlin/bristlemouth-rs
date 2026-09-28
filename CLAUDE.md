@@ -66,6 +66,9 @@ A cargo workspace.
     from `next_dfu_transmission`, as bm_core's runs on its own task.
   - `src/app.rs` — `App`, application code `Node::run_app` runs in the
     node's loop: a cancel-safe `ready` arm, then `act` with `&mut Node`.
+  - `src/channel.rs` — `Channels`, an `embassy-sync` `NodeHandle` for an
+    application in a task of its own: owned `Command`s in, owned
+    `Notification`s out, run by `ChannelApp`, an `App`.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
 - `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
   SPI, on the per-port frame I/O of

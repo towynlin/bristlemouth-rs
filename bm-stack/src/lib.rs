@@ -34,6 +34,7 @@
 #![warn(missing_docs)]
 
 pub mod app;
+pub mod channel;
 pub mod config;
 pub mod dfu;
 #[cfg(feature = "mock")]
@@ -42,6 +43,7 @@ pub mod node;
 pub mod port;
 
 pub use app::App;
+pub use channel::{ChannelApp, Channels, Command, NodeHandle, Notification};
 pub use config::{Config, Configuration, NoConfig};
 pub use node::{Event, MTU, Node, Outbound, Owed, Reflood, deliver, transmit};
 pub use port::{

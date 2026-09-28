@@ -2973,3 +2973,56 @@ fn an_app_pings_on_its_own_timer_and_sees_the_reply() {
         }]
     );
 }
+
+/// [`an_app_pings_on_its_own_timer_and_sees_the_reply`] with the application
+/// as a separate future holding a [`bm_stack::NodeHandle`], run beside the
+/// node by `select` under one `block_on` — two tasks on one executor.
+#[test]
+fn an_app_task_pings_through_a_channel_and_sees_the_reply() {
+    use bm_stack::{Channels, Notification};
+    use embassy_futures::select::{Either, select};
+    use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+    use embassy_time::{Duration, Ticker};
+
+    // Serialised against the other loop tests: the mock clock is global.
+    let _clock = clock_lock();
+    let mut node = node();
+    let mut script = vec![Script::Idle { ms: 50 }; 14];
+    script.push(Script::Receive {
+        port: 1,
+        frame: echo_reply_frame(PEER_ID, OUR_PING_ID, 0, b"hello"),
+    });
+    script.extend(vec![Script::Idle { ms: 50 }; 10]);
+    let mut phy = MockPhy::new(PORTS, script);
+
+    let channels = Channels::<NoopRawMutex, 4>::new();
+    let handle = channels.handle();
+    let mut app = channels.app();
+
+    let mut ticker = Ticker::every(Duration::from_millis(500));
+    let task = async {
+        ticker.next().await;
+        assert!(handle.ping(0, b"hello").await);
+        handle.notification().await
+    };
+
+    let notification = match block_on(select(node.run_app(&mut phy, &mut app), task)) {
+        Either::First(error) => panic!("the node stopped first: {error:?}"),
+        Either::Second(notification) => notification,
+    };
+
+    // The task queues the ping at 500 ms. The node's `select` polls `receive`
+    // before the application arm, so the PHY advances the clock one step
+    // before the node takes it: sent at 550 ms, answered at 700 ms. A separate
+    // task costs a pass of latency that `App` does not.
+    assert_eq!(
+        notification,
+        Notification::EchoReply {
+            source: PEER_ID,
+            seq_num: 0,
+            payload: heapless::Vec::from_slice(b"hello").unwrap(),
+            round_trip_ms: 150,
+        }
+    );
+    assert_eq!(app.dropped(), 0);
+}

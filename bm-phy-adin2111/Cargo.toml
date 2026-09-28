@@ -41,12 +41,14 @@ features = ["tc6", "packetmeta-id"]
 git = "https://github.com/embassy-rs/embassy"
 branch = "main"
 
-# bm-stack depends on released embassy-time and embassy-futures; the driver
-# above brings the git ones. Only one crate may claim `links = "embassy-time"`,
-# so point everything at the git tree.
+# bm-stack depends on released embassy-time, embassy-futures and embassy-sync;
+# the driver above brings the git ones. Only one crate may claim
+# `links = "embassy-time"`, so point everything at the git tree. embassy-sync
+# has no `links`, but two copies would be two unrelated `Channel` types.
 [patch.crates-io]
 embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
 
 [dev-dependencies]
 # The three a board would otherwise supply; see bm-stack's Cargo.toml.

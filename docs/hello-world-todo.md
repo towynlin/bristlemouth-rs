@@ -102,6 +102,15 @@ dependency, and nothing to extend per app-facing call; a firmware wanting a
 separate task makes `ready` receive from its own channel. Test:
 `an_app_pings_on_its_own_timer_and_sees_the_reply` in `bm-stack/tests/node.rs`.
 
+The second option is layered on top: `bm_stack::channel` (`embassy-sync`
+0.8, `heapless` 0.9) gives a task a `NodeHandle` sending `Command`s and
+receiving `Notification`s, and `ChannelApp` is the `App` that serves it.
+Each app-facing call needs a `Command` variant and each event an owned
+`Notification`; only ping has them so far. Notifications are dropped, and
+counted by `ChannelApp::dropped`, when the queue is full, because the node
+never waits on the application. Test:
+`an_app_task_pings_through_a_channel_and_sees_the_reply`.
+
 ## Card E0 — Host example: a BCMP node on the mock PHY
 
 **Blocks:** nothing. **Blocked by:** A1.
