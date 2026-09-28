@@ -64,6 +64,8 @@ A cargo workspace.
     bm_core's: the 10 s heartbeat and `packet.c`'s 150 ms expiry sweep, which
     must not be put on a grid of the port's own (divergence #22). DFU runs
     from `next_dfu_transmission`, as bm_core's runs on its own task.
+  - `src/app.rs` — `App`, application code `Node::run_app` runs in the
+    node's loop: a cancel-safe `ready` arm, then `act` with `&mut Node`.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
 - `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
   SPI, on the per-port frame I/O of

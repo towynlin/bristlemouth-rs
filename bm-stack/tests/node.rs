@@ -2881,3 +2881,95 @@ fn the_run_loop_answers_a_resource_request() {
     assert_eq!(table.publisher_count(), 2);
     assert_eq!(table.subscriber_count(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Application seam -- card A1.
+// ---------------------------------------------------------------------------
+
+/// Pings every node on a ticker of its own, and keeps what comes back.
+struct Pinger {
+    ticker: embassy_time::Ticker,
+    /// Uptime of each ping, as [`bm_stack::App::act`] was given it.
+    pinged_at_ms: Vec<u32>,
+    replies: Vec<Seen>,
+}
+
+impl bm_stack::App<Node<TestIdentity, SoftRtc, 4>> for Pinger {
+    async fn ready(&mut self) {
+        self.ticker.next().await;
+    }
+
+    fn act<'n>(
+        &mut self,
+        node: &'n mut Node<TestIdentity, SoftRtc, 4>,
+        now_ms: u32,
+    ) -> Option<bm_stack::Outbound<'n>> {
+        self.pinged_at_ms.push(now_ms);
+        node.ping(now_ms, &BmIpAddr::LINK_LOCAL_MULTICAST, 0, b"hello")
+    }
+
+    fn on_event(&mut self, event: Event<'_>) {
+        if matches!(event, Event::EchoReply { .. }) {
+            self.replies.push(seen(event));
+        }
+    }
+}
+
+/// An application pings on its own timer while the loop runs, and sees the
+/// reply as an [`Event::EchoReply`].
+///
+/// Steps are 50 ms so neither of the loop's tickers has a backlog to burst
+/// through: a burst would let `receive` consume the scripted reply before the
+/// application's arm was polled.
+#[test]
+fn an_app_pings_on_its_own_timer_and_sees_the_reply() {
+    // Serialised against the other loop tests: the mock clock is global.
+    let _clock = clock_lock();
+    let mut node = node();
+    let mut script = vec![Script::Idle { ms: 50 }; 12];
+    script.push(Script::Receive {
+        port: 1,
+        frame: echo_reply_frame(PEER_ID, OUR_PING_ID, 0, b"hello"),
+    });
+    script.extend(vec![Script::Idle { ms: 50 }; 10]);
+    let mut phy = MockPhy::new(PORTS, script);
+    let mut app = Pinger {
+        ticker: embassy_time::Ticker::every(embassy_time::Duration::from_millis(500)),
+        pinged_at_ms: Vec::new(),
+        replies: Vec::new(),
+    };
+
+    let error = block_on(node.run_app(&mut phy, &mut app));
+    assert_eq!(error, bm_stack::mock::MockError::ScriptFinished);
+
+    assert_eq!(app.pinged_at_ms, [500, 1000], "one ping per app tick");
+    let requests: Vec<(u16, Vec<u8>)> = phy
+        .sent
+        .iter()
+        .filter_map(|sent| {
+            let mut frame = sent.frame.clone();
+            let received = rx::accept(&mut frame).ok()?;
+            (received.header.message_type == MessageType::ECHO_REQUEST).then_some(())?;
+            let request = EchoRequest::decode(received.payload).ok()?;
+            Some((request.seq_num, request.payload.to_vec()))
+        })
+        .collect();
+    let hello = || b"hello".to_vec();
+    assert_eq!(
+        requests,
+        [(0, hello()), (0, hello()), (1, hello()), (1, hello())],
+        "each ping is link-local, so goes out once per port"
+    );
+
+    // The reply arrived after the 12th 50 ms step, 100 ms after the first ping.
+    assert_eq!(
+        app.replies,
+        vec![Seen::EchoReply {
+            source: PEER_ID,
+            id: OUR_PING_ID,
+            seq_num: 0,
+            payload: b"hello".to_vec(),
+            round_trip_ms: 100,
+        }]
+    );
+}
