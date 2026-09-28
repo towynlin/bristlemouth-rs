@@ -55,8 +55,8 @@ bus with a Spotter and a C dev kit:
 | Dev kit board support (MCU HAL, pins, node id, time driver, flash) | **Missing.** No crate targets a board. |
 
 A BCMP-only node — one that heartbeats, is discovered, and answers ping and
-info — can be written today on the mock PHY, but not yet on a board. It cannot
-say hello.
+info — runs on the mock PHY (`bm-stack/examples/hello_node.rs`), but not yet on
+a board. It cannot say hello.
 
 ## The oracle is not the deployed stack for UDP
 
@@ -95,7 +95,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 | `bm_middleware_rx` | Dispatches on the **source** port lwIP/`bm_linux.c` reports, not the bound destination port. Harmless while pub/sub sends from and to 4321. | U2 |
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1) left for the rest
+## What the landed cards (A1, E0) left for the rest
 
 - **Two ways for application code to reach the node.** Both are tested in
   `bm-stack/tests/node.rs` under "Application seam".
@@ -112,19 +112,12 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 - **The mock clock is process-global.** A test or example driving
   `Node::run*` on `MockPhy` holds `tests/node.rs`'s `CLOCK` lock or runs in a
   process of its own.
+- **`bm-stack/examples/hello_node.rs` is the host twin of E1.** P2 and S1 can
+  extend it with a publish, a subscription the scripted neighbour publishes
+  to, and a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
+  `cargo test` only builds examples.
 
 ---
-
-## Card E0 — Host example: a BCMP node on the mock PHY
-
-**Blocks:** nothing. **Blocked by:** nothing.
-
-`bm-stack/examples/hello_node.rs`, a cargo example (auto-discovered, and built by
-`cargo test`), using the `mock` feature as the tests do: brings up
-a `Node`, scripts a heartbeat from a neighbour, prints the neighbour table and
-an echo reply. Proves the public API is usable from outside the crate. Add
-`cargo run -p bm-stack --example hello_node` to `CLAUDE.md`'s verify list and
-CI.
 
 ## Card H0 — Reference captures from a C dev kit
 
@@ -290,14 +283,13 @@ reported individually.
 ## Order
 
 ```
-E0
 H0 ─► U1 ─► U2 ─► P1 ─► P2 ─► S1 ─► E1
 B1 ──────────────────────────────────┘
 ```
 
 (P1's `wildcard_match` half does not need U2 and can start after U1.)
 
-E0, H0 and B1 have no prerequisites and can run in parallel. H0 needs a
+H0 and B1 have no prerequisites and can run in parallel. H0 needs a
 person with hardware; U1 can start without it and add gold vectors later.
 
 # Explicitly out of scope
