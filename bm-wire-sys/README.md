@@ -46,6 +46,8 @@ and its behaviour differs from an RTOS deliberately:
   `_fail_update_and_reset`) and `bm_config_reset` is counted
   (`bm_shim_dfu_counts`), none of them resets anything, and
   `bm_shim_dfu_set_faults` makes open, erase or write fail.
+  `bm_dfu_host_get_chunk` reads the same slot, uncounted and never refused;
+  `bm_shim_dfu_load` writes it the same way, to store a host's image.
 - **Leak-visible.** Every allocation is plain `malloc`, so ASan and
   LeakSanitizer see the whole graph.
 

@@ -122,6 +122,14 @@ const uint8_t *bm_shim_dfu_flash(uint32_t *len) {
   return CTX.flash;
 }
 
+bool bm_shim_dfu_load(uint32_t offset, const uint8_t *data, uint32_t len) {
+  if (!data || (uint64_t)offset + len > DFU_FLASH_BYTES) {
+    return false;
+  }
+  memcpy(&CTX.flash[offset], data, len);
+  return true;
+}
+
 // The three boot hooks reset the processor on hardware. Here they only count.
 BmErr bm_dfu_client_set_confirmed(void) {
   CTX.counts.confirmed++;

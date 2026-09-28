@@ -27,8 +27,8 @@
 //! | `bm_dfu_set_pending_state_change`, `bm_dfu_set_error`, `bm_dfu_get_current_event` | [`Core`] methods |
 //! | `client_update_reboot_info` | [`RebootInfo`], held in [`Core`] |
 //! | `bcmp_tx`, the finish callback, `bm_dfu_core_lpm_peripheral_*` | [`Effects`] |
-//! | the client's and host's `BmTimer`s, `bm_delay` | [`Timer`], [`Core::start_timer`], [`Core::delay`], [`Dfu::poll`] |
-//! | `bm_dfu_generic.h`, `git_sha`, the config store | [`Effects`] |
+//! | the client's and host's `BmTimer`s, `bm_delay` | [`Timer`], [`Core::start_timer`], [`Core::change_period`], [`Core::delay`], [`Dfu::poll`] |
+//! | `bm_dfu_generic.h`, `bm_dfu_host_get_chunk`, `git_sha`, the config store | [`Effects`] |
 //!
 //! # Time
 //!
@@ -251,8 +251,13 @@ impl DfuErr {
     }
 }
 
-/// The DFU timers, in the order `bm_dfu_client_init` and `bm_dfu_host_init`
-/// create them. All are one-shot.
+/// The DFU timers that post events, in the order `bm_dfu_client_init` and
+/// `bm_dfu_host_init` create them. All are one-shot.
+///
+/// `host_ctx.heartbeat_timer` is not here. `s_host_update_run` starts it
+/// before reading a chunk and stops it after sending one, so it fires only
+/// while that read blocks for a second or more, and
+/// [`Effects::host_get_chunk`] does not block. See `bcmp::dfu_host`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Timer {
     /// `CLIENT_CTX.chunk_timer`: [`EventType::ChunkTimeout`] after
@@ -261,11 +266,14 @@ pub enum Timer {
     /// `host_ctx.ack_timer`: [`EventType::AckTimeout`] after
     /// `bm_dfu_host_ack_timeout_ms`.
     Ack,
+    /// `host_ctx.update_timer`: [`EventType::Abort`] after the update's
+    /// `timeoutMs`, which [`Core::change_period`] sets.
+    Update,
 }
 
 impl Timer {
-    /// Both, in creation order.
-    pub const ALL: [Self; 2] = [Self::Chunk, Self::Ack];
+    /// All, in creation order.
+    pub const ALL: [Self; 3] = [Self::Chunk, Self::Ack, Self::Update];
 
     /// The period it is created with.
     #[must_use]
@@ -275,6 +283,8 @@ impl Timer {
             Self::Chunk => 2_000,
             // `bm_dfu_host_ack_timeout_ms`, dfu_host.h.
             Self::Ack => 10_000,
+            // `bm_dfu_update_default_timeout_ms`, dfu_host.h.
+            Self::Update => 300_000,
         }
     }
 
@@ -284,6 +294,7 @@ impl Timer {
         match self {
             Self::Chunk => EventType::ChunkTimeout,
             Self::Ack => EventType::AckTimeout,
+            Self::Update => EventType::Abort,
         }
     }
 }
@@ -499,6 +510,10 @@ pub trait Effects {
     fn flash_erase(&mut self, offset: u32, len: u32) -> bool;
     /// `bm_dfu_client_flash_area_write`.
     fn flash_write(&mut self, offset: u32, data: &[u8]) -> bool;
+    /// `bm_dfu_host_get_chunk(offset, buf, len, timeout)`: read `buf.len()`
+    /// bytes of the image this node hosts from `offset` of its own slot. The
+    /// image starts at [`ImgInfo::LEN`] (`DFU_IMG_START_OFFSET_BYTES`).
+    fn host_get_chunk(&mut self, offset: u32, buf: &mut [u8]) -> bool;
     /// `bm_dfu_client_set_confirmed`: mark the running image good.
     fn set_confirmed(&mut self);
     /// `bm_dfu_client_set_pending_and_reset`: mark the received image to be
@@ -655,6 +670,8 @@ pub struct Core {
     clock: Option<u32>,
     /// Deadline per [`Timer`], `None` when stopped.
     timers: [Option<u32>; Timer::ALL.len()],
+    /// Period per [`Timer`].
+    periods: [u32; Timer::ALL.len()],
 }
 
 impl Core {
@@ -757,7 +774,21 @@ impl Core {
 
     /// `bm_timer_start`: (re)arm `timer` for its period from [`Self::now`].
     pub fn start_timer(&mut self, timer: Timer) {
-        self.timers[timer as usize] = Some(self.now().wrapping_add(timer.period_ms()));
+        self.timers[timer as usize] = Some(self.now().wrapping_add(self.periods[timer as usize]));
+    }
+
+    /// `bm_timer_change_period`: set `timer`'s period and (re)arm it, as
+    /// FreeRTOS's `xTimerChangePeriod` does. The period is kept for later
+    /// starts.
+    pub fn change_period(&mut self, timer: Timer, period_ms: u32) {
+        self.periods[timer as usize] = period_ms;
+        self.start_timer(timer);
+    }
+
+    /// `timer`'s current period.
+    #[must_use]
+    pub fn period(&self, timer: Timer) -> u32 {
+        self.periods[timer as usize]
     }
 
     /// `bm_timer_stop`.
@@ -886,6 +917,11 @@ impl<R: Roles> Dfu<R> {
                 reboot_info,
                 clock: None,
                 timers: [None; Timer::ALL.len()],
+                periods: [
+                    Timer::Chunk.period_ms(),
+                    Timer::Ack.period_ms(),
+                    Timer::Update.period_ms(),
+                ],
             },
             roles,
         }

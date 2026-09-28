@@ -1,5 +1,6 @@
-//! The DFU core state machine and client, compared against `bcmp/dfu_core.c`
-//! and `bcmp/dfu_client.c` in bm_core's live stack.
+//! The DFU core state machine, client and host, compared against
+//! `bcmp/dfu_core.c`, `bcmp/dfu_client.c` and `bcmp/dfu_host.c` in bm_core's
+//! live stack.
 //!
 //! Its own binary because `bm_wire_diff::dfu_core` brings the stack up, whose
 //! `bcmp_init` runs `bm_dfu_init`; see `bm_wire_diff::stack`. Each test is a script for
@@ -7,9 +8,15 @@
 //! assertions on what the C did so that an upstream fix fails here and says
 //! which divergence it retired.
 
-use bm_wire::bcmp::dfu_core::{DfuErr, EVENT_QUEUE_LEN, EventType, State};
+use bm_wire::bcmp::dfu::ImgInfo;
+use bm_wire::bcmp::dfu_client::Client;
+use bm_wire::bcmp::dfu_core::{
+    Accepted, Dfu, DfuErr, EVENT_QUEUE_LEN, EventType, RebootInfo, Roles, State,
+};
+use bm_wire::bcmp::dfu_host::ClientHost;
 use bm_wire_diff::dfu_core::{
-    CoreState, DfuCoreInput, FrameType, Image, NodeRef, Pair, Sender, Step, TestImage, check, reset,
+    CoreState, DfuCoreInput, FrameType, Image, NodeRef, Pair, Recorded, Sender, Step, TestImage,
+    check, reset,
 };
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
 
@@ -45,6 +52,15 @@ fn message(n: u8, src: NodeRef, tail: &[u8]) -> Step {
 
 fn abort_from(src: NodeRef, err: u8) -> Step {
     message(5, src, &[0, err])
+}
+
+/// `D0 + n` from the host's current client.
+fn from_client(n: u8, success: u8, err_code: u8) -> Step {
+    Step::FromClient {
+        n,
+        success,
+        err_code,
+    }
 }
 
 #[test]
@@ -209,40 +225,21 @@ fn a_dropped_nop_defers_the_change() {
     assert_eq!(pair.c.state(), State::Idle);
 }
 
-/// Divergence #59 in the C host itself: a client's NACK carrying
-/// `BmDfuErrFlashAccess` — what a client whose flash fails sends — leaves
-/// `dfu_host.c` in Error for good. C only: the host is D4's. The Rust side is
-/// left behind, and the next [`reset`] brings both back.
+/// Divergence #59 in the host: a client's NACK carrying
+/// `BmDfuErrFlashAccess` — what a client whose flash fails sends — leaves the
+/// host in Error for good, and no update can start until reboot.
 #[test]
-fn the_c_host_adopts_a_clients_fatal_nack() {
+fn a_clients_fatal_nack_stops_the_host() {
     let mut pair = reset();
-    pair.apply(&initiate(NodeRef::Peer, false, true));
+    pair.apply(&initiate(NodeRef::Peer, true, true));
     pair.apply(&Step::Run);
     assert_eq!(pair.c.state(), State::HostReqUpdate);
-
-    let mut nack = vec![0xD4];
-    nack.extend_from_slice(&NodeRef::Peer.id().to_le_bytes());
-    nack.extend_from_slice(&NodeRef::This.id().to_le_bytes());
-    nack.extend_from_slice(&[0, DfuErr::FLASH_ACCESS.0]);
-    unsafe {
-        let buf = bm_wire_sys::bm_malloc(nack.len()).cast::<u8>();
-        std::ptr::copy_nonoverlapping(nack.as_ptr(), buf, nack.len());
-        bm_wire_sys::bm_dfu_process_message(buf, nack.len());
-    }
-    for _ in 0..4 * EVENT_QUEUE_LEN {
-        pair.c.run(true);
-    }
+    pair.apply(&from_client(4, 0, DfuErr::FLASH_ACCESS.0));
+    pair.apply(&Step::RunAll);
     assert_eq!(pair.c.state(), State::Error);
-    assert_eq!(
-        unsafe { bm_wire_sys::bm_dfu_get_error() },
-        u32::from(DfuErr::FLASH_ACCESS.0)
-    );
-    let refused = unsafe {
-        bm_wire_sys::bm_dfu_initiate_update(Default::default(), NodeRef::Peer.id(), None, 0, true)
-    };
-    assert!(!refused, "no update can start");
-    drop(pair);
-    let _ = reset();
+    assert_eq!(pair.rust.core().error(), DfuErr::FLASH_ACCESS);
+    pair.apply(&initiate(NodeRef::Peer, true, true));
+    assert_eq!(pair.c.state(), State::Error, "no update can start");
 }
 
 /// A 5000-byte image in 1000-byte chunks, from [`NodeRef::Peer`].
@@ -529,10 +526,297 @@ fn a_stale_chunk_timer_fires_inside_the_offers_delay() {
 #[test]
 fn the_host_ack_timer_outlives_its_state() {
     let mut pair = reset();
+    pair.apply(&initiate(NodeRef::Peer, false, true));
+    pair.apply(&Step::Run);
+    pair.apply(&Step::SetPending(CoreState::Idle));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::Idle);
     pair.apply(&Step::Advance(10_000));
     assert_eq!(
         pair.rust.core().queue().iter().next().map(|e| e.kind),
         Some(EventType::AckTimeout)
     );
     pair.apply(&Step::RunAll);
+}
+
+/// A 5000-byte image in 1000-byte chunks that a client running
+/// [`GIT_SHA`](bm_wire_diff::stack::GIT_SHA) accepts, and after its reboot
+/// finds itself running.
+const HOSTED: TestImage = TestImage {
+    len: 5000,
+    huge: false,
+    chunk_size: 1000,
+    seed: 0xa5,
+    crc_ok: true,
+    own_sha: true,
+    force: true,
+    major: 4,
+    minor: 5,
+};
+
+fn host(pair: &mut Pair, image: TestImage, internal: bool, timeout_ms: u32) {
+    pair.apply(&Step::Host {
+        dst: NodeRef::Peer,
+        image,
+        notify: true,
+        timeout_ms,
+        internal,
+    });
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::HostReqUpdate);
+}
+
+fn to_host_update(pair: &mut Pair, image: TestImage, internal: bool) {
+    host(pair, image, internal, 60_000);
+    pair.apply(&from_client(4, 1, 0));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::HostUpdate);
+}
+
+fn request_chunk(pair: &mut Pair, seq_num: u16) {
+    pair.apply(&message(1, NodeRef::Peer, &seq_num.to_le_bytes()));
+    pair.apply(&Step::RunAll);
+}
+
+/// `host_golden` end to end: start, ACK, five chunks, the reboot request,
+/// the boot complete, the client's END and the finish callback. Every frame
+/// and the callback are compared.
+#[test]
+fn host_golden_agrees_with_the_c() {
+    let mut pair = reset();
+    to_host_update(&mut pair, HOSTED, true);
+    for seq_num in 0..5 {
+        request_chunk(&mut pair, seq_num);
+    }
+    assert_eq!(pair.rust.roles().host.bytes_remaining(), 0);
+    pair.apply(&from_client(7, 0, 0));
+    pair.apply(&Step::RunAll);
+    pair.apply(&from_client(9, 0, 0));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::HostUpdate);
+    pair.apply(&from_client(3, 1, 0));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::Idle);
+}
+
+/// Divergence #67: the chunk sent is the next in sequence, whatever
+/// `seq_num` asks for, and past the end it is empty.
+#[test]
+fn the_host_serves_chunks_in_sequence_whatever_is_asked_for() {
+    let mut pair = reset();
+    to_host_update(&mut pair, HOSTED, true);
+    for seq_num in [0, 0, 3, 1, 1, 9, 0] {
+        request_chunk(&mut pair, seq_num);
+    }
+    let (_, last) = pair.last_sent.last().expect("a chunk");
+    assert_eq!(last.len(), 19, "an empty chunk");
+    assert_eq!(pair.c.state(), State::HostUpdate);
+}
+
+/// A non-internal update serves what the application queued; an empty
+/// stream is `BmDfuErrFlashAccess`, which is fatal.
+#[test]
+fn a_non_internal_update_serves_what_was_fed() {
+    let mut pair = reset();
+    pair.apply(&Step::Feed(10));
+    to_host_update(&mut pair, HOSTED, false);
+    pair.apply(&Step::Feed(1000));
+    pair.apply(&Step::Feed(1)); // refused: the buffer holds one chunk
+    request_chunk(&mut pair, 0);
+    pair.apply(&Step::Feed(600));
+    pair.apply(&Step::Feed(400));
+    request_chunk(&mut pair, 1);
+    request_chunk(&mut pair, 2);
+    assert_eq!(pair.c.state(), State::Error);
+    assert_eq!(pair.rust.core().error(), DfuErr::FLASH_ACCESS);
+}
+
+/// Divergence #68 is out of domain: a chunk request that would find the
+/// stream part full is discarded on both sides.
+#[test]
+fn a_part_fed_chunk_is_not_run() {
+    let mut pair = reset();
+    to_host_update(&mut pair, HOSTED, false);
+    pair.apply(&Step::Feed(100));
+    request_chunk(&mut pair, 0);
+    assert!(pair.last_sent.is_empty());
+    assert_eq!(pair.rust.roles().host.stream().map(|s| s.len()), Some(100));
+}
+
+/// Divergence #61 is out of domain: a failed non-internal update keeps its
+/// stream buffer, and the next non-internal `BeginHost` is discarded on both
+/// sides rather than leak it; an internal one runs, and its exit frees it.
+#[test]
+fn a_leaked_stream_buffer_bars_the_next_non_internal_update() {
+    let mut pair = reset();
+    host(&mut pair, HOSTED, false, 60_000);
+    pair.apply(&from_client(5, 0, DfuErr::ABORTED.0));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::Idle);
+    assert!(pair.rust.roles().host.stream().is_some());
+    pair.apply(&Step::Host {
+        dst: NodeRef::Peer,
+        image: HOSTED,
+        notify: true,
+        timeout_ms: 60_000,
+        internal: false,
+    });
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::Idle, "discarded");
+    to_host_update(&mut pair, HOSTED, true);
+    pair.apply(&from_client(3, 1, 0));
+    pair.apply(&Step::RunAll);
+    assert!(pair.rust.roles().host.stream().is_none());
+}
+
+/// `host_req_update_fail`, on the clock: a second start ten seconds after
+/// the first, then `BmDfuErrTimeout` ten seconds after that.
+#[test]
+fn an_unanswered_start_is_sent_twice() {
+    let mut pair = reset();
+    host(&mut pair, HOSTED, true, 60_000);
+    pair.apply(&Step::Advance(10_000));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.last_sent.len(), 1, "the second start");
+    pair.apply(&Step::Advance(10_000));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.rust.core().error(), DfuErr::TIMEOUT);
+    assert_eq!(pair.c.state(), State::Idle);
+}
+
+/// The update timer aborts `HostUpdate` `timeoutMs` after its entry, and the
+/// callback hears `BmDfuErrAborted`.
+#[test]
+fn the_update_timer_aborts_the_update() {
+    let mut pair = reset();
+    host(&mut pair, HOSTED, true, 5_000);
+    pair.apply(&from_client(4, 1, 0));
+    pair.apply(&Step::RunAll);
+    request_chunk(&mut pair, 0);
+    pair.apply(&Step::Advance(4_999));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.c.state(), State::HostUpdate);
+    pair.apply(&Step::Advance(1));
+    pair.apply(&Step::RunAll);
+    assert_eq!(pair.rust.core().error(), DfuErr::ABORTED);
+    assert_eq!(pair.c.state(), State::Idle);
+}
+
+/// A bm-wire node that is not the oracle, and its seams.
+struct Peer<R> {
+    dfu: Dfu<R>,
+    fx: Recorded,
+}
+
+impl<R: Roles> Peer<R> {
+    fn new(roles: R, reboot_info: RebootInfo) -> Self {
+        let mut peer = Self {
+            dfu: Dfu::new(NodeRef::Peer.id(), reboot_info, roles),
+            fx: Recorded {
+                flash: vec![0; 256 * 1024],
+                ..Recorded::default()
+            },
+        };
+        peer.run(0);
+        peer
+    }
+
+    fn run(&mut self, now_ms: u32) {
+        while self.dfu.step(&mut self.fx, now_ms).is_some() {}
+    }
+}
+
+/// One exchange between the oracle's pair and `peer`: everything the pair
+/// sent goes to the peer, the peer runs, and everything it sent goes to the
+/// pair, which runs. `false` once nothing moves.
+fn exchange<R: Roles>(pair: &mut Pair, peer: &mut Peer<R>) -> bool {
+    let mut moved = false;
+    for (_, body) in std::mem::take(&mut pair.last_sent) {
+        assert!(matches!(peer.dfu.on_message(&body), Accepted::Queued(_)));
+        moved = true;
+    }
+    peer.run(pair.c.now());
+    for (_, body) in std::mem::take(&mut peer.fx.sent) {
+        pair.receive(&body);
+        moved = true;
+    }
+    pair.apply(&Step::RunAll);
+    moved || !pair.last_sent.is_empty()
+}
+
+fn exchange_until_quiet<R: Roles>(pair: &mut Pair, peer: &mut Peer<R>) {
+    for _ in 0..100 {
+        if !exchange(pair, peer) {
+            return;
+        }
+    }
+    panic!("still talking after 100 exchanges");
+}
+
+/// The card's test, one way round: a bm-wire host updates the C client, which
+/// runs beside a bm-wire client given the same frames. Every frame the client
+/// side sends is compared at every step; the transfer completes, the client
+/// reboots into the image and confirms it, and the host hears success.
+#[test]
+fn a_rust_host_updates_the_c_client() {
+    let mut pair = reset();
+    let mut host = Peer::new(ClientHost::new(), RebootInfo::default());
+    let image = HOSTED;
+    let len = image.image_size() as usize;
+    host.fx.flash[ImgInfo::LEN..ImgInfo::LEN + len].copy_from_slice(&image.bytes(0..len as u32));
+    assert!(host.dfu.initiate_update(
+        &mut host.fx,
+        image.info(),
+        NodeRef::This.id(),
+        true,
+        60_000,
+        true
+    ));
+    host.run(pair.c.now());
+    exchange_until_quiet(&mut pair, &mut host);
+    assert_eq!(pair.c.state(), State::ClientActivating);
+    assert_eq!(host.dfu.state(), State::HostUpdate);
+    assert_eq!(pair.fx.counts.pending_and_reset, 1);
+    assert_eq!(&pair.c.flash()[..len], image.bytes(0..len as u32));
+
+    // The reboot: the C keeps `client_update_reboot_info` in no-init RAM.
+    pair.apply(&Step::SetPending(CoreState::Init));
+    pair.apply(&Step::Post(EventType::InitSuccess as u8));
+    exchange_until_quiet(&mut pair, &mut host);
+    assert_eq!(pair.c.state(), State::Idle);
+    assert_eq!(pair.fx.counts.confirmed, 1);
+    assert_eq!(host.dfu.state(), State::Idle);
+    assert_eq!(host.fx.finished, [(true, 0, NodeRef::This.id())]);
+}
+
+/// The card's test, the other way round: the C host updates a bm-wire
+/// client, beside a bm-wire host given the same frames. Every frame the host
+/// side sends is compared at every step, and the finish callback too.
+#[test]
+fn the_c_host_updates_a_rust_client() {
+    let mut pair = reset();
+    let mut client = Peer::new(Client::new(), RebootInfo::default());
+    pair.apply(&Step::Host {
+        dst: NodeRef::Peer,
+        image: HOSTED,
+        notify: true,
+        timeout_ms: 60_000,
+        internal: true,
+    });
+    pair.apply(&Step::RunAll);
+    exchange_until_quiet(&mut pair, &mut client);
+    assert_eq!(client.dfu.state(), State::ClientActivating);
+    assert_eq!(pair.c.state(), State::HostUpdate);
+    let len = HOSTED.image_size();
+    assert_eq!(client.fx.flash[..len as usize], HOSTED.bytes(0..len));
+
+    // The reboot, with what the client left in no-init RAM.
+    let reboot_info = *client.dfu.core().reboot_info();
+    let mut rebooted = Peer::new(Client::new(), reboot_info);
+    rebooted.fx.flash = std::mem::take(&mut client.fx.flash);
+    pair.last_sent.clear();
+    exchange_until_quiet(&mut pair, &mut rebooted);
+    assert_eq!(rebooted.dfu.state(), State::Idle);
+    assert_eq!(rebooted.fx.counts.confirmed, 1);
+    assert_eq!(pair.c.state(), State::Idle);
 }

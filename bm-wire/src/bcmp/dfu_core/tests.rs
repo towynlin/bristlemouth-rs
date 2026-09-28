@@ -64,6 +64,9 @@ impl Effects for Recorder {
     fn flash_write(&mut self, _offset: u32, _data: &[u8]) -> bool {
         unreachable!("the stand-in roles touch no flash")
     }
+    fn host_get_chunk(&mut self, _offset: u32, _buf: &mut [u8]) -> bool {
+        unreachable!("the stand-in roles touch no flash")
+    }
     fn set_confirmed(&mut self) {
         unreachable!("the stand-in roles do not boot")
     }
