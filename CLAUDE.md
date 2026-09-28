@@ -53,8 +53,8 @@ A cargo workspace.
   - `src/port.rs` — the seams bm_core leaves to the integrator, as traits
     rather than link-time symbols, including the DFU update slot and the
     no-init RAM that carries an update across a reset.
-  - `src/dfu.rs` — the DFU client on a node: the machine, its outbox, and
-    the resets it asks for.
+  - `src/dfu.rs` — DFU on a node, client and host: the machine, its outbox,
+    the resets it asks for and the finish callbacks it reports.
   - `src/config.rs` — `config_init` and `save_config`, the two functions of
     `bcmp/configuration.c` that touch storage; the store itself is
     `bm_wire::configuration`.

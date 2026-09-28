@@ -1,11 +1,14 @@
 //! DFU on a node: frames in, frames out, and the slot and no-init RAM behind
-//! them. The client's behaviour is compared against the C in `bm-wire-diff`;
-//! this is the plumbing.
+//! them. The client's and host's behaviour is compared against the C in
+//! `bm-wire-diff`; this is the plumbing.
 
+use bm_stack::dfu::DfuFinished;
 use bm_stack::node::LINK_LOCAL_PREFIX;
-use bm_stack::{Identity, NoConfig, NoDfu, Node, Outbound, RamDfuSlot, SoftRtc};
+use bm_stack::{Event, Identity, NoConfig, NoDfu, Node, Outbound, RamDfuSlot, SoftRtc};
 use bm_wire::addr;
-use bm_wire::bcmp::dfu::{DfuAddress, DfuChunk, DfuMessage, DfuResult, DfuStart, ImgInfo};
+use bm_wire::bcmp::dfu::{
+    DfuAddress, DfuChunk, DfuMessage, DfuResult, DfuStart, IMG_INFO_FORCE_UPDATE, ImgInfo,
+};
 use bm_wire::bcmp::dfu_core::{DFU_REBOOT_MAGIC, DfuErr, RebootInfo, State};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, DeviceInfo, MessageType, rx, tx};
 use bm_wire::crc::crc16_ccitt;
@@ -33,8 +36,23 @@ impl Identity for TestIdentity {
     }
 }
 
-type DfuNode<'a> = Node<
-    TestIdentity,
+struct HostIdentity;
+
+impl Identity for HostIdentity {
+    fn node_id(&self) -> u64 {
+        HOST
+    }
+
+    fn device_info(&self) -> DeviceInfo {
+        DeviceInfo {
+            git_sha: !GIT_SHA,
+            ..DeviceInfo::default()
+        }
+    }
+}
+
+type DfuNode<'a, I = TestIdentity> = Node<
+    I,
     SoftRtc,
     4,
     4,
@@ -53,6 +71,10 @@ fn node(slot: &mut RamDfuSlot<SLOT>) -> DfuNode<'_> {
 }
 
 fn frame_to(dst: BmIpAddr, message: &DfuMessage<'_>) -> Vec<u8> {
+    frame_from(HOST, dst, message)
+}
+
+fn frame_from(src: u64, dst: BmIpAddr, message: &DfuMessage<'_>) -> Vec<u8> {
     let mut body = vec![0u8; message.encoded_len()];
     message.encode(&mut body).unwrap();
     let payload_len = BCMP_HEADER_LEN + body.len();
@@ -63,7 +85,7 @@ fn frame_to(dst: BmIpAddr, message: &DfuMessage<'_>) -> Vec<u8> {
         .copy_from_slice(&(payload_len as u16).to_be_bytes());
     frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
     frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&addr::nodeid_to_ip(LINK_LOCAL_PREFIX, HOST).0);
+        .copy_from_slice(&addr::nodeid_to_ip(LINK_LOCAL_PREFIX, src).0);
     frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
         .copy_from_slice(&dst.0);
     tx::serialize(&mut frame, message.message_type(), 0, &body).unwrap();
@@ -85,7 +107,7 @@ const TO_HOST: DfuAddress = DfuAddress {
 };
 
 /// Every frame DFU owes at `now_ms`, decoded.
-fn drain(node: &mut DfuNode<'_>, now_ms: u32) -> Vec<(BmIpAddr, Vec<u8>)> {
+fn drain<I: Identity>(node: &mut DfuNode<'_, I>, now_ms: u32) -> Vec<(BmIpAddr, Vec<u8>)> {
     let mut out = Vec::new();
     while let Some(outbound) = node.next_dfu_transmission(now_ms) {
         out.push(decode(&outbound));
@@ -304,4 +326,105 @@ fn a_node_without_a_slot_nacks_with_a_flash_error() {
     );
     assert_eq!(node.dfu().machine().state(), State::Error);
     let _: &NoDfu = node.dfu().slot();
+}
+
+/// Every frame `from` owes, handed to `to` as the wire would.
+fn pass<A: Identity, B: Identity>(
+    from: &mut DfuNode<'_, A>,
+    src: u64,
+    to: &mut DfuNode<'_, B>,
+    now_ms: u32,
+) -> usize {
+    let frames = drain(from, now_ms);
+    for message in bodies(&frames) {
+        let mut frame = frame_from(src, BmIpAddr::GLOBAL_MULTICAST, &message);
+        let _ = to.on_frame(now_ms, 1, &mut frame);
+    }
+    frames.len()
+}
+
+fn converse(host: &mut DfuNode<'_, HostIdentity>, client: &mut DfuNode<'_>, now_ms: u32) {
+    for _ in 0..100 {
+        let moved = pass(host, HOST, client, now_ms) + pass(client, NODE_ID, host, now_ms);
+        if moved == 0 {
+            return;
+        }
+    }
+    panic!("still talking");
+}
+
+/// One node hosts an update of another from its slot: the image lands in the
+/// client's slot, the client reboots into it and confirms, and the host's
+/// application hears success.
+#[test]
+fn a_node_hosts_an_update_to_another_node() {
+    let image = image();
+    let mut host_slot = RamDfuSlot::<SLOT>::new();
+    host_slot.flash[ImgInfo::LEN..ImgInfo::LEN + image.len()].copy_from_slice(&image);
+    let mut client_slot = RamDfuSlot::<SLOT>::new();
+    let mut host: DfuNode<'_, HostIdentity> = Node::with_dfu(
+        HostIdentity,
+        SoftRtc::new(),
+        NoConfig,
+        &mut host_slot,
+        PORTS,
+    );
+    let info = ImgInfo {
+        image_size: image.len() as u32,
+        chunk_size: 1000,
+        crc16: crc16_ccitt(0, &image),
+        major_ver: 2,
+        minor_ver: 3,
+        filter_key: IMG_INFO_FORCE_UPDATE,
+        git_sha: GIT_SHA,
+    };
+    {
+        let mut client = node(&mut client_slot);
+        drain(&mut host, 0);
+        drain(&mut client, 0);
+        assert!(host.dfu_initiate_update(info, NODE_ID, true, 60_000, true));
+        converse(&mut host, &mut client, 0);
+        assert_eq!(client.dfu().machine().state(), State::ClientActivating);
+        assert_eq!(host.dfu().machine().state(), State::HostUpdate);
+    }
+    assert_eq!(&client_slot.flash[..image.len()], &image[..]);
+    assert_eq!(client_slot.boot.pending_and_reset, 1);
+
+    // The reboot: a new node on the same slot and no-init RAM.
+    let mut client = node(&mut client_slot);
+    converse(&mut host, &mut client, 100);
+    assert_eq!(client.dfu().machine().state(), State::Idle);
+    assert_eq!(host.dfu().machine().state(), State::Idle);
+    assert_eq!(
+        host.dfu_mut().take_update_finished(),
+        Some(DfuFinished {
+            success: true,
+            err: DfuErr::NONE,
+            node_id: NODE_ID,
+        })
+    );
+    assert_eq!(host.dfu_mut().take_update_finished(), None);
+    assert_eq!(client.dfu().slot().boot.confirmed, 1);
+}
+
+/// `initiate_update` outside Idle is refused and reported as
+/// `BmDfuErrInProgress`, which [`Event::DfuUpdateFinished`] carries.
+#[test]
+fn a_refused_host_update_is_reported_as_in_progress() {
+    let mut slot = RamDfuSlot::<SLOT>::new();
+    let mut node = node(&mut slot);
+    drain(&mut node, 0);
+    let info = ImgInfo {
+        image_size: 10,
+        chunk_size: 10,
+        ..ImgInfo::default()
+    };
+    assert!(node.dfu_initiate_update(info, HOST, true, 1_000, true));
+    drain(&mut node, 0);
+    assert_eq!(node.dfu().machine().state(), State::HostReqUpdate);
+    assert!(!node.dfu_initiate_update(info, HOST, true, 1_000, true));
+    let finished = node.dfu_mut().take_update_finished().expect("reported");
+    assert_eq!(finished.err, DfuErr::IN_PROGRESS);
+    let event = Event::DfuUpdateFinished(finished);
+    assert!(matches!(event, Event::DfuUpdateFinished(f) if !f.success));
 }

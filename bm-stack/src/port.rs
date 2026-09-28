@@ -362,9 +362,9 @@ impl ConfigStorage for RamConfigStorage {
     fn reset(&mut self) {}
 }
 
-/// The DFU client's update slot and boot hooks: the client half of
-/// `bcmp/bm_dfu_generic.h`, which bm_core declares and leaves to the
-/// integrator (MCUboot's flash-area API on the dev kit).
+/// The DFU update slot and boot hooks: `bcmp/bm_dfu_generic.h`, which
+/// bm_core declares and leaves to the integrator (MCUboot's flash-area API on
+/// the dev kit). [`Self::read`] is the host's half; the rest is the client's.
 ///
 /// There is no oracle for this seam. The harness gives the Rust client and
 /// the C the same RAM slot (`bm-wire-sys/csrc/bm_generic_shim.c`, and
@@ -382,6 +382,11 @@ pub trait DfuSlot {
     /// `bm_dfu_client_flash_area_write`. Called with whole 2048-byte pages,
     /// then once with the remainder.
     fn write(&mut self, offset: u32, data: &[u8]) -> bool;
+    /// `bm_dfu_host_get_chunk`: read `buf.len()` bytes from `offset`, for a
+    /// host update with `internal` set. The image starts at
+    /// [`bm_wire::bcmp::dfu::ImgInfo::LEN`], after its header. Called without
+    /// the slot being opened.
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> bool;
     /// `bm_dfu_client_set_confirmed`: keep the running image.
     fn set_confirmed(&mut self);
     /// `bm_dfu_client_set_pending_and_reset`: boot the received image next,
@@ -433,6 +438,9 @@ impl DfuSlot for NoDfu {
         false
     }
     fn write(&mut self, _offset: u32, _data: &[u8]) -> bool {
+        false
+    }
+    fn read(&mut self, _offset: u32, _buf: &mut [u8]) -> bool {
         false
     }
     fn set_confirmed(&mut self) {}
@@ -551,6 +559,13 @@ impl<const N: usize> DfuSlot for RamDfuSlot<N> {
         self.flash[range].copy_from_slice(data);
         true
     }
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> bool {
+        let Some(range) = Self::range(offset, buf.len()) else {
+            return false;
+        };
+        buf.copy_from_slice(&self.flash[range]);
+        true
+    }
     fn set_confirmed(&mut self) {
         self.boot.confirmed += 1;
     }
@@ -586,6 +601,9 @@ impl<T: DfuSlot + ?Sized> DfuSlot for &mut T {
     }
     fn write(&mut self, offset: u32, data: &[u8]) -> bool {
         (**self).write(offset, data)
+    }
+    fn read(&mut self, offset: u32, buf: &mut [u8]) -> bool {
+        (**self).read(offset, buf)
     }
     fn set_confirmed(&mut self) {
         (**self).set_confirmed();

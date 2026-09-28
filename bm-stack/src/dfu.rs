@@ -1,10 +1,12 @@
-//! DFU on a node: [`bm_wire::bcmp::dfu_core::Dfu`] over the client of
-//! [`bm_wire::bcmp::dfu_client`], with the node's seams behind it.
+//! DFU on a node: [`bm_wire::bcmp::dfu_core::Dfu`] over
+//! [`bm_wire::bcmp::dfu_host::ClientHost`], the client and the host, with the
+//! node's seams behind it.
 //!
 //! bm_core runs DFU on its own task. Here [`NodeDfu`] holds the machine, the
-//! bodies it has sent but the node has not yet framed, and a reset it has
-//! asked for; [`crate::Node::next_dfu_transmission`] steps it and hands the
-//! frames out one at a time.
+//! bodies it has sent but the node has not yet framed, a reset it has asked
+//! for, and the finish callbacks not yet taken;
+//! [`crate::Node::next_dfu_transmission`] steps it and hands the frames out
+//! one at a time.
 //!
 //! Two things are ordered differently from the C, neither visible on the
 //! wire:
@@ -18,20 +20,35 @@
 //!   calls them in place, after a `bm_delay` meant to let those frames go.
 
 use bm_wire::bcmp::MessageType;
-use bm_wire::bcmp::dfu::DfuMessage;
-use bm_wire::bcmp::dfu_client::Client;
+use bm_wire::bcmp::dfu::{DFU_MAX_CHUNK_SIZE, DfuMessage, ImgInfo};
 use bm_wire::bcmp::dfu_core::{Accepted, Dfu, DfuErr, Effects, RebootInfo};
+use bm_wire::bcmp::dfu_host::ClientHost;
 use bm_wire::configuration::{ConfigStore, Partition};
 
 use crate::config::Configuration;
 use crate::port::{DfuSlot, NoInitRam};
 
 /// Bodies the machine may send in one step and the node has yet to frame.
-/// The client sends at most two per step.
+/// The client sends at most two per step, the host one.
 pub const OUTBOX_LEN: usize = 4;
 
-/// The longest body the client or the core sends, a `0xD0`.
-const OUTBOX_BODY: usize = DfuMessage::START_LEN;
+/// The longest body DFU sends, a `0xD2` of [`DFU_MAX_CHUNK_SIZE`] bytes.
+const OUTBOX_BODY: usize = DfuMessage::WITH_TWO_BYTES_LEN + DFU_MAX_CHUNK_SIZE;
+
+/// Finish callbacks held until taken. More in between are dropped.
+pub const FINISHED_LEN: usize = 4;
+
+/// One call of the `UpdateFinishCb` given to
+/// [`crate::Node::dfu_initiate_update`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DfuFinished {
+    /// Whether the client reported success.
+    pub success: bool,
+    /// The client's `err_code`, or this node's error.
+    pub err: DfuErr,
+    /// The client of the last update this node hosted.
+    pub node_id: u64,
+}
 
 /// A reset the client asked for, made once its frames are out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,14 +101,42 @@ impl Outbox {
     }
 }
 
-/// The node's DFU state: `dfu_ctx`, `CLIENT_CTX` and what is waiting to go
-/// out.
+/// Finish callbacks, oldest first.
+#[derive(Debug, Clone, Default)]
+struct Finished {
+    calls: [Option<DfuFinished>; FINISHED_LEN],
+    len: usize,
+}
+
+impl Finished {
+    fn push(&mut self, finished: DfuFinished) {
+        if self.len < FINISHED_LEN {
+            self.calls[self.len] = Some(finished);
+            self.len += 1;
+        }
+    }
+
+    fn pop(&mut self) -> Option<DfuFinished> {
+        if self.len == 0 {
+            return None;
+        }
+        let first = self.calls[0];
+        self.calls.rotate_left(1);
+        self.calls[FINISHED_LEN - 1] = None;
+        self.len -= 1;
+        first
+    }
+}
+
+/// The node's DFU state: `dfu_ctx`, `CLIENT_CTX`, `host_ctx` and what is
+/// waiting to go out.
 pub struct NodeDfu<D> {
-    machine: Dfu<Client>,
+    machine: Dfu<ClientHost>,
     slot: D,
     outbox: Outbox,
     reset: Option<Reset>,
     stored: RebootInfo,
+    finished: Finished,
 }
 
 impl<D> core::fmt::Debug for NodeDfu<D> {
@@ -108,17 +153,54 @@ impl<D: DfuSlot + NoInitRam> NodeDfu<D> {
     pub fn new(self_node_id: u64, mut slot: D) -> Self {
         let stored = slot.load();
         Self {
-            machine: Dfu::new(self_node_id, stored, Client::new()),
+            machine: Dfu::new(self_node_id, stored, ClientHost::new()),
             slot,
             outbox: Outbox::new(),
             reset: None,
             stored,
+            finished: Finished::default(),
         }
     }
 
     /// The state machine.
-    pub fn machine(&self) -> &Dfu<Client> {
+    pub fn machine(&self) -> &Dfu<ClientHost> {
         &self.machine
+    }
+
+    /// `bm_dfu_host_queue_data`: feed a non-internal host update's image.
+    /// `false` if no update is taking it or `data` does not fit.
+    pub fn host_queue_data(&mut self, data: &[u8]) -> bool {
+        self.machine.roles_mut().host.queue_data(data)
+    }
+
+    /// The oldest finish callback not yet taken.
+    pub fn take_update_finished(&mut self) -> Option<DfuFinished> {
+        self.finished.pop()
+    }
+
+    /// `bm_dfu_initiate_update`.
+    pub(crate) fn initiate_update<C: Configuration>(
+        &mut self,
+        config: &mut C,
+        git_sha: u32,
+        request: HostRequest,
+    ) -> bool {
+        let mut fx = Fx {
+            slot: &mut self.slot,
+            outbox: &mut self.outbox,
+            reset: &mut self.reset,
+            finished: &mut self.finished,
+            config,
+            git_sha,
+        };
+        self.machine.initiate_update(
+            &mut fx,
+            request.info,
+            request.dst_node_id,
+            request.notify,
+            request.timeout_ms,
+            request.internal,
+        )
     }
 
     /// The slot and no-init RAM.
@@ -166,6 +248,7 @@ impl<D: DfuSlot + NoInitRam> NodeDfu<D> {
                 slot: &mut self.slot,
                 outbox: &mut self.outbox,
                 reset: &mut self.reset,
+                finished: &mut self.finished,
                 config: &mut *config,
                 git_sha,
             };
@@ -187,11 +270,22 @@ impl<D: DfuSlot + NoInitRam> NodeDfu<D> {
     }
 }
 
+/// The arguments of `bm_dfu_initiate_update`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HostRequest {
+    pub(crate) info: ImgInfo,
+    pub(crate) dst_node_id: u64,
+    pub(crate) notify: bool,
+    pub(crate) timeout_ms: u32,
+    pub(crate) internal: bool,
+}
+
 /// The machine's [`Effects`], over the node's seams.
 struct Fx<'a, C, D> {
     slot: &'a mut D,
     outbox: &'a mut Outbox,
     reset: &'a mut Option<Reset>,
+    finished: &'a mut Finished,
     config: &'a mut C,
     git_sha: u32,
 }
@@ -202,8 +296,13 @@ impl<C: Configuration, D: DfuSlot> Effects for Fx<'_, C, D> {
     }
     fn lpm_peripheral_active(&mut self) {}
     fn lpm_peripheral_inactive(&mut self) {}
-    /// Only a host update registers a callback, and this node does not host.
-    fn update_finished(&mut self, _success: bool, _err: DfuErr, _node_id: u64) {}
+    fn update_finished(&mut self, success: bool, err: DfuErr, node_id: u64) {
+        self.finished.push(DfuFinished {
+            success,
+            err,
+            node_id,
+        });
+    }
     fn flash_open(&mut self) -> bool {
         self.slot.open()
     }
@@ -218,6 +317,9 @@ impl<C: Configuration, D: DfuSlot> Effects for Fx<'_, C, D> {
     }
     fn flash_write(&mut self, offset: u32, data: &[u8]) -> bool {
         self.slot.write(offset, data)
+    }
+    fn host_get_chunk(&mut self, offset: u32, buf: &mut [u8]) -> bool {
+        self.slot.read(offset, buf)
     }
     fn set_confirmed(&mut self) {
         self.slot.set_confirmed();

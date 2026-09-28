@@ -111,6 +111,9 @@ impl Effects for Fake {
         self.flash[offset as usize..offset as usize + data.len()].copy_from_slice(data);
         true
     }
+    fn host_get_chunk(&mut self, _offset: u32, _buf: &mut [u8]) -> bool {
+        unreachable!("a client-only node does not host")
+    }
     fn set_confirmed(&mut self) {
         self.calls.push(Call::Confirmed);
     }

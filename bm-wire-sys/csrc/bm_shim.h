@@ -58,6 +58,10 @@ void bm_shim_dfu_counts(BmShimDfuCounts *out);
 
 // The RAM standing in for the update slot, and its size.
 const uint8_t *bm_shim_dfu_flash(uint32_t *len);
+// Write `len` bytes at `offset` of the slot without counting a call or
+// consulting the faults: an image stored before the test, for
+// bm_dfu_host_get_chunk to serve. False if it does not fit.
+bool bm_shim_dfu_load(uint32_t offset, const uint8_t *data, uint32_t len);
 
 // bm_debug output. Silent by default so fuzzing is not I/O bound.
 void bm_shim_set_debug(bool on);

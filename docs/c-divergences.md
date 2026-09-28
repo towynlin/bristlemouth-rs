@@ -102,6 +102,9 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 64 | A client refusing an image as too large leaves the update slot open | replicated | reading, confirmed differentially |
 | 65 | A rebooted client confirms its image on any `0xD3` from the host, whatever its `success` byte | replicated | reading, confirmed differentially |
 | 66 | A client's chunk count is 16 bits | replicated | reading |
+| 67 | A DFU host ignores the chunk number it is asked for | replicated | reading, confirmed differentially |
+| 68 | A non-internal DFU host sends a whole chunk after a short read | domain-limited | reading |
+| 69 | A host update's `timeoutMs` of zero is a zero timer period | domain-limited | reading |
 
 ---
 
@@ -2186,6 +2189,12 @@ dividend — so one chunk for a non-empty image, none for an empty one; pinned b
 `chunk_size_zero_is_one_chunk`. `bm_wire_diff::dfu_core::in_domain_body` sends
 the C a `chunk_size` of 1 in place of 0.
 
+The host divides by nothing: with `chunk_size` zero, `bm_dfu_host_send_chunk`
+sends an empty `0xD2` for every request and `bytes_remaining` never falls.
+`bm_wire::bcmp::dfu_host::Host` does the same, pinned by
+`a_zero_chunk_size_sends_empty_chunks`; the comparator's `Step::Initiate`
+reaches it against the C.
+
 Fix upstream by rejecting `chunk_size == 0` in both
 `bm_dfu_client_process_update_request` and `bm_dfu_initiate_update`.
 
@@ -2237,8 +2246,12 @@ Two routes reach it:
 **replicated.** `bm_wire::bcmp::dfu_core::DfuErr` is a byte and
 `DfuErr::is_fatal` is the C's comparison. Pinned by `a_fatal_error_is_permanent`
 (core) and `the_c_host_adopts_a_clients_fatal_nack` (the C's `dfu_host.c` taking
-a NACK carrying 14) in `bm-wire-diff/tests/dfu_core.rs`. D4 has to reproduce
-the host half.
+a NACK carrying 14) in `bm-wire-diff/tests/dfu_core.rs` (formerly
+`the_c_host_adopts_a_clients_fatal_nack`, C only).
+`bm_wire::bcmp::dfu_host::Host` reproduces the host half, compared against the
+C by `a_clients_fatal_nack_stops_the_host` and pinned in `bm-wire` by
+`a_nack_carrying_flash_access_leaves_the_host_in_error` and
+`host_update_fail_upon_reboot`.
 
 Fix upstream by mapping a received `err_code` to a non-fatal host error
 (`BmDfuErrAborted`, or a new "client failed" value) instead of casting it.
@@ -2278,9 +2291,12 @@ an unreachable client loses up to about 1 KiB of heap each time.
 Found by LeakSanitizer on `cargo fuzz run dfu_core`'s second run, with a
 `BeginHost` run with `internal` false followed by a forced change to Error.
 
-**c-only.** `bm-wire` holds no heap. D4 decides how the port stores
-externally supplied image data. `bm-wire-diff/src/dfu_core.rs` treats a
-non-internal `BeginHost` as out of domain so the fuzzer can run.
+**c-only.** `bm-wire` holds no heap: `bm_wire::bcmp::dfu_host::Host` keeps
+the stream buffer inline, and a new non-internal update replaces it.
+`bm-wire-diff/src/dfu_core.rs` treats a non-internal `BeginHost` as out of
+domain only while the last one's buffer is still held, which is exactly when
+the C would leak it; `a_leaked_stream_buffer_bars_the_next_non_internal_update`
+pins that.
 
 Fix upstream by deleting `data_queue` in `bm_dfu_host_transition_to_error`,
 or by creating it in `s_host_update_entry` instead.
@@ -2379,3 +2395,77 @@ count of chunks, and then fails validation with `BmDfuErrMismatchLen`.
 **replicated.** `Client` truncates the same way.
 
 Fix upstream by refusing an image whose chunk count exceeds `UINT16_MAX`.
+
+## 67. A DFU host ignores the chunk number it is asked for
+
+`s_host_update_run` answers every `DfuEventChunkRequest` with
+`bm_dfu_host_send_chunk`, which never reads `seq_num`. It sends the
+`min(bytes_remaining, chunk_size)` bytes at
+`DFU_IMG_START_OFFSET_BYTES + image_size - bytes_remaining`, then subtracts
+them. So:
+
+- A client that re-requests chunk *n* after its chunk timer fires — the only
+  recovery `dfu_client.c` has for a lost `0xD2` — is sent chunk *n + 1*. It
+  writes it where chunk *n* belongs, and the update fails validation with
+  `BmDfuErrBadCrc`, or `BmDfuErrMismatchLen` once the host runs out.
+- A client restarting from chunk 0 on a resent `0xD0` (#62) is sent whatever
+  follows the last chunk sent.
+- Once `bytes_remaining` is zero, every request is answered with an empty
+  `0xD2`, which the client treats as a failed write (#63).
+
+A single dropped chunk frame fails the update.
+
+**replicated.** `bm_wire::bcmp::dfu_host::Host` serves in sequence the same
+way. Pinned by `chunks_are_served_in_sequence_whatever_is_asked_for` in
+`bm-wire` and `the_host_serves_chunks_in_sequence_whatever_is_asked_for`
+against the C.
+
+Fix upstream by computing the offset from `seq_num * chunk_size` and the
+length from what remains after it.
+
+## 68. A non-internal DFU host sends a whole chunk after a short read
+
+When `bm_dfu_internal()` is false, `bm_dfu_host_send_chunk` reads the chunk
+with `bm_stream_buffer_receive`, which may return fewer bytes than asked. It
+has already written `payload_length` and computed the frame length from the
+full chunk, so it transmits the full chunk: the bytes read, then the rest of
+a `bm_malloc` buffer that was never written. It subtracts only the bytes read
+from `bytes_remaining`, so the next chunk starts where the short one ended.
+
+The integrations disagree about an empty stream at the timeout:
+
+| `bm_stream_buffer_receive` | Empty at the timeout | Effect in the host |
+|---|---|---|
+| `common/bm_freertos.c` | `BmOK`, `*size = 0` | a whole chunk of uninitialised heap on the wire |
+| `common/bm_posix.c`, `csrc/bm_os_shim.c` | `BmETIMEDOUT` | `BmDfuErrFlashAccess`, which is fatal (#59) |
+
+On FreeRTOS, then, a host whose application is late feeding the stream sends
+heap contents to the client; on the others it disables its own DFU until
+reboot.
+
+**domain-limited.** `bm_wire::bcmp::dfu_host::StreamBuffer` has the shim's
+semantics, and a short read sends zeros where the C sends uninitialised heap;
+pinned by `a_short_read_sends_a_whole_chunk`. The comparator discards, on both
+sides, a chunk request that would find the stream holding some but not all of
+the chunk (`bm_wire_diff::dfu_core::in_domain`).
+
+Fix upstream by sending only the bytes read, with `payload_length` to match,
+and by treating a zero-byte read as a timeout in `bm_freertos.c`.
+
+## 69. A host update's `timeoutMs` of zero is a zero timer period
+
+`bm_dfu_initiate_update` passes `timeoutMs` through to `bm_dfu_host_set_params`
+unchecked, and `s_host_update_entry` makes it `update_timer`'s period with
+`bm_timer_change_period`. FreeRTOS's timer task asserts that a period is
+greater than zero (`configASSERT` in `prvProcessReceivedCommands`), so with
+`configASSERT` defined a zero timeout halts the node on entry to
+`BmDfuStateHostUpdate`. The shim arms
+the timer due at the current tick and fires it at the next tick.
+
+**domain-limited.** `bm_wire::bcmp::dfu_core::Core::change_period` accepts
+zero and the timer is due at once, so the next poll aborts the update. The
+comparator's `Step::Initiate` and `Step::Host` send the C a timeout of 1 in
+place of 0.
+
+Fix upstream by rejecting `timeoutMs == 0` in `bm_dfu_initiate_update`, or
+treating it as `bm_dfu_update_default_timeout_ms`.

@@ -93,7 +93,8 @@
 //! is queued by [`Node::on_frame`] and run by [`Node::next_dfu_transmission`],
 //! which [`Node::run`] drains after everything else; one for another node
 //! arriving link-local is re-flooded as config's are. The node is a DFU
-//! client only; the host role is card D4's.
+//! client, and a host once [`Node::dfu_initiate_update`] starts an update;
+//! the finish callback arrives as [`Event::DfuUpdateFinished`].
 //!
 //! # Two timers, not one
 //!
@@ -111,7 +112,7 @@ use bm_wire::bcmp::config::{
     ConfigStatusRequest, ConfigValue, MAX_KEY_LEN, MAX_VALUE_LEN, encode_status_response,
     status_response_len,
 };
-use bm_wire::bcmp::dfu::DfuAddress;
+use bm_wire::bcmp::dfu::{DfuAddress, ImgInfo};
 use bm_wire::bcmp::info::{
     CACHED_STRING_BYTES, CachedInfo, DeviceInfoReply, DeviceInfoRequest, InfoCache,
     InfoRequestKind, InfoRequests,
@@ -146,7 +147,7 @@ use bm_wire::util::BmIpAddr;
 use bm_wire::{BmWireError, addr::MAC_LEN};
 
 use crate::config::{Configuration, NoConfig};
-use crate::dfu::NodeDfu;
+use crate::dfu::{DfuFinished, HostRequest, NodeDfu};
 use crate::port::{DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy, Rtc, RtcTimeAndDate};
 
 /// Largest frame the node will build or accept.
@@ -345,6 +346,10 @@ pub enum Event<'a> {
         /// the timer, so an integrator has to remember this itself.
         target_node_id: u64,
     },
+    /// The `UpdateFinishCb` given to [`Node::dfu_initiate_update`]: the
+    /// update this node hosted ended, or — divergence #58 — this node's DFU
+    /// entered its error state for any reason since.
+    DfuUpdateFinished(DfuFinished),
 }
 
 /// A frame the node wants transmitted, and the ports it goes out on.
@@ -2184,8 +2189,39 @@ impl<
         &mut self.dfu
     }
 
-    /// Milliseconds until a DFU timer is due — the client's chunk timer — or
-    /// `None` when none is running. Zero if one is overdue.
+    /// Start hosting an update of `dst_node_id` — `bm_dfu_initiate_update`.
+    ///
+    /// `internal` reads the image from [`DfuSlot::read`]; otherwise the
+    /// application feeds it with [`NodeDfu::host_queue_data`], a chunk ahead
+    /// of the client's request (see `bm_wire::bcmp::dfu_host`). `notify` asks
+    /// for [`Event::DfuUpdateFinished`], or
+    /// [`NodeDfu::take_update_finished`] when driving the node by hand.
+    ///
+    /// Queues the request; [`Node::next_dfu_transmission`] runs it. `false`
+    /// for a `chunk_size` over 1024, or if DFU is not idle, which with
+    /// `notify` is also reported as finished with `BmDfuErrInProgress`.
+    pub fn dfu_initiate_update(
+        &mut self,
+        info: ImgInfo,
+        dst_node_id: u64,
+        notify: bool,
+        timeout_ms: u32,
+        internal: bool,
+    ) -> bool {
+        let git_sha = self.identity.device_info().git_sha;
+        let request = HostRequest {
+            info,
+            dst_node_id,
+            notify,
+            timeout_ms,
+            internal,
+        };
+        self.dfu.initiate_update(&mut self.config, git_sha, request)
+    }
+
+    /// Milliseconds until a DFU timer is due — the client's chunk timer, the
+    /// host's ACK or update timer — or `None` when none is running. Zero if
+    /// one is overdue.
     #[must_use]
     pub fn dfu_remaining_ms(&self, now_ms: u32) -> Option<u32> {
         let left = self.dfu.next_deadline()?.wrapping_sub(now_ms);
@@ -3144,6 +3180,9 @@ impl<
             // DFU timer due.
             if let Err(error) = self.transmit_dfu(phy, uptime_ms(())).await {
                 return error;
+            }
+            while let Some(finished) = self.dfu.take_update_finished() {
+                events(Event::DfuUpdateFinished(finished));
             }
         }
     }
