@@ -200,7 +200,11 @@ fn ll_stores_and_removes_by_id() {
 
         let mut fetched: *mut std::ffi::c_void = std::ptr::null_mut();
         assert_eq!(ll_get_item(&mut list, 7, &mut fetched), BmErr_BmOK);
-        assert_eq!(*fetched.cast::<u32>(), 0xABCD_1234);
+        let value = fetched
+            .cast::<u32>()
+            .as_ref()
+            .expect("ll_get_item: null item");
+        assert_eq!(*value, 0xABCD_1234);
 
         // An id that was never added must not be reported as present.
         assert_ne!(ll_get_item(&mut list, 8, &mut fetched), BmErr_BmOK);
