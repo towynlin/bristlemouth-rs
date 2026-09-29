@@ -49,7 +49,7 @@ bus with a Spotter and a C dev kit:
 | BCMP: heartbeat, ping, info, neighbours, resources, time, config, DFU | Done (`bm-wire`, `bm_stack::Node`) |
 | PHY for the ADIN2111 | Done (`bm-phy-adin2111`), untested on hardware |
 | Application code running beside the node | Done: `bm_stack::App`, run by `Node::run_app`; `bm_stack::channel` for an app in its own task |
-| UDP over IPv6 | **Half.** `bm_wire::udp` builds and accepts a datagram's frame. `Node` neither sends nor dispatches UDP: `Node::on_frame` relays a UDP frame per `l2_policy` and then drops it in `rx::accept`. |
+| UDP over IPv6 | Done: `bm_wire::udp`; `Node::bind_udp`, `Node::send_udp`, `Event::Udp` |
 | Pub/sub (`middleware/pubsub.c`, `middleware.c`) | **Missing.** Listed out of scope in `bcmp-port-todo.md`. |
 | `spotter_log`, `spotter_tx_data` | **Missing.** |
 | Dev kit board support (MCU HAL, pins, node id, time driver, flash) | **Missing.** No crate targets a board. |
@@ -98,10 +98,9 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 | `bm_wildcard_match` (`common/util.c`) | Returns `j == pattern_len` without requiring `i == str_len`, so a pattern matches any topic it prefixes: a subscription to `spotter` receives `spotter/printf`. Confirmed by compiling the function alone; not yet through the oracle. | P1 |
 | `bm_handle_msg` (`pubsub.c`) | `data_len = size - sizeof(BmPubSubData) - header->topic_len` is unchecked; a UDP payload shorter than its `topic_len` underflows and the callback reads out of bounds. Remote-triggerable. | P1 |
 | `bm_pub_wl` (`pubsub.c`) | `message_size` is `uint16_t`; `5 + topic_len + len` wraps, and the `memcpy`s write `len` bytes into the short buffer before `bm_middleware_net_tx`'s size check runs. | P1 |
-| `bm_middleware_rx` | Dispatches on the **source** port lwIP/`bm_linux.c` reports, not the bound destination port. Harmless while pub/sub sends from and to 4321. | U2 |
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, E0, F1, H0, U1) left for the rest
+## What the landed cards (A1, E0, F1, H0, U1, U2) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -118,7 +117,8 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   seam".
 - **The channel covers ping only.** Each new app-facing call (P2's publish and
   subscribe, S1's `spotter_log`) needs a `Command` variant, and each new event
-  an owned `Notification`. A full notification queue drops, counted by
+  an owned `Notification`. `Event::Udp` has none: bm_core applications never
+  see raw UDP, only pub/sub. A full notification queue drops, counted by
   `ChannelApp::dropped`: the node never waits on the application.
 - **The mock clock is process-global.** A test or example driving
   `Node::run*` on `MockPhy` holds `tests/node.rs`'s `CLOCK` lock or runs in a
@@ -145,29 +145,52 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   lwIP (#70, #71, #72); `capture_h0.rs` rebuilds all 2300 captured UDP frames
   with `build`. `build` takes the source address rather than a node id so a
   comparator can build the frame `bm_linux.c` would, from `fe80::<id>`.
-  `accept` does not filter on destination address or port: U2 decides what
-  the node is bound to.
+  `accept` does not filter on destination address or port.
+- **UDP on the node.**
+
+  | Item | Shape |
+  |---|---|
+  | `Node::bind_udp(port) -> Result<(), UdpBindError>` | `UDP_PORTS` (4) slots; `InUse`, `Full`. `unbind_udp`, `udp_bound`. |
+  | `Event::Udp { port, src_port, source, payload }` | a datagram to a bound port, reported from `on_frame_with` after the relay decision |
+  | `Node::send_udp(src_port, dst, dst_port, payload) -> Option<Outbound>` | from `udp::source_address`; mask from byte 13 of `dst` (`take_requested_egress_port`), else all ports; `None` past `MTU` |
+
+  Matching is on the destination port, as lwIP's `udp_input`. bm_core's
+  middleware then looks its application up by the **source** port
+  (divergence #73, open): a datagram to 4321 from any other port reaches no
+  subscriber. P2 reproduces that from `Event::Udp`'s `src_port`.
+  No destination-address filter: `bm_linux.c` has none, and lwIP's
+  (`ip6_input`: joined groups, `ff01::1`, `ff02::1`, the netif's addresses) is
+  not in the tree to port; #72 records it. A Rust node therefore also
+  delivers, for example, `ff02::2` datagrams a C node drops.
+  `on_frame` passes no link-local routing callback: `bm_middleware_init`
+  registers `handle_middleware_routing`, but with pub/sub's `FF03::1` as the
+  only application address it returns what no callback does.
 - **Comparing UDP frames with the oracle.** `stack::drain` rewrites the
   source MAC and hop limit of every frame the oracle built
   (`stack::normalise`), for BCMP and UDP alike. The UDP source address and
   checksum it cannot rewrite, because the address is under the checksum. A
-  Rust node sends from `source_address`, `fd00::<id>` for `ff03::1`, so U2,
-  P2 and S1's frame comparators compare in two steps: the node's frame equals
+  Rust node sends from `source_address`, `fd00::<id>` for `ff03::1`, so P2
+  and S1's frame comparators compare in two steps, as
+  `bm_wire_diff::node_udp::check_send` does: the node's frame equals
   `udp::build` of its UDP payload from `source_address`; and `udp::build` of
   the same payload from `fe80::<id>`, passed through
   `bm_wire_diff::udp::as_bm_linux_writes_it`, equals the oracle's frame.
   `bm_wire_diff::l2_egress::port_transmit` turns one built frame into what
   reaches each port.
-- **Receiving in the oracle without L2.** `bm-wire-diff/src/udp.rs` binds five
-  ports with `bm_udp_bind_port` once per process (the UDP list has no unbind)
-  and calls `bm_l2_submit` directly. Port 4321 is already bound to
-  `bm_middleware_rx`, which reaches `bm_handle_msg`'s out-of-bounds read
-  ("Suspected C defects"), so that comparator never delivers to it; U2 and P2
-  will, and must constrain the payload per P1's finding.
+- **Receiving in the oracle.** `bm-wire-diff/src/udp.rs` binds five ports
+  with `bm_udp_bind_port` once per process (the UDP list has no unbind);
+  `udp::bind` and `udp::take_delivered` expose them. `udp.rs` calls
+  `bm_l2_submit` directly; `bm-wire-diff/src/node_udp.rs` injects through L2
+  and subscribes the oracle to `*` (`bm_sub_wl`), which matches every topic,
+  to see what reaches `bm_handle_msg`. A datagram from 4321 to 4321 reaches
+  its out-of-bounds read ("Suspected C defects"), so `node_udp` rewrites that
+  payload into a well-formed one with `node_udp::publication`. P2's
+  comparator can reuse `node_udp::Peer`, `receiver` and the subscription.
 - **Scripted peer frames come from `bm_stack::mock::frames`, comparator
   inputs from `bm_wire_diff::frames`.** Both wrap `tx::build` in a `Vec`.
-  U2, P2 and S1 add their UDP, publication and `spotter_log` builders there
-  rather than in a test file. A comparator needing non-standard header bytes
+  Both have `udp(src, dst, src_port, dst_port, payload)`, from
+  `udp::source_address`; P2 and S1 add their publication and `spotter_log`
+  builders there rather than in a test file. A comparator needing non-standard header bytes
   calls `write_headers` and mutates the result, as `bm-wire-diff/src/forward.rs`
   does.
 - **The capture: `bm-wire-diff/testdata/hello-pub-card-h0.pcap`.** 166 s,
@@ -197,26 +220,6 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
 ---
 
-## Card U2 — UDP through `bm_stack::Node`
-
-**Blocks:** P2. **Blocked by:** nothing.
-
-C: `bm_l2_process_tx_evt` (global multicast goes out once to
-`device_all_ports`, no egress stamp, no checksum patch), `bm_l2_process_rx_evt`
-(ingress nibble set before submit), `bm_middleware_rx`, `middleware.c`.
-
-Rust: `Node::on_frame` hands an accepted UDP frame for a bound port to the
-application as `Event::Udp { port, source, payload }` (or straight to P2's
-pub/sub). A send path producing an `Outbound` whose mask is all ports.
-No UDP checksum check on receive, as deployed builds.
-
-Comparator: whole frames, in the style of `bm-wire-diff/tests/node_frames.rs`,
-in a stack-target binary of its own (`stack::` brings up `bm_linux.c`, whose
-UDP list is process-global).
-
-Done: a UDP frame from the oracle reaches a Rust node's event, one from the
-Rust node reaches `bm_middleware_rx` in the oracle, and relaying is unchanged.
-
 ## Card P1 — Pub/sub codec and topic matching in `bm-wire`
 
 **Blocks:** P2, S1. **Blocked by:** nothing.
@@ -242,7 +245,7 @@ Done: comparator, fuzz targets, confirmed divergences numbered.
 
 ## Card P2 — Pub/sub on the node
 
-**Blocks:** S1, E1. **Blocked by:** U2, P1.
+**Blocks:** S1, E1. **Blocked by:** P1.
 
 C: `bm_pubsub_init`, `bm_sub_wl`, `bm_unsub_wl`, `bm_pub_wl`,
 `publish_data_locally`, `bm_handle_msg`.
@@ -255,6 +258,9 @@ successful send, `bm_sub_wl` adds `SUB` on every successful call. A local subscr
 matching a publication delivers `Event::Publication` locally too. Reachable
 from `App::act`, and through `bm_stack::channel` as new `Command` and
 `Notification` variants.
+
+Receives from `Event::Udp` on 4321, dispatching on `src_port` as
+`middleware_net_task` does (divergence #73).
 
 Comparator: frames from `bm_pub` vs `Node::publish` for the same topic, type,
 version, data and identity; an oracle publication delivered to a Rust
@@ -286,7 +292,7 @@ Done: comparator, fuzz target `spotter`.
 
 ## Card B1 — Dev kit board support
 
-**Blocks:** E1. **Blocked by:** nothing (can run beside U2–S1).
+**Blocks:** E1. **Blocked by:** nothing (can run beside P1–S1).
 
 The dev kit's mote is an STM32U5 (Cortex-M33, `thumbv8m.main-none-eabihf`)
 with an ADIN2111 on SPI. The pin map, the ADIN2111 power and reset sequence,
@@ -323,12 +329,12 @@ reported individually.
 ## Order
 
 ```
-U2 ─┬─► P2 ─► S1 ─► E1
-P1 ─┘                ▲
-B1 ──────────────────┘
+P1 ─► P2 ─► S1 ─► E1
+                   ▲
+B1 ────────────────┘
 ```
 
-U2, P1 and B1 can start now and run in parallel.
+P1 and B1 can start now and run in parallel.
 
 # Explicitly out of scope
 
