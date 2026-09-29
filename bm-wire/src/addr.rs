@@ -1,9 +1,14 @@
-//! Node-id, IPv6 and MAC derivation, ported from `network/bm_linux.c`.
+//! Node-id, IPv6 and MAC derivation, ported from `network/bm_linux.c`,
+//! `network/bm_lwip.c` and `common/device.c`.
 
 use crate::util::BmIpAddr;
 
 /// The IPv6 prefix bm_core builds a node's link-local address from.
 pub const LINK_LOCAL_PREFIX: u32 = 0xFE80_0000;
+
+/// The unique-local prefix of a node's second address, `fd00::<id>`, which
+/// `bm_ip_init` gives the netif beside the link-local one.
+pub const UNIQUE_LOCAL_PREFIX: u32 = 0xFD00_0000;
 
 /// Length of an Ethernet MAC address.
 pub const MAC_LEN: usize = 6;
@@ -26,12 +31,28 @@ pub fn nodeid_to_ip(prefix: u32, id: u64) -> BmIpAddr {
 /// and clears the multicast bit in byte 0 — so the MAC is not a faithful
 /// reflection of those id bits, and two ids differing only in bits 40 and 41
 /// collide.
+///
+/// What `bm_linux.c` writes as a frame's source MAC. A deployed node writes
+/// [`mac_address`] (divergence #70).
 #[must_use]
 pub fn mac_from_nodeid(id: u64) -> [u8; MAC_LEN] {
     let mut mac = [0u8; MAC_LEN];
     mac.copy_from_slice(&id.to_be_bytes()[2..8]);
     mac[0] |= 0x02; // locally administered
     mac[0] &= !0x01; // unicast
+    mac
+}
+
+/// A node's own MAC, ported from `mac_address` in `common/device.c`: `00:00`
+/// followed by the low 32 bits of the id.
+///
+/// `bm_lwip.c` gives the netif this address, so it is the source MAC of every
+/// frame a deployed node builds. `bm_linux.c` writes [`mac_from_nodeid`]
+/// instead (divergence #70).
+#[must_use]
+pub fn mac_address(id: u64) -> [u8; MAC_LEN] {
+    let mut mac = [0u8; MAC_LEN];
+    mac[2..].copy_from_slice(&id.to_be_bytes()[4..]);
     mac
 }
 
@@ -197,6 +218,16 @@ mod tests {
         assert_eq!(mac[0] & 0x02, 0x02, "locally administered bit set");
         assert_eq!(mac[0] & 0x01, 0x00, "multicast bit clear");
         assert_eq!(&mac[1..], &[0xEF, 0x12, 0x34, 0x56, 0x78]);
+    }
+
+    /// Card H0's dev kit, `0b54ccce5c7978bf`: the source MAC of every frame
+    /// it sent in `bm-wire-diff/testdata/hello-pub-card-h0.pcap`.
+    #[test]
+    fn mac_address_is_two_zero_bytes_and_the_low_half_of_the_id() {
+        assert_eq!(
+            mac_address(0x0b54_ccce_5c79_78bf),
+            [0, 0, 0x5c, 0x79, 0x78, 0xbf]
+        );
     }
 
     #[test]

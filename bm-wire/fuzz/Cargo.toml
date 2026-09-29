@@ -267,3 +267,12 @@ path = "fuzz_targets/dfu_core.rs"
 test = false
 doc = false
 bench = false
+
+# Stack-backed, same rule about `bcmp`. Binds five ports in the oracle once per
+# process and keeps nothing else between iterations.
+[[bin]]
+name = "udp"
+path = "fuzz_targets/udp.rs"
+test = false
+doc = false
+bench = false

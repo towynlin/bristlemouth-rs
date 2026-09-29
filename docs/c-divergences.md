@@ -107,7 +107,9 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 67 | A DFU host ignores the chunk number it is asked for | replicated | reading, confirmed differentially |
 | 68 | A non-internal DFU host sends a whole chunk after a short read | domain-limited | reading |
 | 69 | A host update's `timeoutMs` of zero is a zero timer period | domain-limited | reading |
-| 70 | `bm_linux.c` writes a source MAC, hop limit and UDP source address that deployed nodes do not | open | capture, card H0 |
+| 70 | `bm_linux.c` writes a source MAC, hop limit and UDP source address that deployed nodes do not | replicated | capture, card H0 |
+| 71 | `bm_linux.c` writes the UDP checksum byte-swapped, and a zero checksum as zero | replicated | differentially (byte order); reading lwIP (zero) |
+| 72 | `bm_linux.c` delivers a received datagram by its UDP length field; lwIP ignores the field | replicated | reading lwIP, confirmed differentially |
 
 ---
 
@@ -2487,7 +2489,8 @@ The oracle's IP layer is `network/bm_linux.c`; deployed nodes use
 | UDP source to `ff03::1` | `fe80::<id>` | `fd00::<id>` | lwIP source-address selection |
 
 Both agree on the destination MAC, the version/class/flow word, BCMP's
-`fe80::<id>` source, and a present, valid UDP checksum on transmit. Neither
+`fe80::<id>` source, and a present UDP checksum on transmit, which only
+lwIP writes in network order (#71). Neither
 verifies a received UDP checksum: `bm_linux.c` never does, and `bm_protocol`
 sets `CHECKSUM_CHECK_UDP` 0. That is what lets `bm_l2_policy_rx_apply` write
 the ingress nibble without patching the UDP checksum.
@@ -2495,10 +2498,78 @@ the ingress nibble without patching the UDP checksum.
 No field is known to break interoperation: receivers ignore source MAC and hop
 limit, and `ip_to_nodeid` reads only the address's low 64 bits.
 
-**open.** `frame::write_headers` takes `mac_from_nodeid` and
-`frame::HOP_LIMIT` (64) from `bm_linux.c`, so a Rust node's frames differ from
-a C node's in those two fields. Card U1 moves `bm-wire` to the deployed values;
-comparators against `bm_linux.c` then normalise the two fields.
+**replicated**, against the deployed values:
+
+| Field | `bm-wire` |
+|---|---|
+| Source MAC | `frame::write_headers` writes `addr::mac_address` |
+| Hop limit | `frame::HOP_LIMIT` is 255, for BCMP and UDP |
+| UDP source address | `udp::source_address`: lwIP's `ip6_select_source_address` over the netif's two addresses |
+
+Pinned by `bm-wire-diff/tests/capture_h0.rs`, which rebuilds all 2300 UDP
+frames in the capture byte for byte, and by
+`bcmp::tx::tests::build_reproduces_a_deployed_heartbeat` for BCMP.
+Comparators against the oracle read its frames through `stack::drain`, which
+rewrites the source MAC and hop limit of every frame the oracle built
+(`stack::normalise`); `bm-wire-diff/src/udp.rs` builds its Rust side from
+`bm_linux.c`'s `fe80::<id>`.
 
 Fix upstream by having `bm_linux.c` use `mac_address`, hop limit 255 and
 `fd00::<id>` as the UDP source for `ff03::1`.
+
+## 71. `bm_linux.c` writes the UDP checksum byte-swapped, and a zero checksum as zero
+
+`ipv6_pseudo_checksum` returns `ntohs(~sum)`: byte-swapped on a
+little-endian host, ready to be stored into a packed little-endian field, as
+`packet.c` stores BCMP's. `bm_udp_tx_perform` instead writes it high byte
+first:
+
+```c
+uint16_t cksum = ipv6_pseudo_checksum(&src_addr, dest_addr, ip_proto_udp,
+                                      udp_total, udp);
+udp[6] = (uint8_t)(cksum >> 8);
+udp[7] = (uint8_t)(cksum);
+```
+
+so on every little-endian host the checksum's two bytes are reversed on the
+wire. It also sends a checksum that computes to zero as zero, which UDP
+reserves for "no checksum" and RFC 8200 section 8.1 forbids over IPv6. lwIP's
+`udp_sendto_if_chksum` writes the checksum in network order and replaces zero
+with `0xFFFF`; card H0's capture holds 2300 UDP frames with valid checksums.
+
+Invisible between Bristlemouth nodes, because none checks a received UDP
+checksum (#70). A standard IPv6 stack drops these datagrams.
+
+**replicated**, against lwIP: `bm_wire::udp::build` writes what lwIP writes.
+`bm-wire-diff/src/udp.rs` rewrites the Rust frame's checksum to what
+`bm_linux.c` would have written before comparing, and so asserts that the
+checksum is the only difference; `a_checksum_of_zero_is_the_one_difference`
+(`bm-wire-diff/tests/udp.rs`) reaches the zero case.
+
+Fix upstream by storing the checksum in network order and writing `0xFFFF` for
+zero.
+
+## 72. `bm_linux.c` delivers a received datagram by its UDP length field; lwIP ignores the field
+
+| | `bm_l2_submit` (`bm_linux.c`) | lwIP (`ip6_input`, `udp_input`) |
+|---|---|---|
+| UDP length under 8, or past the IPv6 payload | refused | delivered |
+| Payload delivered | UDP length less 8 | IPv6 payload less 8 |
+
+lwIP trims the frame to the IPv6 payload length in `ip6_input` and reads
+`udphdr->len` only under `CHECKSUM_CHECK_UDP`, which `bm_protocol` sets to 0.
+The two agree whenever the UDP length equals the IPv6 payload length, which is
+true of every frame either sends.
+
+lwIP's `ip6_input` also drops a version other than 6 and a destination the
+netif has not joined; `bm_linux.c` checks neither, and neither does
+`bm_wire::udp::accept` or `bm_wire::bcmp::rx::accept`.
+
+**replicated**, against lwIP: `bm_wire::udp::accept` returns the IPv6 payload
+after the UDP header and does not read the length field.
+`bm-wire-diff/src/udp.rs` asserts the C refuses exactly the frames whose
+length field is out of range and otherwise delivers a prefix of the Rust
+payload; `the_udp_length_field` (`bm-wire-diff/tests/udp.rs`) covers both.
+
+Fix upstream in `bm_linux.c` by following lwIP, or in both by checking the
+length field is equal to the IPv6 payload length.

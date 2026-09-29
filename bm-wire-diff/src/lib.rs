@@ -43,6 +43,7 @@ pub mod replay;
 pub mod resource;
 pub mod stack;
 pub mod time;
+pub mod udp;
 pub mod util;
 
 /// Inputs restricted to a domain where the C has defined behaviour.

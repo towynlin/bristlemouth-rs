@@ -264,6 +264,9 @@ raising, and the hook fails loudly on both:
   `bm-wire-diff/tests/`, and register its seeds in `replay::STACK_TARGETS`
   rather than `replay::TARGETS`. A test asserts every `seeds/` directory is in
   exactly one list.
+- `stack::drain` returns every frame the oracle built with the source MAC and
+  hop limit rewritten to a deployed node's (`stack::normalise`, divergence
+  #70), so a comparator compares them against `bm-wire`'s frames unchanged.
 - Use `stack::pump_until_quiet`, not a bare `bm_shim_pump`, after injecting: one
   pump runs each task once in creation order, so a received frame reaches L2,
   then BCMP, then L2 again over successive pumps.

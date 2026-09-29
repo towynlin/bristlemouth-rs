@@ -27,10 +27,7 @@
 use arbitrary::{Arbitrary, Result, Unstructured};
 
 use bm_wire::bcmp::{BCMP_HEADER_LEN, MessageType, tx};
-use bm_wire::frame::{
-    IP_PROTO_BCMP, IP_PROTO_UDP, MIN_FRAME_WITH_ADDRESSES, UDP_CHECKSUM_OFFSET, UDP_HEADER_LEN,
-    UDP_LENGTH_OFFSET,
-};
+use bm_wire::frame::{IP_PROTO_BCMP, IP_PROTO_UDP, MIN_FRAME_WITH_ADDRESSES, UDP_HEADER_LEN};
 use bm_wire::l2::{self, REQUESTED_EGRESS_PORT_OFFSET, TxKind};
 use bm_wire::util::BmIpAddr;
 
@@ -178,20 +175,15 @@ impl L2EgressInput {
                     .expect("frame is sized for the body");
             }
             Upper::Udp => {
-                let udp = MIN_FRAME_WITH_ADDRESSES;
-                frame[udp..udp + 2].copy_from_slice(&self.udp_ports.0.to_be_bytes());
-                frame[udp + 2..udp + 4].copy_from_slice(&self.udp_ports.1.to_be_bytes());
-                frame[UDP_LENGTH_OFFSET..UDP_LENGTH_OFFSET + 2]
-                    .copy_from_slice(&(payload_len as u16).to_be_bytes());
-                frame[MIN_FRAME_WITH_ADDRESSES + UDP_HEADER_LEN..].copy_from_slice(&self.body);
-                let checksum = bm_wire::checksum::ipv6_pseudo_checksum(
+                bm_wire::udp::build(
+                    &mut frame,
                     &src,
                     &dst,
-                    IP_PROTO_UDP,
-                    &frame[MIN_FRAME_WITH_ADDRESSES..],
-                );
-                frame[UDP_CHECKSUM_OFFSET..UDP_CHECKSUM_OFFSET + 2]
-                    .copy_from_slice(&checksum.to_le_bytes());
+                    self.udp_ports.0,
+                    self.udp_ports.1,
+                    &self.body,
+                )
+                .expect("frame is sized for the body");
             }
         }
 
@@ -240,12 +232,19 @@ fn oracle_transmit(frame: &[u8]) -> Vec<(u8, Vec<u8>)> {
     }
 }
 
-/// What `bm_wire::l2` says should be emitted, composed the way firmware would.
+/// What `bm_wire::l2` says should be emitted, composed the way firmware would:
+/// `(egress port, frame)` in transmit order, port 0 for every port at once,
+/// as [`drain`] returns them.
 ///
-/// This composition is the part `bm-stack` will eventually own. Spelling it out
+/// `bm_stack::transmit` is the same composition for a node. Spelling it out
 /// here is the point: the comparator proves the primitives compose to the
 /// bytes bm_core puts on the wire.
-fn port_transmit(frame: &[u8]) -> Vec<(u8, Vec<u8>)> {
+///
+/// # Panics
+///
+/// If `frame` is too short to stamp.
+#[must_use]
+pub fn port_transmit(frame: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut frame = frame.to_vec();
     let all_ports = (1u16 << NUM_PORTS) - 1;
     let mask = l2::take_requested_egress_port(&mut frame, NUM_PORTS)

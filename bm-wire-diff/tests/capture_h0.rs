@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use bm_wire::addr::{self, LINK_LOCAL_PREFIX};
+use bm_wire::addr::{self, LINK_LOCAL_PREFIX, UNIQUE_LOCAL_PREFIX};
 use bm_wire::checksum::ipv6_pseudo_checksum;
 use bm_wire::frame::{
     ETHERNET_DESTINATION_OFFSET, ETHERNET_SRC_OFFSET, ETHERNET_TYPE_IPV6, IP_PROTO_BCMP,
@@ -39,8 +39,6 @@ const DEV_KIT: u64 = 0x0b54_ccce_5c79_78bf;
 const SOFT_MODULE: u64 = 0xe5d1_4eea_4fc2_db6b;
 const BRIDGE: u64 = 0xe4ce_8ae3_662e_97df;
 
-/// `bm_lwip.c`'s unique-local prefix, the second address it gives the netif.
-const UNIQUE_LOCAL_PREFIX: u32 = 0xFD00_0000;
 /// `BM_MIDDLEWARE_PORT`, pub/sub's source and destination port.
 const MIDDLEWARE_PORT: u16 = 4321;
 
@@ -93,15 +91,6 @@ fn the_capture_holds_three_nodes_udp_and_bcmp() {
     );
 }
 
-/// `mac_address` in `common/device.c`, which `bm_lwip.c` gives the netif:
-/// `00:00` and the low 32 bits of the node id. `bm_linux.c` and
-/// [`addr::mac_from_nodeid`] use the low 48 bits with the locally-administered
-/// bit set.
-fn device_mac(id: u64) -> [u8; 6] {
-    let b = id.to_be_bytes();
-    [0, 0, b[4], b[5], b[6], b[7]]
-}
-
 /// UDP and BCMP alike: version 6, zero traffic class and flow label, hop limit
 /// 255 where `bm_linux.c` writes 64, the destination MAC `bm_linux.c` derives,
 /// and a source MAC it does not.
@@ -130,7 +119,7 @@ fn every_frame_has_hop_limit_255_and_the_device_c_source_mac() {
         );
         assert_eq!(
             f[ETHERNET_SRC_OFFSET..][..6],
-            device_mac(src(f).to_node_id()),
+            addr::mac_address(src(f).to_node_id()),
             "frame {i}"
         );
     }
@@ -174,6 +163,33 @@ fn udp_is_from_the_unique_local_address_with_a_valid_checksum() {
             0,
             "udp frame {i}"
         );
+    }
+}
+
+/// `bm_wire::udp` builds every UDP frame in the capture, from all three nodes,
+/// byte for byte from its source node id, ports and payload: source address,
+/// source MAC, hop limit and checksum included.
+#[test]
+fn bm_wire_udp_rebuilds_every_udp_frame() {
+    for (i, r) in frames().iter().filter(|r| udp(r.frame)).enumerate() {
+        let f = r.frame;
+        let d = dst(f);
+        let payload = &f[bm_wire::udp::PAYLOAD_OFFSET..];
+        let mut buf = vec![0u8; f.len()];
+        let len = bm_wire::udp::build(
+            &mut buf,
+            &bm_wire::udp::source_address(src(f).to_node_id(), &d),
+            &d,
+            u16_at(f, UDP_SOURCE_PORT_OFFSET),
+            u16_at(f, UDP_DESTINATION_PORT_OFFSET),
+            payload,
+        )
+        .unwrap();
+        assert_eq!(&buf[..len], f, "udp frame {i}");
+
+        let datagram = bm_wire::udp::accept(f).unwrap();
+        assert_eq!(datagram.source, src(f).to_node_id(), "udp frame {i}");
+        assert_eq!(datagram.payload, payload, "udp frame {i}");
     }
 }
 

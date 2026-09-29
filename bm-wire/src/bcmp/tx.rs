@@ -19,8 +19,8 @@ use crate::util::BmIpAddr;
 /// `body` writes the message body into the slice it is given, which starts at
 /// [`BCMP_HEADER_OFFSET`] + [`BCMP_HEADER_LEN`] and runs to the end of `buf`,
 /// and returns how many bytes it wrote. The source address is `node_id`'s
-/// link-local address and the hop limit [`HOP_LIMIT`], as `bm_ip_tx_new` in
-/// `network/bm_linux.c` sets them; the headers are [`frame::write_headers`]'s.
+/// link-local address, as `bm_ip_tx_new` sets it, and the hop limit
+/// [`HOP_LIMIT`]; the headers are [`frame::write_headers`]'s.
 ///
 /// Returns the frame length.
 ///
@@ -175,6 +175,38 @@ mod tests {
             "must agree with the capture, not merely with the C"
         );
         assert_eq!(&frame[BCMP_HEADER_OFFSET + BCMP_HEADER_LEN..], &body);
+    }
+
+    /// Frame 45 of `bm-wire-diff/testdata/hello-pub-card-h0.pcap`: card H0's
+    /// dev kit's heartbeat as it left on port 1. Pins the source MAC and hop
+    /// limit deployed nodes use (divergence #70) as well as the body.
+    #[test]
+    fn build_reproduces_a_deployed_heartbeat() {
+        const FRAME_45: [u8; 79] = [
+            0x33, 0x33, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x5c, 0x79, 0x78, 0xbf, 0x86, 0xdd,
+            0x60, 0x00, 0x00, 0x00, 0x00, 0x19, 0xbc, 0xff, 0xfe, 0x80, 0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x0b, 0x54, 0xcc, 0xce, 0x5c, 0x79, 0x78, 0xbf, 0xff, 0x02, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x00,
+            0x15, 0xc3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x38, 0x00, 0x45,
+            0x3c, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00,
+        ];
+        let body_at = BCMP_HEADER_OFFSET + BCMP_HEADER_LEN;
+        let mut buf = [0u8; FRAME_45.len()];
+        let len = build(
+            &mut buf,
+            0x0b54_ccce_5c79_78bf,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            MessageType::HEARTBEAT,
+            0,
+            |body| {
+                body.copy_from_slice(&FRAME_45[body_at..]);
+                Ok(body.len())
+            },
+        )
+        .unwrap();
+        assert_eq!(len, FRAME_45.len());
+        let stamped = crate::l2::stamp_egress_port(&mut buf, 1).unwrap();
+        assert_eq!(*stamped, FRAME_45);
     }
 
     #[test]
