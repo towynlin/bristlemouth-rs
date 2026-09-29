@@ -26,8 +26,12 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use bm_stack::port::{Egress, Identity, Phy, RtcTimeAndDate, SoftRtc};
 use bm_stack::{Node, Outbound, Reflood};
+use bm_wire::addr;
 use bm_wire::bcmp::{BCMP_HEADER_OFFSET, BcmpHeader, DeviceInfo, MessageType};
-use bm_wire::frame::{ETHERNET_TYPE_IPV6, IP_PROTO_BCMP, IPV6_NEXT_HEADER_OFFSET, ethernet_type};
+use bm_wire::frame::{
+    ETHERNET_SRC_OFFSET, ETHERNET_TYPE_IPV6, IP_PROTO_BCMP, IPV6_HOP_LIMIT_OFFSET,
+    IPV6_NEXT_HEADER_OFFSET, ethernet_type,
+};
 
 /// Ports the capture device reports, from `SHIM_NUM_PORTS` in
 /// `bm-wire-sys/csrc/bm_net_device_shim.c`.
@@ -143,9 +147,14 @@ pub fn pump_until_quiet() {
 /// A port of 0 is the device's "all ports" encoding, which L2 uses for global
 /// multicast when the mask covers every port.
 ///
+/// Every frame the oracle built itself is returned with divergence #70's two
+/// header fields normalised to a deployed node's; see [`normalise`]. A frame
+/// it relayed is returned as it arrived.
+///
 /// # Panics
 ///
-/// If a captured frame is longer than the drain buffer.
+/// If a captured frame is longer than the drain buffer, or [`normalise`]
+/// panics.
 pub fn drain() -> Vec<(u8, Vec<u8>)> {
     let mut out = Vec::new();
     loop {
@@ -162,8 +171,41 @@ pub fn drain() -> Vec<(u8, Vec<u8>)> {
             "captured frame truncated by the drain buffer"
         );
         buf.truncate(len);
+        normalise(&mut buf);
         out.push((port, buf));
     }
+}
+
+/// The hop limit `bm_linux.c` writes, where a deployed node writes
+/// [`bm_wire::frame::HOP_LIMIT`] (divergence #70).
+pub const LINUX_HOP_LIMIT: u8 = 64;
+
+/// Rewrite the source MAC and hop limit of a frame the oracle built to the
+/// values a deployed node writes: [`addr::mac_address`] and
+/// [`bm_wire::frame::HOP_LIMIT`] in place of `bm_linux.c`'s
+/// [`addr::mac_from_nodeid`] and [`LINUX_HOP_LIMIT`] (divergence #70).
+///
+/// A frame is the oracle's own when its source MAC is `mac_from_nodeid` of
+/// [`NODE_ID`]; L2 relays other frames with their sender's MAC unchanged.
+/// Neither field is covered by a checksum, so nothing else moves.
+///
+/// # Panics
+///
+/// If an oracle-built frame does not carry [`LINUX_HOP_LIMIT`], which would
+/// mean the normalisation is hiding something other than #70.
+pub fn normalise(frame: &mut [u8]) {
+    let src_mac = ETHERNET_SRC_OFFSET..ETHERNET_SRC_OFFSET + addr::MAC_LEN;
+    if frame.len() <= IPV6_HOP_LIMIT_OFFSET
+        || frame[src_mac.clone()] != addr::mac_from_nodeid(NODE_ID)
+    {
+        return;
+    }
+    assert_eq!(
+        frame[IPV6_HOP_LIMIT_OFFSET], LINUX_HOP_LIMIT,
+        "an oracle-built frame without bm_linux.c's hop limit"
+    );
+    frame[src_mac].copy_from_slice(&addr::mac_address(NODE_ID));
+    frame[IPV6_HOP_LIMIT_OFFSET] = bm_wire::frame::HOP_LIMIT;
 }
 
 /// A frame the oracle transmitted, and the port it went out on — one element

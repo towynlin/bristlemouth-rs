@@ -121,11 +121,11 @@ where
     (Adin2111Phy { device, links }, runner)
 }
 
-/// The same, with the MAC derived from the node id the way bm_core derives it
-/// — locally administered, unicast, from the low 48 bits.
+/// The same, with the MAC a deployed node derives from its node id,
+/// [`bm_wire::addr::mac_address`]: `00:00` and the low 32 bits.
 ///
-/// Using this keeps the MAC on the wire consistent with the one a peer computes
-/// from the node id in our address.
+/// Using this keeps the chip's MAC the same as the source MAC
+/// `bm_wire::frame::write_headers` puts on every frame.
 pub async fn for_node<'d, const N_RX: usize, const N_TX: usize, SPI, INT, RST>(
     node_id: u64,
     state: &'d mut State<N_RX, N_TX>,
@@ -140,7 +140,7 @@ where
     RST: OutputPin,
 {
     new(
-        bm_wire::addr::mac_from_nodeid(node_id),
+        bm_wire::addr::mac_address(node_id),
         state,
         spi,
         int,

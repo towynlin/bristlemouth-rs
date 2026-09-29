@@ -99,13 +99,13 @@ fn the_heartbeat_we_emit_is_a_well_formed_frame() {
 
     // Ethernet: 33:33 multicast MAC for ff02::1, our derived MAC, IPv6.
     assert_eq!(&frame[0..6], &[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
-    assert_eq!(&frame[6..12], &addr::mac_from_nodeid(NODE_ID));
+    assert_eq!(&frame[6..12], &addr::mac_address(NODE_ID));
     assert_eq!(
         u16::from_be_bytes([frame[12], frame[13]]),
         ETHERNET_TYPE_IPV6
     );
 
-    // IPv6: version 6, no traffic class or flow label, BCMP, hop limit 64.
+    // IPv6: version 6, no traffic class or flow label, BCMP, hop limit 255.
     assert_eq!(&frame[14..18], &[0x60, 0x00, 0x00, 0x00]);
     assert_eq!(frame[IPV6_NEXT_HEADER_OFFSET], IP_PROTO_BCMP);
     assert_eq!(frame[IPV6_HOP_LIMIT_OFFSET], HOP_LIMIT);

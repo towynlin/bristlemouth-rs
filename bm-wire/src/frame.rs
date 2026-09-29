@@ -79,19 +79,22 @@ pub const UDP_CHECKSUM_OFFSET: usize = UDP_LENGTH_OFFSET + 2;
 /// Size of a UDP header.
 pub const UDP_HEADER_LEN: usize = 8;
 
-/// The hop limit bm_core sets on everything it transmits.
-pub const HOP_LIMIT: u8 = 64;
+/// The hop limit a deployed node sets on everything it transmits: lwIP's
+/// `UDP_TTL` for UDP and its default `RAW_TTL` for BCMP's raw pcb, both 255.
+/// `bm_linux.c` writes 64 (divergence #70).
+pub const HOP_LIMIT: u8 = 255;
 
 /// Write the Ethernet and IPv6 headers for a `payload_len`-byte payload into
 /// the start of `buf`.
 ///
-/// Byte for byte what `bm_ip_tx_new` and `bm_ip_tx_perform` in
-/// `network/bm_linux.c` write:
+/// What a deployed node's lwIP writes, which is what `bm_ip_tx_new` and
+/// `bm_ip_tx_perform` in `network/bm_linux.c` write except for the source MAC
+/// (divergence #70):
 ///
 /// | Field | Value |
 /// |---|---|
 /// | Destination MAC | [`addr::multicast_mac_from_ipv6`] of `dst` if it is multicast, else broadcast: bm_core has no neighbour discovery to resolve a unicast address with |
-/// | Source MAC | [`addr::mac_from_nodeid`] of `src`'s node id |
+/// | Source MAC | [`addr::mac_address`] of `src`'s node id |
 /// | EtherType | [`ETHERNET_TYPE_IPV6`] |
 /// | Version, traffic class, flow label | 6, 0, 0 |
 /// | Payload length | `payload_len` |
@@ -126,7 +129,7 @@ pub fn write_headers(
     buf[ETHERNET_DESTINATION_OFFSET..ETHERNET_DESTINATION_OFFSET + MAC_LEN]
         .copy_from_slice(&dst_mac);
     buf[ETHERNET_SRC_OFFSET..ETHERNET_SRC_OFFSET + MAC_LEN]
-        .copy_from_slice(&addr::mac_from_nodeid(src.to_node_id()));
+        .copy_from_slice(&addr::mac_address(src.to_node_id()));
     buf[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + ETHERNET_TYPE_SIZE]
         .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
 
@@ -190,10 +193,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(buf[..6], [0x33, 0x33, 0, 0, 0, 1]);
-        assert_eq!(buf[6..12], [0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+        assert_eq!(buf[6..12], [0, 0, 0x44, 0x55, 0x66, 0x77]);
         assert_eq!(
             buf[12..22],
-            [0x86, 0xDD, 0x60, 0, 0, 0, 0x01, 0x02, 0xBC, 64]
+            [0x86, 0xDD, 0x60, 0, 0, 0, 0x01, 0x02, 0xBC, 255]
         );
         assert_eq!(buf[22..38], src.0);
         assert_eq!(buf[38..54], BmIpAddr::LINK_LOCAL_MULTICAST.0);

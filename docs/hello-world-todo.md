@@ -49,7 +49,7 @@ bus with a Spotter and a C dev kit:
 | BCMP: heartbeat, ping, info, neighbours, resources, time, config, DFU | Done (`bm-wire`, `bm_stack::Node`) |
 | PHY for the ADIN2111 | Done (`bm-phy-adin2111`), untested on hardware |
 | Application code running beside the node | Done: `bm_stack::App`, run by `Node::run_app`; `bm_stack::channel` for an app in its own task |
-| UDP over IPv6 | **Missing.** `bm-wire/src/frame.rs` has the UDP offsets and `l2::add_egress_port` its checksum patch; nothing builds, accepts or dispatches UDP. `Node::on_frame` relays a UDP frame per `l2_policy` and then drops it in `rx::accept`. |
+| UDP over IPv6 | **Half.** `bm_wire::udp` builds and accepts a datagram's frame. `Node` neither sends nor dispatches UDP: `Node::on_frame` relays a UDP frame per `l2_policy` and then drops it in `rx::accept`. |
 | Pub/sub (`middleware/pubsub.c`, `middleware.c`) | **Missing.** Listed out of scope in `bcmp-port-todo.md`. |
 | `spotter_log`, `spotter_tx_data` | **Missing.** |
 | Dev kit board support (MCU HAL, pins, node id, time driver, flash) | **Missing.** No crate targets a board. |
@@ -71,8 +71,9 @@ paths share `bcmp/packet.c`; for UDP they do not. Observed in
 | IPv6 source address, UDP to `ff03::1` | `fe80::<id>` | `fd00::<id>` |
 | IPv6 source address, BCMP | `fe80::<id>` | `fe80::<id>` |
 | Hop limit, UDP and BCMP | 64 | 255 (`UDP_TTL` 255; no multicast TTL option set) |
-| UDP checksum on transmit | computed | computed, valid (`CHECKSUM_GEN_UDP` 1) |
+| UDP checksum on transmit | computed, byte-swapped; zero sent as zero (#71) | computed, valid (`CHECKSUM_GEN_UDP` 1); zero sent as `0xFFFF` |
 | UDP checksum on receive | not checked | not checked (`CHECKSUM_CHECK_UDP` 0) |
+| UDP payload on receive | UDP length field less 8; refused if out of range (#72) | IPv6 payload less 8; length field not read |
 | Destination MAC | `multicast_mac_from_ipv6` | the same: `33:33:00:00:00:01` for `ff03::1` |
 | Source MAC | `mac_from_nodeid`: low 48 bits of the id, byte 0 `\|= 0x02` | `mac_address` (`common/device.c`): `00:00` + low 32 bits |
 | Port nibbles, `ff03::1` | none | none, sent once to all ports; a relayed copy is byte-identical |
@@ -100,7 +101,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 | `bm_middleware_rx` | Dispatches on the **source** port lwIP/`bm_linux.c` reports, not the bound destination port. Harmless while pub/sub sends from and to 4321. | U2 |
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, E0, F1, H0) left for the rest
+## What the landed cards (A1, E0, F1, H0, U1) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -123,13 +124,46 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   `Node::run*` on `MockPhy` holds `tests/node.rs`'s `CLOCK` lock or runs in a
   process of its own.
 - **One header writer.** `bm_wire::frame::write_headers(buf, src, dst,
-  next_header, hop_limit, payload_len)` writes Ethernet and IPv6;
-  `bm_wire::bcmp::tx::build` wraps it for BCMP from a node's `fe80::`
-  address with `HOP_LIMIT`. Source address and hop limit are parameters of
-  `write_headers`; U1 sets them from the capture, not from `bm_linux.c`.
-  The destination MAC rule (multicast MAC, else broadcast) is fixed inside it;
-  the capture shows lwIP's is the same for UDP. `LINK_LOCAL_PREFIX` is in `bm_wire::addr`, `HOP_LIMIT` in
-  `bm_wire::frame`; `bm_stack::node` re-exports both.
+  next_header, hop_limit, payload_len)` writes Ethernet and IPv6 with a
+  deployed node's source MAC, `addr::mac_address`. `bm_wire::bcmp::tx::build`
+  wraps it for BCMP from a node's `fe80::` address, `bm_wire::udp::build` for
+  UDP; both use `HOP_LIMIT`, 255. The destination MAC rule (multicast MAC,
+  else broadcast) is fixed inside it. `LINK_LOCAL_PREFIX` and
+  `UNIQUE_LOCAL_PREFIX` are in `bm_wire::addr`, `HOP_LIMIT` in
+  `bm_wire::frame`; `bm_stack::node` re-exports `LINK_LOCAL_PREFIX` and
+  `HOP_LIMIT`.
+- **`bm_wire::udp`, and why it follows lwIP.**
+
+  | Item | Shape |
+  |---|---|
+  | `build(buf, src, dst, src_port, dst_port, payload) -> Result<usize>` | whole frame, checksum in network order, `0xFFFF` for zero; no egress stamp |
+  | `source_address(node_id, dst)` | `fe80::<id>` for link-local scope or narrower (`ff02::1`), else `fd00::<id>` (`ff03::1`) |
+  | `accept(frame) -> Result<Datagram>` | `src_port`, `dst_port`, `source` node id, `payload`; checksum and UDP length field not read |
+  | `PAYLOAD_OFFSET`, `MAX_PAYLOAD_LEN` | 62; 65527 |
+
+  Deployed nodes run lwIP, so every field where `bm_linux.c` differs follows
+  lwIP (#70, #71, #72); `capture_h0.rs` rebuilds all 2300 captured UDP frames
+  with `build`. `build` takes the source address rather than a node id so a
+  comparator can build the frame `bm_linux.c` would, from `fe80::<id>`.
+  `accept` does not filter on destination address or port: U2 decides what
+  the node is bound to.
+- **Comparing UDP frames with the oracle.** `stack::drain` rewrites the
+  source MAC and hop limit of every frame the oracle built
+  (`stack::normalise`), for BCMP and UDP alike. The UDP source address and
+  checksum it cannot rewrite, because the address is under the checksum. A
+  Rust node sends from `source_address`, `fd00::<id>` for `ff03::1`, so U2,
+  P2 and S1's frame comparators compare in two steps: the node's frame equals
+  `udp::build` of its UDP payload from `source_address`; and `udp::build` of
+  the same payload from `fe80::<id>`, passed through
+  `bm_wire_diff::udp::as_bm_linux_writes_it`, equals the oracle's frame.
+  `bm_wire_diff::l2_egress::port_transmit` turns one built frame into what
+  reaches each port.
+- **Receiving in the oracle without L2.** `bm-wire-diff/src/udp.rs` binds five
+  ports with `bm_udp_bind_port` once per process (the UDP list has no unbind)
+  and calls `bm_l2_submit` directly. Port 4321 is already bound to
+  `bm_middleware_rx`, which reaches `bm_handle_msg`'s out-of-bounds read
+  ("Suspected C defects"), so that comparator never delivers to it; U2 and P2
+  will, and must constrain the payload per P1's finding.
 - **Scripted peer frames come from `bm_stack::mock::frames`, comparator
   inputs from `bm_wire_diff::frames`.** Both wrap `tx::build` in a `Vec`.
   U2, P2 and S1 add their UDP, publication and `spotter_log` builders there
@@ -143,8 +177,8 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   (`e5d14eea4fc2db6b`, temperature). The callback sees received frames before
   `bm_l2_policy_rx_apply`, so none carries an ingress nibble, and it does not
   record the port. `tests/capture_h0.rs` names the nodes and asserts the
-  header table above; `bm_wire_diff::pcap::records` reads the file for U1's
-  and S1's gold vectors. The dev kit published every 10 s:
+  header table above; `bm_wire_diff::pcap::records` reads the file for S1's
+  gold vectors. The dev kit published every 10 s:
 
   | Call | Topic | Body as captured |
   |---|---|---|
@@ -156,13 +190,6 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   84–86 are the first round (counter 100). The card asked for a publication
   with two-port and one-port egress: the dev kit's own is the first (one
   frame to all ports), a neighbour's relayed copy the second.
-- **Divergence #70 is U1's to close.** `frame::write_headers` uses
-  `mac_from_nodeid` and `HOP_LIMIT` 64 for everything, as `bm_linux.c` does;
-  deployed nodes use `mac_address`'s MAC and 255. The capture wins (see "The
-  oracle is not the deployed stack for UDP"), so U1 moves both, including for
-  BCMP, and the comparators against `bm_linux.c` normalise those two fields.
-  `bm-phy-adin2111`'s `for_node` also hands the chip `mac_from_nodeid`.
-
 - **`bm-stack/examples/hello_node.rs` is the host twin of E1.** P2 and S1 can
   extend it with a publish, a subscription the scripted neighbour publishes
   to, and a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
@@ -170,29 +197,9 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
 ---
 
-## Card U1 — UDP over IPv6 in `bm-wire`
-
-**Blocks:** U2, P1. **Blocked by:** nothing.
-
-C: `bm_udp_tx_perform` and the UDP branch of `bm_ip_rx` in
-`network/bm_linux.c`; lwIP's `udp_sendto_if` for what deployed nodes do.
-
-Rust: `bm-wire/src/udp.rs` — build a frame (Ethernet and IPv6 via
-`frame::write_headers`, then UDP and payload) into a caller buffer from source address, destination, ports and payload; accept a
-received frame and return ports, source node id and payload. Checksum via
-`checksum::ipv6_pseudo_checksum`. Source `fd00::<id>`, hop limit 255, and the
-source MAC and BCMP hop limit moved to the deployed values (#70).
-
-Comparator: `bm-wire-diff/src/udp.rs`, frames from `bm_udp_tx_perform` vs
-ours for identical inputs, with #70's fields normalised; fuzz target `udp`.
-Gold vectors from `testdata/hello-pub-card-h0.pcap` as `bm-wire` unit tests.
-
-Done: comparator, fuzz target with seeds, gold-vector tests, and #70 moved to
-**replicated**.
-
 ## Card U2 — UDP through `bm_stack::Node`
 
-**Blocks:** P2. **Blocked by:** U1.
+**Blocks:** P2. **Blocked by:** nothing.
 
 C: `bm_l2_process_tx_evt` (global multicast goes out once to
 `device_all_ports`, no egress stamp, no checksum patch), `bm_l2_process_rx_evt`
@@ -212,7 +219,7 @@ Rust node reaches `bm_middleware_rx` in the oracle, and relaying is unchanged.
 
 ## Card P1 — Pub/sub codec and topic matching in `bm-wire`
 
-**Blocks:** P2, S1. **Blocked by:** U1.
+**Blocks:** P2, S1. **Blocked by:** nothing.
 
 C: `BmPubSubData` and `BmPubSubHeader` (`middleware/pubsub.h`),
 `bm_pub_wl`'s header fill, `bm_handle_msg`, `bm_wildcard_match`
@@ -279,7 +286,7 @@ Done: comparator, fuzz target `spotter`.
 
 ## Card B1 — Dev kit board support
 
-**Blocks:** E1. **Blocked by:** nothing (can run beside U1–S1).
+**Blocks:** E1. **Blocked by:** nothing (can run beside U2–S1).
 
 The dev kit's mote is an STM32U5 (Cortex-M33, `thumbv8m.main-none-eabihf`)
 with an ADIN2111 on SPI. The pin map, the ADIN2111 power and reset sequence,
@@ -316,13 +323,12 @@ reported individually.
 ## Order
 
 ```
-U1 ─► U2 ─► P1 ─► P2 ─► S1 ─► E1
-B1 ────────────────────────────┘
+U2 ─┬─► P2 ─► S1 ─► E1
+P1 ─┘                ▲
+B1 ──────────────────┘
 ```
 
-(P1's `wildcard_match` half does not need U2 and can start after U1.)
-
-U1 and B1 can start now and run in parallel.
+U2, P1 and B1 can start now and run in parallel.
 
 # Explicitly out of scope
 
