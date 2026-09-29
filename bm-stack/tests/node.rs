@@ -2833,6 +2833,236 @@ fn the_run_loop_answers_a_resource_request() {
 }
 
 // ---------------------------------------------------------------------------
+// UDP -- card U2.
+// ---------------------------------------------------------------------------
+
+const MIDDLEWARE_PORT: u16 = 4321;
+
+/// The `Event::Udp`s one received frame produced, owned.
+fn udp_events(
+    node: &mut Node<TestIdentity, SoftRtc, 4>,
+    ingress_port: u8,
+    frame: &mut [u8],
+) -> Vec<(u16, u16, u64, Vec<u8>)> {
+    let mut seen = Vec::new();
+    let _ = node.on_frame_with(1000, ingress_port, frame, |event| {
+        if let Event::Udp {
+            port,
+            src_port,
+            source,
+            payload,
+        } = event
+        {
+            seen.push((port, src_port, source, payload.to_vec()));
+        }
+    });
+    seen
+}
+
+#[test]
+fn a_datagram_to_a_bound_port_is_reported_and_relayed() {
+    let mut node = node();
+    node.bind_udp(MIDDLEWARE_PORT).unwrap();
+    let original = frames::udp(
+        PEER_ID,
+        BmIpAddr::GLOBAL_MULTICAST,
+        MIDDLEWARE_PORT,
+        MIDDLEWARE_PORT,
+        b"hello",
+    );
+
+    let mut frame = original.clone();
+    assert_eq!(
+        udp_events(&mut node, 1, &mut frame),
+        [(MIDDLEWARE_PORT, MIDDLEWARE_PORT, PEER_ID, b"hello".to_vec())]
+    );
+
+    let mut frame = original.clone();
+    let phy = relay_through(&mut node, 1, &mut frame);
+    assert_eq!(phy.sent.len(), 1);
+    assert_eq!(phy.sent[0].egress, Egress::Port(2));
+    assert_eq!(phy.sent[0].frame, original, "relayed as it arrived");
+}
+
+#[test]
+fn a_datagram_to_an_unbound_port_is_relayed_and_not_reported() {
+    let mut node = node();
+    node.bind_udp(MIDDLEWARE_PORT).unwrap();
+    let original = frames::udp(
+        PEER_ID,
+        BmIpAddr::GLOBAL_MULTICAST,
+        MIDDLEWARE_PORT,
+        MIDDLEWARE_PORT + 1,
+        b"x",
+    );
+    let mut frame = original.clone();
+    assert!(udp_events(&mut node, 2, &mut frame).is_empty());
+
+    let mut frame = original.clone();
+    let phy = relay_through(&mut node, 2, &mut frame);
+    assert_eq!(phy.sent.len(), 1);
+    assert_eq!(phy.sent[0].egress, Egress::Port(1));
+    assert_eq!(phy.sent[0].frame, original);
+}
+
+/// The destination port is what is bound; the source port is reported beside
+/// it, since bm_core's middleware dispatches on it (divergence #73).
+#[test]
+fn a_datagram_is_matched_on_its_destination_port() {
+    let mut node = node();
+    node.bind_udp(0x1234).unwrap();
+    let mut frame = frames::udp(PEER_ID, BmIpAddr::GLOBAL_MULTICAST, 0x1234 + 1, 0x1234, b"");
+    assert_eq!(
+        udp_events(&mut node, 1, &mut frame),
+        [(0x1234, 0x1235, PEER_ID, Vec::new())]
+    );
+    let mut frame = frames::udp(PEER_ID, BmIpAddr::GLOBAL_MULTICAST, 0x1234, 0x1234 + 1, b"");
+    assert!(udp_events(&mut node, 1, &mut frame).is_empty());
+}
+
+#[test]
+fn binding_a_port_twice_or_past_capacity_is_refused() {
+    let mut node = node();
+    for port in 0..bm_stack::node::UDP_PORTS as u16 {
+        node.bind_udp(port).unwrap();
+    }
+    assert_eq!(node.bind_udp(0), Err(bm_stack::UdpBindError::InUse));
+    assert_eq!(node.bind_udp(100), Err(bm_stack::UdpBindError::Full));
+    assert!(node.unbind_udp(0));
+    assert!(!node.unbind_udp(0));
+    assert!(!node.udp_bound(0));
+    node.bind_udp(100).unwrap();
+    assert!(node.udp_bound(100));
+}
+
+/// `FF03::1` goes out once to every port, unstamped, from `fd00::<id>`.
+#[test]
+fn a_datagram_to_global_multicast_goes_out_once_to_all_ports() {
+    let mut node = node();
+    let outbound = node
+        .send_udp(
+            MIDDLEWARE_PORT,
+            &BmIpAddr::GLOBAL_MULTICAST,
+            MIDDLEWARE_PORT,
+            b"hello world",
+        )
+        .unwrap();
+    assert_eq!(outbound.mask(), 0b11);
+    let mut phy = MockPhy::new(PORTS, Vec::new());
+    block_on(transmit(&mut phy, outbound, PORTS)).unwrap();
+    assert_eq!(phy.sent.len(), 1);
+    assert_eq!(phy.sent[0].egress, Egress::AllPorts);
+    assert_eq!(
+        phy.sent[0].frame,
+        frames::udp(
+            NODE_ID,
+            BmIpAddr::GLOBAL_MULTICAST,
+            MIDDLEWARE_PORT,
+            MIDDLEWARE_PORT,
+            b"hello world"
+        )
+    );
+    assert_eq!(
+        &phy.sent[0].frame[IPV6_SOURCE_ADDRESS_OFFSET..][..2],
+        [0xFD, 0x00]
+    );
+}
+
+/// `FF02::1` goes out once per port, stamped, from `fe80::<id>`.
+#[test]
+fn a_datagram_to_link_local_multicast_is_stamped_per_port() {
+    let mut node = node();
+    let outbound = node
+        .send_udp(9, &BmIpAddr::LINK_LOCAL_MULTICAST, 9, b"ll")
+        .unwrap();
+    let mut phy = MockPhy::new(PORTS, Vec::new());
+    block_on(transmit(&mut phy, outbound, PORTS)).unwrap();
+    let unstamped = frames::udp(NODE_ID, BmIpAddr::LINK_LOCAL_MULTICAST, 9, 9, b"ll");
+    assert_eq!(phy.sent.len(), usize::from(PORTS));
+    for (sent, port) in phy.sent.iter().zip(1..) {
+        assert_eq!(sent.egress, Egress::Port(port));
+        let mut expected = unstamped.clone();
+        let stamped = bm_wire::l2::stamp_egress_port(&mut expected, port).unwrap();
+        assert_eq!(sent.frame, *stamped);
+    }
+}
+
+/// Byte 13 of the destination selects one port and is cleared, as
+/// `bm_l2_link_output` does, after the checksum was computed over it.
+#[test]
+fn a_requested_egress_port_narrows_the_mask_and_is_cleared() {
+    let mut dst = BmIpAddr::GLOBAL_MULTICAST;
+    dst.0[13] = 2;
+    let mut node = node();
+    let outbound = node.send_udp(1, &dst, 2, b"p").unwrap();
+    assert_eq!(outbound.mask(), 0b10);
+    assert_eq!(outbound.frame()[IPV6_DESTINATION_ADDRESS_OFFSET + 13], 0);
+    let built = frames::udp(NODE_ID, dst, 1, 2, b"p");
+    assert_eq!(
+        outbound.frame()[UDP_CHECKSUM_OFFSET..][..2],
+        built[UDP_CHECKSUM_OFFSET..][..2],
+        "the checksum covers the byte as requested"
+    );
+}
+
+#[test]
+fn a_datagram_too_large_for_the_mtu_is_not_sent() {
+    let mut node = node();
+    let fits = vec![0u8; bm_stack::MTU - bm_wire::udp::PAYLOAD_OFFSET];
+    assert!(
+        node.send_udp(1, &BmIpAddr::GLOBAL_MULTICAST, 1, &fits)
+            .is_some()
+    );
+    let over = vec![0u8; fits.len() + 1];
+    assert!(
+        node.send_udp(1, &BmIpAddr::GLOBAL_MULTICAST, 1, &over)
+            .is_none()
+    );
+}
+
+/// One node's datagram reaches another's bound port.
+#[test]
+fn a_datagram_crosses_between_two_nodes() {
+    struct Peer;
+    impl Identity for Peer {
+        fn node_id(&self) -> u64 {
+            PEER_ID
+        }
+        fn device_info(&self) -> DeviceInfo {
+            DeviceInfo::default()
+        }
+        fn version_string(&self) -> &[u8] {
+            b""
+        }
+        fn device_name(&self) -> &[u8] {
+            b""
+        }
+    }
+    let mut sender = Node::<Peer, SoftRtc, 4>::new(Peer, SoftRtc::new(), PORTS);
+    let mut receiver = node();
+    receiver.bind_udp(MIDDLEWARE_PORT).unwrap();
+    let mut frame = sender
+        .send_udp(
+            MIDDLEWARE_PORT,
+            &BmIpAddr::GLOBAL_MULTICAST,
+            MIDDLEWARE_PORT,
+            b"across",
+        )
+        .unwrap()
+        .frame()
+        .to_vec();
+    assert_eq!(
+        udp_events(&mut receiver, 2, &mut frame),
+        [(
+            MIDDLEWARE_PORT,
+            MIDDLEWARE_PORT,
+            PEER_ID,
+            b"across".to_vec()
+        )]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Application seam -- card A1.
 // ---------------------------------------------------------------------------
 

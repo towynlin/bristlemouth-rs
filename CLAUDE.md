@@ -94,6 +94,9 @@ A cargo workspace.
     builder.
   - `tests/node_frames.rs` — compares whole frames `bm-stack` builds against
     the ones bm_core emits for the same question from the same identity.
+  - `src/node_udp.rs`, `tests/node_udp.rs` — UDP through `bm_stack::Node`
+    against the oracle's whole stack: sends, relays, and delivery to bound
+    ports and to `bm_middleware_rx`.
   - `testdata/` — pcaps from C dev kits. `hello-pub-card-h0.pcap` is card
     H0's; `tests/capture_h0.rs` documents it and asserts the header fields
     where deployed nodes differ from `bm_linux.c` (divergence #70).

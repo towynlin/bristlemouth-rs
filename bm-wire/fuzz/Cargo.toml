@@ -276,3 +276,12 @@ path = "fuzz_targets/udp.rs"
 test = false
 doc = false
 bench = false
+
+# Stack-backed. Binds the same five ports as `udp` and subscribes to `*` once
+# per process.
+[[bin]]
+name = "node_udp"
+path = "fuzz_targets/node_udp.rs"
+test = false
+doc = false
+bench = false

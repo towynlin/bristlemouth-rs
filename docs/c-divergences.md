@@ -110,6 +110,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 70 | `bm_linux.c` writes a source MAC, hop limit and UDP source address that deployed nodes do not | replicated | capture, card H0 |
 | 71 | `bm_linux.c` writes the UDP checksum byte-swapped, and a zero checksum as zero | replicated | differentially (byte order); reading lwIP (zero) |
 | 72 | `bm_linux.c` delivers a received datagram by its UDP length field; lwIP ignores the field | replicated | reading lwIP, confirmed differentially |
+| 73 | `bm_middleware_rx` dispatches on the datagram's source port | open (P2) | reading, confirmed differentially (card U2) |
 
 ---
 
@@ -2573,3 +2574,30 @@ payload; `the_udp_length_field` (`bm-wire-diff/tests/udp.rs`) covers both.
 
 Fix upstream in `bm_linux.c` by following lwIP, or in both by checking the
 length field is equal to the IPv6 payload length.
+
+## 73. `bm_middleware_rx` dispatches on the datagram's source port
+
+`bm_udp_bind_port`'s callback is called with the sender's port: `bm_lwip.c`'s
+`udp_recv_cb` passes lwIP's `port` argument, which is the remote port, and
+`bm_linux.c`'s `bm_l2_submit` passes `src_port`. `bm_middleware_rx` queues it
+as `NetQueueItem::port`, and `middleware_net_task` looks the application up
+with `ll_get_item(&CTX.applications, item.port, ...)`.
+
+| Datagram to 4321 from | Reaches `bm_handle_msg` |
+|---|---|
+| port 4321 | yes |
+| any other port | no; dropped in `middleware_net_task` |
+
+Every C node publishes from 4321 to 4321, so the two agree on the wire today.
+A sender on an ephemeral port, as a standard UDP socket uses, is never heard.
+
+**open**, card P2. `bm_stack::Node` matches a datagram to a bound port on its
+destination port, as lwIP's `udp_input` does, and reports the source port
+beside it in `Event::Udp`; pub/sub on the node has no middleware lookup yet.
+P2 reproduces it. `bm-wire-diff/src/node_udp.rs` asserts the oracle
+delivers to its subscriber exactly when both ports are 4321;
+`the_middleware_dispatches_on_the_source_port`
+(`bm-wire-diff/tests/node_udp.rs`) covers it.
+
+Fix upstream by passing the bound port rather than the source port, or by
+keying the lookup on the pcb.
