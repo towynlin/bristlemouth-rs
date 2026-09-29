@@ -36,6 +36,7 @@ pub mod l2_policy;
 pub mod ll;
 pub mod neighbor;
 pub mod neighbor_table;
+pub mod pcap;
 pub mod ping;
 pub mod registry;
 pub mod replay;
