@@ -96,6 +96,17 @@
 //! client, and a host once [`Node::dfu_initiate_update`] starts an update;
 //! the finish callback arrives as [`Event::DfuUpdateFinished`].
 //!
+//! # UDP
+//!
+//! [`Node::on_frame`] hands a UDP datagram addressed to a port
+//! [`Node::bind_udp`] bound to the application as [`Event::Udp`], after the
+//! relay decision, as `bm_l2_process_rx_evt` submits after it relays.
+//! Datagrams to any other port are dropped. The frame is taken by
+//! [`bm_wire::udp::accept`], which follows lwIP rather than `bm_linux.c`
+//! (divergence #72): no checksum check, and no filter on the destination
+//! address. [`Node::send_udp`] is `bm_udp_tx_perform` through
+//! `bm_l2_link_output`.
+//!
 //! # Two timers, not one
 //!
 //! The 10-second heartbeat timer is [`Node::on_tick`]; `packet.c`'s 150 ms
@@ -141,6 +152,7 @@ use bm_wire::frame::{
 use bm_wire::l2::{self, TxKind};
 use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
+use bm_wire::udp;
 use bm_wire::util::BmIpAddr;
 
 use crate::app::{App, Observer};
@@ -180,6 +192,21 @@ pub const EXPIRY_PERIOD_MS: u32 = MESSAGE_TIMER_EXPIRY_PERIOD_MS;
 /// one-shot armed by the request. What it is not is a give-up — see
 /// divergence #36.
 pub const NEIGHBOR_REQUEST_TIMEOUT_MS: u32 = bm_wire::bcmp::neighbors::NEIGHBOR_REQUEST_TIMEOUT_MS;
+
+/// How many UDP ports a node can [`Node::bind_udp`] at once.
+///
+/// bm_core binds one, `BM_MIDDLEWARE_PORT` 4321, for pub/sub; its UDP list is
+/// unbounded.
+pub const UDP_PORTS: usize = 4;
+
+/// Why [`Node::bind_udp`] refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpBindError {
+    /// The port is already bound.
+    InUse,
+    /// [`UDP_PORTS`] ports are already bound.
+    Full,
+}
 
 /// What a received message, or a request that gave up waiting, tells the
 /// application.
@@ -345,6 +372,20 @@ pub enum Event<'a> {
     /// update this node hosted ended, or — divergence #58 — this node's DFU
     /// entered its error state for any reason since.
     DfuUpdateFinished(DfuFinished),
+    /// A UDP datagram arrived for a port [`Node::bind_udp`] bound — what
+    /// lwIP's `udp_input` hands `bm_lwip.c`'s `udp_recv_cb`.
+    Udp {
+        /// The destination port, which is bound.
+        port: u16,
+        /// The sender's port. bm_core's bound callback is given this and not
+        /// `port`, and `bm_middleware_rx` looks the application up by it
+        /// (divergence #73).
+        src_port: u16,
+        /// Node id in the low half of the source address.
+        source: u64,
+        /// The IPv6 payload after the UDP header.
+        payload: &'a [u8],
+    },
 }
 
 /// A frame the node wants transmitted, and the ports it goes out on.
@@ -766,6 +807,8 @@ pub struct Node<
     /// arrangement bm_core has, where L2 keeps `enabled_ports_mask` up to date
     /// from link-change callbacks and `bm_l2_get_port_state` only reads it.
     link_mask: u16,
+    /// Ports [`Node::bind_udp`] bound, `CTX.udp_list`.
+    udp_ports: [Option<u16>; UDP_PORTS],
     tx: [u8; MTU],
 }
 
@@ -945,6 +988,7 @@ impl<
             dfu,
             port_count,
             link_mask: 0,
+            udp_ports: [None; UDP_PORTS],
             tx: [0u8; MTU],
         }
     }
@@ -1033,8 +1077,8 @@ impl<
         &self.neighbors
     }
 
-    /// This node's link-local address, which is the source of everything it
-    /// sends.
+    /// This node's link-local address, the source of every BCMP frame it
+    /// sends. [`Node::send_udp`] sends from [`udp::source_address`].
     #[must_use]
     pub fn link_local(&self) -> BmIpAddr {
         addr::nodeid_to_ip(LINK_LOCAL_PREFIX, self.identity.node_id())
@@ -1053,20 +1097,22 @@ impl<
     /// 1. [`bm_wire::l2_policy::rx_apply`] stamps the ingress port into the
     ///    frame's source address and decides which ports the frame is relayed
     ///    to, and whether it also goes up the local stack;
-    /// 2. if it does, the frame is validated as BCMP and answered.
+    /// 2. if it does, a UDP datagram to a bound port is reported as
+    ///    [`Event::Udp`], and anything else is validated as BCMP and answered.
     ///
     /// `frame` is mutated in place, as bm_core mutates it. When a relay is owed
     /// the frame comes back as the C's forwarded copy — the whole ports byte
     /// cleared, everything else as it arrived — and [`Owed::relay`] borrows it.
-    /// Anything that does not validate as BCMP is dropped silently, as in
-    /// bm_core; a dropped frame can still be relayed, since the two decisions
-    /// are made by different layers.
+    /// Anything else is dropped silently, as in bm_core; a dropped frame can
+    /// still be relayed, since the two decisions are made by different layers.
     ///
     /// bm_core's L2 also takes a link-local routing callback, consulted for
-    /// link-local multicast that is not `FF02::1`. Nothing in bm_core registers
-    /// one (`bm_l2_register_link_local_routing_callback` has no callers), so
-    /// this passes `None`: such a frame is submitted locally and relayed
-    /// nowhere.
+    /// link-local multicast that is not `FF02::1`. `bm_middleware_init`
+    /// registers `handle_middleware_routing`, which defers to the application
+    /// whose destination address is the frame's. Pub/sub's is `FF03::1`, never
+    /// link-local, so the callback returns true and leaves the egress mask
+    /// zero, which is what no callback does. This passes `None`: such a frame
+    /// is submitted locally and relayed nowhere.
     pub fn on_frame<'f>(
         &mut self,
         now_ms: u32,
@@ -1138,6 +1184,17 @@ impl<
         frame: &mut [u8],
         events: &mut impl FnMut(Event<'_>),
     ) -> (Option<Outbound<'s>>, Option<Reflood>) {
+        if let Ok(datagram) = udp::accept(frame) {
+            if self.udp_bound(datagram.dst_port) {
+                events(Event::Udp {
+                    port: datagram.dst_port,
+                    src_port: datagram.src_port,
+                    source: datagram.source,
+                    payload: datagram.payload,
+                });
+            }
+            return (None, None);
+        }
         let Ok(received) = rx::accept(frame) else {
             return (None, None);
         };
@@ -2249,6 +2306,81 @@ impl<
             &body[..len],
             0,
         )
+    }
+
+    /// Bind `port`, so datagrams to it arrive as [`Event::Udp`] —
+    /// `bm_udp_bind_port`.
+    ///
+    /// The C also takes a multicast group to join, which `bm_linux.c` ignores
+    /// and `bm_lwip.c` passes to MLD; this node filters on no destination
+    /// address, so it takes none.
+    ///
+    /// # Errors
+    ///
+    /// [`UdpBindError::InUse`] for a port already bound. lwIP's `udp_bind`
+    /// refuses the same, and `bm_lwip.c` ignores its return, leaving a pcb
+    /// that receives nothing. [`UdpBindError::Full`] once [`UDP_PORTS`] are
+    /// bound.
+    pub fn bind_udp(&mut self, port: u16) -> Result<(), UdpBindError> {
+        if self.udp_bound(port) {
+            return Err(UdpBindError::InUse);
+        }
+        let slot = self
+            .udp_ports
+            .iter_mut()
+            .find(|slot| slot.is_none())
+            .ok_or(UdpBindError::Full)?;
+        *slot = Some(port);
+        Ok(())
+    }
+
+    /// Unbind `port`, reporting whether it was bound. bm_core has no
+    /// counterpart: its UDP list is never removed from.
+    pub fn unbind_udp(&mut self, port: u16) -> bool {
+        match self.udp_ports.iter_mut().find(|slot| **slot == Some(port)) {
+            Some(slot) => {
+                *slot = None;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether `port` is bound.
+    #[must_use]
+    pub fn udp_bound(&self, port: u16) -> bool {
+        self.udp_ports.contains(&Some(port))
+    }
+
+    /// Build a UDP datagram from `src_port` to `dst` port `dst_port` —
+    /// `bm_udp_tx_perform`, then `bm_l2_link_output`.
+    ///
+    /// The source address is [`udp::source_address`], `fd00::<id>` for
+    /// `FF03::1`, as lwIP chooses it. `src_port` need not be bound: the C sends
+    /// from a pcb, which is always bound, and a caller here names the port
+    /// instead.
+    ///
+    /// The mask is every port, unless byte 13 of `dst` requests one, which
+    /// `bm_l2_link_output` reads and clears after the checksum is computed
+    /// ([`l2::take_requested_egress_port`]). [`transmit`] then sends
+    /// `FF03::1` once to all ports unstamped and link-local multicast once per
+    /// port stamped, and drops anything else, as `bm_l2_process_tx_evt` does.
+    ///
+    /// Returns `None` if the frame would exceed [`MTU`]. lwIP would fragment
+    /// it instead; `bm_middleware_net_tx` refuses a payload over
+    /// `max_payload_len_udp` before it gets that far.
+    pub fn send_udp(
+        &mut self,
+        src_port: u16,
+        dst: &BmIpAddr,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Option<Outbound<'_>> {
+        let src = udp::source_address(self.identity.node_id(), dst);
+        let end = udp::build(&mut self.tx, &src, dst, src_port, dst_port, payload).ok()?;
+        let frame = &mut self.tx[..end];
+        let mask = l2::take_requested_egress_port(frame, self.port_count).ok()?;
+        Some(Outbound { frame, mask })
     }
 
     /// Advertise a resource — `bcmp_resource_discovery_add_resource`.

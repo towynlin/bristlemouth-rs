@@ -49,7 +49,7 @@ pub use app::App;
 #[cfg(feature = "channel")]
 pub use channel::{ChannelApp, Channels, Command, NodeHandle, Notification};
 pub use config::{Config, Configuration, NoConfig};
-pub use node::{Event, MTU, Node, Outbound, Owed, Reflood, deliver, transmit};
+pub use node::{Event, MTU, Node, Outbound, Owed, Reflood, UdpBindError, deliver, transmit};
 pub use port::{
     BootRequests, ConfigStorage, DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy,
     RamConfigStorage, RamDfuSlot, Rtc, RtcTimeAndDate, SoftRtc,

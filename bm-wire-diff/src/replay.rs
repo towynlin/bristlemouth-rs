@@ -117,6 +117,9 @@ pub fn replay_target(target: &str) -> usize {
                 crate::time::check(i);
             }),
             "udp" => replay_one::<crate::udp::UdpInput, _>(&bytes, crate::udp::check),
+            "node_udp" => {
+                replay_one::<crate::node_udp::NodeUdpInput, _>(&bytes, crate::node_udp::check)
+            }
             "config" => replay_one::<crate::config::ConfigInput, _>(&bytes, |i| {
                 crate::config::check(i);
             }),
@@ -179,6 +182,7 @@ pub const STACK_TARGETS: &[&str] = &[
     "l2_egress",
     "neighbor",
     "neighbor_table",
+    "node_udp",
     "ping",
     "registry",
     "resource",

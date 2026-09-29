@@ -20,8 +20,8 @@
 //! | 71 | UDP checksum byte order, and a checksum computing to 0 | asserted: the Rust frame is given the checksum `bm_linux.c` writes, byte-swapped or 0, before L2, and must then match |
 //! | 72 | UDP length field on receive | asserted: the C's payload is the first `length - 8` bytes of the Rust one, and the C refuses exactly where that length is under 8 or past the IPv6 payload |
 //!
-//! Receiving never goes through L2: relaying and the ingress nibble are
-//! card U2's.
+//! Receiving never goes through L2: `crate::node_udp` covers relaying and the
+//! ingress nibble, through `bm_stack::Node`.
 
 use std::sync::Mutex;
 
@@ -86,7 +86,9 @@ pub enum Dst {
 }
 
 impl Dst {
-    fn addr(self) -> BmIpAddr {
+    /// The address.
+    #[must_use]
+    pub fn addr(self) -> BmIpAddr {
         match self {
             Self::Global => BmIpAddr::GLOBAL_MULTICAST,
             Self::LinkLocal => BmIpAddr::LINK_LOCAL_MULTICAST,
@@ -150,7 +152,9 @@ pub struct UdpInput {
 pub fn check(input: &UdpInput) {
     for step in &input.steps {
         match step {
-            Step::Send(send) => check_send(send),
+            Step::Send(send) => {
+                check_send(send);
+            }
             Step::Receive(receive) => check_receive(receive),
         }
     }
@@ -158,7 +162,7 @@ pub fn check(input: &UdpInput) {
 
 /// What reached a port the oracle bound: `(index into BOUND_PORTS, source
 /// port, source node id, payload)`.
-type Delivery = (usize, u16, u64, Vec<u8>);
+pub type Delivery = (usize, u16, u64, Vec<u8>);
 
 static DELIVERED: Mutex<Vec<Delivery>> = Mutex::new(Vec::new());
 
@@ -219,18 +223,53 @@ fn pcb(_oracle: &std::sync::MutexGuard<'static, ()>, index: usize) -> *mut core:
     pcbs.0[index] as *mut core::ffi::c_void
 }
 
+/// Bind [`BOUND_PORTS`] in the oracle if they are not bound yet. Takes the
+/// oracle lock's guard as proof it is held.
+pub fn bind(oracle: &std::sync::MutexGuard<'static, ()>) {
+    let _ = pcb(oracle, 0);
+}
+
+/// Everything the oracle delivered to [`BOUND_PORTS`] since the last call, in
+/// order. [`MIDDLEWARE_PORT`] never appears: `bm_middleware_rx` is bound to it
+/// first, and `bm_linux.c` delivers to the first binding.
+pub fn take_delivered() -> Vec<Delivery> {
+    std::mem::take(&mut *DELIVERED.lock().unwrap_or_else(|p| p.into_inner()))
+}
+
+impl Send {
+    /// The port sent from, out of [`BOUND_PORTS`].
+    #[must_use]
+    pub fn src_port(&self) -> u16 {
+        BOUND_PORTS[usize::from(self.src_port) % BOUND_PORTS.len()]
+    }
+
+    /// The destination address.
+    #[must_use]
+    pub fn dst_addr(&self) -> BmIpAddr {
+        self.dst.addr()
+    }
+
+    /// The payload, cut to [`MAX_PAYLOAD`].
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload[..self.payload.len().min(MAX_PAYLOAD)]
+    }
+}
+
 /// Assert a datagram sent by `bm_udp_tx_perform` and by [`udp::build`] leaves
 /// on the same ports as the same bytes, modulo divergences #70 and #71 as the
 /// module docs say.
 ///
+/// Returns what the oracle transmitted, as [`crate::stack::drain`] returns it.
+///
 /// # Panics
 ///
 /// If the C refuses the send, or the frames differ.
-pub fn check_send(send: &Send) {
+pub fn check_send(send: &Send) -> Vec<(u8, Vec<u8>)> {
     let index = usize::from(send.src_port) % BOUND_PORTS.len();
-    let src_port = BOUND_PORTS[index];
-    let dst = send.dst.addr();
-    let payload = &send.payload[..send.payload.len().min(MAX_PAYLOAD)];
+    let src_port = send.src_port();
+    let dst = send.dst_addr();
+    let payload = send.payload();
 
     let guard = oracle();
     let c = unsafe {
@@ -282,6 +321,7 @@ pub fn check_send(send: &Send) {
             "frame to port {port} differs ({send:?})\n  C:    {c_frame:02x?}\n  Rust: {rs_frame:02x?}"
         );
     }
+    c
 }
 
 /// Rewrite the checksum [`udp::build`] wrote as `bm_udp_tx_perform` writes
@@ -374,7 +414,7 @@ pub fn check_receive(receive: &Receive) {
         }
         err
     };
-    let delivered = std::mem::take(&mut *DELIVERED.lock().unwrap_or_else(|p| p.into_inner()));
+    let delivered = take_delivered();
     drop(guard);
 
     let rs = udp::accept(&frame);

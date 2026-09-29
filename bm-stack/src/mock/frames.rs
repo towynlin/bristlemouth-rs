@@ -1,7 +1,8 @@
-//! BCMP frames as a peer would put them on the wire, for scripting a
+//! BCMP and UDP frames as a peer would put them on the wire, for scripting a
 //! [`MockPhy`](super::MockPhy).
 //!
-//! Every frame is [`bm_wire::bcmp::tx::build`]'s, as the node's own are.
+//! Every frame is [`bm_wire::bcmp::tx::build`]'s or [`bm_wire::udp::build`]'s,
+//! as the node's own are.
 
 extern crate alloc;
 
@@ -13,6 +14,7 @@ use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, Heartbeat, MessageType, tx};
 use bm_wire::frame::MIN_FRAME_WITH_ADDRESSES;
 use bm_wire::neighbor::HEARTBEAT_PERIOD_S;
+use bm_wire::udp;
 use bm_wire::util::BmIpAddr;
 
 /// A BCMP message from node `src` (at its `fe80::` address) to `dst`.
@@ -104,4 +106,25 @@ pub fn device_info_reply(src: u64, reply: &DeviceInfoReply<'_>) -> Vec<u8> {
         0,
         &body,
     )
+}
+
+/// A UDP datagram from node `src` to `dst`, from the address a deployed node
+/// sends it from, [`udp::source_address`].
+///
+/// # Panics
+///
+/// If `payload` is longer than [`udp::MAX_PAYLOAD_LEN`].
+#[must_use]
+pub fn udp(src: u64, dst: BmIpAddr, src_port: u16, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+    let mut frame = vec![0u8; udp::PAYLOAD_OFFSET + payload.len()];
+    udp::build(
+        &mut frame,
+        &udp::source_address(src, &dst),
+        &dst,
+        src_port,
+        dst_port,
+        payload,
+    )
+    .expect("payload fits");
+    frame
 }
