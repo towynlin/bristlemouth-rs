@@ -95,7 +95,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 | `bm_middleware_rx` | Dispatches on the **source** port lwIP/`bm_linux.c` reports, not the bound destination port. Harmless while pub/sub sends from and to 4321. | U2 |
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, E0) left for the rest
+## What the landed cards (A1, E0, F1) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -117,60 +117,27 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 - **The mock clock is process-global.** A test or example driving
   `Node::run*` on `MockPhy` holds `tests/node.rs`'s `CLOCK` lock or runs in a
   process of its own.
-- **Scripted peer frames come from `bm_stack::mock::frames`.** U2, P2 and S1
-  add their UDP, publication and `spotter_log` builders there rather than in
-  a test file.
+- **One header writer.** `bm_wire::frame::write_headers(buf, src, dst,
+  next_header, hop_limit, payload_len)` writes Ethernet and IPv6;
+  `bm_wire::bcmp::tx::build` wraps it for BCMP from a node's `fe80::`
+  address with `HOP_LIMIT`. Source address and hop limit are parameters of
+  `write_headers` so U1 can set them from H0 rather than from `bm_linux.c`.
+  The destination MAC rule (multicast MAC, else broadcast) is fixed inside it;
+  if H0 shows lwIP's differs for UDP, that is a parameter to add, not a
+  second writer. `LINK_LOCAL_PREFIX` is in `bm_wire::addr`, `HOP_LIMIT` in
+  `bm_wire::frame`; `bm_stack::node` re-exports both.
+- **Scripted peer frames come from `bm_stack::mock::frames`, comparator
+  inputs from `bm_wire_diff::frames`.** Both wrap `tx::build` in a `Vec`.
+  U2, P2 and S1 add their UDP, publication and `spotter_log` builders there
+  rather than in a test file. A comparator needing non-standard header bytes
+  calls `write_headers` and mutates the result, as `bm-wire-diff/src/forward.rs`
+  does.
 - **`bm-stack/examples/hello_node.rs` is the host twin of E1.** P2 and S1 can
   extend it with a publish, a subscription the scripted neighbour publishes
   to, and a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
   `cargo test` only builds examples.
 
 ---
-
-## Card F1 — Frame builder in `bm-wire`
-
-**Blocks:** U1 (reuses the header writer). **Blocked by:** nothing.
-
-The Ethernet and IPv6 headers of a BCMP frame are written in 15 places:
-
-| Where | What |
-|---|---|
-| `bm-stack/src/node.rs`: `write_frame_headers`, `build_frame` (private) | The node's transmit path. Full headers: MACs, version, hop limit. |
-| `bm-stack/src/mock/frames.rs`: `bcmp` | Scripted peer frames. EtherType, payload length, next header, addresses only. |
-| `bm-wire-diff/src/`: `info.rs`, `ping.rs`, `neighbor.rs`, `neighbor_table.rs`, `resource.rs`, `bcmp.rs`, `bcmp_messages.rs`, `registry.rs`, `config.rs`, `time.rs`, `forward.rs`, `l2_egress.rs`; `tests/l2_egress.rs` | Comparator inputs, each a local copy of the `mock::frames` shape. |
-
-Rust: move the node's builder into `bm-wire`, `no_std` and alloc-free:
-
-- `bm_wire::frame::write_headers(buf, src: &BmIpAddr, dst: &BmIpAddr, next_header, hop_limit, payload_len)` —
-  Ethernet (source MAC from `src`, destination MAC per `node.rs`'s current
-  rule: `multicast_mac_from_ipv6`, else broadcast) and IPv6. Source address
-  and hop limit are parameters because U1 needs them open until H0 fixes them.
-- `bm_wire::bcmp::tx::build(buf, node_id, dst, message_type, seq_num, body)`,
-  where `body: FnOnce(&mut [u8]) -> Result<usize, BmWireError>` writes the
-  payload in place, as `node.rs`'s `build_frame` does now. Returns the frame
-  length.
-- `LINK_LOCAL_PREFIX` and `HOP_LIMIT` move from `bm_stack::node` to
-  `bm-wire`; `bm_stack::node` re-exports them.
-
-Then replace the copies: `node.rs` calls `build`; `mock::frames::bcmp` wraps it
-in a `Vec`; each `bm-wire-diff` copy that builds a well-formed frame calls it.
-A copy that writes specific header bytes on purpose (`forward.rs` and
-`l2_egress.rs` set port nibbles and legacy bytes) keeps them, as a mutation
-after `build`, with a comment saying which bytes and why.
-
-Mock and comparator frames gain MACs, version and hop limit they did not have.
-Neither `rx::accept` nor the C's receive path reads them today; if a test or
-seed changes result, that is a finding, not something to paper over.
-
-Comparator: none new. `bm-wire-diff/tests/node_frames.rs` already compares the
-node's whole frames with bm_core's, so it passing unchanged proves the move is
-byte-identical. bm_core has no whole-frame gold vectors (`bm_linux_test.cpp`'s
-are address, payload and checksum), so step 4 is unavailable; say so in the
-commit.
-
-Done: one header writer in the tree; `cargo test` (all seeds replayed),
-`node_frames.rs` untouched and passing, `cargo tree -p bm-wire` unchanged,
-both bare-metal `bm-wire` builds.
 
 ## Card H0 — Reference captures from a C dev kit
 
@@ -191,13 +158,13 @@ oracle is not the deployed stack for UDP" filled in with observed values.
 
 ## Card U1 — UDP over IPv6 in `bm-wire`
 
-**Blocks:** U2, P1. **Blocked by:** F1; H0 for gold vectors only, and the
-codec can start before H0.
+**Blocks:** U2, P1. **Blocked by:** nothing; H0 for gold vectors only, and
+the codec can start before H0.
 
 C: `bm_udp_tx_perform` and the UDP branch of `bm_ip_rx` in
 `network/bm_linux.c`; lwIP's `udp_sendto_if` for what deployed nodes do.
 
-Rust: `bm-wire/src/udp.rs` — build a frame (Ethernet and IPv6 via F1's
+Rust: `bm-wire/src/udp.rs` — build a frame (Ethernet and IPv6 via
 `frame::write_headers`, then UDP and payload) into a caller buffer from source address, destination, ports and payload; accept a
 received frame and return ports, source node id and payload. Checksum via
 `checksum::ipv6_pseudo_checksum`. Source address and hop limit are parameters
@@ -336,15 +303,14 @@ reported individually.
 ## Order
 
 ```
-F1 ─┐
-H0 ─┴► U1 ─► U2 ─► P1 ─► P2 ─► S1 ─► E1
-B1 ───────────────────────────────────┘
+H0 ─► U1 ─► U2 ─► P1 ─► P2 ─► S1 ─► E1
+B1 ──────────────────────────────────┘
 ```
 
 (P1's `wildcard_match` half does not need U2 and can start after U1.)
 
-F1, H0 and B1 have no prerequisites and can run in parallel. H0 needs a
-person with hardware; U1 can start without it and add gold vectors later.
+U1 and B1 can start now and run in parallel. H0 needs a person with
+hardware; U1 does not wait for it and adds gold vectors later.
 
 # Explicitly out of scope
 

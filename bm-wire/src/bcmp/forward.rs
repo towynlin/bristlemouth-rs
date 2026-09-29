@@ -193,10 +193,7 @@ mod tests {
     use super::*;
     use crate::bcmp::header::MessageType;
     use crate::bcmp::{rx, tx};
-    use crate::frame::{
-        ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IPV6_INGRESS_EGRESS_PORTS_OFFSET,
-        IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET,
-    };
+    use crate::frame::IPV6_INGRESS_EGRESS_PORTS_OFFSET;
     use crate::l2::REQUESTED_EGRESS_PORT_OFFSET;
 
     const FORWARDER: u64 = 0xC0FF_EE00_1234_5678;
@@ -205,15 +202,15 @@ mod tests {
     /// A frame carrying `bcmp` from `src`, with the headers a forwarder writes.
     fn frame_for(src: u64, bcmp_len: usize) -> [u8; 256] {
         let mut frame = [0u8; 256];
-        frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-            .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-        frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(bcmp_len as u16).to_be_bytes());
-        frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-        frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&addr::nodeid_to_ip(0xFE80_0000, src).0);
-        frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&BmIpAddr::LINK_LOCAL_MULTICAST.0);
+        crate::frame::write_headers(
+            &mut frame,
+            &addr::nodeid_to_ip(addr::LINK_LOCAL_PREFIX, src),
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            IP_PROTO_BCMP,
+            crate::frame::HOP_LIMIT,
+            bcmp_len,
+        )
+        .unwrap();
         frame
     }
 

@@ -28,9 +28,7 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 
 use bm_wire::bcmp::{BCMP_HEADER_LEN, MessageType, tx};
 use bm_wire::frame::{
-    ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IP_PROTO_UDP,
-    IPV6_DESTINATION_ADDRESS_OFFSET, IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET,
-    IPV6_SOURCE_ADDRESS_OFFSET, MIN_FRAME_WITH_ADDRESSES, UDP_CHECKSUM_OFFSET, UDP_HEADER_LEN,
+    IP_PROTO_BCMP, IP_PROTO_UDP, MIN_FRAME_WITH_ADDRESSES, UDP_CHECKSUM_OFFSET, UDP_HEADER_LEN,
     UDP_LENGTH_OFFSET,
 };
 use bm_wire::l2::{self, REQUESTED_EGRESS_PORT_OFFSET, TxKind};
@@ -157,25 +155,29 @@ impl L2EgressInput {
     fn build(&self) -> Vec<u8> {
         let payload_len = self.payload_len();
         let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
-        frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-            .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-        frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(payload_len as u16).to_be_bytes());
-
-        let src = bm_wire::addr::nodeid_to_ip(0xFE80_0000, self.source_node_id);
+        let src =
+            bm_wire::addr::nodeid_to_ip(bm_wire::addr::LINK_LOCAL_PREFIX, self.source_node_id);
         let dst = self.destination.addr();
-        frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16].copy_from_slice(&src.0);
-        frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&dst.0);
+        let next_header = match self.upper {
+            Upper::Bcmp => IP_PROTO_BCMP,
+            Upper::Udp => IP_PROTO_UDP,
+        };
+        bm_wire::frame::write_headers(
+            &mut frame,
+            &src,
+            &dst,
+            next_header,
+            bm_wire::frame::HOP_LIMIT,
+            payload_len,
+        )
+        .expect("frame is sized for the headers");
 
         match self.upper {
             Upper::Bcmp => {
-                frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
                 tx::serialize(&mut frame, MessageType::HEARTBEAT, 0, &self.body)
                     .expect("frame is sized for the body");
             }
             Upper::Udp => {
-                frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_UDP;
                 let udp = MIN_FRAME_WITH_ADDRESSES;
                 frame[udp..udp + 2].copy_from_slice(&self.udp_ports.0.to_be_bytes());
                 frame[udp + 2..udp + 4].copy_from_slice(&self.udp_ports.1.to_be_bytes());

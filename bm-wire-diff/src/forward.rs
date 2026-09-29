@@ -54,11 +54,7 @@
 use arbitrary::{Arbitrary, Result, Unstructured};
 
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, MessageType, forward, tx};
-use bm_wire::frame::{
-    ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET,
-    IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
-    MIN_FRAME_WITH_ADDRESSES,
-};
+use bm_wire::frame::{IP_PROTO_BCMP, MIN_FRAME_WITH_ADDRESSES};
 use bm_wire::util::BmIpAddr;
 
 use crate::Domain;
@@ -292,19 +288,23 @@ impl ForwardInput {
     fn build(&self) -> Vec<u8> {
         let payload_len = BCMP_HEADER_LEN + self.body.len();
         let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
-        frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-            .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-        frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(payload_len as u16).to_be_bytes());
-        frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
 
-        let mut src = bm_wire::addr::nodeid_to_ip(0xFE80_0000, PEER_NODE_ID);
+        // The sender's egress nibble (byte 2) and the legacy port bytes (4 and
+        // 5) as a previous hop may leave them in the source address. Set before
+        // the checksum, which covers the address as it stands.
+        let mut src = bm_wire::addr::nodeid_to_ip(bm_wire::addr::LINK_LOCAL_PREFIX, PEER_NODE_ID);
         src.0[2] = self.sender_egress_nibble;
         src.0[4] = self.legacy_ports[0];
         src.0[5] = self.legacy_ports[1];
-        frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16].copy_from_slice(&src.0);
-        frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&self.destination.addr().0);
+        bm_wire::frame::write_headers(
+            &mut frame,
+            &src,
+            &self.destination.addr(),
+            IP_PROTO_BCMP,
+            bm_wire::frame::HOP_LIMIT,
+            payload_len,
+        )
+        .expect("frame is sized for the headers");
 
         // The checksum the previous hop's L2 put on the wire, over the address
         // as it stands -- egress nibble, legacy bytes and all.

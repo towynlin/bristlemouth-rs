@@ -105,6 +105,7 @@
 //! make the port retry and give up on requests at different moments from a C
 //! node.
 
+use bm_wire::BmWireError;
 use bm_wire::addr;
 use bm_wire::bcmp::config::{
     ConfigClearRequest, ConfigClearResponse, ConfigCommit, ConfigDeleteRequest,
@@ -134,17 +135,13 @@ use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeRespons
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, Heartbeat, MessageType, forward, rx, tx};
 use bm_wire::configuration::{Key, Partition};
 use bm_wire::frame::{
-    ETHERNET_DESTINATION_OFFSET, ETHERNET_SRC_OFFSET, ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET,
-    IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET, IPV6_HOP_LIMIT_OFFSET,
-    IPV6_INGRESS_EGRESS_PORTS_OFFSET, IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET,
-    IPV6_SOURCE_ADDRESS_OFFSET, IPV6_VERSION_TRAFFIC_CLASS_FLOW_LABEL_OFFSET,
+    self, IP_PROTO_BCMP, IPV6_INGRESS_EGRESS_PORTS_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
     MIN_FRAME_WITH_ADDRESSES,
 };
 use bm_wire::l2::{self, TxKind};
 use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::util::BmIpAddr;
-use bm_wire::{BmWireError, addr::MAC_LEN};
 
 use crate::app::{App, Observer};
 use crate::config::{Configuration, NoConfig};
@@ -157,11 +154,8 @@ use crate::port::{DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy, Rtc, 
 /// `bcmp_max_payload_size_bytes` in `bcmp/bcmp.h` works out to.
 pub const MTU: usize = 1514;
 
-/// The IPv6 prefix bm_core builds a node's link-local address from.
-pub const LINK_LOCAL_PREFIX: u32 = 0xFE80_0000;
-
-/// The hop limit bm_core sets on everything it transmits.
-pub const HOP_LIMIT: u8 = 64;
+pub use bm_wire::addr::LINK_LOCAL_PREFIX;
+pub use bm_wire::frame::HOP_LIMIT;
 
 /// How many message types a node's registry holds.
 ///
@@ -1708,12 +1702,15 @@ impl<
         // bm_ip_tx_new: our own link-local address as the source, the plain
         // FF02::1 as the destination, then the header and body copied in and
         // checksummed against that destination.
-        write_frame_headers(
+        frame::write_headers(
             frame,
-            identity.node_id(),
+            &addr::nodeid_to_ip(LINK_LOCAL_PREFIX, identity.node_id()),
             &BmIpAddr::LINK_LOCAL_MULTICAST,
+            IP_PROTO_BCMP,
+            HOP_LIMIT,
             bcmp.len(),
-        )?;
+        )
+        .ok()?;
         forward::serialize_forwarded(frame, bcmp).ok()?;
 
         // bm_ip_tx_perform, then bm_l2_link_output: the egress port goes into
@@ -2783,81 +2780,7 @@ fn port_mask(port: u8) -> u16 {
         .map_or(0, |bit| 1u16 << bit)
 }
 
-/// Write the Ethernet and IPv6 headers into `tx` for a `payload_len`-byte BCMP
-/// payload.
-///
-/// Byte for byte what `bm_ip_tx_new` and `bm_ip_tx_perform` in
-/// `network/bm_linux.c` produce, including the payload-length field — so a
-/// caller that fills the payload afterwards has to know its length up front,
-/// which every caller here does.
-fn write_frame_headers(
-    tx: &mut [u8],
-    node_id: u64,
-    dst: &BmIpAddr,
-    payload_len: usize,
-) -> Option<()> {
-    if tx.len() < MIN_FRAME_WITH_ADDRESSES {
-        return None;
-    }
-    let src = addr::nodeid_to_ip(LINK_LOCAL_PREFIX, node_id);
-
-    // Ethernet. bm_core broadcasts anything not multicast, having no neighbour
-    // discovery to resolve a unicast address with.
-    let dst_mac = if addr::is_multicast(dst) {
-        addr::multicast_mac_from_ipv6(dst)
-    } else {
-        [0xFF; MAC_LEN]
-    };
-    tx[ETHERNET_DESTINATION_OFFSET..ETHERNET_DESTINATION_OFFSET + MAC_LEN]
-        .copy_from_slice(&dst_mac);
-    tx[ETHERNET_SRC_OFFSET..ETHERNET_SRC_OFFSET + MAC_LEN]
-        .copy_from_slice(&addr::mac_from_nodeid(node_id));
-    tx[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-        .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-
-    // IPv6: version 6, no traffic class, no flow label.
-    tx[IPV6_VERSION_TRAFFIC_CLASS_FLOW_LABEL_OFFSET] = 0x60;
-    tx[IPV6_VERSION_TRAFFIC_CLASS_FLOW_LABEL_OFFSET + 1] = 0x00;
-    tx[IPV6_VERSION_TRAFFIC_CLASS_FLOW_LABEL_OFFSET + 2] = 0x00;
-    tx[IPV6_VERSION_TRAFFIC_CLASS_FLOW_LABEL_OFFSET + 3] = 0x00;
-    tx[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-    tx[IPV6_HOP_LIMIT_OFFSET] = HOP_LIMIT;
-    tx[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16].copy_from_slice(&src.0);
-    tx[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&dst.0);
-    tx[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-        .copy_from_slice(&u16::try_from(payload_len).ok()?.to_be_bytes());
-    Some(())
-}
-
-/// Write the frame headers into `tx`, let `body` fill the BCMP payload, then
-/// put the BCMP header and checksum around it.
-///
-/// Returns the total frame length. The body is written straight into the
-/// transmit buffer rather than into a second one, which is what
-/// `bm_wire::bcmp::tx::serialize_in_place` is for.
-fn build_frame<F>(
-    tx: &mut [u8],
-    node_id: u64,
-    dst: &BmIpAddr,
-    message_type: MessageType,
-    seq_num: u32,
-    body: F,
-) -> Option<usize>
-where
-    F: FnOnce(&mut [u8]) -> Result<usize, BmWireError>,
-{
-    let body_at = BCMP_HEADER_OFFSET + BCMP_HEADER_LEN;
-    let body_len = body(tx.get_mut(body_at..)?).ok()?;
-    let payload_len = BCMP_HEADER_LEN + body_len;
-    write_frame_headers(tx, node_id, dst, payload_len)?;
-
-    let end = MIN_FRAME_WITH_ADDRESSES + payload_len;
-    tx::serialize_in_place(tx.get_mut(..end)?, message_type, seq_num, body_len).ok()?;
-    Some(end)
-}
-
-/// [`build_frame`], handed back as the [`Outbound`] every `build_*` returns.
+/// [`tx::build`], handed back as the [`Outbound`] every `build_*` returns.
 ///
 /// A tracked request's frame is also kept in `held`, for re-sending.
 fn build_outbound<'a, F, const PENDING: usize>(
@@ -2872,7 +2795,7 @@ fn build_outbound<'a, F, const PENDING: usize>(
 where
     F: FnOnce(&mut [u8]) -> Result<usize, BmWireError>,
 {
-    let end = build_frame(tx, node_id, dst, message_type, stamp.seq_num, body)?;
+    let end = tx::build(tx, node_id, dst, message_type, stamp.seq_num, body).ok()?;
     let frame = tx.get_mut(..end)?;
     if stamp.tracked {
         held.hold(stamp.seq_num, frame);

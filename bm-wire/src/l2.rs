@@ -308,22 +308,20 @@ fn patch(frame: &mut [u8], port: u8, op: Patch) -> Result<(), BmWireError> {
 mod tests {
     use super::*;
     use crate::bcmp::{MessageType, tx};
-    use crate::frame::{
-        ETHERNET_TYPE_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
-    };
+    use crate::frame::ETHERNET_TYPE_OFFSET;
 
     fn bcmp_frame(body_len: usize) -> [u8; 128] {
         let mut frame = [0u8; 128];
-        frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-            .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-        frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
         let payload_len = crate::bcmp::BCMP_HEADER_LEN + body_len;
-        frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(payload_len as u16).to_be_bytes());
-        frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&crate::addr::nodeid_to_ip(0xFE80_0000, 0x55AA_0011).0);
-        frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&BmIpAddr::LINK_LOCAL_MULTICAST.0);
+        crate::frame::write_headers(
+            &mut frame,
+            &crate::addr::nodeid_to_ip(crate::addr::LINK_LOCAL_PREFIX, 0x55AA_0011),
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            IP_PROTO_BCMP,
+            crate::frame::HOP_LIMIT,
+            payload_len,
+        )
+        .unwrap();
         let end = MIN_FRAME_WITH_ADDRESSES + payload_len;
         tx::serialize(
             &mut frame[..end],

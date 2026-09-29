@@ -29,6 +29,7 @@ pub mod crc;
 pub mod dfu_codec;
 pub mod dfu_core;
 pub mod forward;
+pub mod frames;
 pub mod info;
 pub mod l2_egress;
 pub mod l2_policy;

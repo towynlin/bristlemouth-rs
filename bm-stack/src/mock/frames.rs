@@ -1,28 +1,19 @@
 //! BCMP frames as a peer would put them on the wire, for scripting a
 //! [`MockPhy`](super::MockPhy).
 //!
-//! Only what a receiving node reads is filled in: EtherType, IPv6 payload
-//! length, next header, source and destination address, and the BCMP header
-//! with its checksum. MAC addresses and the hop limit are zero.
+//! Every frame is [`bm_wire::bcmp::tx::build`]'s, as the node's own are.
 
 extern crate alloc;
 
 use alloc::vec;
 use alloc::vec::Vec;
 
-use bm_wire::addr;
 use bm_wire::bcmp::info::DeviceInfoReply;
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, Heartbeat, MessageType, tx};
-use bm_wire::frame::{
-    ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET,
-    IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
-    MIN_FRAME_WITH_ADDRESSES,
-};
+use bm_wire::frame::MIN_FRAME_WITH_ADDRESSES;
 use bm_wire::neighbor::HEARTBEAT_PERIOD_S;
 use bm_wire::util::BmIpAddr;
-
-use crate::node::LINK_LOCAL_PREFIX;
 
 /// A BCMP message from node `src` (at its `fe80::` address) to `dst`.
 ///
@@ -37,21 +28,13 @@ pub fn bcmp(
     seq_num: u32,
     body: &[u8],
 ) -> Vec<u8> {
-    let payload_len = BCMP_HEADER_LEN + body.len();
-    let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
-    frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-        .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-    frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2].copy_from_slice(
-        &u16::try_from(payload_len)
-            .expect("body fits an IPv6 payload")
-            .to_be_bytes(),
-    );
-    frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-    frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&addr::nodeid_to_ip(LINK_LOCAL_PREFIX, src).0);
-    frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&dst.0);
-    tx::serialize(&mut frame, message_type, seq_num, body).expect("frame is sized for the body");
+    let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + BCMP_HEADER_LEN + body.len()];
+    let len = tx::build(&mut frame, src, &dst, message_type, seq_num, |at| {
+        at[..body.len()].copy_from_slice(body);
+        Ok(body.len())
+    })
+    .expect("body fits an IPv6 payload");
+    debug_assert_eq!(len, frame.len());
     frame
 }
 

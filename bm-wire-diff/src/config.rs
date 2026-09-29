@@ -57,13 +57,9 @@ use bm_stack::config::{Config, config_init, save_config};
 use bm_wire::bcmp::config::{
     ConfigClearResponse, ConfigDeleteResponse, ConfigHeader, ConfigStatusResponse, ConfigValue,
 };
-use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, BcmpHeader, MessageType, rx, tx};
+use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, BcmpHeader, MessageType, rx};
 use bm_wire::configuration::{ConfigStore, Key, Partition};
-use bm_wire::frame::{
-    ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET,
-    IPV6_INGRESS_EGRESS_PORTS_OFFSET, IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET,
-    IPV6_SOURCE_ADDRESS_OFFSET, MIN_FRAME_WITH_ADDRESSES,
-};
+use bm_wire::frame::{IPV6_INGRESS_EGRESS_PORTS_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET};
 use bm_wire::util::BmIpAddr;
 
 use crate::Domain;
@@ -459,21 +455,13 @@ impl ConfigInput {
 
     /// The frame both stacks are given, checksummed and ready to inject.
     fn build(&self) -> Vec<u8> {
-        let body = self.body();
-        let payload_len = BCMP_HEADER_LEN + body.len();
-        let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
-        frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-            .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-        frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(payload_len as u16).to_be_bytes());
-        frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-        frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&bm_wire::addr::nodeid_to_ip(0xFE80_0000, PEER_NODE_ID).0);
-        frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&self.destination().0);
-        tx::serialize(&mut frame, self.message.message_type(), self.seq_num, &body)
-            .expect("frame is sized for the body");
-        frame
+        crate::frames::bcmp(
+            PEER_NODE_ID,
+            &self.destination(),
+            self.message.message_type(),
+            self.seq_num,
+            &self.body(),
+        )
     }
 }
 

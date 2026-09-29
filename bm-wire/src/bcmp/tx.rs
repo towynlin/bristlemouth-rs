@@ -1,15 +1,62 @@
 //! Serializing a BCMP message into a frame, ported from `serialize` in
-//! `bcmp/packet.c`.
+//! `bcmp/packet.c`, and building a whole frame around one.
 
 use crate::BmWireError;
+use crate::addr::{self, LINK_LOCAL_PREFIX};
 use crate::bcmp::header::{
     BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, BcmpHeader, CHECKSUM_FIELD_OFFSET, MessageType,
 };
 use crate::checksum::ipv6_pseudo_checksum;
 use crate::frame::{
-    IP_PROTO_BCMP, IPV6_ADDRESS_SIZE, IPV6_DESTINATION_ADDRESS_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
+    self, HOP_LIMIT, IP_PROTO_BCMP, IPV6_ADDRESS_SIZE, IPV6_DESTINATION_ADDRESS_OFFSET,
+    IPV6_SOURCE_ADDRESS_OFFSET, MIN_FRAME_WITH_ADDRESSES,
 };
 use crate::util::BmIpAddr;
+
+/// Build a whole BCMP frame from `node_id` to `dst` into `buf`: Ethernet and
+/// IPv6 headers, BCMP header, body, checksum.
+///
+/// `body` writes the message body into the slice it is given, which starts at
+/// [`BCMP_HEADER_OFFSET`] + [`BCMP_HEADER_LEN`] and runs to the end of `buf`,
+/// and returns how many bytes it wrote. The source address is `node_id`'s
+/// link-local address and the hop limit [`HOP_LIMIT`], as `bm_ip_tx_new` in
+/// `network/bm_linux.c` sets them; the headers are [`frame::write_headers`]'s.
+///
+/// Returns the frame length.
+///
+/// # Errors
+///
+/// Whatever `body` returns; [`BmWireError::Truncated`] if `buf` cannot hold
+/// the headers; [`BmWireError::Invalid`] if the payload does not fit the IPv6
+/// payload length.
+pub fn build<F>(
+    buf: &mut [u8],
+    node_id: u64,
+    dst: &BmIpAddr,
+    message_type: MessageType,
+    seq_num: u32,
+    body: F,
+) -> Result<usize, BmWireError>
+where
+    F: FnOnce(&mut [u8]) -> Result<usize, BmWireError>,
+{
+    let body_at = BCMP_HEADER_OFFSET + BCMP_HEADER_LEN;
+    let body_len = body(buf.get_mut(body_at..).ok_or(BmWireError::Truncated)?)?;
+    let payload_len = BCMP_HEADER_LEN
+        .checked_add(body_len)
+        .ok_or(BmWireError::Invalid)?;
+    let src = addr::nodeid_to_ip(LINK_LOCAL_PREFIX, node_id);
+    frame::write_headers(buf, &src, dst, IP_PROTO_BCMP, HOP_LIMIT, payload_len)?;
+
+    let end = MIN_FRAME_WITH_ADDRESSES + payload_len;
+    serialize_in_place(
+        buf.get_mut(..end).ok_or(BmWireError::Truncated)?,
+        message_type,
+        seq_num,
+        body_len,
+    )?;
+    Ok(end)
+}
 
 /// Write a BCMP header and body into `frame`, then checksum them.
 ///
@@ -97,7 +144,8 @@ fn read_addr(frame: &[u8], offset: usize) -> BmIpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::MIN_FRAME_WITH_ADDRESSES;
+    use crate::bcmp::rx;
+    use crate::frame::{IPV6_HOP_LIMIT_OFFSET, IPV6_NEXT_HEADER_OFFSET};
 
     #[test]
     fn serialize_reproduces_a_captured_heartbeat() {
@@ -168,6 +216,72 @@ mod tests {
         assert_eq!(
             serialize(&mut frame, MessageType::HEARTBEAT, 0, &[]),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn build_writes_a_frame_the_receive_path_accepts() {
+        let mut buf = [0u8; 128];
+        let len = build(
+            &mut buf,
+            0x55AA_0011,
+            &BmIpAddr::LINK_LOCAL_MULTICAST,
+            MessageType::HEARTBEAT,
+            9,
+            |body| {
+                body[..3].copy_from_slice(&[1, 2, 3]);
+                Ok(3)
+            },
+        )
+        .unwrap();
+        assert_eq!(len, MIN_FRAME_WITH_ADDRESSES + BCMP_HEADER_LEN + 3);
+        assert_eq!(buf[IPV6_NEXT_HEADER_OFFSET], IP_PROTO_BCMP);
+        assert_eq!(buf[IPV6_HOP_LIMIT_OFFSET], HOP_LIMIT);
+        let received = rx::accept(&mut buf[..len]).unwrap();
+        assert_eq!(received.header.message_type, MessageType::HEARTBEAT);
+        assert_eq!(received.header.seq_num, 9);
+        assert_eq!(received.payload, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn build_matches_headers_then_serialize() {
+        let body = [0x5Au8; 12];
+        let dst = addr::nodeid_to_ip(0xFD00_0000, 3);
+        let mut built = [0u8; MIN_FRAME_WITH_ADDRESSES + BCMP_HEADER_LEN + 12];
+        build(&mut built, 42, &dst, MessageType::ACK, 1, |b| {
+            b[..12].copy_from_slice(&body);
+            Ok(12)
+        })
+        .unwrap();
+
+        let mut by_hand = [0u8; MIN_FRAME_WITH_ADDRESSES + BCMP_HEADER_LEN + 12];
+        frame::write_headers(
+            &mut by_hand,
+            &addr::nodeid_to_ip(LINK_LOCAL_PREFIX, 42),
+            &dst,
+            IP_PROTO_BCMP,
+            HOP_LIMIT,
+            BCMP_HEADER_LEN + 12,
+        )
+        .unwrap();
+        serialize(&mut by_hand, MessageType::ACK, 1, &body).unwrap();
+        assert_eq!(built, by_hand);
+    }
+
+    #[test]
+    fn build_passes_on_the_body_error_and_refuses_a_short_buffer() {
+        let dst = BmIpAddr::LINK_LOCAL_MULTICAST;
+        let mut buf = [0u8; 128];
+        assert_eq!(
+            build(&mut buf, 1, &dst, MessageType::ACK, 0, |_| Err(
+                BmWireError::Invalid
+            )),
+            Err(BmWireError::Invalid)
+        );
+        let mut short = [0u8; BCMP_HEADER_OFFSET];
+        assert_eq!(
+            build(&mut short, 1, &dst, MessageType::ACK, 0, |_| Ok(0)),
+            Err(BmWireError::Truncated)
         );
     }
 }

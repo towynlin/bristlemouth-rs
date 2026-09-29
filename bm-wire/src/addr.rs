@@ -2,6 +2,9 @@
 
 use crate::util::BmIpAddr;
 
+/// The IPv6 prefix bm_core builds a node's link-local address from.
+pub const LINK_LOCAL_PREFIX: u32 = 0xFE80_0000;
+
 /// Length of an Ethernet MAC address.
 pub const MAC_LEN: usize = 6;
 

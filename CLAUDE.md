@@ -89,6 +89,9 @@ A cargo workspace.
   frame moves.
 - `bm-wire-diff/` — the differential harness. Host-only. One comparator per
   surface, shared by the fuzz targets and by ordinary `#[test]`s.
+  - `src/frames.rs` — BCMP frames a peer sends, for comparators to inject;
+    `bm_wire::bcmp::tx::build` into a `Vec`. Use it rather than a local
+    builder.
   - `tests/node_frames.rs` — compares whole frames `bm-stack` builds against
     the ones bm_core emits for the same question from the same identity.
 - `bm-wire-sys/` — raw FFI bindings to the real bm_core C. The oracle.
