@@ -167,14 +167,15 @@ mod tests {
     fn bcmp_frame(src: BmIpAddr, dst: BmIpAddr, ty: MessageType, body: &[u8]) -> TestFrame {
         let payload_len = BCMP_HEADER_LEN + body.len();
         let mut frame = [0u8; 256];
-        frame[12] = 0x86;
-        frame[13] = 0xDD;
-        frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(payload_len as u16).to_be_bytes());
-        frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-        frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16].copy_from_slice(&src.0);
-        frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&dst.0);
+        crate::frame::write_headers(
+            &mut frame,
+            &src,
+            &dst,
+            IP_PROTO_BCMP,
+            crate::frame::HOP_LIMIT,
+            payload_len,
+        )
+        .unwrap();
         let end = MIN_FRAME_WITH_ADDRESSES + payload_len;
         tx::serialize(&mut frame[..end], ty, 0, body).unwrap();
         TestFrame {

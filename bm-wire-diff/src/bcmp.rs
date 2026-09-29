@@ -37,8 +37,7 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 use bm_wire::bcmp::header::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, CHECKSUM_FIELD_OFFSET};
 use bm_wire::bcmp::{BcmpHeader, MessageType, rx, tx};
 use bm_wire::frame::{
-    ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET,
-    IPV6_INGRESS_EGRESS_PORTS_OFFSET, IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET,
+    IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET, IPV6_INGRESS_EGRESS_PORTS_OFFSET,
     IPV6_SOURCE_ADDRESS_OFFSET, MIN_FRAME_WITH_ADDRESSES,
 };
 
@@ -311,15 +310,15 @@ impl BcmpInput {
     fn blank_frame(&self) -> Vec<u8> {
         let trailing = usize::from(self.trailing);
         let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + self.payload_len() + trailing];
-        frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-            .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-        frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(self.payload_len() as u16).to_be_bytes());
-        frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-        frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&self.src);
-        frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&self.dst);
+        bm_wire::frame::write_headers(
+            &mut frame,
+            &bm_wire::util::BmIpAddr(self.src),
+            &bm_wire::util::BmIpAddr(self.dst),
+            IP_PROTO_BCMP,
+            bm_wire::frame::HOP_LIMIT,
+            self.payload_len(),
+        )
+        .expect("frame is sized for the headers");
         let end = MIN_FRAME_WITH_ADDRESSES + self.payload_len();
         frame[end..].fill(0xA5);
         frame

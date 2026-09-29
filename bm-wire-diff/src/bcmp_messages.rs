@@ -35,12 +35,7 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
 use bm_wire::bcmp::neighbors::{NeighborTableReply, NeighborTableRequest};
-use bm_wire::bcmp::{BCMP_HEADER_LEN, MessageType, rx, tx};
-use bm_wire::frame::{
-    ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET,
-    IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
-    MIN_FRAME_WITH_ADDRESSES,
-};
+use bm_wire::bcmp::{MessageType, rx};
 use bm_wire::util::BmIpAddr;
 
 use crate::Domain;
@@ -176,20 +171,13 @@ impl BcmpMessagesInput {
     /// The request frame, checksummed and ready to inject.
     fn build(&self) -> Vec<u8> {
         let body = self.target.node_id().to_le_bytes();
-        let payload_len = BCMP_HEADER_LEN + body.len();
-        let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
-        frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-            .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-        frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-            .copy_from_slice(&(payload_len as u16).to_be_bytes());
-        frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-        frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&bm_wire::addr::nodeid_to_ip(0xFE80_0000, PEER_NODE_ID).0);
-        frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-            .copy_from_slice(&self.destination().0);
-        tx::serialize(&mut frame, self.request.request_type(), 0, &body)
-            .expect("frame is sized for the body");
-        frame
+        crate::frames::bcmp(
+            PEER_NODE_ID,
+            &self.destination(),
+            self.request.request_type(),
+            0,
+            &body,
+        )
     }
 }
 

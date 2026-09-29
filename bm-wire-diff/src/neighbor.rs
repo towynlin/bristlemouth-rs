@@ -33,12 +33,7 @@ use std::sync::{Mutex, OnceLock};
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 
-use bm_wire::bcmp::{BCMP_HEADER_LEN, Heartbeat, MessageType, tx};
-use bm_wire::frame::{
-    ETHERNET_TYPE_IPV6, ETHERNET_TYPE_OFFSET, IP_PROTO_BCMP, IPV6_DESTINATION_ADDRESS_OFFSET,
-    IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
-    MIN_FRAME_WITH_ADDRESSES,
-};
+use bm_wire::bcmp::{Heartbeat, MessageType};
 use bm_wire::neighbor::{Neighbor, NeighborTable};
 use bm_wire::util::BmIpAddr;
 
@@ -155,22 +150,15 @@ impl Domain for NeighborInput {
 
 /// A heartbeat frame from `node_id`, ready to inject.
 fn heartbeat_frame(node_id: u64, heartbeat: &Heartbeat) -> Vec<u8> {
-    let payload_len = BCMP_HEADER_LEN + Heartbeat::LEN;
-    let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
-    frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-        .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-    frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-        .copy_from_slice(&(payload_len as u16).to_be_bytes());
-    frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-    frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&bm_wire::addr::nodeid_to_ip(0xFE80_0000, node_id).0);
-    frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&BmIpAddr::LINK_LOCAL_MULTICAST.0);
-
     let mut body = [0u8; Heartbeat::LEN];
     heartbeat.encode(&mut body).expect("12 bytes");
-    tx::serialize(&mut frame, MessageType::HEARTBEAT, 0, &body).expect("frame is sized");
-    frame
+    crate::frames::bcmp(
+        node_id,
+        &BmIpAddr::LINK_LOCAL_MULTICAST,
+        MessageType::HEARTBEAT,
+        0,
+        &body,
+    )
 }
 
 /// What bm_core's discovery callback saw, since it was last cleared.
