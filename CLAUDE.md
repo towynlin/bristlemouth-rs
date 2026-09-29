@@ -66,10 +66,17 @@ A cargo workspace.
     from `next_dfu_transmission`, as bm_core's runs on its own task.
   - `src/app.rs` — `App`, application code `Node::run_app` runs in the
     node's loop: a cancel-safe `ready` arm, then `act` with `&mut Node`.
-  - `src/channel.rs` — `Channels`, an `embassy-sync` `NodeHandle` for an
-    application in a task of its own: owned `Command`s in, owned
-    `Notification`s out, run by `ChannelApp`, an `App`.
+  - `src/channel.rs` — behind the `channel` feature: `Channels`, an
+    `embassy-sync` `NodeHandle` for an application in a task of its own:
+    owned `Command`s in, owned `Notification`s out, run by `ChannelApp`, an
+    `App`. Off by default, so a single-task firmware carries neither
+    `embassy-sync` nor `heapless`.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
+    `src/mock/frames.rs` builds the peer frames a script feeds it; use it
+    rather than a local builder.
+  - `examples/hello_node.rs` — a node on the mock PHY through the public API
+    only: a scripted neighbour, an `App` that pings it. Panics on a wrong
+    outcome, so CI runs it.
 - `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
   SPI, on the per-port frame I/O of
   [embassy-rs/embassy#7024](https://github.com/embassy-rs/embassy/pull/7024),
@@ -96,11 +103,11 @@ A cargo workspace.
     `--check` fails on anything outside its libc allowlist, which deliberately
     omits `rand` and `time`, so a non-deterministic reach from `csrc/` trips it.
 - `docs/c-divergences.md` — the upstream defect list.
-- `docs/bcmp-port-todo.md` — what of BCMP is unported, as dependency-ordered
-  task cards. Read its shared contract before starting a card.
-- `docs/hello-world-todo.md` — what stands between the tree and a Rust
-  hello-world app on a dev kit (app seam, UDP, pub/sub, `spotter_log`, board
-  support), as task cards.
+- `docs/hello-world-todo.md` — **the active plan**: what stands between the
+  tree and a Rust hello-world app on a dev kit (UDP, pub/sub, `spotter_log`,
+  board support), as task cards. Its "Working a card" says how to edit it.
+- `docs/bcmp-port-todo.md` — the BCMP port. Complete and closed to new
+  cards; its shared contract still governs hello-world cards.
 - `docs/embassy-port-tracking-prompt.md` — the brief that produced
   embassy#7024, which made `embassy-net-adin1110` report the ingress port and
   take an egress port per frame. Merged; kept as the record of the design.
@@ -146,6 +153,7 @@ As above, plus:
 
 ```
 cargo test                                                 # workspace, incl. differential tests
+cargo run -p bm-stack --example hello_node                 # the public API, end to end
 cargo build -p bm-wire --target thumbv7em-none-eabihf      # proves no_std, alloc-free
 cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Cortex-M33
 cargo build -p bm-stack --target thumbv8m.main-none-eabihf

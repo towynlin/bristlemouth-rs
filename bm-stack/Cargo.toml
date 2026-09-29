@@ -12,16 +12,19 @@ default = []
 # Enabled for tests, and useful for bringing firmware up before the board is
 # on the bench.
 mock = ["embassy-time/mock-driver"]
+# `bm_stack::channel`: a `NodeHandle` for an application running as a task of
+# its own. An application that fits in `App::act` needs neither dependency.
+channel = ["dep:embassy-sync", "dep:heapless"]
 
 [dependencies]
 bm-wire = { path = "../bm-wire" }
 embassy-time = "0.5"
 embassy-futures = "0.1"
-embassy-sync = "0.8"
-heapless = { version = "0.9", default-features = false }
+embassy-sync = { version = "0.8", optional = true }
+heapless = { version = "0.9", default-features = false, optional = true }
 
 [dev-dependencies]
-bm-stack = { path = ".", features = ["mock"] }
+bm-stack = { path = ".", features = ["mock", "channel"] }
 # Host tests have to supply what a board otherwise would: a time driver (the
 # mock one, via the `mock` feature above), somewhere for embassy-time to keep
 # its pending timers, and a critical section. Firmware gets all three from its

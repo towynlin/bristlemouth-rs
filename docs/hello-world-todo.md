@@ -2,8 +2,31 @@
 
 What stands between the current tree and a Rust hello-world app on a
 Bristlemouth dev kit, as dependency-ordered task cards sized for one agent
-each. Same card format and shared contract as `docs/bcmp-port-todo.md`; read
-that file's "The shared contract" first.
+each. This is the active plan. Same card format and shared contract as
+`docs/bcmp-port-todo.md`, which is complete and takes no new cards; read that
+file's "The shared contract" first.
+
+## Working a card
+
+Before starting:
+
+1. Pick a card whose **Blocked by** is "nothing". If it turns out to be two
+   cards, split it here first, in its own commit.
+2. Read "What the landed cards left for the rest" below.
+
+When the card's code is done and verified, edit this file in a separate
+commit, the last one of the card's branch:
+
+| Section | Edit |
+|---|---|
+| The card | Delete it. Git history is the record of the work; do not leave a "Landed" note or a list of what was done. |
+| What the landed cards left for the rest | Add what a remaining card needs to know: the API shape, a limit or gap left open, and **the reason for any decision between options**, so no later card reopens it. Delete entries no remaining card needs. Keep the heading's card list current. |
+| Other cards | Remove the card from every **Blocks** and **Blocked by**; write "nothing" where none remain. Fix any text that names it. |
+| Order | Remove it from the graph and the paragraph under it. |
+| Suspected C defects | Confirmed rows: add to `docs/c-divergences.md` with a number, cite the number in the commit message, delete the row. Discarded rows: delete, and say why in the commit message. |
+
+If the card added files, crates or verify commands, `CLAUDE.md`'s layout and
+"Verifying" sections are updated in the card's code commits, not here.
 
 ## The target
 
@@ -25,15 +48,15 @@ bus with a Spotter and a C dev kit:
 |---|---|
 | BCMP: heartbeat, ping, info, neighbours, resources, time, config, DFU | Done (`bm-wire`, `bm_stack::Node`) |
 | PHY for the ADIN2111 | Done (`bm-phy-adin2111`), untested on hardware |
-| Application code running beside the node | Done (card A1): `bm_stack::App`, run by `Node::run_app`. |
+| Application code running beside the node | Done: `bm_stack::App`, run by `Node::run_app`; `bm_stack::channel` for an app in its own task |
 | UDP over IPv6 | **Missing.** `bm-wire/src/frame.rs` has the UDP offsets and `l2::add_egress_port` its checksum patch; nothing builds, accepts or dispatches UDP. `Node::on_frame` relays a UDP frame per `l2_policy` and then drops it in `rx::accept`. |
 | Pub/sub (`middleware/pubsub.c`, `middleware.c`) | **Missing.** Listed out of scope in `bcmp-port-todo.md`. |
 | `spotter_log`, `spotter_tx_data` | **Missing.** |
 | Dev kit board support (MCU HAL, pins, node id, time driver, flash) | **Missing.** No crate targets a board. |
 
 A BCMP-only node — one that heartbeats, is discovered, and answers ping and
-info — can be written today on the mock PHY, but not yet on a board. It cannot
-say hello.
+info — runs on the mock PHY (`bm-stack/examples/hello_node.rs`), but not yet on
+a board. It cannot say hello.
 
 ## The oracle is not the deployed stack for UDP
 
@@ -72,55 +95,82 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 | `bm_middleware_rx` | Dispatches on the **source** port lwIP/`bm_linux.c` reports, not the bound destination port. Harmless while pub/sub sends from and to 4321. | U2 |
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
+## What the landed cards (A1, E0) left for the rest
+
+- **Two ways for application code to reach the node, and why.** Some
+  applications need a task of their own and some fit in the node's loop, so
+  both exist and the second is opt-in:
+
+  | Seam | Shape | Test |
+  |---|---|---|
+  | `bm_stack::App<N>`, run by `Node::run_app` | `ready` is the loop's fifth `select` arm and must be cancel-safe; then `act(&mut Node, now_ms)` calls node methods directly and returns at most one `Outbound`; events arrive at `on_event`. `run_with` is `run_app` with an app that never acts. No dependency, and nothing to add per app-facing call. | `an_app_pings_on_its_own_timer_and_sees_the_reply` |
+  | `bm_stack::channel`, behind the `channel` feature (`embassy-sync`, `heapless`) | A task holds a `NodeHandle`, sends `Command`s and receives owned `Notification`s; `ChannelApp` is the `App` serving it. Costs one loop pass of latency over `App`. | `an_app_task_pings_through_a_channel_and_sees_the_reply` |
+
+  Rejected: a closure `FnMut(&mut Node, Event)` in place of `FnMut(Event)`,
+  because the app could then act only inside an event and not on a timer of
+  its own. Both tests are in `bm-stack/tests/node.rs` under "Application
+  seam".
+- **The channel covers ping only.** Each new app-facing call (P2's publish and
+  subscribe, S1's `spotter_log`) needs a `Command` variant, and each new event
+  an owned `Notification`. A full notification queue drops, counted by
+  `ChannelApp::dropped`: the node never waits on the application.
+- **The mock clock is process-global.** A test or example driving
+  `Node::run*` on `MockPhy` holds `tests/node.rs`'s `CLOCK` lock or runs in a
+  process of its own.
+- **Scripted peer frames come from `bm_stack::mock::frames`.** U2, P2 and S1
+  add their UDP, publication and `spotter_log` builders there rather than in
+  a test file.
+- **`bm-stack/examples/hello_node.rs` is the host twin of E1.** P2 and S1 can
+  extend it with a publish, a subscription the scripted neighbour publishes
+  to, and a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
+  `cargo test` only builds examples.
+
 ---
 
-## Card A1 — Application seam on `Node::run`
+## Card F1 — Frame builder in `bm-wire`
 
-**Blocks:** E0, P2, E1. **Blocked by:** nothing.
+**Blocks:** U1 (reuses the header writer). **Blocked by:** nothing.
 
-An application must be able to ask the running node to send (ping, publish,
-request info) and to see what arrives, without owning the loop.
+The Ethernet and IPv6 headers of a BCMP frame are written in 15 places:
 
-Options, pick one and say why in the PR:
-
-| Option | Cost |
+| Where | What |
 |---|---|
-| `run_with` takes an extra `async` source of commands (a trait with `async fn next(&mut self) -> Command`) as a fifth `select` arm | No new dependency. `Command` is an enum that grows with every app-facing call. |
-| A `Node` handle over an `embassy_sync::channel::Channel` | Idiomatic embassy; adds `embassy-sync`, which moves all three lockfiles. |
-| A closure `FnMut(&mut Node, Event)` in place of `FnMut(Event)` | Smallest diff; app runs inside the event callback only, so it cannot act on a timer of its own. |
+| `bm-stack/src/node.rs`: `write_frame_headers`, `build_frame` (private) | The node's transmit path. Full headers: MACs, version, hop limit. |
+| `bm-stack/src/mock/frames.rs`: `bcmp` | Scripted peer frames. EtherType, payload length, next header, addresses only. |
+| `bm-wire-diff/src/`: `info.rs`, `ping.rs`, `neighbor.rs`, `neighbor_table.rs`, `resource.rs`, `bcmp.rs`, `bcmp_messages.rs`, `registry.rs`, `config.rs`, `time.rs`, `forward.rs`, `l2_egress.rs`; `tests/l2_egress.rs` | Comparator inputs, each a local copy of the `mock::frames` shape. |
 
-Done: a host test on `mock` where an app task sends a ping on its own timer
-while the node runs, and sees the `EchoReply` event. No wire change; no
-comparator.
+Rust: move the node's builder into `bm-wire`, `no_std` and alloc-free:
 
-**Landed** as a variant of the first option without the `Command` enum:
-`bm_stack::App<N>` has a cancel-safe `async fn ready`, polled as the fifth
-`select` arm; when it resolves the loop calls `act(&mut Node, now_ms)`, which
-calls node methods directly and returns at most one `Outbound`. Events go to
-`App::on_event`. `run_with` is `run_app` with an app that never acts. No new
-dependency, and nothing to extend per app-facing call; a firmware wanting a
-separate task makes `ready` receive from its own channel. Test:
-`an_app_pings_on_its_own_timer_and_sees_the_reply` in `bm-stack/tests/node.rs`.
+- `bm_wire::frame::write_headers(buf, src: &BmIpAddr, dst: &BmIpAddr, next_header, hop_limit, payload_len)` —
+  Ethernet (source MAC from `src`, destination MAC per `node.rs`'s current
+  rule: `multicast_mac_from_ipv6`, else broadcast) and IPv6. Source address
+  and hop limit are parameters because U1 needs them open until H0 fixes them.
+- `bm_wire::bcmp::tx::build(buf, node_id, dst, message_type, seq_num, body)`,
+  where `body: FnOnce(&mut [u8]) -> Result<usize, BmWireError>` writes the
+  payload in place, as `node.rs`'s `build_frame` does now. Returns the frame
+  length.
+- `LINK_LOCAL_PREFIX` and `HOP_LIMIT` move from `bm_stack::node` to
+  `bm-wire`; `bm_stack::node` re-exports them.
 
-The second option is layered on top: `bm_stack::channel` (`embassy-sync`
-0.8, `heapless` 0.9) gives a task a `NodeHandle` sending `Command`s and
-receiving `Notification`s, and `ChannelApp` is the `App` that serves it.
-Each app-facing call needs a `Command` variant and each event an owned
-`Notification`; only ping has them so far. Notifications are dropped, and
-counted by `ChannelApp::dropped`, when the queue is full, because the node
-never waits on the application. Test:
-`an_app_task_pings_through_a_channel_and_sees_the_reply`.
+Then replace the copies: `node.rs` calls `build`; `mock::frames::bcmp` wraps it
+in a `Vec`; each `bm-wire-diff` copy that builds a well-formed frame calls it.
+A copy that writes specific header bytes on purpose (`forward.rs` and
+`l2_egress.rs` set port nibbles and legacy bytes) keeps them, as a mutation
+after `build`, with a comment saying which bytes and why.
 
-## Card E0 — Host example: a BCMP node on the mock PHY
+Mock and comparator frames gain MACs, version and hop limit they did not have.
+Neither `rx::accept` nor the C's receive path reads them today; if a test or
+seed changes result, that is a finding, not something to paper over.
 
-**Blocks:** nothing. **Blocked by:** A1.
+Comparator: none new. `bm-wire-diff/tests/node_frames.rs` already compares the
+node's whole frames with bm_core's, so it passing unchanged proves the move is
+byte-identical. bm_core has no whole-frame gold vectors (`bm_linux_test.cpp`'s
+are address, payload and checksum), so step 4 is unavailable; say so in the
+commit.
 
-`bm-stack/examples/hello_node.rs`, a cargo example (auto-discovered, and built by
-`cargo test`), using the `mock` feature as the tests do: brings up
-a `Node`, scripts a heartbeat from a neighbour, prints the neighbour table and
-an echo reply. Proves the public API is usable from outside the crate. Add
-`cargo run -p bm-stack --example hello_node` to `CLAUDE.md`'s verify list and
-CI.
+Done: one header writer in the tree; `cargo test` (all seeds replayed),
+`node_frames.rs` untouched and passing, `cargo tree -p bm-wire` unchanged,
+both bare-metal `bm-wire` builds.
 
 ## Card H0 — Reference captures from a C dev kit
 
@@ -141,14 +191,14 @@ oracle is not the deployed stack for UDP" filled in with observed values.
 
 ## Card U1 — UDP over IPv6 in `bm-wire`
 
-**Blocks:** U2, P1. **Blocked by:** H0 for gold vectors only; the codec can
-start before.
+**Blocks:** U2, P1. **Blocked by:** F1; H0 for gold vectors only, and the
+codec can start before H0.
 
 C: `bm_udp_tx_perform` and the UDP branch of `bm_ip_rx` in
 `network/bm_linux.c`; lwIP's `udp_sendto_if` for what deployed nodes do.
 
-Rust: `bm-wire/src/udp.rs` — build a frame (Ethernet, IPv6, UDP, payload) into
-a caller buffer from source address, destination, ports and payload; accept a
+Rust: `bm-wire/src/udp.rs` — build a frame (Ethernet and IPv6 via F1's
+`frame::write_headers`, then UDP and payload) into a caller buffer from source address, destination, ports and payload; accept a
 received frame and return ports, source node id and payload. Checksum via
 `checksum::ipv6_pseudo_checksum`. Source address and hop limit are parameters
 until H0 fixes them.
@@ -205,7 +255,7 @@ Done: comparator, fuzz targets, confirmed divergences numbered.
 
 ## Card P2 — Pub/sub on the node
 
-**Blocks:** S1, E1. **Blocked by:** A1, U2, P1.
+**Blocks:** S1, E1. **Blocked by:** U2, P1.
 
 C: `bm_pubsub_init`, `bm_sub_wl`, `bm_unsub_wl`, `bm_pub_wl`,
 `publish_data_locally`, `bm_handle_msg`.
@@ -216,7 +266,8 @@ to `ff03::1` port 4321; add `PUB`/`SUB` to `Node::resources` as the C does
 (`Node::add_resource`, already ported): `bm_pub_wl` adds `PUB` only after a
 successful send, `bm_sub_wl` adds `SUB` on every successful call. A local subscription
 matching a publication delivers `Event::Publication` locally too. Reachable
-through A1's seam.
+from `App::act`, and through `bm_stack::channel` as new `Command` and
+`Notification` variants.
 
 Comparator: frames from `bm_pub` vs `Node::publish` for the same topic, type,
 version, data and identity; an oracle publication delivered to a Rust
@@ -269,7 +320,7 @@ check the PR reports as done or not done.
 
 ## Card E1 — The hello-world example
 
-**Blocks:** nothing. **Blocked by:** A1, P2, S1, B1.
+**Blocks:** nothing. **Blocked by:** P2, S1, B1.
 
 `bm-devkit/src/bin/hello_world.rs` — embassy's convention for board examples
 (`examples/<board>/src/bin/*.rs`, own workspace, own `memory.x`) applies, so
@@ -285,15 +336,14 @@ reported individually.
 ## Order
 
 ```
-A1 ──► E0
-A1 ─────────────────────┐
-H0 ─► U1 ─► U2 ─► P1 ─► P2 ─► S1 ─► E1
-B1 ──────────────────────────────────┘
+F1 ─┐
+H0 ─┴► U1 ─► U2 ─► P1 ─► P2 ─► S1 ─► E1
+B1 ───────────────────────────────────┘
 ```
 
 (P1's `wildcard_match` half does not need U2 and can start after U1.)
 
-A1, H0 and B1 have no prerequisites and can run in parallel. H0 needs a
+F1, H0 and B1 have no prerequisites and can run in parallel. H0 needs a
 person with hardware; U1 can start without it and add gold vectors later.
 
 # Explicitly out of scope

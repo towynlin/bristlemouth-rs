@@ -1,6 +1,6 @@
 //! The node, driven with a mock PHY.
 
-use bm_stack::mock::{MockPhy, Script, Sent};
+use bm_stack::mock::{MockPhy, Script, Sent, frames};
 use bm_stack::node::{EXPIRY_PERIOD_MS, HOP_LIMIT, LINK_LOCAL_PREFIX, NEIGHBOR_REQUEST_TIMEOUT_MS};
 use bm_stack::{Egress, Event, Identity, Node, Rtc, RtcTimeAndDate, SoftRtc, deliver, transmit};
 use bm_wire::addr;
@@ -16,9 +16,7 @@ use bm_wire::bcmp::resource::{
     encode_resource_table_reply,
 };
 use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
-use bm_wire::bcmp::{
-    BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, DeviceInfo, Heartbeat, MessageType, rx, tx,
-};
+use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, DeviceInfo, Heartbeat, MessageType, rx};
 use bm_wire::frame::*;
 use bm_wire::neighbor::HEARTBEAT_PERIOD_S;
 use bm_wire::util::BmIpAddr;
@@ -86,34 +84,11 @@ fn peer_frame(message_type: MessageType, body: &[u8], dst: BmIpAddr) -> Vec<u8> 
 /// The same, carrying a sequence number — what a reply to one of our requests
 /// looks like.
 fn peer_frame_seq(message_type: MessageType, body: &[u8], dst: BmIpAddr, seq_num: u32) -> Vec<u8> {
-    let payload_len = BCMP_HEADER_LEN + body.len();
-    let mut frame = vec![0u8; MIN_FRAME_WITH_ADDRESSES + payload_len];
-    frame[ETHERNET_TYPE_OFFSET..ETHERNET_TYPE_OFFSET + 2]
-        .copy_from_slice(&ETHERNET_TYPE_IPV6.to_be_bytes());
-    frame[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-        .copy_from_slice(&(payload_len as u16).to_be_bytes());
-    frame[IPV6_NEXT_HEADER_OFFSET] = IP_PROTO_BCMP;
-    frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&addr::nodeid_to_ip(LINK_LOCAL_PREFIX, PEER_ID).0);
-    frame[IPV6_DESTINATION_ADDRESS_OFFSET..IPV6_DESTINATION_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&dst.0);
-    tx::serialize(&mut frame, message_type, seq_num, body).unwrap();
-    frame
+    frames::bcmp(PEER_ID, dst, message_type, seq_num, body)
 }
 
 fn heartbeat_frame(uptime_us: u64) -> Vec<u8> {
-    let mut body = [0u8; Heartbeat::LEN];
-    Heartbeat {
-        time_since_boot_us: uptime_us,
-        liveliness_lease_dur_s: HEARTBEAT_PERIOD_S,
-    }
-    .encode(&mut body)
-    .unwrap();
-    peer_frame(
-        MessageType::HEARTBEAT,
-        &body,
-        BmIpAddr::LINK_LOCAL_MULTICAST,
-    )
+    frames::heartbeat(PEER_ID, uptime_us)
 }
 
 #[test]
@@ -1208,36 +1183,23 @@ fn the_run_loop_retries_then_times_out_an_unanswered_request() {
 const OUR_PING_ID: u16 = NODE_ID as u16;
 
 fn echo_request_frame(target_node_id: u64, id: u16, seq_num: u16, payload: &[u8]) -> Vec<u8> {
-    echo_frame(
-        MessageType::ECHO_REQUEST,
+    let request = EchoRequest {
         target_node_id,
         id,
         seq_num,
         payload,
-    )
+    };
+    frames::echo_request(PEER_ID, BmIpAddr::LINK_LOCAL_MULTICAST, &request)
 }
 
 fn echo_reply_frame(node_id: u64, id: u16, seq_num: u16, payload: &[u8]) -> Vec<u8> {
-    echo_frame(MessageType::ECHO_REPLY, node_id, id, seq_num, payload)
-}
-
-/// Both messages are the same fourteen bytes, so one builder does for both.
-fn echo_frame(
-    message_type: MessageType,
-    node_id: u64,
-    id: u16,
-    seq_num: u16,
-    payload: &[u8],
-) -> Vec<u8> {
-    let request = EchoRequest {
-        target_node_id: node_id,
+    let reply = EchoReply {
+        node_id,
         id,
         seq_num,
         payload,
     };
-    let mut body = vec![0u8; request.encoded_len()];
-    request.encode(&mut body).unwrap();
-    peer_frame(message_type, &body, BmIpAddr::LINK_LOCAL_MULTICAST)
+    frames::echo_reply(PEER_ID, &reply)
 }
 
 /// The body of whatever the node built, parsed back as an echo reply.
@@ -1905,13 +1867,7 @@ fn the_run_loop_answers_a_time_request() {
 
 /// A heartbeat frame from `node_id` rather than from the peer.
 fn heartbeat_frame_from(node_id: u64, uptime_us: u64) -> Vec<u8> {
-    let mut frame = heartbeat_frame(uptime_us);
-    frame[IPV6_SOURCE_ADDRESS_OFFSET..IPV6_SOURCE_ADDRESS_OFFSET + 16]
-        .copy_from_slice(&addr::nodeid_to_ip(LINK_LOCAL_PREFIX, node_id).0);
-    // The source address is inside the checksum, so it has to be rebuilt.
-    let body = frame[BCMP_HEADER_OFFSET + BCMP_HEADER_LEN..].to_vec();
-    tx::serialize(&mut frame, MessageType::HEARTBEAT, 0, &body).unwrap();
-    frame
+    frames::heartbeat(node_id, uptime_us)
 }
 
 /// A device-info reply frame from the peer, claiming `node_id`.
@@ -1931,13 +1887,7 @@ fn info_reply_frame(node_id: u64, version: &[u8], name: &[u8]) -> Vec<u8> {
         version_string: version,
         device_name: name,
     };
-    let mut body = vec![0u8; reply.encoded_len()];
-    reply.encode(&mut body).unwrap();
-    peer_frame(
-        MessageType::DEVICE_INFO_REPLY,
-        &body,
-        BmIpAddr::LINK_LOCAL_MULTICAST,
-    )
+    frames::device_info_reply(PEER_ID, &reply)
 }
 
 /// The heartbeat asks, the reply answers, and the node keeps the answer.

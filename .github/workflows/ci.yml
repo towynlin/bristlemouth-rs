@@ -70,7 +70,7 @@ jobs:
       # The firmware view. The host lint above never compiles this cfg, and
       # bare-metal is where bm-wire and bm-stack actually have to hold up.
       - name: Cortex-M33
-        run: cargo clippy -p bm-wire -p bm-stack --target thumbv8m.main-none-eabihf --locked -- -D warnings
+        run: cargo clippy -p bm-wire -p bm-stack --features bm-stack/channel --target thumbv8m.main-none-eabihf --locked -- -D warnings
 
   test:
     name: test
@@ -95,6 +95,9 @@ jobs:
       # The differential tests and every committed fuzz seed.
       - name: Workspace
         run: cargo test --workspace --locked
+      # `cargo test` builds examples but does not run them; this one asserts.
+      - name: bm-stack example
+        run: cargo run -p bm-stack --example hello_node --locked
       # bm-wire on its own, with `std` off, the way firmware gets it. The
       # workspace run above always has it on, through bm-wire-diff.
       - name: bm-wire, default features

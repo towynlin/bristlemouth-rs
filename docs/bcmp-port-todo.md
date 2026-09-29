@@ -1,7 +1,11 @@
 # BCMP porting todo
 
-What of BCMP is still unported, in dependency order, as task cards sized for
-one agent each.
+> **Complete and closed.** Every card has landed. Do not add cards here or
+> edit this file as part of a card; new work goes in
+> `docs/hello-world-todo.md`. "The shared contract" below still applies to
+> that file's cards.
+
+What of BCMP was ported, and the rules the port followed.
 
 `bm-wire` carries six of BCMP's exchanges — heartbeat (`0x01`), echo
 (`0x02`/`0x03`, both halves), device info (`0x04`/`0x05`, both halves),
@@ -32,7 +36,8 @@ or an unsolicited message arrives.
 ## Status at a glance
 
 Every card has landed. What bm_core has that the port does not is listed
-under "Explicitly out of scope". A new card goes here, in the format below.
+under "Explicitly out of scope"; pub/sub, UDP and `spotter.c` are planned in
+`docs/hello-world-todo.md`.
 
 ---
 
@@ -536,8 +541,6 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 
 # Keeping this current
 
-When a card lands, delete it — git history is the record — and move anything
-the next cards need into "What the landed cards left for the rest". When a card
-turns up a C defect, the finding goes in `docs/c-divergences.md` and the card
-references the number. If a card turns out to be two cards, split it here
-before starting.
+Closed. Only "The shared contract" is maintained, because
+`docs/hello-world-todo.md` depends on it. When a hello-world card needs a new
+rule, add it to the contract.

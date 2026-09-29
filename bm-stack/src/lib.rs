@@ -26,6 +26,8 @@
 //! * [`node::Node::run`] joins them, and is the only async code here.
 //!   [`node::Node::run_app`] runs an [`app::App`] in the same loop, which is
 //!   how application code sends while the node runs.
+//! * [`channel`], behind the `channel` feature, is a [`NodeHandle`] for an
+//!   application running as a task of its own.
 //! * [`mock`], behind the `mock` feature, is a PHY that replays a script and
 //!   records what was sent.
 
@@ -34,6 +36,7 @@
 #![warn(missing_docs)]
 
 pub mod app;
+#[cfg(feature = "channel")]
 pub mod channel;
 pub mod config;
 pub mod dfu;
@@ -43,6 +46,7 @@ pub mod node;
 pub mod port;
 
 pub use app::App;
+#[cfg(feature = "channel")]
 pub use channel::{ChannelApp, Channels, Command, NodeHandle, Notification};
 pub use config::{Config, Configuration, NoConfig};
 pub use node::{Event, MTU, Node, Outbound, Owed, Reflood, deliver, transmit};
