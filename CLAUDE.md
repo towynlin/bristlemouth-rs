@@ -94,6 +94,10 @@ A cargo workspace.
     builder.
   - `tests/node_frames.rs` — compares whole frames `bm-stack` builds against
     the ones bm_core emits for the same question from the same identity.
+  - `testdata/` — pcaps from C dev kits. `hello-pub-card-h0.pcap` is card
+    H0's; `tests/capture_h0.rs` documents it and asserts the header fields
+    where deployed nodes differ from `bm_linux.c` (divergence #70).
+    `src/pcap.rs` reads them.
 - `bm-wire-sys/` — raw FFI bindings to the real bm_core C. The oracle.
   - `vendor/bm_core/` — the C submodule. **Never edit it from here.** Fixes go
     upstream to `bristlemouth/bm_core`.

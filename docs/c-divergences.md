@@ -18,6 +18,8 @@ Status values:
 - **benign** — technically undefined, but every real toolchain produces the
   intended value and the port produces it by construction.
 - **c-only** — a defect in state or an API `bm-wire` has no counterpart for.
+- **open** — `bm-wire` does not yet match; the entry names the card that
+  changes it.
 - **fixed upstream** — bm_core has repaired it, the submodule includes the
   fix, and the port and the C agree. The entry is kept as the record.
 
@@ -105,6 +107,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 67 | A DFU host ignores the chunk number it is asked for | replicated | reading, confirmed differentially |
 | 68 | A non-internal DFU host sends a whole chunk after a short read | domain-limited | reading |
 | 69 | A host update's `timeoutMs` of zero is a zero timer period | domain-limited | reading |
+| 70 | `bm_linux.c` writes a source MAC, hop limit and UDP source address that deployed nodes do not | open | capture, card H0 |
 
 ---
 
@@ -2469,3 +2472,33 @@ place of 0.
 
 Fix upstream by rejecting `timeoutMs == 0` in `bm_dfu_initiate_update`, or
 treating it as `bm_dfu_update_default_timeout_ms`.
+
+## 70. `bm_linux.c` writes a source MAC, hop limit and UDP source address that deployed nodes do not
+
+The oracle's IP layer is `network/bm_linux.c`; deployed nodes use
+`network/bm_lwip.c` and lwIP. Card H0's capture from a `bm_protocol` dev kit
+(`bm-wire-diff/testdata/hello-pub-card-h0.pcap`, asserted by
+`bm-wire-diff/tests/capture_h0.rs`) differs from `bm_linux.c` in three fields:
+
+| Field | `bm_linux.c` | Deployed | Deployed value comes from |
+|---|---|---|---|
+| Source MAC | `mac_from_nodeid`: low 48 bits of the id, byte 0 `\|= 0x02` | `00:00` + low 32 bits of the id | `mac_address` (`common/device.c`), the netif `hwaddr` in `bm_ip_init` |
+| Hop limit, UDP and BCMP | 64 | 255 | `UDP_TTL` 255 in `bm_protocol`'s `lwipopts.h`; lwIP's default `RAW_TTL` for BCMP's raw pcb |
+| UDP source to `ff03::1` | `fe80::<id>` | `fd00::<id>` | lwIP source-address selection |
+
+Both agree on the destination MAC, the version/class/flow word, BCMP's
+`fe80::<id>` source, and a present, valid UDP checksum on transmit. Neither
+verifies a received UDP checksum: `bm_linux.c` never does, and `bm_protocol`
+sets `CHECKSUM_CHECK_UDP` 0. That is what lets `bm_l2_policy_rx_apply` write
+the ingress nibble without patching the UDP checksum.
+
+No field is known to break interoperation: receivers ignore source MAC and hop
+limit, and `ip_to_nodeid` reads only the address's low 64 bits.
+
+**open.** `frame::write_headers` takes `mac_from_nodeid` and
+`frame::HOP_LIMIT` (64) from `bm_linux.c`, so a Rust node's frames differ from
+a C node's in those two fields. Card U1 moves `bm-wire` to the deployed values;
+comparators against `bm_linux.c` then normalise the two fields.
+
+Fix upstream by having `bm_linux.c` use `mac_address`, hop limit 255 and
+`fd00::<id>` as the UDP source for `ff03::1`.
