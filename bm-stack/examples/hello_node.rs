@@ -2,10 +2,11 @@
 //!
 //! A scripted neighbour heartbeats and describes itself; an [`App`] subscribes
 //! to `hello/*` and pings every node on its own timer, then publishes on the
-//! next tick. The neighbour answers the ping and publishes to `hello/peer`.
-//! The example prints the neighbour table, the echo reply, the publication
-//! received and what the node transmitted, and panics if any of them is
-//! missing.
+//! next tick, then logs `hello world` to the Spotter console with
+//! `spotter_log`. The neighbour answers the ping and publishes to
+//! `hello/peer`. The example prints the neighbour table, the echo reply, the
+//! publication received and what the node transmitted, and panics if any of
+//! them is missing.
 //!
 //! ```text
 //! cargo run -p bm-stack --example hello_node
@@ -20,6 +21,7 @@ use bm_stack::{App, Event, Identity, Node, Outbound, SoftRtc};
 use bm_wire::bcmp::info::DeviceInfoReply;
 use bm_wire::bcmp::ping::EchoReply;
 use bm_wire::bcmp::{DeviceInfo, rx};
+use bm_wire::spotter::USE_TIMESTAMP;
 use bm_wire::util::BmIpAddr;
 use bm_wire::{pubsub, udp};
 use embassy_futures::block_on;
@@ -58,7 +60,8 @@ impl Identity for ExampleIdentity {
 type ExampleNode = Node<ExampleIdentity, SoftRtc, 4>;
 
 /// On the first tick of its own ticker, subscribes to [`SUBSCRIPTION`] and
-/// pings every node; on the second, publishes. Keeps what comes back.
+/// pings every node; on the second, publishes; on the third, logs to the
+/// Spotter console. Keeps what comes back.
 struct Hello {
     ticker: Ticker,
     ticks: u8,
@@ -70,7 +73,7 @@ struct Hello {
 
 impl App<ExampleNode> for Hello {
     async fn ready(&mut self) {
-        if self.ticks == 2 {
+        if self.ticks == 3 {
             core::future::pending::<()>().await;
         }
         // Cancel-safe: the deadline lives in the ticker, not in this future.
@@ -84,9 +87,13 @@ impl App<ExampleNode> for Hello {
             node.subscribe(SUBSCRIPTION)
                 .expect("room for one subscription");
             node.ping(now_ms, &BmIpAddr::LINK_LOCAL_MULTICAST, 0, PING_PAYLOAD)
-        } else {
+        } else if self.ticks == 2 {
             println!("{now_ms:>5} ms  publish to hello/rust");
             node.publish(b"hello/rust", 1, pubsub::COMMON_VERSION, b"hello world")
+                .ok()
+        } else {
+            println!("{now_ms:>5} ms  spotter_log_console: hello world");
+            node.spotter_log(0, None, USE_TIMESTAMP, b"hello world")
                 .ok()
         }
     }
@@ -176,7 +183,7 @@ fn main() {
         port: 1,
         frame: frames::publication(PEER_ID, b"hello/peer", 1, 2, b"hello from the peer"),
     });
-    script.extend(vec![Script::Idle { ms: 50 }; 4]);
+    script.extend(vec![Script::Idle { ms: 50 }; 14]);
     let mut phy = MockPhy::new(PORTS, script);
 
     let mut app = Hello {
@@ -245,5 +252,10 @@ fn main() {
             .any(|sent| sent.frame
                 == frames::publication(NODE_ID, b"hello/rust", 1, 2, b"hello world")),
         "the publication was sent"
+    );
+    assert!(
+        phy.sent.iter().any(|sent| sent.frame
+            == frames::spotter_log(NODE_ID, 0, None, USE_TIMESTAMP, b"hello world")),
+        "the spotter_log line was sent"
     );
 }

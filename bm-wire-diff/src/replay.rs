@@ -121,6 +121,9 @@ pub fn replay_target(target: &str) -> usize {
             "node_udp" => {
                 replay_one::<crate::node_udp::NodeUdpInput, _>(&bytes, crate::node_udp::check)
             }
+            "spotter" => {
+                replay_one::<crate::spotter::SpotterInput, _>(&bytes, crate::spotter::check)
+            }
             "config" => replay_one::<crate::config::ConfigInput, _>(&bytes, |i| {
                 crate::config::check(i);
             }),
@@ -188,6 +191,7 @@ pub const STACK_TARGETS: &[&str] = &[
     "pubsub",
     "registry",
     "resource",
+    "spotter",
     "time",
     "udp",
 ];

@@ -294,3 +294,12 @@ path = "fuzz_targets/pubsub.rs"
 test = false
 doc = false
 bench = false
+
+# Stack-backed. Subscribes to `*` and seeds `PUB_LIST` with the three Spotter
+# topics once per process.
+[[bin]]
+name = "spotter"
+path = "fuzz_targets/spotter.rs"
+test = false
+doc = false
+bench = false

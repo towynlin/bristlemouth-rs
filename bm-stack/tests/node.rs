@@ -3507,3 +3507,157 @@ fn an_app_task_publishes_and_subscribes_through_a_channel() {
     );
     assert_eq!(app.dropped(), 0);
 }
+
+// Spotter
+
+#[test]
+fn spotter_log_publishes_to_printf_or_fprintf() {
+    use bm_wire::spotter::{self, USE_TIMESTAMP};
+
+    let mut node = subscribed_node(&[b"spotter/*"]);
+    for file_name in [None, Some(&b"hello.log"[..])] {
+        let mut events = Vec::new();
+        let outbound = node
+            .spotter_log_with(0, file_name, USE_TIMESTAMP, b"hello world", |e| {
+                events.extend(delivered(e));
+            })
+            .unwrap();
+        let frame = frames::spotter_log(NODE_ID, 0, file_name, USE_TIMESTAMP, b"hello world");
+        assert_eq!(outbound.mask(), 0b11);
+        assert_eq!(outbound.frame(), frame);
+        let publication = bm_wire::pubsub::decode(&frame[bm_wire::udp::PAYLOAD_OFFSET..]).unwrap();
+        assert_eq!(
+            events,
+            vec![(
+                NODE_ID,
+                b"spotter/*".to_vec(),
+                spotter::log_topic(file_name).to_vec(),
+                spotter::KIND,
+                bm_wire::pubsub::COMMON_VERSION,
+                publication.data.to_vec(),
+            )]
+        );
+    }
+    assert!(
+        node.resources()
+            .iter(ResourceType::Publisher)
+            .eq([spotter::PRINTF_TOPIC, spotter::FPRINTF_TOPIC])
+    );
+}
+
+/// Divergence #81: `max_str_len` allows a line `bm_pub` refuses, after
+/// delivering it locally.
+#[test]
+fn spotter_log_refusals() {
+    use bm_stack::SpotterError;
+    use bm_wire::spotter::max_text_len;
+
+    let mut node = subscribed_node(&[b"*"]);
+    let text = [b'a'; 1500];
+    // 5 + 14 + 13 + text + 1 bytes to `spotter/printf`.
+    let fits = bm_wire::pubsub::MAX_MESSAGE_LEN - 5 - 14 - 13 - 1;
+    assert!(node.spotter_log(0, None, 0, &text[..fits]).is_ok());
+
+    for len in [fits + 1, max_text_len(0)] {
+        let mut count = 0;
+        let err = node
+            .spotter_log_with(0, None, 0, &text[..len], |e| {
+                count += usize::from(delivered(e).is_some());
+            })
+            .unwrap_err();
+        assert_eq!(err, SpotterError::NotSent, "{len}");
+        assert_eq!(count, 1, "delivered locally ({len})");
+    }
+
+    let mut count = 0;
+    let mut refused = |file_name: Option<&[u8]>, text: &[u8]| {
+        node.spotter_log_with(0, file_name, 0, text, |_| count += 1)
+            .unwrap_err()
+    };
+    assert_eq!(refused(None, b""), SpotterError::NoData);
+    assert_eq!(refused(Some(&[b'n'; 64]), b"x"), SpotterError::MessageSize);
+    assert_eq!(
+        refused(None, &text[..max_text_len(0) + 1]),
+        SpotterError::MessageSize
+    );
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn spotter_tx_data_publishes_to_transmit_data() {
+    use bm_stack::SpotterError;
+    use bm_wire::spotter::NetworkType;
+
+    let mut node = subscribed_node(&[b"*"]);
+    let data = [0x5A; 1001];
+    for (network, max) in [
+        (NetworkType::CELLULAR_IRI_FALLBACK, 311),
+        (NetworkType::CELLULAR_ONLY, 1000),
+    ] {
+        let mut count = 0;
+        let outbound = node
+            .spotter_tx_data_with(&data[..max], network, |e| {
+                count += usize::from(delivered(e).is_some());
+            })
+            .unwrap();
+        assert_eq!(
+            outbound.frame(),
+            frames::spotter_tx_data(NODE_ID, &data[..max], network)
+        );
+        assert_eq!(count, 1);
+        assert_eq!(
+            node.spotter_tx_data(&data[..=max], network).unwrap_err(),
+            SpotterError::MessageSize
+        );
+    }
+}
+
+/// A task logs to the Spotter through a [`bm_stack::NodeHandle`].
+#[test]
+fn an_app_task_logs_to_the_spotter_through_a_channel() {
+    use bm_stack::Channels;
+    use bm_wire::spotter::{NetworkType, USE_TIMESTAMP};
+    use embassy_futures::select::{Either, select};
+    use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+
+    let _clock = clock_lock();
+    let mut node = node();
+    let mut phy = MockPhy::new(PORTS, vec![Script::Idle { ms: 50 }; 4]);
+
+    let channels = Channels::<NoopRawMutex, 4>::new();
+    let handle = channels.handle();
+    let mut app = channels.app();
+
+    let task = async {
+        assert!(
+            handle
+                .spotter_log(0, Some(b"hello.log"), USE_TIMESTAMP, b"hello world")
+                .await
+        );
+        assert!(!handle.spotter_log(0, Some(&[b'n'; 64]), 0, b"x").await);
+        assert!(
+            handle
+                .spotter_tx_data(&[1, 2, 3, 4], NetworkType::CELLULAR_ONLY)
+                .await
+        );
+        assert!(handle.subscribe(b"never").await);
+        handle.notification().await
+    };
+
+    if let Either::Second(n) = block_on(select(node.run_app(&mut phy, &mut app), task)) {
+        panic!("no notification was due: {n:?}");
+    }
+    assert_eq!(
+        phy.sent_to(Egress::AllPorts),
+        vec![
+            &frames::spotter_log(
+                NODE_ID,
+                0,
+                Some(b"hello.log"),
+                USE_TIMESTAMP,
+                b"hello world"
+            )[..],
+            &frames::spotter_tx_data(NODE_ID, &[1, 2, 3, 4], NetworkType::CELLULAR_ONLY)[..],
+        ]
+    );
+}

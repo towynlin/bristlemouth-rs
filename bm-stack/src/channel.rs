@@ -17,6 +17,7 @@ use embassy_sync::channel::{Channel, Receiver, Sender};
 use heapless::Vec;
 
 use bm_wire::bcmp::resource::RESOURCE_NAME_BYTES;
+use bm_wire::spotter::{self, NetworkType};
 use bm_wire::util::BmIpAddr;
 
 use crate::app::App;
@@ -33,6 +34,10 @@ pub const TOPIC_BYTES: usize = RESOURCE_NAME_BYTES;
 /// directly. A received publication with more is counted by
 /// [`ChannelApp::dropped`].
 pub const DATA_BYTES: usize = 256;
+
+/// Longest file name a [`Command::SpotterLog`] carries: the longest
+/// [`Node::spotter_log`] accepts.
+pub const FILE_NAME_BYTES: usize = spotter::MAX_FILE_NAME_LEN - 1;
 
 /// Something an application asks the node to do.
 ///
@@ -73,6 +78,26 @@ pub enum Command {
     Unsubscribe {
         /// The topic.
         topic: Vec<u8, TOPIC_BYTES>,
+    },
+    /// [`Node::spotter_log_with`]; local deliveries come back as
+    /// [`Notification::Publication`].
+    SpotterLog {
+        /// Spotter to print, or zero for every one.
+        target_node_id: u64,
+        /// The file to append to, or `None` for the console.
+        file_name: Option<Vec<u8, FILE_NAME_BYTES>>,
+        /// [`spotter::USE_TIMESTAMP`] or [`spotter::NO_TIMESTAMP`].
+        print_time: u8,
+        /// The formatted text.
+        text: Vec<u8, DATA_BYTES>,
+    },
+    /// [`Node::spotter_tx_data_with`]; local deliveries come back as
+    /// [`Notification::Publication`].
+    SpotterTxData {
+        /// The data.
+        data: Vec<u8, DATA_BYTES>,
+        /// The network to send it over.
+        network: NetworkType,
     },
 }
 
@@ -275,6 +300,47 @@ impl<M: RawMutex, const DEPTH: usize> NodeHandle<'_, M, DEPTH> {
         true
     }
 
+    /// Publish a line for the Spotter; see [`Node::spotter_log`].
+    ///
+    /// Returns `false` without queueing anything when `file_name` is longer
+    /// than [`FILE_NAME_BYTES`] or `text` than [`DATA_BYTES`].
+    pub async fn spotter_log(
+        &self,
+        target_node_id: u64,
+        file_name: Option<&[u8]>,
+        print_time: u8,
+        text: &[u8],
+    ) -> bool {
+        let file_name = match file_name.map(Vec::from_slice) {
+            None => None,
+            Some(Ok(name)) => Some(name),
+            Some(Err(_)) => return false,
+        };
+        let Ok(text) = Vec::from_slice(text) else {
+            return false;
+        };
+        self.send(Command::SpotterLog {
+            target_node_id,
+            file_name,
+            print_time,
+            text,
+        })
+        .await;
+        true
+    }
+
+    /// Ask the Spotter to send `data`; see [`Node::spotter_tx_data`].
+    ///
+    /// Returns `false` without queueing anything when `data` is longer than
+    /// [`DATA_BYTES`].
+    pub async fn spotter_tx_data(&self, data: &[u8], network: NetworkType) -> bool {
+        let Ok(data) = Vec::from_slice(data) else {
+            return false;
+        };
+        self.send(Command::SpotterTxData { data, network }).await;
+        true
+    }
+
     /// The next notification, waiting for one.
     pub async fn notification(&self) -> Notification {
         self.notifications.receive().await
@@ -407,6 +473,29 @@ impl<
             Command::Unsubscribe { topic } => {
                 let _ = node.unsubscribe(&topic);
                 None
+            }
+            Command::SpotterLog {
+                target_node_id,
+                file_name,
+                print_time,
+                text,
+            } => {
+                let (notifications, dropped) = (&self.notifications, &mut self.dropped);
+                node.spotter_log_with(
+                    target_node_id,
+                    file_name.as_deref(),
+                    print_time,
+                    &text,
+                    |event| notify(notifications, dropped, &event),
+                )
+                .ok()
+            }
+            Command::SpotterTxData { data, network } => {
+                let (notifications, dropped) = (&self.notifications, &mut self.dropped);
+                node.spotter_tx_data_with(&data, network, |event| {
+                    notify(notifications, dropped, &event);
+                })
+                .ok()
             }
         }
     }

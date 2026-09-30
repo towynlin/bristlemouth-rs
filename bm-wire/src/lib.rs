@@ -36,6 +36,7 @@ pub mod l2;
 pub mod l2_policy;
 pub mod neighbor;
 pub mod pubsub;
+pub mod spotter;
 pub mod udp;
 pub mod util;
 

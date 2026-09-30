@@ -239,11 +239,16 @@ pub enum Published {
     /// Topic and data within the payload: `(node id, topic, data, type,
     /// version)`.
     Read(u64, Vec<u8>, Vec<u8>, u8, u8),
-    /// A data length past [`pubsub::MAX_MESSAGE_LEN`], which no payload here
-    /// reaches, so wrapped (divergence #75); the topic and data are not read.
-    /// `(node id, topic_len, data_len, type, version)`.
+    /// A data length of at least [`WRAPPED_DATA_LEN`], which only a topic
+    /// past the payload produces (divergence #75); the topic and data are not
+    /// read. `(node id, topic_len, data_len, type, version)`.
     Wrapped(u64, u16, u16, u8, u8),
 }
+
+/// The least data length `bm_handle_msg` computes for a topic past the
+/// payload: `size - 5 - topic_len` wraps to at least `65536 - 255`. Every
+/// publication a comparator here makes or receives has less data.
+pub const WRAPPED_DATA_LEN: usize = 0x1_0000 - pubsub::TOPIC_MAX_LEN;
 
 /// What `bm_handle_msg` hands a subscriber for `payload` from `node_id`,
 /// computed from [`pubsub::decode`] and, where it refuses, from the C's
@@ -283,7 +288,7 @@ unsafe extern "C" fn on_publication(
     kind: u8,
     version: u8,
 ) {
-    let published = if usize::from(data_len) > pubsub::MAX_MESSAGE_LEN {
+    let published = if usize::from(data_len) >= WRAPPED_DATA_LEN {
         Published::Wrapped(node_id, topic_len, data_len, kind, version)
     } else {
         let (topic, data) = unsafe {
@@ -301,14 +306,20 @@ unsafe extern "C" fn on_publication(
 }
 
 static SUBSCRIBED: Once = Once::new();
+static SEEDED: Once = Once::new();
 
 /// Bind [`BOUND_PORTS`] and subscribe to `*` in the oracle, once per
-/// process. `*` matches every topic `bm_wildcard_match` is given.
+/// process. `*` matches every topic `bm_wildcard_match` is given; what it
+/// receives, [`take_published`] returns.
 ///
 /// Asserts [`pubsub_domain`]'s premise on every call, since a test may have
 /// subscribed since: every oracle subscription but `*` starts with a literal
 /// byte other than [`OFF_PATTERN`].
-fn prepare(guard: &std::sync::MutexGuard<'static, ()>) {
+///
+/// # Panics
+///
+/// If `bm_sub_wl` refuses, or the premise does not hold.
+pub fn subscribe_all(guard: &std::sync::MutexGuard<'static, ()>) {
     bind(guard);
     SUBSCRIBED.call_once(|| unsafe {
         assert_eq!(
@@ -316,7 +327,6 @@ fn prepare(guard: &std::sync::MutexGuard<'static, ()>) {
             bm_wire_sys::BmErr_BmOK,
             "bm_sub_wl"
         );
-        seed_pub_list();
     });
     for topic in subscriptions() {
         if topic != b"*" {
@@ -327,6 +337,12 @@ fn prepare(guard: &std::sync::MutexGuard<'static, ()>) {
             );
         }
     }
+}
+
+/// [`subscribe_all`], and seed `PUB_LIST` once per process.
+fn prepare(guard: &std::sync::MutexGuard<'static, ()>) {
+    subscribe_all(guard);
+    SEEDED.call_once(seed_pub_list);
 }
 
 /// Put [`pool_topic`]`(254)` at the head of `resource_discovery.c`'s
@@ -379,7 +395,8 @@ fn subscriptions() -> Vec<Vec<u8>> {
     }
 }
 
-fn take_published() -> Vec<Published> {
+/// What the oracle's `*` subscription received since the last call.
+pub fn take_published() -> Vec<Published> {
     std::mem::take(&mut *PUBLISHED.lock().unwrap_or_else(|p| p.into_inner()))
 }
 

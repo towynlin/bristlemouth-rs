@@ -15,7 +15,7 @@ use bm_wire::bcmp::{BCMP_HEADER_LEN, Heartbeat, MessageType, tx};
 use bm_wire::frame::MIN_FRAME_WITH_ADDRESSES;
 use bm_wire::neighbor::HEARTBEAT_PERIOD_S;
 use bm_wire::util::BmIpAddr;
-use bm_wire::{pubsub, udp};
+use bm_wire::{pubsub, spotter, udp};
 
 /// A BCMP message from node `src` (at its `fe80::` address) to `dst`.
 ///
@@ -145,5 +145,51 @@ pub fn publication(src: u64, topic: &[u8], kind: u8, version: u8, data: &[u8]) -
         pubsub::PORT,
         pubsub::PORT,
         &payload,
+    )
+}
+
+/// A `spotter_log` publication from node `src`: [`spotter::encode_log`] in
+/// [`publication`] to [`spotter::log_topic`].
+///
+/// # Panics
+///
+/// If `spotter_log` would refuse the arguments.
+#[must_use]
+pub fn spotter_log(
+    src: u64,
+    target_node_id: u64,
+    file_name: Option<&[u8]>,
+    print_time: u8,
+    text: &[u8],
+) -> Vec<u8> {
+    let mut body = vec![0u8; spotter::MAX_LOG_LEN];
+    let len = spotter::encode_log(&mut body, target_node_id, file_name, print_time, text)
+        .expect("arguments spotter_log accepts");
+    publication(
+        src,
+        spotter::log_topic(file_name),
+        spotter::KIND,
+        pubsub::COMMON_VERSION,
+        &body[..len],
+    )
+}
+
+/// A `spotter_tx_data` publication from node `src`:
+/// [`spotter::encode_tx_data`] in [`publication`] to
+/// [`spotter::TRANSMIT_DATA_TOPIC`].
+///
+/// # Panics
+///
+/// If `data` is longer than [`spotter::NetworkType::max_len`].
+#[must_use]
+pub fn spotter_tx_data(src: u64, data: &[u8], network: spotter::NetworkType) -> Vec<u8> {
+    let mut body = vec![0u8; spotter::MAX_TX_LEN];
+    let len = spotter::encode_tx_data(&mut body, network, data).expect("data within the limit");
+    publication(
+        src,
+        spotter::TRANSMIT_DATA_TOPIC,
+        spotter::KIND,
+        pubsub::COMMON_VERSION,
+        &body[..len],
     )
 }
