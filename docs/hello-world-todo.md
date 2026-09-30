@@ -52,12 +52,12 @@ bus with a Spotter and a C dev kit:
 | UDP over IPv6 | Done: `bm_wire::udp`; `Node::bind_udp`, `Node::send_udp`, `Event::Udp` |
 | Pub/sub codec and topic matching | Done: `bm_wire::pubsub`, `bm_wire::util::bm_wildcard_match` |
 | Pub/sub on the node (`middleware/pubsub.c`, `middleware.c`) | Done: `Node::subscribe`, `unsubscribe`, `publish`, `Event::Publication` |
-| `spotter_log`, `spotter_tx_data` | **Missing.** |
+| `spotter_log`, `spotter_tx_data` | Done: `bm_wire::spotter`; `Node::spotter_log`, `Node::spotter_tx_data` |
 | Dev kit board support (MCU HAL, pins, node id, time driver, flash) | **Missing.** No crate targets a board. |
 
-A node that heartbeats, is discovered, answers ping and info, and publishes
-and subscribes runs on the mock PHY (`bm-stack/examples/hello_node.rs`), but
-not yet on a board. It cannot yet `spotter_log`.
+A node that heartbeats, is discovered, answers ping and info, publishes,
+subscribes and calls `spotter_log` runs on the mock PHY
+(`bm-stack/examples/hello_node.rs`), but not yet on a board.
 
 ## The oracle is not the deployed stack for UDP
 
@@ -98,7 +98,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 |---|---|---|
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, E0, F1, H0, P1, P2, U1, U2) left for the rest
+## What the landed cards (A1, E0, F1, H0, P1, P2, S1, U1, U2) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -113,8 +113,8 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   because the app could then act only inside an event and not on a timer of
   its own. Both tests are in `bm-stack/tests/node.rs` under "Application
   seam".
-- **The channel covers ping and pub/sub.** Each new app-facing call (S1's
-  `spotter_log`) needs a `Command` variant, and each new event an owned
+- **The channel covers ping, pub/sub and the Spotter calls.** Each new
+  app-facing call needs a `Command` variant, and each new event an owned
   `Notification`. `Event::Udp` has none: bm_core applications never see raw
   UDP, only pub/sub. Owned topics are at most `channel::TOPIC_BYTES` (64) and
   data `channel::DATA_BYTES` (256), fixed rather than generic so `Command`
@@ -189,8 +189,9 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 - **Scripted peer frames come from `bm_stack::mock::frames`, comparator
   inputs from `bm_wire_diff::frames`.** Both wrap `tx::build` in a `Vec`.
   Both have `udp(src, dst, src_port, dst_port, payload)`, from
-  `udp::source_address`, and `publication(src, topic, kind, version, data)`;
-  S1 adds its `spotter_log` builders there rather than in a test file. A comparator needing non-standard header bytes
+  `udp::source_address`, `publication(src, topic, kind, version, data)`,
+  `spotter_log(src, target_node_id, file_name, print_time, text)` and
+  `spotter_tx_data(src, data, network)`. A comparator needing non-standard header bytes
   calls `write_headers` and mutates the result, as `bm-wire-diff/src/forward.rs`
   does.
 - **The capture: `bm-wire-diff/testdata/hello-pub-card-h0.pcap`.** 166 s,
@@ -200,8 +201,9 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   (`e5d14eea4fc2db6b`, temperature). The callback sees received frames before
   `bm_l2_policy_rx_apply`, so none carries an ingress nibble, and it does not
   record the port. `tests/capture_h0.rs` names the nodes and asserts the
-  header table above; `bm_wire_diff::pcap::records` reads the file for S1's
-  gold vectors. The dev kit published every 10 s:
+  header table above; `bm_wire_diff::pcap::records` reads the file.
+  `node_spotter_calls_rebuild_the_dev_kits_frames` rebuilds all 51 of the
+  dev kit's Spotter publications with `Node`. The dev kit published every 10 s:
 
   | Call | Topic | Body as captured |
   |---|---|---|
@@ -235,13 +237,12 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   | `Node<…, SUBSCRIPTIONS = 8>` | after `RESOURCE_REQUESTS`; a topic is at most `RESOURCE_NAME` bytes, since it is also a resource |
 
   One subscriber per topic, the application, so bm_core's callback lists
-  (and #79) have no counterpart. S1's `Node::spotter_log` wraps `publish`.
+  (and #79) have no counterpart.
 - **Comparing publications.** `node_udp::Step::Publish` compares `bm_pub_wl`
   with `Node::publish_with`: result, local delivery to `*`, and frames in the
   two steps above. `bm-wire-diff/src/pubsub.rs` (stack target `pubsub`)
   mirrors the oracle's subscription and resource lists in one Rust node for
-  the life of the process and compares everything after every step. S1 can
-  reuse `node_udp::check_publish`'s shape for `spotter_log`.
+  the life of the process and compares everything after every step.
 - **Divergence #38 constrains every oracle publish and subscribe.**
   `bm_pub_wl` and `bm_sub_wl` look the topic up in `PUB_LIST`/`SUB_LIST`,
   which reads past every shorter entry before a match. `node_udp` therefore:
@@ -253,10 +254,11 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
   `oracle_delivers` publishes with `MAX_MESSAGE_LEN` bytes of data, which is
   delivered locally and never reaches `PUB_LIST`, so it can use any topic.
-  `pubsub.rs` keeps every pattern 10 bytes and every topic 14. S1's topics
-  (`spotter/transmit-data` 21, `spotter/fprintf` 15, `spotter/printf` 14)
-  are safe in a fresh `PUB_LIST` published longest first: every lookup then
-  meets only longer entries before its own.
+  `pubsub.rs` keeps every pattern 10 bytes and every topic 14.
+  `bm_wire_diff::spotter` seeds a fresh `PUB_LIST` with its three topics
+  longest first, so every lookup meets only longer entries before its own.
+  `node_udp::subscribe_all` is the `*` subscription without `node_udp`'s
+  `PUB_LIST` seed, for a comparator that seeds its own.
 - **Malformed publications reach the oracle only in bounds.**
   `node_udp::pubsub_domain` pads a payload to the header and, where its topic
   runs past the end, sets the first topic byte to `OFF_PATTERN` (`#`), which no
@@ -266,36 +268,34 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   `?`; every `node_udp` comparator asserts it through `bm_get_subs` (#78: keep
   the subscriptions few).
 - **`bm-stack/examples/hello_node.rs` is the host twin of E1.** It subscribes
-  to `hello/*`, publishes, and receives the scripted neighbour's publication;
-  S1 adds a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
-  `cargo test` only builds examples.
+  to `hello/*`, publishes, receives the scripted neighbour's publication, and
+  sends `hello world` with `spotter_log`. It asserts its outcome, and CI's
+  `test` job runs it: `cargo test` only builds examples.
+- **Spotter calls.**
+
+  | Item | Shape |
+  |---|---|
+  | `Node::spotter_log(target_node_id, file_name, print_time, text) -> Result<Outbound, SpotterError>` | `file_name` `None` is `spotter/printf` (`spotter_log_console` with `USE_TIMESTAMP`), `Some` is `spotter/fprintf`, even `Some(b"")` |
+  | `Node::spotter_tx_data(data, NetworkType) -> Result<Outbound, SpotterError>` | `spotter/transmit-data`; 311 bytes, or 1000 for `CELLULAR_ONLY` |
+  | `SpotterError` | `NoData` (`BmENODATA`), `MessageSize` (`BmEMSGSIZE`), `NotSent` (`BmENETDOWN`, after local delivery, #81) |
+  | `_with` twins | report local deliveries, as `publish_with` |
+  | `channel::Command::SpotterLog`, `SpotterTxData` | text and data at most `DATA_BYTES`, file name `FILE_NAME_BYTES` (63) |
+
+  Text is bytes the caller formatted, as the card decided: format with
+  `core::fmt::Write` into a buffer. It is taken whole, NULs included, as a C
+  format can write one; a file name is read to its first NUL, as
+  `bm_strnlen` reads it. Each call builds its body in a buffer on the stack
+  (`spotter::MAX_LOG_LEN`, 1461 bytes, or `MAX_TX_LEN`, 1001) rather than in
+  the node, so a node carries no second 1.5 KB buffer; E1's node task needs
+  the stack for it. `NetworkType` is a `u8` newtype, not an enum, because the
+  C sends any byte and gives every value but `CELLULAR_ONLY` the Iridium
+  limit.
 
 ---
 
-## Card S1 — `spotter_log` and `spotter_tx_data`
-
-**Blocks:** E1. **Blocked by:** nothing.
-
-C: `integrations/spotter.c`, `bm_print_publication_t` and
-`BmSerialNetworkDataHeader` (`bm_common_messages/bm_common_pub_sub.h`).
-
-Rust: `bm-wire/src/spotter.rs` encodes both bodies (`target_node_id` u64,
-`fname_len` u16, `data_len` u16, `print_time` u8, file name, text, trailing
-NUL — the C sends the NUL); `bm-stack` wraps them as `Node::spotter_log` and
-`Node::spotter_tx_data`, taking bytes rather than a format string (callers
-format with `core::fmt::Write` into a buffer). Topics `spotter/printf`,
-`spotter/fprintf`, `spotter/transmit-data`; type 1, version
-`BM_COMMON_PUB_SUB_VERSION` (2). Size limits: `max_str_len`, 311 bytes
-Iridium, 1000 cellular.
-
-Comparator: frames from `spotter_log`/`spotter_tx_data` vs ours. `spotter_log`
-is variadic; call it with `"%s"` and the text.
-
-Done: comparator, fuzz target `spotter`.
-
 ## Card B1 — Dev kit board support
 
-**Blocks:** E1. **Blocked by:** nothing (can run beside S1).
+**Blocks:** E1. **Blocked by:** nothing.
 
 The dev kit's mote is an STM32U5 (Cortex-M33, `thumbv8m.main-none-eabihf`)
 with an ADIN2111 on SPI. The pin map, the ADIN2111 power and reset sequence,
@@ -316,7 +316,7 @@ check the PR reports as done or not done.
 
 ## Card E1 — The hello-world example
 
-**Blocks:** nothing. **Blocked by:** S1, B1.
+**Blocks:** nothing. **Blocked by:** B1.
 
 `bm-devkit/src/bin/hello_world.rs` — embassy's convention for board examples
 (`examples/<board>/src/bin/*.rs`, own workspace, own `memory.x`) applies, so
@@ -332,12 +332,10 @@ reported individually.
 ## Order
 
 ```
-S1 ─► E1
-       ▲
-B1 ────┘
+B1 ─► E1
 ```
 
-S1 and B1 can start now and run in parallel.
+B1 can start now.
 
 # Explicitly out of scope
 
