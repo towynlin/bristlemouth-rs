@@ -154,9 +154,9 @@ fn link_local_datagrams_are_not_relayed() {
     }
 }
 
+/// Every port but pub/sub's is bound on both sides; 0x4000 on neither.
 #[test]
-fn ports_bound_on_one_side_only() {
-    // 0xFFFF is bound in the oracle only; 0x4000 on neither.
+fn bound_and_unbound_ports() {
     for dst_port in [0xFFFF, 0x4000] {
         check_receive(&arrival(0, Dst::Global, 7, dst_port, b"x"));
     }

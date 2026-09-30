@@ -6,8 +6,8 @@
 
 use bm_wire::bcmp::{BCMP_HEADER_LEN, MessageType, tx};
 use bm_wire::frame::MIN_FRAME_WITH_ADDRESSES;
-use bm_wire::udp;
 use bm_wire::util::BmIpAddr;
+use bm_wire::{pubsub, udp};
 
 /// A BCMP message from node `src` (at its `fe80::` address) to `dst`.
 ///
@@ -50,4 +50,23 @@ pub fn udp(src: u64, dst: &BmIpAddr, src_port: u16, dst_port: u16, payload: &[u8
     )
     .expect("payload fits");
     frame
+}
+
+/// A publication from node `src`, as `bm_pub_wl` sends it: [`pubsub::encode`]
+/// in a datagram to `FF03::1` from and to [`pubsub::PORT`].
+///
+/// # Panics
+///
+/// If `topic` is empty or [`pubsub::TOPIC_MAX_LEN`] bytes or longer.
+#[must_use]
+pub fn publication(src: u64, topic: &[u8], kind: u8, version: u8, data: &[u8]) -> Vec<u8> {
+    let mut payload = vec![0u8; pubsub::HEADER_LEN + topic.len() + data.len()];
+    pubsub::encode(&mut payload, topic, kind, version, data).expect("a topic bm_pub_wl sends");
+    udp(
+        src,
+        &BmIpAddr::GLOBAL_MULTICAST,
+        pubsub::PORT,
+        pubsub::PORT,
+        &payload,
+    )
 }

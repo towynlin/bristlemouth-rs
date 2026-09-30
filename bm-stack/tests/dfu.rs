@@ -60,6 +60,7 @@ type DfuNode<'a, I = TestIdentity> = Node<
     { bm_stack::node::RESOURCES_DEFAULT },
     { bm_wire::bcmp::resource::RESOURCE_NAME_BYTES },
     { bm_stack::node::RESOURCE_REQUESTS_DEFAULT },
+    { bm_stack::node::SUBSCRIPTIONS_DEFAULT },
     NoConfig,
     &'a mut RamDfuSlot<SLOT>,
 >;

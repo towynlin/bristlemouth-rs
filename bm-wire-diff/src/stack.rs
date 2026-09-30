@@ -386,6 +386,7 @@ pub type ConfigNode = Node<
     { bm_stack::node::RESOURCES_DEFAULT },
     { bm_wire::bcmp::resource::RESOURCE_NAME_BYTES },
     { bm_stack::node::RESOURCE_REQUESTS_DEFAULT },
+    { bm_stack::node::SUBSCRIPTIONS_DEFAULT },
     bm_stack::Config<bm_stack::RamConfigStorage>,
 >;
 

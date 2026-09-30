@@ -39,6 +39,7 @@ pub mod neighbor_table;
 pub mod node_udp;
 pub mod pcap;
 pub mod ping;
+pub mod pubsub;
 pub mod registry;
 pub mod replay;
 pub mod resource;

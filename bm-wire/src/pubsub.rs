@@ -20,6 +20,8 @@
 //! | A subscription matches any topic it prefixes, unless it holds a `*` | [`crate::util::bm_wildcard_match`] does the same | #74 |
 //! | `bm_handle_msg` computes the data length unchecked; a `topic_len` past the payload wraps it and the callback reads out of bounds | [`decode`] refuses | #75 |
 //! | `bm_pub_wl` sizes its buffer in a `uint16_t` that wraps, then copies past it | [`encode`] takes `usize` lengths and a caller buffer | #76 |
+//!
+//! [`Subscriptions`] is `CTX.subscription_list` with one callback per topic.
 
 use crate::BmWireError;
 
@@ -109,6 +111,161 @@ pub fn decode(payload: &[u8]) -> Result<Publication<'_>, BmWireError> {
         version: *version,
         data,
     })
+}
+
+/// Why [`Subscriptions`] refused, with the `BmErr` `bm_sub_wl` or
+/// `bm_unsub_wl` returns for the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriptionError {
+    /// The topic is empty: `BmEINVAL`.
+    EmptyTopic,
+    /// The topic is [`TOPIC_MAX_LEN`] bytes or longer: `BmEMSGSIZE`.
+    TopicTooLong,
+    /// `N` topics are held, or the topic is longer than `TOPIC`: ceilings
+    /// bm_core does not have. The C's nearest is `BmENOMEM` from `bm_malloc`.
+    Full,
+    /// [`Subscriptions::unsubscribe`] of a topic not subscribed. `bm_unsub_wl`
+    /// returns `BmEINVAL`: its `err` is never reassigned on that path.
+    NotSubscribed,
+}
+
+/// `middleware/pubsub.c`'s `CTX.subscription_list`, holding one subscriber
+/// per topic.
+///
+/// The C keeps a list of callbacks per topic. A node here has one subscriber,
+/// its application, so a topic is subscribed or not:
+///
+/// | C | Here |
+/// |---|---|
+/// | `bm_sub_wl` of a new topic appends it | [`Self::subscribe`] appends it |
+/// | `bm_sub_wl` of a topic already held with the same callback: `BmOK`, no change | [`Self::subscribe`]: `Ok`, no change |
+/// | `bm_unsub_wl` of its last callback deletes the topic | [`Self::unsubscribe`] deletes it |
+/// | `bm_handle_msg` calls the callbacks of every matching topic, in list order | [`Self::matching`], in list order |
+/// | `get_sub(topic, len, true)`: whether any topic matches | [`Self::any_match`] |
+///
+/// Topics are compared exactly for subscribing, and matched with
+/// [`bm_wildcard_match`](crate::util::bm_wildcard_match), publication topic
+/// first, for delivery (divergence #74). Order is insertion order; a topic
+/// unsubscribed and subscribed again goes to the end.
+///
+/// `N` is how many topics are held and `TOPIC` the longest; bm_core has
+/// neither ceiling.
+#[derive(Debug, Clone)]
+pub struct Subscriptions<const N: usize, const TOPIC: usize> {
+    entries: [([u8; TOPIC], usize); N],
+    len: usize,
+}
+
+impl<const N: usize, const TOPIC: usize> Default for Subscriptions<N, TOPIC> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const N: usize, const TOPIC: usize> Subscriptions<N, TOPIC> {
+    /// No subscriptions.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: [([0; TOPIC], 0); N],
+            len: 0,
+        }
+    }
+
+    /// How many topics are subscribed.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether no topic is subscribed.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The subscribed topics, in list order.
+    pub fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.entries[..self.len]
+            .iter()
+            .map(|(topic, len)| &topic[..*len])
+    }
+
+    /// Whether `topic` itself is subscribed: `get_sub(topic, len, false)`.
+    #[must_use]
+    pub fn contains(&self, topic: &[u8]) -> bool {
+        self.position(topic).is_some()
+    }
+
+    fn position(&self, topic: &[u8]) -> Option<usize> {
+        self.iter().position(|held| held == topic)
+    }
+
+    /// Subscribe to `topic`, as `bm_sub_wl` up to its resource-table call.
+    ///
+    /// # Errors
+    ///
+    /// [`SubscriptionError::EmptyTopic`], [`SubscriptionError::TopicTooLong`]
+    /// or [`SubscriptionError::Full`]; nothing changes.
+    pub fn subscribe(&mut self, topic: &[u8]) -> Result<(), SubscriptionError> {
+        check_topic(topic)?;
+        if self.contains(topic) {
+            return Ok(());
+        }
+        if self.len == N || topic.len() > TOPIC {
+            return Err(SubscriptionError::Full);
+        }
+        let (held, len) = &mut self.entries[self.len];
+        held[..topic.len()].copy_from_slice(topic);
+        *len = topic.len();
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Unsubscribe from `topic`, as `bm_unsub_wl`.
+    ///
+    /// # Errors
+    ///
+    /// [`SubscriptionError::EmptyTopic`], [`SubscriptionError::TopicTooLong`]
+    /// or [`SubscriptionError::NotSubscribed`]; nothing changes.
+    pub fn unsubscribe(&mut self, topic: &[u8]) -> Result<(), SubscriptionError> {
+        check_topic(topic)?;
+        let index = self
+            .position(topic)
+            .ok_or(SubscriptionError::NotSubscribed)?;
+        self.entries[index..self.len].rotate_left(1);
+        self.len -= 1;
+        Ok(())
+    }
+
+    /// The subscribed topics a publication on `topic` is delivered to, in the
+    /// order `bm_handle_msg` calls them.
+    pub fn matching<'a>(&'a self, topic: &'a [u8]) -> impl Iterator<Item = &'a [u8]> + 'a {
+        self.iter()
+            .filter(move |pattern| crate::util::bm_wildcard_match(topic, pattern))
+    }
+
+    /// Whether a publication on `topic` reaches any subscription:
+    /// `bm_pub_wl`'s test for a local delivery.
+    #[must_use]
+    pub fn any_match(&self, topic: &[u8]) -> bool {
+        self.matching(topic).next().is_some()
+    }
+}
+
+/// The topic checks `bm_sub_wl`, `bm_unsub_wl` and `bm_pub_wl` make first.
+///
+/// # Errors
+///
+/// [`SubscriptionError::EmptyTopic`] or [`SubscriptionError::TopicTooLong`].
+pub fn check_topic(topic: &[u8]) -> Result<(), SubscriptionError> {
+    if topic.is_empty() {
+        Err(SubscriptionError::EmptyTopic)
+    } else if topic.len() >= TOPIC_MAX_LEN {
+        Err(SubscriptionError::TopicTooLong)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -272,5 +429,37 @@ mod tests {
         assert!(bm_wildcard_match(b"anything", b""));
         assert!(!bm_wildcard_match(b"spotter/printf", b"spotter*x"));
         assert!(!bm_wildcard_match(b"spotter", b"spotter/printf"));
+    }
+
+    #[test]
+    fn subscriptions_keep_list_order_and_refuse_as_bm_sub_wl() {
+        let mut subs: Subscriptions<3, 8> = Subscriptions::new();
+        assert_eq!(subs.subscribe(b""), Err(SubscriptionError::EmptyTopic));
+        assert_eq!(
+            subs.subscribe(&[b'a'; TOPIC_MAX_LEN]),
+            Err(SubscriptionError::TopicTooLong)
+        );
+        assert_eq!(subs.subscribe(b"123456789"), Err(SubscriptionError::Full));
+        subs.subscribe(b"a").unwrap();
+        subs.subscribe(b"b*").unwrap();
+        subs.subscribe(b"a").unwrap();
+        assert_eq!(subs.len(), 2, "a second subscribe changes nothing");
+        subs.subscribe(b"*").unwrap();
+        assert_eq!(subs.subscribe(b"c"), Err(SubscriptionError::Full));
+        assert_eq!(
+            subs.unsubscribe(b"c"),
+            Err(SubscriptionError::NotSubscribed)
+        );
+        subs.unsubscribe(b"a").unwrap();
+        subs.subscribe(b"a").unwrap();
+        assert!(subs.iter().eq([&b"b*"[..], b"*", b"a"]));
+        assert!(
+            subs.matching(b"abc").eq([&b"*"[..], b"a"]),
+            "prefix match, #74"
+        );
+        assert!(subs.matching(b"bc").eq([&b"b*"[..], b"*"]));
+        assert!(subs.any_match(b"x"));
+        subs.unsubscribe(b"*").unwrap();
+        assert!(!subs.any_match(b"x"));
     }
 }

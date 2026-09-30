@@ -2838,6 +2838,9 @@ fn the_run_loop_answers_a_resource_request() {
 
 const MIDDLEWARE_PORT: u16 = 4321;
 
+/// A port for the application's own UDP: pub/sub holds [`MIDDLEWARE_PORT`].
+const APP_PORT: u16 = 4000;
+
 /// The `Event::Udp`s one received frame produced, owned.
 fn udp_events(
     node: &mut Node<TestIdentity, SoftRtc, 4>,
@@ -2862,19 +2865,19 @@ fn udp_events(
 #[test]
 fn a_datagram_to_a_bound_port_is_reported_and_relayed() {
     let mut node = node();
-    node.bind_udp(MIDDLEWARE_PORT).unwrap();
+    node.bind_udp(APP_PORT).unwrap();
     let original = frames::udp(
         PEER_ID,
         BmIpAddr::GLOBAL_MULTICAST,
-        MIDDLEWARE_PORT,
-        MIDDLEWARE_PORT,
+        APP_PORT,
+        APP_PORT,
         b"hello",
     );
 
     let mut frame = original.clone();
     assert_eq!(
         udp_events(&mut node, 1, &mut frame),
-        [(MIDDLEWARE_PORT, MIDDLEWARE_PORT, PEER_ID, b"hello".to_vec())]
+        [(APP_PORT, APP_PORT, PEER_ID, b"hello".to_vec())]
     );
 
     let mut frame = original.clone();
@@ -2887,12 +2890,12 @@ fn a_datagram_to_a_bound_port_is_reported_and_relayed() {
 #[test]
 fn a_datagram_to_an_unbound_port_is_relayed_and_not_reported() {
     let mut node = node();
-    node.bind_udp(MIDDLEWARE_PORT).unwrap();
+    node.bind_udp(APP_PORT).unwrap();
     let original = frames::udp(
         PEER_ID,
         BmIpAddr::GLOBAL_MULTICAST,
-        MIDDLEWARE_PORT,
-        MIDDLEWARE_PORT + 1,
+        APP_PORT,
+        APP_PORT + 1,
         b"x",
     );
     let mut frame = original.clone();
@@ -3040,25 +3043,15 @@ fn a_datagram_crosses_between_two_nodes() {
     }
     let mut sender = Node::<Peer, SoftRtc, 4>::new(Peer, SoftRtc::new(), PORTS);
     let mut receiver = node();
-    receiver.bind_udp(MIDDLEWARE_PORT).unwrap();
+    receiver.bind_udp(APP_PORT).unwrap();
     let mut frame = sender
-        .send_udp(
-            MIDDLEWARE_PORT,
-            &BmIpAddr::GLOBAL_MULTICAST,
-            MIDDLEWARE_PORT,
-            b"across",
-        )
+        .send_udp(APP_PORT, &BmIpAddr::GLOBAL_MULTICAST, APP_PORT, b"across")
         .unwrap()
         .frame()
         .to_vec();
     assert_eq!(
         udp_events(&mut receiver, 2, &mut frame),
-        [(
-            MIDDLEWARE_PORT,
-            MIDDLEWARE_PORT,
-            PEER_ID,
-            b"across".to_vec()
-        )]
+        [(APP_PORT, APP_PORT, PEER_ID, b"across".to_vec())]
     );
 }
 
@@ -3203,6 +3196,314 @@ fn an_app_task_pings_through_a_channel_and_sees_the_reply() {
             payload: heapless::Vec::from_slice(b"hello").unwrap(),
             round_trip_ms: 150,
         }
+    );
+    assert_eq!(app.dropped(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Pub/sub -- card P2.
+// ---------------------------------------------------------------------------
+
+/// What an [`Event::Publication`] carried: `(source, subscription, topic,
+/// kind, version, data)`.
+type Delivered = (u64, Vec<u8>, Vec<u8>, u8, u8, Vec<u8>);
+
+fn delivered(event: Event<'_>) -> Option<Delivered> {
+    match event {
+        Event::Publication {
+            source,
+            subscription,
+            topic,
+            kind,
+            version,
+            data,
+        } => Some((
+            source,
+            subscription.to_vec(),
+            topic.to_vec(),
+            kind,
+            version,
+            data.to_vec(),
+        )),
+        _ => None,
+    }
+}
+
+fn subscribed_node(topics: &[&[u8]]) -> Node<TestIdentity, SoftRtc, 4> {
+    let mut node = node();
+    for port in 1..=PORTS {
+        node.set_link_up(port, true);
+    }
+    for topic in topics {
+        node.subscribe(topic).unwrap();
+    }
+    node
+}
+
+#[test]
+fn subscribing_advertises_and_unsubscribing_does_not_withdraw() {
+    use bm_stack::SubscribeError;
+    use bm_wire::pubsub::SubscriptionError;
+
+    let mut node = subscribed_node(&[b"sensor/*", b"spotter"]);
+    node.subscribe(b"sensor/*").unwrap();
+    assert!(
+        node.subscriptions()
+            .iter()
+            .eq([&b"sensor/*"[..], b"spotter"])
+    );
+    assert!(
+        node.resources()
+            .iter(ResourceType::Subscriber)
+            .eq([&b"sensor/*"[..], b"spotter"])
+    );
+
+    node.unsubscribe(b"spotter").unwrap();
+    assert!(node.subscriptions().iter().eq([&b"sensor/*"[..]]));
+    assert_eq!(node.resources().count(ResourceType::Subscriber), 2);
+
+    assert_eq!(
+        node.unsubscribe(b"spotter"),
+        Err(SubscriptionError::NotSubscribed)
+    );
+    assert_eq!(
+        node.subscribe(b""),
+        Err(SubscribeError::Refused(SubscriptionError::EmptyTopic))
+    );
+    assert_eq!(
+        node.subscribe(&[b'x'; 255]),
+        Err(SubscribeError::Refused(SubscriptionError::TopicTooLong))
+    );
+    assert_eq!(
+        node.subscribe(&[b'x'; 65]),
+        Err(SubscribeError::Refused(SubscriptionError::Full)),
+        "longer than RESOURCE_NAME"
+    );
+}
+
+/// `bm_sub_wl` keeps the subscription when the resource add fails.
+#[test]
+fn a_full_resource_table_still_subscribes() {
+    let mut node: Node<TestIdentity, SoftRtc, 4, 4, 64, 8, 64, 1> =
+        Node::new(TestIdentity, SoftRtc::new(), PORTS);
+    node.subscribe(b"a").unwrap();
+    assert_eq!(
+        node.subscribe(b"b"),
+        Err(bm_stack::SubscribeError::NotAdvertised)
+    );
+    assert!(node.subscriptions().iter().eq([&b"a"[..], b"b"]));
+}
+
+#[test]
+fn pubsub_holds_its_port() {
+    let mut node = node();
+    assert!(node.udp_bound(bm_wire::pubsub::PORT));
+    assert_eq!(
+        node.bind_udp(bm_wire::pubsub::PORT),
+        Err(bm_stack::UdpBindError::InUse)
+    );
+}
+
+#[test]
+fn a_publication_goes_to_ff03_1_and_to_each_matching_local_subscription() {
+    let mut node = subscribed_node(&[b"sensor/*", b"other", b"sensor"]);
+    let mut events = Vec::new();
+    let outbound = node
+        .publish_with(b"sensor/temp", 1, 2, b"21.5", |e| {
+            events.extend(delivered(e));
+        })
+        .unwrap();
+    assert_eq!(outbound.mask(), 0b11);
+    assert_eq!(
+        outbound.frame(),
+        frames::publication(NODE_ID, b"sensor/temp", 1, 2, b"21.5")
+    );
+    let local = |sub: &[u8]| {
+        (
+            NODE_ID,
+            sub.to_vec(),
+            b"sensor/temp".to_vec(),
+            1,
+            2,
+            b"21.5".to_vec(),
+        )
+    };
+    // `sensor` prefixes the topic, divergence #74.
+    assert_eq!(events, vec![local(b"sensor/*"), local(b"sensor")]);
+    assert!(
+        node.resources()
+            .iter(ResourceType::Publisher)
+            .eq([&b"sensor/temp"[..]])
+    );
+}
+
+/// `bm_pub_wl` delivers locally before `bm_middleware_net_tx` refuses.
+#[test]
+fn a_publication_too_long_to_send_is_still_delivered_locally() {
+    use bm_stack::PublishError;
+    use bm_wire::pubsub::{HEADER_LEN, MAX_MESSAGE_LEN};
+
+    let mut node = subscribed_node(&[b"*"]);
+    let data = vec![7u8; MAX_MESSAGE_LEN - HEADER_LEN - 1];
+    assert!(
+        node.publish(b"t", 0, 0, &data).is_ok(),
+        "exactly MAX_MESSAGE_LEN"
+    );
+
+    let mut count = 0;
+    let err = node
+        .publish_with(b"u", 0, 0, &[0; MAX_MESSAGE_LEN - HEADER_LEN], |e| {
+            count += usize::from(delivered(e).is_some());
+        })
+        .unwrap_err();
+    assert_eq!(err, PublishError::MessageTooLong);
+    assert_eq!(count, 1);
+    assert!(
+        node.resources()
+            .iter(ResourceType::Publisher)
+            .eq([&b"t"[..]])
+    );
+
+    let mut count = 0;
+    assert_eq!(
+        node.publish_with(b"", 0, 0, b"", |_| count += 1)
+            .unwrap_err(),
+        PublishError::EmptyTopic
+    );
+    assert_eq!(
+        node.publish_with(&[b'*'; 255], 0, 0, b"", |_| count += 1)
+            .unwrap_err(),
+        PublishError::TopicTooLong
+    );
+    assert_eq!(count, 0);
+}
+
+fn received(node: &mut Node<TestIdentity, SoftRtc, 4>, frame: &[u8]) -> (Vec<Delivered>, bool) {
+    let mut frame = frame.to_vec();
+    let mut events = Vec::new();
+    let mut udp = false;
+    let owed = node.on_frame_with(0, 1, &mut frame, |e| {
+        udp |= matches!(e, Event::Udp { .. });
+        events.extend(delivered(e));
+    });
+    assert!(
+        owed.relay.is_some(),
+        "FF03::1 is relayed out the other port"
+    );
+    assert!(owed.reply.is_none());
+    assert!(!udp, "pub/sub's port is not reported as UDP");
+    (events, udp)
+}
+
+#[test]
+fn a_received_publication_reaches_each_matching_subscription() {
+    let mut node = subscribed_node(&[b"spotter/*", b"*", b"sensor"]);
+    let frame = frames::publication(PEER_ID, b"spotter/printf", 1, 2, b"hello\0");
+    let (events, _) = received(&mut node, &frame);
+    let from = |sub: &[u8]| {
+        (
+            PEER_ID,
+            sub.to_vec(),
+            b"spotter/printf".to_vec(),
+            1,
+            2,
+            b"hello\0".to_vec(),
+        )
+    };
+    assert_eq!(events, vec![from(b"spotter/*"), from(b"*")]);
+
+    node.unsubscribe(b"*").unwrap();
+    let (events, _) = received(&mut node, &frame);
+    assert_eq!(events, vec![from(b"spotter/*")]);
+}
+
+/// Divergence #73: `middleware_net_task` looks the application up by source
+/// port.
+#[test]
+fn a_publication_from_another_port_reaches_nobody() {
+    let mut node = subscribed_node(&[b"*"]);
+    let mut payload = [0u8; 16];
+    let len = bm_wire::pubsub::encode(&mut payload, b"topic", 1, 2, b"data").unwrap();
+    for src_port in [0, 4320, 4322, 0xFFFF] {
+        let frame = frames::udp(
+            PEER_ID,
+            BmIpAddr::GLOBAL_MULTICAST,
+            src_port,
+            bm_wire::pubsub::PORT,
+            &payload[..len],
+        );
+        assert_eq!(received(&mut node, &frame).0, vec![], "from {src_port}");
+    }
+}
+
+/// Divergence #75: `bm_handle_msg` reads past such a publication; the node
+/// drops it.
+#[test]
+fn a_publication_with_its_topic_past_the_payload_reaches_nobody() {
+    let mut node = subscribed_node(&[b"*"]);
+    for payload in [&b""[..], b"\0\0\x05\x01", b"\0\0\x05\x01\x02abcd"] {
+        let frame = frames::udp(
+            PEER_ID,
+            BmIpAddr::GLOBAL_MULTICAST,
+            bm_wire::pubsub::PORT,
+            bm_wire::pubsub::PORT,
+            payload,
+        );
+        assert_eq!(received(&mut node, &frame).0, vec![], "{payload:?}");
+    }
+}
+
+/// A task subscribes, publishes to itself, and hears a peer through a
+/// [`bm_stack::NodeHandle`].
+#[test]
+fn an_app_task_publishes_and_subscribes_through_a_channel() {
+    use bm_stack::{Channels, Notification};
+    use embassy_futures::select::{Either, select};
+    use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+
+    let _clock = clock_lock();
+    let mut node = node();
+    let mut script = vec![Script::Idle { ms: 50 }; 4];
+    script.push(Script::Receive {
+        port: 1,
+        frame: frames::publication(PEER_ID, b"news/peer", 1, 2, b"from the peer"),
+    });
+    script.extend(vec![Script::Idle { ms: 50 }; 4]);
+    let mut phy = MockPhy::new(PORTS, script);
+
+    let channels = Channels::<NoopRawMutex, 4>::new();
+    let handle = channels.handle();
+    let mut app = channels.app();
+
+    let task = async {
+        assert!(handle.subscribe(b"news/*").await);
+        assert!(handle.publish(b"news/self", 1, 2, b"to myself").await);
+        [handle.notification().await, handle.notification().await]
+    };
+
+    let notifications = match block_on(select(node.run_app(&mut phy, &mut app), task)) {
+        Either::First(error) => panic!("the node stopped first: {error:?}"),
+        Either::Second(notifications) => notifications,
+    };
+    let publication = |source, topic: &[u8], data: &[u8]| Notification::Publication {
+        source,
+        subscription: heapless::Vec::from_slice(b"news/*").unwrap(),
+        topic: heapless::Vec::from_slice(topic).unwrap(),
+        kind: 1,
+        version: 2,
+        data: heapless::Vec::from_slice(data).unwrap(),
+    };
+    assert_eq!(
+        notifications,
+        [
+            publication(NODE_ID, b"news/self", b"to myself"),
+            publication(PEER_ID, b"news/peer", b"from the peer"),
+        ]
+    );
+    assert_eq!(
+        phy.sent_to(Egress::AllPorts),
+        vec![&frames::publication(NODE_ID, b"news/self", 1, 2, b"to myself")[..]],
+        "the publication went on the wire"
     );
     assert_eq!(app.dropped(), 0);
 }

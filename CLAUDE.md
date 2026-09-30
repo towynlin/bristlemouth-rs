@@ -64,6 +64,8 @@ A cargo workspace.
     bm_core's: the 10 s heartbeat and `packet.c`'s 150 ms expiry sweep, which
     must not be put on a grid of the port's own (divergence #22). DFU runs
     from `next_dfu_transmission`, as bm_core's runs on its own task.
+    Pub/sub (`subscribe`, `unsubscribe`, `publish`, `Event::Publication`)
+    holds UDP port 4321; the subscription table is `bm_wire::pubsub::Subscriptions`.
   - `src/app.rs` — `App`, application code `Node::run_app` runs in the
     node's loop: a cancel-safe `ready` arm, then `act` with `&mut Node`.
   - `src/channel.rs` — behind the `channel` feature: `Channels`, an
@@ -89,14 +91,18 @@ A cargo workspace.
   frame moves.
 - `bm-wire-diff/` — the differential harness. Host-only. One comparator per
   surface, shared by the fuzz targets and by ordinary `#[test]`s.
-  - `src/frames.rs` — BCMP frames a peer sends, for comparators to inject;
-    `bm_wire::bcmp::tx::build` into a `Vec`. Use it rather than a local
+  - `src/frames.rs` — BCMP, UDP and publication frames a peer sends, for
+    comparators to inject; `bm_wire::bcmp::tx::build` into a `Vec`. Use it rather than a local
     builder.
   - `tests/node_frames.rs` — compares whole frames `bm-stack` builds against
     the ones bm_core emits for the same question from the same identity.
   - `src/node_udp.rs`, `tests/node_udp.rs` — UDP through `bm_stack::Node`
     against the oracle's whole stack: sends, relays, and delivery to bound
-    ports and to `bm_middleware_rx`; `bm_pub_wl` against `bm_wire::pubsub`.
+    ports and to `bm_middleware_rx`; `bm_pub_wl` against `Node::publish`.
+  - `src/pubsub.rs`, `tests/pubsub.rs` — `bm_sub_wl`, `bm_unsub_wl`,
+    `bm_pub_wl` and `bm_handle_msg` against `Node`'s pub/sub, with one Rust
+    node mirroring the oracle's subscription and resource lists for the life
+    of the process.
   - `testdata/` — pcaps from C dev kits. `hello-pub-card-h0.pcap` is card
     H0's; `tests/capture_h0.rs` documents it and asserts the header fields
     where deployed nodes differ from `bm_linux.c` (divergence #70).
