@@ -101,11 +101,29 @@
 //! [`Node::on_frame`] hands a UDP datagram addressed to a port
 //! [`Node::bind_udp`] bound to the application as [`Event::Udp`], after the
 //! relay decision, as `bm_l2_process_rx_evt` submits after it relays.
-//! Datagrams to any other port are dropped. The frame is taken by
+//! Datagrams to any other port are dropped, and those to [`pubsub::PORT`] go
+//! to pub/sub. The frame is taken by
 //! [`bm_wire::udp::accept`], which follows lwIP rather than `bm_linux.c`
 //! (divergence #72): no checksum check, and no filter on the destination
 //! address. [`Node::send_udp`] is `bm_udp_tx_perform` through
 //! `bm_l2_link_output`.
+//!
+//! # Pub/sub
+//!
+//! `middleware/pubsub.c` and the part of `middleware/middleware.c` it uses.
+//! [`pubsub::PORT`] is bound from construction, as `bm_pubsub_init` binds it.
+//!
+//! | C | Here |
+//! |---|---|
+//! | `bm_sub_wl` | [`Node::subscribe`]; adds a `SUB` resource on every success |
+//! | `bm_unsub_wl` | [`Node::unsubscribe`]; the resource stays |
+//! | `bm_pub_wl` | [`Node::publish`]: local delivery first, then the frame to `FF03::1` from and to [`pubsub::PORT`]; adds a `PUB` resource once the frame is built |
+//! | `middleware_net_task`, then `bm_handle_msg` | [`Node::on_frame`]: a datagram to [`pubsub::PORT`] **from** [`pubsub::PORT`] is decoded and reported as one [`Event::Publication`] per matching subscription; from any other port it is dropped (divergence #73) |
+//!
+//! The C has a list of callbacks per topic; a node here has one subscriber,
+//! its application, so a topic is subscribed or not. A publication
+//! [`pubsub::decode`] refuses is dropped, where `bm_handle_msg` reads past it
+//! (divergence #75).
 //!
 //! # Two timers, not one
 //!
@@ -152,6 +170,7 @@ use bm_wire::frame::{
 use bm_wire::l2::{self, TxKind};
 use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
+use bm_wire::pubsub::{self, SubscriptionError, Subscriptions};
 use bm_wire::udp;
 use bm_wire::util::BmIpAddr;
 
@@ -199,10 +218,35 @@ pub const NEIGHBOR_REQUEST_TIMEOUT_MS: u32 = bm_wire::bcmp::neighbors::NEIGHBOR_
 /// unbounded.
 pub const UDP_PORTS: usize = 4;
 
+/// Why [`Node::subscribe`] refused, or subscribed without advertising.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeError {
+    /// Not subscribed: the reason, as [`Subscriptions::subscribe`] gives it.
+    Refused(SubscriptionError),
+    /// Subscribed, but the `SUB` resource could not be added:
+    /// [`ResourceAddError::Full`]. `bm_sub_wl` likewise keeps the subscription
+    /// and returns `bcmp_resource_discovery_add_resource`'s `BmENOMEM`.
+    NotAdvertised,
+}
+
+/// Why [`Node::publish`] sent nothing, with the `BmErr` `bm_pub_wl` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishError {
+    /// The topic is empty: `BmEINVAL`. Nothing is delivered.
+    EmptyTopic,
+    /// The topic is [`pubsub::TOPIC_MAX_LEN`] bytes or longer: `BmEMSGSIZE`.
+    /// Nothing is delivered.
+    TopicTooLong,
+    /// The publication is longer than [`pubsub::MAX_MESSAGE_LEN`]: `BmEINVAL`
+    /// from `bm_middleware_net_tx`. **Local subscribers have already received
+    /// it**, as in the C.
+    MessageTooLong,
+}
+
 /// Why [`Node::bind_udp`] refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UdpBindError {
-    /// The port is already bound.
+    /// The port is already bound, or is [`pubsub::PORT`].
     InUse,
     /// [`UDP_PORTS`] ports are already bound.
     Full,
@@ -386,6 +430,28 @@ pub enum Event<'a> {
         /// The IPv6 payload after the UDP header.
         payload: &'a [u8],
     },
+    /// A publication reached a subscription — `bm_handle_msg` calling a
+    /// subscriber's `BmPubSubCb`.
+    ///
+    /// Reported once per matching subscription, in the order they were made,
+    /// so a publication matching two is reported twice. Received from the
+    /// network by [`Node::on_frame_with`], or delivered locally by
+    /// [`Node::publish_with`].
+    Publication {
+        /// Node id the publication came from: the source address's low half,
+        /// or this node's own id for a local delivery.
+        source: u64,
+        /// The subscription that matched.
+        subscription: &'a [u8],
+        /// The publication's topic.
+        topic: &'a [u8],
+        /// `ext_header.type`.
+        kind: u8,
+        /// `ext_header.version`.
+        version: u8,
+        /// Everything after the topic.
+        data: &'a [u8],
+    },
 }
 
 /// A frame the node wants transmitted, and the ports it goes out on.
@@ -560,6 +626,13 @@ pub const RESOURCES_DEFAULT: usize = 8;
 /// `RESOURCE_REQUEST_LIST` is unbounded and never expires an entry, as
 /// `INFO_REQUEST_LIST` is (divergence #19), so there is no C number to match.
 pub const RESOURCE_REQUESTS_DEFAULT: usize = 4;
+
+/// Default number of topics a node can subscribe to at once, [`Node`]'s
+/// `SUBSCRIPTIONS`.
+///
+/// bm_core's `CTX.subscription_list` is `bm_malloc`'d and unbounded.
+/// [`Node::subscribe`] reports [`SubscriptionError::Full`] past it.
+pub const SUBSCRIPTIONS_DEFAULT: usize = 8;
 
 /// Default size of a node's expected-ping-payload buffer, [`Node`]'s
 /// `PING_PAYLOAD`.
@@ -763,6 +836,10 @@ struct Stamp {
 /// `bcmp/resource_discovery.c`'s lists, `RESOURCE_NAME` the longest name one
 /// may have, and `RESOURCE_REQUESTS` how many unanswered resource-table
 /// requests are remembered. All three are ceilings bm_core does not have.
+///
+/// `SUBSCRIPTIONS` is how many topics [`Node::subscribe`] holds at once. A
+/// topic is at most `RESOURCE_NAME` bytes, since each is also advertised as a
+/// resource.
 pub struct Node<
     I,
     R = NoRtc,
@@ -774,6 +851,7 @@ pub struct Node<
     const RESOURCES: usize = RESOURCES_DEFAULT,
     const RESOURCE_NAME: usize = RESOURCE_NAME_BYTES,
     const RESOURCE_REQUESTS: usize = RESOURCE_REQUESTS_DEFAULT,
+    const SUBSCRIPTIONS: usize = SUBSCRIPTIONS_DEFAULT,
     C = NoConfig,
     D = NoDfu,
 > {
@@ -797,6 +875,8 @@ pub struct Node<
     /// `RESOURCE_REQUEST_LIST`, which correlates the `0x0B`s that come back.
     resources: ResourceTable<RESOURCES, RESOURCE_NAME>,
     resource_requests: ResourceRequests<RESOURCE_REQUESTS>,
+    /// `middleware/pubsub.c`'s `CTX.subscription_list`.
+    subscriptions: Subscriptions<SUBSCRIPTIONS, RESOURCE_NAME>,
     /// `CONFIGS` and its flash, which `0xA0`–`0xA9` read and write.
     config: C,
     /// `dfu_core.c` and `dfu_client.c`, their update slot and no-init RAM.
@@ -823,6 +903,7 @@ impl<
     const RESOURCES: usize,
     const RESOURCE_NAME: usize,
     const RESOURCE_REQUESTS: usize,
+    const SUBSCRIPTIONS: usize,
 >
     Node<
         I,
@@ -835,6 +916,7 @@ impl<
         RESOURCES,
         RESOURCE_NAME,
         RESOURCE_REQUESTS,
+        SUBSCRIPTIONS,
         NoConfig,
         NoDfu,
     >
@@ -859,6 +941,7 @@ impl<
     const RESOURCES: usize,
     const RESOURCE_NAME: usize,
     const RESOURCE_REQUESTS: usize,
+    const SUBSCRIPTIONS: usize,
     C: Configuration,
 >
     Node<
@@ -872,6 +955,7 @@ impl<
         RESOURCES,
         RESOURCE_NAME,
         RESOURCE_REQUESTS,
+        SUBSCRIPTIONS,
         C,
         NoDfu,
     >
@@ -898,6 +982,7 @@ impl<
     const RESOURCES: usize,
     const RESOURCE_NAME: usize,
     const RESOURCE_REQUESTS: usize,
+    const SUBSCRIPTIONS: usize,
     C: Configuration,
     D: DfuSlot + NoInitRam,
 >
@@ -912,6 +997,7 @@ impl<
         RESOURCES,
         RESOURCE_NAME,
         RESOURCE_REQUESTS,
+        SUBSCRIPTIONS,
         C,
         D,
     >
@@ -984,6 +1070,7 @@ impl<
             table_requests: TableRequests::new(),
             resources: ResourceTable::new(),
             resource_requests: ResourceRequests::new(),
+            subscriptions: Subscriptions::new(),
             config,
             dfu,
             port_count,
@@ -1185,7 +1272,15 @@ impl<
         events: &mut impl FnMut(Event<'_>),
     ) -> (Option<Outbound<'s>>, Option<Reflood>) {
         if let Ok(datagram) = udp::accept(frame) {
-            if self.udp_bound(datagram.dst_port) {
+            if datagram.dst_port == pubsub::PORT {
+                // `middleware_net_task` looks the application up by the
+                // source port (divergence #73).
+                if datagram.src_port == pubsub::PORT
+                    && let Ok(publication) = pubsub::decode(datagram.payload)
+                {
+                    self.deliver_publication(datagram.source, &publication, events);
+                }
+            } else if self.udp_bound(datagram.dst_port) {
                 events(Event::Udp {
                     port: datagram.dst_port,
                     src_port: datagram.src_port,
@@ -2317,7 +2412,8 @@ impl<
     ///
     /// # Errors
     ///
-    /// [`UdpBindError::InUse`] for a port already bound. lwIP's `udp_bind`
+    /// [`UdpBindError::InUse`] for a port already bound, including
+    /// [`pubsub::PORT`], which pub/sub holds. lwIP's `udp_bind`
     /// refuses the same, and `bm_lwip.c` ignores its return, leaving a pcb
     /// that receives nothing. [`UdpBindError::Full`] once [`UDP_PORTS`] are
     /// bound.
@@ -2346,10 +2442,10 @@ impl<
         }
     }
 
-    /// Whether `port` is bound.
+    /// Whether `port` is bound. [`pubsub::PORT`] always is.
     #[must_use]
     pub fn udp_bound(&self, port: u16) -> bool {
-        self.udp_ports.contains(&Some(port))
+        port == pubsub::PORT || self.udp_ports.contains(&Some(port))
     }
 
     /// Build a UDP datagram from `src_port` to `dst` port `dst_port` —
@@ -2383,11 +2479,149 @@ impl<
         Some(Outbound { frame, mask })
     }
 
+    /// Subscribe to `topic` — `bm_sub_wl`.
+    ///
+    /// Publications matching it arrive as [`Event::Publication`]. `topic` may
+    /// hold `*` and `?`, and matches every topic it prefixes (divergence #74).
+    /// Subscribing to a topic already subscribed changes nothing. Either way
+    /// `topic` is then advertised as a `SUB` resource, which a topic already
+    /// covered does not change (divergence #38).
+    ///
+    /// # Errors
+    ///
+    /// [`SubscribeError::Refused`] with nothing changed, for an empty topic,
+    /// one of [`pubsub::TOPIC_MAX_LEN`] bytes or more, one longer than
+    /// `RESOURCE_NAME`, or `SUBSCRIPTIONS` already held.
+    /// [`SubscribeError::NotAdvertised`] when subscribed but the resource
+    /// table is full.
+    pub fn subscribe(&mut self, topic: &[u8]) -> Result<(), SubscribeError> {
+        self.subscriptions
+            .subscribe(topic)
+            .map_err(SubscribeError::Refused)?;
+        match self.resources.add(topic, ResourceType::Subscriber) {
+            Ok(()) | Err(ResourceAddError::AlreadyPresent) => Ok(()),
+            Err(ResourceAddError::Full) => Err(SubscribeError::NotAdvertised),
+        }
+    }
+
+    /// Unsubscribe from `topic` — `bm_unsub_wl`. The `SUB` resource stays: the
+    /// C's resource lists have no remove.
+    ///
+    /// # Errors
+    ///
+    /// As [`Subscriptions::unsubscribe`]; nothing changes.
+    pub fn unsubscribe(&mut self, topic: &[u8]) -> Result<(), SubscriptionError> {
+        self.subscriptions.unsubscribe(topic)
+    }
+
+    /// The topics subscribed, in the order publications reach them.
+    pub fn subscriptions(&self) -> &Subscriptions<SUBSCRIPTIONS, RESOURCE_NAME> {
+        &self.subscriptions
+    }
+
+    /// [`Node::publish_with`], discarding local deliveries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::publish_with`].
+    pub fn publish(
+        &mut self,
+        topic: &[u8],
+        kind: u8,
+        version: u8,
+        data: &[u8],
+    ) -> Result<Outbound<'_>, PublishError> {
+        self.publish_with(topic, kind, version, data, |_| {})
+    }
+
+    /// Publish `data` on `topic` — `bm_pub_wl`.
+    ///
+    /// In the C's order:
+    ///
+    /// 1. each of this node's subscriptions matching `topic` is reported to
+    ///    `events` as [`Event::Publication`] from this node's own id;
+    /// 2. the publication is built as [`pubsub::encode`] into a datagram to
+    ///    `FF03::1` from and to [`pubsub::PORT`], as [`Node::send_udp`] builds
+    ///    one;
+    /// 3. `topic` is advertised as a `PUB` resource, ignoring a refusal as
+    ///    `bm_pub_wl` does.
+    ///
+    /// `kind` and `version` are `ext_header.type` and `.version`; bm_core's
+    /// own messages use 1 and [`pubsub::COMMON_VERSION`].
+    ///
+    /// # Errors
+    ///
+    /// See [`PublishError`]: only [`PublishError::MessageTooLong`] comes after
+    /// the local deliveries.
+    pub fn publish_with(
+        &mut self,
+        topic: &[u8],
+        kind: u8,
+        version: u8,
+        data: &[u8],
+        mut events: impl FnMut(Event<'_>),
+    ) -> Result<Outbound<'_>, PublishError> {
+        pubsub::check_topic(topic).map_err(|e| match e {
+            SubscriptionError::EmptyTopic => PublishError::EmptyTopic,
+            _ => PublishError::TopicTooLong,
+        })?;
+        let node_id = self.identity.node_id();
+        for subscription in self.subscriptions.matching(topic) {
+            events(Event::Publication {
+                source: node_id,
+                subscription,
+                topic,
+                kind,
+                version,
+                data,
+            });
+        }
+        if pubsub::HEADER_LEN + topic.len() + data.len() > pubsub::MAX_MESSAGE_LEN {
+            return Err(PublishError::MessageTooLong);
+        }
+        let dst = BmIpAddr::GLOBAL_MULTICAST;
+        let src = udp::source_address(node_id, &dst);
+        // Cannot fail: MAX_MESSAGE_LEN is what fits in MTU after the headers.
+        let end = udp::build_with(
+            &mut self.tx,
+            &src,
+            &dst,
+            pubsub::PORT,
+            pubsub::PORT,
+            |buf| pubsub::encode(buf, topic, kind, version, data),
+        )
+        .map_err(|_| PublishError::MessageTooLong)?;
+        let _ = self.resources.add(topic, ResourceType::Publisher);
+        let frame = &mut self.tx[..end];
+        let mask = l2::take_requested_egress_port(frame, self.port_count)
+            .map_err(|_| PublishError::MessageTooLong)?;
+        Ok(Outbound { frame, mask })
+    }
+
+    /// `bm_handle_msg`: one [`Event::Publication`] per matching subscription.
+    fn deliver_publication(
+        &self,
+        source: u64,
+        publication: &pubsub::Publication<'_>,
+        events: &mut impl FnMut(Event<'_>),
+    ) {
+        for subscription in self.subscriptions.matching(publication.topic) {
+            events(Event::Publication {
+                source,
+                subscription,
+                topic: publication.topic,
+                kind: publication.kind,
+                version: publication.version,
+                data: publication.data,
+            });
+        }
+    }
+
     /// Advertise a resource — `bcmp_resource_discovery_add_resource`.
     ///
-    /// `bm_stack` has no publish/subscribe layer, so nothing calls this by
-    /// itself: the two lists are what the firmware puts in them, and they are
-    /// what a `0x0A` is answered with.
+    /// [`Node::subscribe`] and [`Node::publish`] call this as `bm_sub_wl` and
+    /// `bm_pub_wl` do; anything else advertised is the firmware's. The two
+    /// lists are what a `0x0A` is answered with.
     ///
     /// # Errors
     ///
@@ -3026,6 +3260,7 @@ impl<
     const RESOURCES: usize,
     const RESOURCE_NAME: usize,
     const RESOURCE_REQUESTS: usize,
+    const SUBSCRIPTIONS: usize,
     C: Configuration,
     D: DfuSlot + NoInitRam,
 >
@@ -3040,6 +3275,7 @@ impl<
         RESOURCES,
         RESOURCE_NAME,
         RESOURCE_REQUESTS,
+        SUBSCRIPTIONS,
         C,
         D,
     >

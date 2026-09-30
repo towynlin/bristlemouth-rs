@@ -285,3 +285,12 @@ path = "fuzz_targets/node_udp.rs"
 test = false
 doc = false
 bench = false
+
+# Stack-backed. Mirrors the oracle's subscription and resource lists in one
+# Rust node for the life of the process.
+[[bin]]
+name = "pubsub"
+path = "fuzz_targets/pubsub.rs"
+test = false
+doc = false
+bench = false

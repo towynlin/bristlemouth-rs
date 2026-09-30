@@ -7,9 +7,9 @@
 //!
 //! | Step | C | Rust | Asserted |
 //! |---|---|---|---|
-//! | [`Step::Send`] | `bm_udp_tx_perform`, as [`crate::udp::check_send`] | [`Node::send_udp`] | the node's frames are [`udp::build`]'s from [`udp::source_address`] through L2's egress; `check_send` compares that build from `fe80::<id>` with the oracle's; each oracle frame reaches a Rust node's bound port as [`Event::Udp`] |
-//! | [`Step::Receive`] | a Rust peer's frame injected on one port | the same frame to [`Node::on_frame_with`] on the same port | the same relay; the same payload reaching each bound port; `bm_handle_msg` reports what [`pubsub::decode`] reads |
-//! | [`Step::Publish`] | `bm_pub_wl` | [`pubsub::encode`] | the oracle's frames are [`as_bm_linux_sends_it`] of the encoding; the local delivery is its decoding; the same refusals |
+//! | [`Step::Send`] | `bm_udp_tx_perform`, as [`crate::udp::check_send`] | [`Node::send_udp`] | the node's frames are [`udp::build`]'s from [`udp::source_address`] through L2's egress; `check_send` compares that build from `fe80::<id>` with the oracle's; each oracle frame reaches a Rust node's bound port as [`Event::Udp`], or its `*` subscription as [`Event::Publication`] |
+//! | [`Step::Receive`] | a Rust peer's frame injected on one port | the same frame to [`Node::on_frame_with`] on the same port | the same relay; the same payload reaching each bound port; `bm_handle_msg` reports what [`pubsub::decode`] reads, and the Rust node's `*` subscription the same where it reads in bounds |
+//! | [`Step::Publish`] | `bm_pub_wl` | [`Node::publish_with`] | the oracle's frames are [`as_bm_linux_sends_it`] of [`pubsub::encode`]; the node's are [`udp::build`] of it from [`udp::source_address`]; both local deliveries are its decoding; the same refusals, error for error |
 //!
 //! Where the oracle delivers a received datagram:
 //!
@@ -28,8 +28,9 @@ use std::sync::{Mutex, Once};
 
 use arbitrary::Arbitrary;
 
-use bm_stack::{Event, Identity, NoRtc, Node};
+use bm_stack::{Event, Identity, NoRtc, Node, PublishError};
 use bm_wire::bcmp::DeviceInfo;
+use bm_wire::bcmp::resource::{RESOURCE_NAME_BYTES, ResourceType};
 use bm_wire::util::BmIpAddr;
 use bm_wire::{BmWireError, pubsub, udp};
 
@@ -47,10 +48,10 @@ pub const PUBSUB_HEADER_LEN: usize = pubsub::HEADER_LEN;
 /// No oracle subscription starts with it; every comparator here asserts so.
 pub const OFF_PATTERN: u8 = b'#';
 
-/// The ports a Rust node binds: the first [`bm_stack::node::UDP_PORTS`] of
-/// [`BOUND_PORTS`]. The last, `0xFFFF`, is bound in the oracle only.
+/// The ports a Rust node binds with [`Node::bind_udp`]: [`BOUND_PORTS`] but
+/// [`MIDDLEWARE_PORT`], which pub/sub holds.
 pub fn rust_bound_ports() -> &'static [u16] {
-    &BOUND_PORTS[..bm_stack::node::UDP_PORTS]
+    &BOUND_PORTS[1..=bm_stack::node::UDP_PORTS]
 }
 
 /// An identity for a Rust node other than the oracle's.
@@ -75,7 +76,8 @@ impl Identity for Peer {
     }
 }
 
-/// A Rust node with `id`, both links up, and [`rust_bound_ports`] bound.
+/// A Rust node with `id`, both links up, [`rust_bound_ports`] bound, and
+/// subscribed to `*`, as the oracle is.
 ///
 /// # Panics
 ///
@@ -90,6 +92,7 @@ pub fn receiver(id: u64) -> Node<Peer, NoRtc, 4> {
         node.bind_udp(*port)
             .expect("distinct ports, within UDP_PORTS");
     }
+    node.subscribe(b"*").expect("an empty table");
     node
 }
 
@@ -384,15 +387,59 @@ fn take_published() -> Vec<Published> {
 /// node id, payload)`.
 pub type Reported = (u16, u16, u64, Vec<u8>);
 
-/// Hand `frame` to `node` on `ingress`, returning its UDP events and what it
-/// relayed.
+/// An [`Event::Publication`] as the `*` callback records it: its subscription
+/// is `*`, which it asserts.
+///
+/// # Panics
+///
+/// If the subscription is not `*`.
+#[must_use]
+pub fn as_published(event: &Event<'_>) -> Option<Published> {
+    match *event {
+        Event::Publication {
+            source,
+            subscription,
+            topic,
+            kind,
+            version,
+            data,
+        } => {
+            assert_eq!(subscription, b"*");
+            Some(Published::Read(
+                source,
+                topic.to_vec(),
+                data.to_vec(),
+                kind,
+                version,
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// What the Rust node's `*` subscription receives where the oracle's records
+/// `published`: the same, less what the oracle reads past the payload for,
+/// which [`pubsub::decode`] refuses (divergence #75).
+#[must_use]
+pub fn read_in_bounds(published: &[Published]) -> Vec<Published> {
+    published
+        .iter()
+        .filter(|p| matches!(p, Published::Read(..)))
+        .cloned()
+        .collect()
+}
+
+/// Hand `frame` to `node` on `ingress`, returning its UDP events, its
+/// publications and what it relayed.
 pub fn receive(
     node: &mut Node<Peer, NoRtc, 4>,
     ingress: u8,
     frame: &mut [u8],
-) -> (Vec<Reported>, Vec<Captured>) {
+) -> (Vec<Reported>, Vec<Published>, Vec<Captured>) {
     let mut reported = Vec::new();
+    let mut published = Vec::new();
     let owed = node.on_frame_with(0, ingress, frame, |event| {
+        published.extend(as_published(&event));
         if let Event::Udp {
             port,
             src_port,
@@ -405,7 +452,7 @@ pub fn receive(
     });
     assert!(owed.reply.is_none() && owed.forward.is_none());
     let relayed = owed.relay.map(capture).unwrap_or_default();
-    (reported, relayed)
+    (reported, published, relayed)
 }
 
 /// Assert the oracle and [`Node::send_udp`] send the same datagram as the
@@ -443,10 +490,19 @@ pub fn check_send(send: &Send) {
         "egress ports ({send:?})"
     );
 
+    let expected_published: Vec<Published> = if reaches_pubsub(src_port, send.dst_port) {
+        pubsub::decode(payload)
+            .ok()
+            .map(|_| expected_publication(stack::NODE_ID, payload))
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     for (port, frame) in c {
         let mut frame = frame;
         let mut receiver = receiver(!stack::NODE_ID);
-        let (reported, _) = receive(&mut receiver, port.max(1), &mut frame);
+        let (reported, published, _) = receive(&mut receiver, port.max(1), &mut frame);
         let expected: Vec<Reported> = rust_bound_ports()
             .contains(&send.dst_port)
             .then(|| (send.dst_port, src_port, stack::NODE_ID, payload.to_vec()))
@@ -455,6 +511,10 @@ pub fn check_send(send: &Send) {
         assert_eq!(
             reported, expected,
             "the oracle's frame to port {port} ({send:?})"
+        );
+        assert_eq!(
+            published, expected_published,
+            "the oracle's publication to port {port} ({send:?})"
         );
     }
 }
@@ -488,7 +548,7 @@ pub fn check_receive(arrival: &Arrival) {
 
     let mut rs_frame = frame.clone();
     let mut node = receiver(!arrival.src);
-    let (reported, rs_relayed) = receive(&mut node, ingress, &mut rs_frame);
+    let (reported, rs_published, rs_relayed) = receive(&mut node, ingress, &mut rs_frame);
 
     assert_eq!(c_relayed, rs_relayed, "relay ({arrival:?})");
 
@@ -517,6 +577,11 @@ pub fn check_receive(arrival: &Arrival) {
         Vec::new()
     };
     assert_eq!(published, expected, "C publication ({arrival:?})");
+    assert_eq!(
+        rs_published,
+        read_in_bounds(&published),
+        "Rust publication ({arrival:?})"
+    );
 }
 
 /// Topics [`Publish`] draws from: a prefix of this, cycled to its length.
@@ -644,14 +709,19 @@ pub fn oracle_delivers(pattern: &[u8], topic: &[u8]) -> bool {
     PREFIXED.load(std::sync::atomic::Ordering::Relaxed) > 0
 }
 
-/// Assert `bm_pub_wl` and [`pubsub::encode`] agree: on refusing, on the frames
-/// the oracle sends, and on what reaches the oracle's own `*` subscription.
+/// Assert `bm_pub_wl`, [`pubsub::encode`] and [`Node::publish_with`] agree:
+/// on refusing, on the frames sent, and on what reaches each side's own `*`
+/// subscription.
 ///
-/// | [`pubsub::encode`] | `bm_pub_wl` | Local delivery | Frames |
-/// |---|---|---|---|
-/// | [`BmWireError::Invalid`] | `BmEINVAL`, `BmEMSGSIZE` | none | none |
-/// | longer than [`pubsub::MAX_MESSAGE_LEN`] | `BmEINVAL` | the decoding | none |
-/// | otherwise | `BmOK` | the decoding | [`as_bm_linux_sends_it`] from and to [`pubsub::PORT`] at `ff03::1` |
+/// | [`pubsub::encode`] | `bm_pub_wl` | [`Node::publish_with`] | Local delivery | Frames |
+/// |---|---|---|---|---|
+/// | [`BmWireError::Invalid`] | `BmEINVAL`, `BmEMSGSIZE` | [`PublishError::EmptyTopic`], [`PublishError::TopicTooLong`] | none | none |
+/// | longer than [`pubsub::MAX_MESSAGE_LEN`] | `BmEINVAL` | [`PublishError::MessageTooLong`] | the decoding | none |
+/// | otherwise | `BmOK` | `Ok` | the decoding | the oracle's [`as_bm_linux_sends_it`], the node's [`udp::build`] from [`udp::source_address`], from and to [`pubsub::PORT`] at `ff03::1` |
+///
+/// The node's `PUB` resource is added only on `Ok`, and only for a topic
+/// within `RESOURCE_NAME`. The oracle's `PUB_LIST` is held fixed by
+/// `seed_pub_list`, so its side is not compared here.
 ///
 /// # Panics
 ///
@@ -682,16 +752,30 @@ pub fn check_publish(publish: &Publish) {
     let published = take_published();
     drop(guard);
 
+    let mut node = stack::node();
+    node.subscribe(b"*").expect("an empty table");
+    let mut rs_published = Vec::new();
+    let rs = node
+        .publish_with(&topic, publish.kind, publish.version, data, |event| {
+            rs_published.extend(as_published(&event));
+        })
+        .map(capture);
+    assert_eq!(rs_published, published, "Rust local delivery ({publish:?})");
+    let rs_pub = node.resources().count(ResourceType::Publisher);
+
     let mut buf = vec![0u8; PUBSUB_HEADER_LEN + topic.len() + data.len()];
     match pubsub::encode(&mut buf, &topic, publish.kind, publish.version, data) {
         Err(e) => {
             assert_eq!(e, BmWireError::Invalid, "encode ({publish:?})");
-            assert!(
-                [bm_wire_sys::BmErr_BmEINVAL, bm_wire_sys::BmErr_BmEMSGSIZE].contains(&err),
-                "bm_pub_wl returned {err} ({publish:?})"
-            );
+            let expected = match err {
+                bm_wire_sys::BmErr_BmEINVAL => PublishError::EmptyTopic,
+                bm_wire_sys::BmErr_BmEMSGSIZE => PublishError::TopicTooLong,
+                _ => panic!("bm_pub_wl returned {err} ({publish:?})"),
+            };
+            assert_eq!(rs.unwrap_err(), expected, "Node::publish ({publish:?})");
             assert!(published.is_empty(), "local delivery ({publish:?})");
             assert!(c.is_empty(), "frames ({publish:?})");
+            assert_eq!(rs_pub, 0, "PUB resource ({publish:?})");
         }
         Ok(len) => {
             assert_eq!(len, buf.len());
@@ -702,9 +786,16 @@ pub fn check_publish(publish: &Publish) {
             );
             if len > pubsub::MAX_MESSAGE_LEN {
                 assert_eq!(err, bm_wire_sys::BmErr_BmEINVAL, "bm_pub_wl ({publish:?})");
+                assert_eq!(
+                    rs.unwrap_err(),
+                    PublishError::MessageTooLong,
+                    "Node::publish ({publish:?})"
+                );
                 assert!(c.is_empty(), "frames ({publish:?})");
+                assert_eq!(rs_pub, 0, "PUB resource ({publish:?})");
             } else {
                 assert_eq!(err, bm_wire_sys::BmErr_BmOK, "bm_pub_wl ({publish:?})");
+                let rs_frames = rs;
                 let rs = as_bm_linux_sends_it(
                     pubsub::PORT,
                     &BmIpAddr::GLOBAL_MULTICAST,
@@ -712,6 +803,28 @@ pub fn check_publish(publish: &Publish) {
                     &buf,
                 );
                 assert_eq!(c, rs, "frames ({publish:?})");
+
+                let dst = BmIpAddr::GLOBAL_MULTICAST;
+                let mut built = vec![0u8; udp::PAYLOAD_OFFSET + len];
+                udp::build(
+                    &mut built,
+                    &udp::source_address(stack::NODE_ID, &dst),
+                    &dst,
+                    pubsub::PORT,
+                    pubsub::PORT,
+                    &buf,
+                )
+                .expect("sized for the payload");
+                assert_eq!(
+                    rs_frames.expect("Node::publish sent"),
+                    port_transmit(&built),
+                    "Node::publish frames ({publish:?})"
+                );
+                assert_eq!(
+                    rs_pub,
+                    usize::from(topic.len() <= RESOURCE_NAME_BYTES) as u16,
+                    "PUB resource ({publish:?})"
+                );
             }
         }
     }

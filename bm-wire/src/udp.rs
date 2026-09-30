@@ -100,7 +100,38 @@ pub fn build(
     if payload.len() > MAX_PAYLOAD_LEN {
         return Err(BmWireError::Invalid);
     }
-    let udp_len = UDP_HEADER_LEN + payload.len();
+    build_with(buf, src, dst, src_port, dst_port, |out| {
+        let out = out.get_mut(..payload.len()).ok_or(BmWireError::Truncated)?;
+        out.copy_from_slice(payload);
+        Ok(payload.len())
+    })
+}
+
+/// [`build`], with the payload written in place by `payload`, which is given
+/// the buffer from [`PAYLOAD_OFFSET`] on and returns how much it wrote.
+///
+/// # Errors
+///
+/// As [`build`], and whatever `payload` returns.
+pub fn build_with<F>(
+    buf: &mut [u8],
+    src: &BmIpAddr,
+    dst: &BmIpAddr,
+    src_port: u16,
+    dst_port: u16,
+    payload: F,
+) -> Result<usize, BmWireError>
+where
+    F: FnOnce(&mut [u8]) -> Result<usize, BmWireError>,
+{
+    let payload_len = payload(
+        buf.get_mut(PAYLOAD_OFFSET..)
+            .ok_or(BmWireError::Truncated)?,
+    )?;
+    if payload_len > MAX_PAYLOAD_LEN {
+        return Err(BmWireError::Invalid);
+    }
+    let udp_len = UDP_HEADER_LEN + payload_len;
     let end = MIN_FRAME_WITH_ADDRESSES + udp_len;
     let buf = buf.get_mut(..end).ok_or(BmWireError::Truncated)?;
     frame::write_headers(buf, src, dst, IP_PROTO_UDP, HOP_LIMIT, udp_len)?;
@@ -110,7 +141,6 @@ pub fn build(
     put_u16(buf, UDP_DESTINATION_PORT_OFFSET, dst_port);
     put_u16(buf, UDP_LENGTH_OFFSET, udp_len);
     put_u16(buf, UDP_CHECKSUM_OFFSET, 0);
-    buf[PAYLOAD_OFFSET..].copy_from_slice(payload);
 
     // `ipv6_pseudo_checksum` returns the checksum byte-swapped for a
     // little-endian store; swapping back gives the wire value.

@@ -16,6 +16,7 @@ use embassy_sync::blocking_mutex::raw::RawMutex;
 use embassy_sync::channel::{Channel, Receiver, Sender};
 use heapless::Vec;
 
+use bm_wire::bcmp::resource::RESOURCE_NAME_BYTES;
 use bm_wire::util::BmIpAddr;
 
 use crate::app::App;
@@ -23,9 +24,26 @@ use crate::config::Configuration;
 use crate::node::{Event, Node, Outbound, PING_PAYLOAD_BYTES};
 use crate::port::{DfuSlot, Identity, NoInitRam, Rtc};
 
+/// Longest topic a [`Command`] or [`Notification`] carries: the default
+/// `RESOURCE_NAME`, which bounds a [`Node`] subscription's topic.
+pub const TOPIC_BYTES: usize = RESOURCE_NAME_BYTES;
+
+/// Most data a [`Command::Publish`] or [`Notification::Publication`] carries.
+/// An application publishing more uses [`App`] and [`Node::publish_with`]
+/// directly. A received publication with more is counted by
+/// [`ChannelApp::dropped`].
+pub const DATA_BYTES: usize = 256;
+
 /// Something an application asks the node to do.
+///
+/// Nothing reports whether a command succeeded; an application that needs to
+/// know uses [`App`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "no allocator to box into; a queue slot is sized for the largest variant"
+)]
 pub enum Command {
     /// [`Node::ping`] to `FF02::1`.
     Ping {
@@ -34,11 +52,37 @@ pub enum Command {
         /// Echoed back in the reply.
         payload: Vec<u8, PING_PAYLOAD_BYTES>,
     },
+    /// [`Node::publish_with`]; local deliveries come back as
+    /// [`Notification::Publication`].
+    Publish {
+        /// The topic.
+        topic: Vec<u8, TOPIC_BYTES>,
+        /// `ext_header.type`.
+        kind: u8,
+        /// `ext_header.version`.
+        version: u8,
+        /// The data.
+        data: Vec<u8, DATA_BYTES>,
+    },
+    /// [`Node::subscribe`].
+    Subscribe {
+        /// The topic, which may hold `*` and `?`.
+        topic: Vec<u8, TOPIC_BYTES>,
+    },
+    /// [`Node::unsubscribe`].
+    Unsubscribe {
+        /// The topic.
+        topic: Vec<u8, TOPIC_BYTES>,
+    },
 }
 
 /// An [`Event`], owned, for sending to another task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "no allocator to box into; a queue slot is sized for the largest variant"
+)]
 pub enum Notification {
     /// [`Event::EchoReply`].
     EchoReply {
@@ -51,11 +95,26 @@ pub enum Notification {
         /// Milliseconds since the ping.
         round_trip_ms: u32,
     },
+    /// [`Event::Publication`].
+    Publication {
+        /// Node id the publication came from.
+        source: u64,
+        /// The subscription that matched.
+        subscription: Vec<u8, TOPIC_BYTES>,
+        /// The publication's topic.
+        topic: Vec<u8, { bm_wire::pubsub::TOPIC_MAX_LEN }>,
+        /// `ext_header.type`.
+        kind: u8,
+        /// `ext_header.version`.
+        version: u8,
+        /// The data.
+        data: Vec<u8, DATA_BYTES>,
+    },
 }
 
 impl Notification {
     /// The owned form of `event`, or `None` for an event with no
-    /// [`Notification`] yet.
+    /// [`Notification`] yet or a publication with more than [`DATA_BYTES`].
     #[must_use]
     pub fn from_event(event: &Event<'_>) -> Option<Self> {
         match *event {
@@ -70,6 +129,21 @@ impl Notification {
                 // payload, which is at most `PING_PAYLOAD_BYTES` long.
                 payload: Vec::from_slice(reply.payload).ok()?,
                 round_trip_ms,
+            }),
+            Event::Publication {
+                source,
+                subscription,
+                topic,
+                kind,
+                version,
+                data,
+            } => Some(Self::Publication {
+                source,
+                subscription: Vec::from_slice(subscription).ok()?,
+                topic: Vec::from_slice(topic).ok()?,
+                kind,
+                version,
+                data: Vec::from_slice(data).ok()?,
             }),
             _ => None,
         }
@@ -159,6 +233,48 @@ impl<M: RawMutex, const DEPTH: usize> NodeHandle<'_, M, DEPTH> {
         true
     }
 
+    /// Publish `data` on `topic`.
+    ///
+    /// Returns `false` without queueing anything when `topic` is longer than
+    /// [`TOPIC_BYTES`] or `data` than [`DATA_BYTES`].
+    pub async fn publish(&self, topic: &[u8], kind: u8, version: u8, data: &[u8]) -> bool {
+        let (Ok(topic), Ok(data)) = (Vec::from_slice(topic), Vec::from_slice(data)) else {
+            return false;
+        };
+        self.send(Command::Publish {
+            topic,
+            kind,
+            version,
+            data,
+        })
+        .await;
+        true
+    }
+
+    /// Subscribe to `topic`.
+    ///
+    /// Returns `false` without queueing anything when `topic` is longer than
+    /// [`TOPIC_BYTES`].
+    pub async fn subscribe(&self, topic: &[u8]) -> bool {
+        let Ok(topic) = Vec::from_slice(topic) else {
+            return false;
+        };
+        self.send(Command::Subscribe { topic }).await;
+        true
+    }
+
+    /// Unsubscribe from `topic`.
+    ///
+    /// Returns `false` without queueing anything when `topic` is longer than
+    /// [`TOPIC_BYTES`].
+    pub async fn unsubscribe(&self, topic: &[u8]) -> bool {
+        let Ok(topic) = Vec::from_slice(topic) else {
+            return false;
+        };
+        self.send(Command::Unsubscribe { topic }).await;
+        true
+    }
+
     /// The next notification, waiting for one.
     pub async fn notification(&self) -> Notification {
         self.notifications.receive().await
@@ -175,11 +291,28 @@ pub struct ChannelApp<'a, M: RawMutex, const DEPTH: usize> {
 }
 
 impl<M: RawMutex, const DEPTH: usize> ChannelApp<'_, M, DEPTH> {
-    /// Notifications discarded because the queue was full. The node never
-    /// waits on the application, so a task that stops reading loses them.
+    /// Notifications discarded because the queue was full, or publications
+    /// with more than [`DATA_BYTES`]. The node never waits on the application,
+    /// so a task that stops reading loses them.
     #[must_use]
     pub fn dropped(&self) -> u32 {
         self.dropped
+    }
+}
+
+/// Queue `event` as a [`Notification`], counting it in `dropped` if it is a
+/// publication too large to own or the queue is full.
+fn notify<M: RawMutex, const DEPTH: usize>(
+    notifications: &Sender<'_, M, Notification, DEPTH>,
+    dropped: &mut u32,
+    event: &Event<'_>,
+) {
+    let sent = match Notification::from_event(event) {
+        Some(notification) => notifications.try_send(notification).is_ok(),
+        None => !matches!(event, Event::Publication { .. }),
+    };
+    if !sent {
+        *dropped = dropped.wrapping_add(1);
     }
 }
 
@@ -196,6 +329,7 @@ impl<
     const RESOURCES: usize,
     const RESOURCE_NAME: usize,
     const RESOURCE_REQUESTS: usize,
+    const SUBSCRIPTIONS: usize,
     C: Configuration,
     D: DfuSlot + NoInitRam,
 >
@@ -211,6 +345,7 @@ impl<
             RESOURCES,
             RESOURCE_NAME,
             RESOURCE_REQUESTS,
+            SUBSCRIPTIONS,
             C,
             D,
         >,
@@ -237,6 +372,7 @@ impl<
             RESOURCES,
             RESOURCE_NAME,
             RESOURCE_REQUESTS,
+            SUBSCRIPTIONS,
             C,
             D,
         >,
@@ -252,14 +388,30 @@ impl<
                 target_node_id,
                 &payload,
             ),
+            Command::Publish {
+                topic,
+                kind,
+                version,
+                data,
+            } => {
+                let (notifications, dropped) = (&self.notifications, &mut self.dropped);
+                node.publish_with(&topic, kind, version, &data, |event| {
+                    notify(notifications, dropped, &event);
+                })
+                .ok()
+            }
+            Command::Subscribe { topic } => {
+                let _ = node.subscribe(&topic);
+                None
+            }
+            Command::Unsubscribe { topic } => {
+                let _ = node.unsubscribe(&topic);
+                None
+            }
         }
     }
 
     fn on_event(&mut self, event: Event<'_>) {
-        if let Some(notification) = Notification::from_event(&event)
-            && self.notifications.try_send(notification).is_err()
-        {
-            self.dropped = self.dropped.wrapping_add(1);
-        }
+        notify(&self.notifications, &mut self.dropped, &event);
     }
 }

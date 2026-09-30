@@ -620,11 +620,13 @@ fn model() -> MutexGuard<'static, Model> {
 /// which is what `bcmp_process_resource_discovery_request` answers with, minus
 /// the transmission.
 ///
+/// The caller holds [`oracle`]'s lock.
+///
 /// # Panics
 ///
 /// If the C cannot allocate the reply, which it only fails to do out of
 /// memory.
-fn oracle_local_resources() -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>) {
+pub fn oracle_local_resources() -> (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<u8>) {
     // SAFETY: the buffer was built by `populate_msg_data` from the C's own
     // lists, so each record's declared length is the length it copied and the
     // walk below stays inside the allocation. The caller owns it.

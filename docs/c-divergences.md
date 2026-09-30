@@ -110,12 +110,14 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 70 | `bm_linux.c` writes a source MAC, hop limit and UDP source address that deployed nodes do not | replicated | capture, card H0 |
 | 71 | `bm_linux.c` writes the UDP checksum byte-swapped, and a zero checksum as zero | replicated | differentially (byte order); reading lwIP (zero) |
 | 72 | `bm_linux.c` delivers a received datagram by its UDP length field; lwIP ignores the field | replicated | reading lwIP, confirmed differentially |
-| 73 | `bm_middleware_rx` dispatches on the datagram's source port | open (P2) | reading, confirmed differentially (card U2) |
+| 73 | `bm_middleware_rx` dispatches on the datagram's source port | replicated | reading, confirmed differentially (card U2) |
 | 74 | `bm_wildcard_match` matches any topic a `*`-free pattern prefixes | replicated | reading, confirmed differentially |
 | 75 | `bm_handle_msg` wraps the data length of a topic longer than the payload | domain-limited | reading, confirmed differentially |
 | 76 | `bm_pub_wl` sizes its buffer in 16 bits and copies past it | domain-limited | reading |
 | 77 | `bm_pub_wl` with NULL data sends uninitialised bytes, and dereferences NULL for a local subscriber | c-only | reading |
 | 78 | `bm_get_subs` writes past its 256-byte buffer | c-only | reading |
+| 79 | `bm_sub_wl` checks only a topic's first callback for a duplicate | c-only | reading, confirmed differentially (card P2) |
+| 80 | `bm_unsub_wl` returns `BmEINVAL` for a topic not subscribed | replicated | reading, confirmed differentially (card P2) |
 
 ---
 
@@ -2596,13 +2598,14 @@ with `ll_get_item(&CTX.applications, item.port, ...)`.
 Every C node publishes from 4321 to 4321, so the two agree on the wire today.
 A sender on an ephemeral port, as a standard UDP socket uses, is never heard.
 
-**open**, card P2. `bm_stack::Node` matches a datagram to a bound port on its
+**replicated.** `bm_stack::Node` matches a datagram to a bound port on its
 destination port, as lwIP's `udp_input` does, and reports the source port
-beside it in `Event::Udp`; pub/sub on the node has no middleware lookup yet.
-P2 reproduces it. `bm-wire-diff/src/node_udp.rs` asserts the oracle
-delivers to its subscriber exactly when both ports are 4321;
-`the_middleware_dispatches_on_the_source_port`
-(`bm-wire-diff/tests/node_udp.rs`) covers it.
+beside it in `Event::Udp`. A datagram to 4321 reaches pub/sub only from 4321,
+and is otherwise dropped. `bm-wire-diff/src/node_udp.rs` and
+`bm-wire-diff/src/pubsub.rs` assert both sides deliver exactly when both ports
+are 4321; `the_middleware_dispatches_on_the_source_port`
+(`bm-wire-diff/tests/node_udp.rs`) and `received_publications`
+(`bm-wire-diff/tests/pubsub.rs`) cover it.
 
 Fix upstream by passing the bound port rather than the source port, or by
 keying the lookup on the pcb.
@@ -2660,7 +2663,8 @@ Any node on the bus can send such a datagram from and to port 4321 at
 `ff03::1`, and every C node's middleware task parses it.
 
 **domain-limited.** `bm_wire::pubsub::decode` returns
-`BmWireError::Truncated` for both short cases. `bm-wire-diff/src/node_udp.rs`
+`BmWireError::Truncated` for both short cases, and `bm_stack::Node` drops the
+datagram. `bm-wire-diff/src/node_udp.rs`
 sends the oracle such datagrams only where it reads nothing past them
 (`pubsub_domain`: at least five bytes, and a first topic byte no subscription
 starts with), and asserts the `*` subscriber is called with the wrapped
@@ -2720,3 +2724,46 @@ subscriptions can overflow it.
 subscriptions through it and keeps them few.
 
 Fix upstream by bounding each append by the space left.
+
+## 79. `bm_sub_wl` checks only a topic's first callback for a duplicate
+
+`middleware/pubsub.c`, `bm_sub_wl`, for a topic already subscribed:
+
+```c
+while ((ptr->sub.callbacks->callback_fn != callback) &&
+       last_cb_node->next) {
+  last_cb_node = last_cb_node->next;
+}
+if (ptr->sub.callbacks->callback_fn == callback) {
+```
+
+Both tests read the list head, `ptr->sub.callbacks`, not `last_cb_node`. A
+callback that is not first is appended again on every call:
+
+| Calls on topic `t` | Callbacks per publication on `t` |
+|---|---|
+| `bm_sub(t, A)` twice | `A` once |
+| `bm_sub(t, A)`, `bm_sub(t, B)` | `A` once, `B` once |
+| `bm_sub(t, A)`, `bm_sub(t, B)` twice | `A` once, `B` twice |
+| the same, then `bm_unsub(t, B)` | `A` once, `B` once |
+
+**c-only.** A `bm_stack::Node` has one subscriber per topic, its application,
+and a second `Node::subscribe` of a topic changes nothing.
+`a_second_callback_subscribed_twice_is_called_twice`
+(`bm-wire-diff/tests/pubsub.rs`) asserts the table against the oracle.
+
+Fix upstream by testing `last_cb_node->callback_fn` in both places.
+
+## 80. `bm_unsub_wl` returns `BmEINVAL` for a topic not subscribed
+
+`bm_unsub_wl` initialises `err` to `BmEINVAL` and assigns it only when the
+topic is found, so a topic with no subscription returns `BmEINVAL`, the code
+for an empty topic. A subscribed topic without the given callback returns
+`BmENOENT`.
+
+**replicated**, in meaning: `bm_wire::pubsub::Subscriptions::unsubscribe`
+returns `SubscriptionError::NotSubscribed`, documented as the C's `BmEINVAL`,
+and a node has no second callback to be missing. `bm-wire-diff/src/pubsub.rs`
+maps each `BmErr` to the Rust error it must equal.
+
+Fix upstream by returning `BmENOENT` when `get_sub` finds nothing.

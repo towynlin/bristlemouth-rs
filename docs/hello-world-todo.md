@@ -51,13 +51,13 @@ bus with a Spotter and a C dev kit:
 | Application code running beside the node | Done: `bm_stack::App`, run by `Node::run_app`; `bm_stack::channel` for an app in its own task |
 | UDP over IPv6 | Done: `bm_wire::udp`; `Node::bind_udp`, `Node::send_udp`, `Event::Udp` |
 | Pub/sub codec and topic matching | Done: `bm_wire::pubsub`, `bm_wire::util::bm_wildcard_match` |
-| Pub/sub on the node (`middleware/pubsub.c`, `middleware.c`) | **Missing.** |
+| Pub/sub on the node (`middleware/pubsub.c`, `middleware.c`) | Done: `Node::subscribe`, `unsubscribe`, `publish`, `Event::Publication` |
 | `spotter_log`, `spotter_tx_data` | **Missing.** |
 | Dev kit board support (MCU HAL, pins, node id, time driver, flash) | **Missing.** No crate targets a board. |
 
-A BCMP-only node — one that heartbeats, is discovered, and answers ping and
-info — runs on the mock PHY (`bm-stack/examples/hello_node.rs`), but not yet on
-a board. It cannot say hello.
+A node that heartbeats, is discovered, answers ping and info, and publishes
+and subscribes runs on the mock PHY (`bm-stack/examples/hello_node.rs`), but
+not yet on a board. It cannot yet `spotter_log`.
 
 ## The oracle is not the deployed stack for UDP
 
@@ -96,10 +96,9 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
 | Where | Suspicion | Card |
 |---|---|---|
-| `bm_sub_wl` (`pubsub.c`) | The duplicate-callback check compares only the topic's **first** callback: `bm_sub(t, A); bm_sub(t, B); bm_sub(t, B)` links `B` twice, and each publication on `t` calls it twice. One `bm_unsub(t, B)` then removes one. | P2 |
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, E0, F1, H0, P1, U1, U2) left for the rest
+## What the landed cards (A1, E0, F1, H0, P1, P2, U1, U2) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -114,11 +113,15 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   because the app could then act only inside an event and not on a timer of
   its own. Both tests are in `bm-stack/tests/node.rs` under "Application
   seam".
-- **The channel covers ping only.** Each new app-facing call (P2's publish and
-  subscribe, S1's `spotter_log`) needs a `Command` variant, and each new event
-  an owned `Notification`. `Event::Udp` has none: bm_core applications never
-  see raw UDP, only pub/sub. A full notification queue drops, counted by
-  `ChannelApp::dropped`: the node never waits on the application.
+- **The channel covers ping and pub/sub.** Each new app-facing call (S1's
+  `spotter_log`) needs a `Command` variant, and each new event an owned
+  `Notification`. `Event::Udp` has none: bm_core applications never see raw
+  UDP, only pub/sub. Owned topics are at most `channel::TOPIC_BYTES` (64) and
+  data `channel::DATA_BYTES` (256), fixed rather than generic so `Command`
+  stays one type; larger publications go through `App`. A full notification
+  queue, or a publication too large to own, is dropped and counted by
+  `ChannelApp::dropped`: the node never waits on the application. Commands
+  report no result.
 - **The mock clock is process-global.** A test or example driving
   `Node::run*` on `MockPhy` holds `tests/node.rs`'s `CLOCK` lock or runs in a
   process of its own.
@@ -153,10 +156,10 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   | `Event::Udp { port, src_port, source, payload }` | a datagram to a bound port, reported from `on_frame_with` after the relay decision |
   | `Node::send_udp(src_port, dst, dst_port, payload) -> Option<Outbound>` | from `udp::source_address`; mask from byte 13 of `dst` (`take_requested_egress_port`), else all ports; `None` past `MTU` |
 
-  Matching is on the destination port, as lwIP's `udp_input`. bm_core's
-  middleware then looks its application up by the **source** port
-  (divergence #73, open): a datagram to 4321 from any other port reaches no
-  subscriber. P2 reproduces that from `Event::Udp`'s `src_port`.
+  Matching is on the destination port, as lwIP's `udp_input`. Port 4321 is
+  pub/sub's: `bind_udp(4321)` is `InUse`, and a datagram to it is never
+  `Event::Udp`; it reaches pub/sub only from 4321 (divergence #73). The
+  application's own ports are the other `UDP_PORTS`.
   No destination-address filter: `bm_linux.c` has none, and lwIP's
   (`ip6_input`: joined groups, `ff01::1`, `ff02::1`, the netif's addresses) is
   not in the tree to port; #72 records it. A Rust node therefore also
@@ -168,8 +171,8 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   source MAC and hop limit of every frame the oracle built
   (`stack::normalise`), for BCMP and UDP alike. The UDP source address and
   checksum it cannot rewrite, because the address is under the checksum. A
-  Rust node sends from `source_address`, `fd00::<id>` for `ff03::1`, so P2
-  and S1's frame comparators compare in two steps, as
+  Rust node sends from `source_address`, `fd00::<id>` for `ff03::1`, so frame
+  comparators compare in two steps, as
   `bm_wire_diff::node_udp::check_send` does: the node's frame equals
   `udp::build` of its UDP payload from `source_address`; and `udp::build` of
   the same payload from `fe80::<id>`, passed through
@@ -181,13 +184,13 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   `udp::bind` and `udp::take_delivered` expose them. `udp.rs` calls
   `bm_l2_submit` directly; `bm-wire-diff/src/node_udp.rs` injects through L2
   and subscribes the oracle to `*` (`bm_sub_wl`), which matches every topic,
-  to see what reaches `bm_handle_msg`. P2's comparator can reuse
-  `node_udp::Peer`, `receiver` and the subscription.
+  to see what reaches `bm_handle_msg`; `node_udp::receiver` is a Rust node
+  bound and subscribed alike.
 - **Scripted peer frames come from `bm_stack::mock::frames`, comparator
   inputs from `bm_wire_diff::frames`.** Both wrap `tx::build` in a `Vec`.
   Both have `udp(src, dst, src_port, dst_port, payload)`, from
-  `udp::source_address`; P2 and S1 add their publication and `spotter_log`
-  builders there rather than in a test file. A comparator needing non-standard header bytes
+  `udp::source_address`, and `publication(src, topic, kind, version, data)`;
+  S1 adds its `spotter_log` builders there rather than in a test file. A comparator needing non-standard header bytes
   calls `write_headers` and mutates the result, as `bm-wire-diff/src/forward.rs`
   does.
 - **The capture: `bm-wire-diff/testdata/hello-pub-card-h0.pcap`.** 166 s,
@@ -221,19 +224,24 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   Matching stays `bm_wire::util::bm_wildcard_match`, where `common/util.c`
   has it, with its prefix match (#74). `capture_h0.rs` re-encodes all 2300
   captured publications byte for byte.
-- **`bm_pub_wl` is compared as `node_udp::Step::Publish`**, against
-  `pubsub::encode` built into a frame with `udp::as_bm_linux_sends_it`. What
-  P2's `Node::publish` must reproduce; the step asserts every column but the
-  last, which is from reading `bm_pub_wl`:
+- **Pub/sub on the node.**
 
-  | Publication | `bm_pub_wl` | Local subscribers | Frame | `PUB` resource |
-  |---|---|---|---|---|
-  | empty topic, or 255 bytes or more | `BmEINVAL`, `BmEMSGSIZE` | no | no | no |
-  | longer than `MAX_MESSAGE_LEN` | `BmEINVAL` | **yes**, before the refusal | no | no |
-  | otherwise | `BmOK` | yes, with the node's own id | one, to all ports | added |
+  | Item | Shape |
+  |---|---|
+  | `Node::subscribe(topic) -> Result<(), SubscribeError>` | `Refused(SubscriptionError)` with nothing changed; `NotAdvertised` when subscribed but the resource table is full, as `bm_sub_wl` keeps the subscription. Adds `SUB` on every success. |
+  | `Node::unsubscribe(topic) -> Result<(), SubscriptionError>` | `NotSubscribed` is the C's `BmEINVAL` (#80); `SUB` stays |
+  | `Node::publish(topic, kind, version, data) -> Result<Outbound, PublishError>` | one frame to `FF03::1`, all ports; `PUB` added once built. `publish_with` also reports local deliveries, before `MessageTooLong` as in the C. |
+  | `Event::Publication { source, subscription, topic, kind, version, data }` | once per matching subscription, in list order |
+  | `Node<…, SUBSCRIPTIONS = 8>` | after `RESOURCE_REQUESTS`; a topic is at most `RESOURCE_NAME` bytes, since it is also a resource |
 
-  P2 adds the Rust node's side to that step rather than a new binary: the
-  oracle's `*` subscription and the constraints below live in `node_udp`.
+  One subscriber per topic, the application, so bm_core's callback lists
+  (and #79) have no counterpart. S1's `Node::spotter_log` wraps `publish`.
+- **Comparing publications.** `node_udp::Step::Publish` compares `bm_pub_wl`
+  with `Node::publish_with`: result, local delivery to `*`, and frames in the
+  two steps above. `bm-wire-diff/src/pubsub.rs` (stack target `pubsub`)
+  mirrors the oracle's subscription and resource lists in one Rust node for
+  the life of the process and compares everything after every step. S1 can
+  reuse `node_udp::check_publish`'s shape for `spotter_log`.
 - **Divergence #38 constrains every oracle publish and subscribe.**
   `bm_pub_wl` and `bm_sub_wl` look the topic up in `PUB_LIST`/`SUB_LIST`,
   which reads past every shorter entry before a match. `node_udp` therefore:
@@ -245,8 +253,10 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
   `oracle_delivers` publishes with `MAX_MESSAGE_LEN` bytes of data, which is
   delivered locally and never reaches `PUB_LIST`, so it can use any topic.
-  P2's resource-table comparison has to live inside these rules or in a
-  binary of its own.
+  `pubsub.rs` keeps every pattern 10 bytes and every topic 14. S1's topics
+  (`spotter/transmit-data` 21, `spotter/fprintf` 15, `spotter/printf` 14)
+  are safe in a fresh `PUB_LIST` published longest first: every lookup then
+  meets only longer entries before its own.
 - **Malformed publications reach the oracle only in bounds.**
   `node_udp::pubsub_domain` pads a payload to the header and, where its topic
   runs past the end, sets the first topic byte to `OFF_PATTERN` (`#`), which no
@@ -255,42 +265,16 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   `Published::Wrapped`. A test subscription must not start with `#`, `*` or
   `?`; every `node_udp` comparator asserts it through `bm_get_subs` (#78: keep
   the subscriptions few).
-- **`bm-stack/examples/hello_node.rs` is the host twin of E1.** P2 and S1 can
-  extend it with a publish, a subscription the scripted neighbour publishes
-  to, and a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
+- **`bm-stack/examples/hello_node.rs` is the host twin of E1.** It subscribes
+  to `hello/*`, publishes, and receives the scripted neighbour's publication;
+  S1 adds a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
   `cargo test` only builds examples.
 
 ---
 
-## Card P2 — Pub/sub on the node
-
-**Blocks:** S1, E1. **Blocked by:** nothing.
-
-C: `bm_pubsub_init`, `bm_sub_wl`, `bm_unsub_wl`, `bm_pub_wl`,
-`publish_data_locally`, `bm_handle_msg`.
-
-Rust: `Node::subscribe`, `Node::unsubscribe`, `Node::publish`, over a
-fixed-capacity subscription table (const generic, as `RESOURCES` is). Publish
-to `ff03::1` port 4321; add `PUB`/`SUB` to `Node::resources` as the C does
-(`Node::add_resource`, already ported): `bm_pub_wl` adds `PUB` only after a
-successful send, `bm_sub_wl` adds `SUB` on every successful call. A local subscription
-matching a publication delivers `Event::Publication` locally too. Reachable
-from `App::act`, and through `bm_stack::channel` as new `Command` and
-`Notification` variants.
-
-Receives from `Event::Udp` on 4321, dispatching on `src_port` as
-`middleware_net_task` does (divergence #73).
-
-Comparator: frames from `bm_pub` vs `Node::publish` for the same topic, type,
-version, data and identity; an oracle publication delivered to a Rust
-subscriber and vice versa. Stack-target binary.
-
-Done: comparators, fuzz target `pubsub`, and the resource-table side effects
-compared.
-
 ## Card S1 — `spotter_log` and `spotter_tx_data`
 
-**Blocks:** E1. **Blocked by:** P2.
+**Blocks:** E1. **Blocked by:** nothing.
 
 C: `integrations/spotter.c`, `bm_print_publication_t` and
 `BmSerialNetworkDataHeader` (`bm_common_messages/bm_common_pub_sub.h`).
@@ -311,7 +295,7 @@ Done: comparator, fuzz target `spotter`.
 
 ## Card B1 — Dev kit board support
 
-**Blocks:** E1. **Blocked by:** nothing (can run beside P2–S1).
+**Blocks:** E1. **Blocked by:** nothing (can run beside S1).
 
 The dev kit's mote is an STM32U5 (Cortex-M33, `thumbv8m.main-none-eabihf`)
 with an ADIN2111 on SPI. The pin map, the ADIN2111 power and reset sequence,
@@ -332,7 +316,7 @@ check the PR reports as done or not done.
 
 ## Card E1 — The hello-world example
 
-**Blocks:** nothing. **Blocked by:** P2, S1, B1.
+**Blocks:** nothing. **Blocked by:** S1, B1.
 
 `bm-devkit/src/bin/hello_world.rs` — embassy's convention for board examples
 (`examples/<board>/src/bin/*.rs`, own workspace, own `memory.x`) applies, so
@@ -348,17 +332,17 @@ reported individually.
 ## Order
 
 ```
-P2 ─► S1 ─► E1
-             ▲
-B1 ──────────┘
+S1 ─► E1
+       ▲
+B1 ────┘
 ```
 
-P2 and B1 can start now and run in parallel.
+S1 and B1 can start now and run in parallel.
 
 # Explicitly out of scope
 
 - **`bm_service*.c` and the built-in services** (sys_info, power_info,
   metrics, config CBOR map, echo). Request/reply over pub/sub; not needed to
-  say hello. A natural next plan once P2 lands.
+  say hello. A natural next plan.
 - **`integrations/topology.c`**, as in `bcmp-port-todo.md`.
 - **DFU slot and no-init RAM on the dev kit.** B1 starts with `NoDfu`.
