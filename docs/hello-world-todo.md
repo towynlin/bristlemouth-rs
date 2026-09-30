@@ -53,11 +53,13 @@ bus with a Spotter and a C dev kit:
 | Pub/sub codec and topic matching | Done: `bm_wire::pubsub`, `bm_wire::util::bm_wildcard_match` |
 | Pub/sub on the node (`middleware/pubsub.c`, `middleware.c`) | Done: `Node::subscribe`, `unsubscribe`, `publish`, `Event::Publication` |
 | `spotter_log`, `spotter_tx_data` | **Missing.** |
-| Dev kit board support (MCU HAL, pins, node id, time driver, flash) | **Missing.** No crate targets a board. |
+| Dev kit board support (MCU HAL, pins, node id, time driver) | Done (`bm-devkit`), untested on hardware |
+| Config in the dev kit's NOR flash | **Missing.** `bm-devkit` keeps config in RAM. |
 
 A node that heartbeats, is discovered, answers ping and info, and publishes
-and subscribes runs on the mock PHY (`bm-stack/examples/hello_node.rs`), but
-not yet on a board. It cannot yet `spotter_log`.
+and subscribes runs on the mock PHY (`bm-stack/examples/hello_node.rs`), and
+builds for the dev kit (`bm-devkit/src/bin/bringup.rs`). It cannot yet
+`spotter_log`.
 
 ## The oracle is not the deployed stack for UDP
 
@@ -98,7 +100,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 |---|---|---|
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, E0, F1, H0, P1, P2, U1, U2) left for the rest
+## What the landed cards (A1, B1, E0, F1, H0, P1, P2, U1, U2) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -265,6 +267,33 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   `Published::Wrapped`. A test subscription must not start with `#`, `*` or
   `?`; every `node_udp` comparator asserts it through `bm_get_subs` (#78: keep
   the subscriptions few).
+- **`bm-devkit`, the board.** `README.md` there is the only record of
+  bm_protocol's BSP in this repo (pins, clocks, ADIN2111 sequence, node id,
+  config partitions, flash layout), with commit, file and line references;
+  later cards read it rather than bm_protocol.
+
+  | Item | Shape |
+  |---|---|
+  | `start() -> Board` | `embassy_stm32::init(config())`, ADIN2111 powered and up; `Board { node_id, phy, adin_runner, adin_power }` |
+  | `Board::adin_runner` | spawn it in a task; nothing moves until it runs |
+  | `Board::adin_power` | hold it: dropping an embassy `Output` disconnects PH1 and powers the ADIN2111 off |
+  | `node(node_id) -> Devkit` | `Node` with `DevkitIdentity`, `SoftRtc`, `Config<RamConfigStorage>` in `Layout::ARM_EABI_GCC`, `NoDfu`, 2 ports |
+  | `node_id_from_uid`, `uid_string` | `getNodeId` and `getUIDStr`, checked on host against a Python rendering of the C, not yet against a kit |
+
+  Decisions, and why:
+
+  | Decision | Reason |
+  |---|---|
+  | Own workspace, `Cargo.lock` on bm-phy-adin2111's embassy commit | the git embassy; one commit keeps the two crates from diverging. `cargo update -p embassy-stm32 --precise <rev>` moves it. |
+  | `start` takes every peripheral | E1 needs only the ADIN2111; a card needing more (LEDs, flash) splits it |
+  | `memory.x` at `0x08000000`, no bootloader, top 512 bytes of RAM left out | NoDfu needs no MCUboot; the 512 bytes are where the C keeps its no-init block, for a DFU card |
+  | Logging is defmt over RTT through probe-rs | the C console is USB CDC, which is not ported |
+  | SMPS, watchdog, RTC on LSE, Bristlefin expander and LEDs not configured | not needed to say hello; the embassy example runs without them |
+  | No host tests (`test = false`) | the crate builds only for thumb; its pure functions are small and cross-checked by hand |
+
+  Not yet run on a kit: link up on both ports, and heartbeats seen by a C
+  node. E1's bench checks cover both; run `bringup` first if E1's fail.
+  Flashing with `probe-rs run` replaces an installed MCUboot bootloader.
 - **`bm-stack/examples/hello_node.rs` is the host twin of E1.** It subscribes
   to `hello/*`, publishes, and receives the scripted neighbour's publication;
   S1 adds a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
@@ -293,36 +322,33 @@ is variadic; call it with `"%s"` and the text.
 
 Done: comparator, fuzz target `spotter`.
 
-## Card B1 — Dev kit board support
+## Card B2 — Config storage in the dev kit's NOR flash
 
-**Blocks:** E1. **Blocked by:** nothing (can run beside S1).
+**Blocks:** nothing. **Blocked by:** nothing.
 
-The dev kit's mote is an STM32U5 (Cortex-M33, `thumbv8m.main-none-eabihf`)
-with an ADIN2111 on SPI. The pin map, the ADIN2111 power and reset sequence,
-and where the provisioned node id lives come from `bm_protocol`'s BSP, which
-is not vendored here; the card starts by recording them, with file and line
-references, in the crate's docs.
+`bm_stack::ConfigStorage` over the W25Q64 on SPI2 (`FLASH_CS` PA8), at the
+partitions and with the write semantics `bm-devkit/README.md` records
+("Configuration storage"). `ConfigStorage` is synchronous, so use embassy's
+blocking SPI; SPI2 is free in `bm-devkit`. `reset` resets the MCU, as
+`bm_config_reset` does.
 
-Rust: `bm-devkit/`, its own workspace beside `bm-phy-adin2111` (same
-git-embassy constraint). `embassy-stm32` with the exact chip feature and its
-time driver; `Identity` from the provisioned node id; `ConfigStorage` over
-internal flash at the partitions `bm_protocol` uses, or `RamConfigStorage`
-first with flash a follow-up; `NoDfu` first. `memory.x`, `.cargo/config.toml`
-with a `probe-rs run` runner, `defmt` logging.
+A write is read-modify-erase-program per 4 KB sector, as `W25::write`; a
+torn write loses the sector, as in the C. Confirm the image layout against a
+kit's flash: dump the system partition of a C dev kit and load it with
+`bm_wire::configuration` in `Layout::ARM_EABI_GCC`.
 
-Done: `cargo build --target thumbv8m.main-none-eabihf` in CI. On-hardware
-bring-up (link up on both ports, heartbeats seen by a C node) is a manual
-check the PR reports as done or not done.
+Done: builds in CI; on a kit, a value set (`0xA2`) and committed (`0xA3`) survives a
+reset, and a partition written by the C firmware loads. Both reported as
+done or not done.
 
 ## Card E1 — The hello-world example
 
-**Blocks:** nothing. **Blocked by:** S1, B1.
+**Blocks:** nothing. **Blocked by:** S1.
 
-`bm-devkit/src/bin/hello_world.rs` — embassy's convention for board examples
-(`examples/<board>/src/bin/*.rs`, own workspace, own `memory.x`) applies, so
-if B1 is named `examples/devkit/` instead, put it there. It spawns the
-ADIN2111 runner, runs the node, subscribes to one topic, and every 10 s
-publishes `hello world` via `spotter_log` and logs anything received.
+`bm-devkit/src/bin/hello_world.rs`, beside `bringup.rs`, which shows the
+shape: `bm_devkit::start`, spawn `adin_runner`, `bm_devkit::node`,
+`Node::run_app`. It subscribes to one topic, and every 10 s publishes
+`hello world` via `spotter_log` and logs anything received.
 
 Done: builds in CI; the four checks under "The target" are run on a bench and
 reported individually.
@@ -333,11 +359,11 @@ reported individually.
 
 ```
 S1 ─► E1
-       ▲
-B1 ────┘
+
+B2
 ```
 
-S1 and B1 can start now and run in parallel.
+S1 and B2 can start now and run in parallel. B2 is not needed to say hello.
 
 # Explicitly out of scope
 
@@ -345,4 +371,5 @@ S1 and B1 can start now and run in parallel.
   metrics, config CBOR map, echo). Request/reply over pub/sub; not needed to
   say hello. A natural next plan.
 - **`integrations/topology.c`**, as in `bcmp-port-todo.md`.
-- **DFU slot and no-init RAM on the dev kit.** B1 starts with `NoDfu`.
+- **DFU slot and no-init RAM on the dev kit.** `bm-devkit` has `NoDfu`;
+  `README.md` there records the C's MCUboot layout and no-init block.
