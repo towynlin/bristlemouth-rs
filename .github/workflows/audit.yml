@@ -52,3 +52,4 @@ jobs:
       - run: cargo audit --file Cargo.lock
       - run: cargo audit --file bm-wire/fuzz/Cargo.lock
       - run: cargo audit --file bm-phy-adin2111/Cargo.lock
+      - run: cargo audit --file bm-devkit/Cargo.lock

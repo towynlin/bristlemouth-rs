@@ -1,0 +1,68 @@
+[package]
+name = "bm-devkit"
+version = "0.1.0"
+edition = "2024"
+# Its own workspace, so it repeats the root's number; see bm-phy-adin2111.
+rust-version = "1.97"
+publish = false
+description = "Board support for the Bristlemouth dev kit's mote: STM32U575 and ADIN2111"
+
+# Its own workspace, for bm-phy-adin2111's reason: it pins embassy to git, and
+# `embassy-time-driver` carries `links = "embassy-time"`, so it cannot share a
+# dependency graph with the root workspace's crates.io embassy.
+[workspace]
+
+# No host target to run tests on: the harness needs `std`.
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "bringup"
+test = false
+bench = false
+
+[dependencies]
+bm-stack = { path = "../bm-stack" }
+bm-wire = { path = "../bm-wire" }
+bm-phy-adin2111 = { path = "../bm-phy-adin2111" }
+
+cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
+cortex-m-rt = "0.7"
+defmt = "1.0.1"
+defmt-rtt = "1.0"
+panic-probe = { version = "1.0", features = ["print-defmt"] }
+embedded-hal-bus = { version = "0.1", features = ["async"] }
+static_cell = "2"
+
+# Same git source as bm-phy-adin2111's driver, so Cargo resolves one embassy.
+# Cargo.lock pins the commit.
+[dependencies.embassy-stm32]
+git = "https://github.com/embassy-rs/embassy"
+branch = "main"
+features = ["defmt", "stm32u575ci", "time-driver-any", "exti"]
+
+[dependencies.embassy-executor]
+git = "https://github.com/embassy-rs/embassy"
+branch = "main"
+features = ["platform-cortex-m", "executor-thread", "defmt"]
+
+[dependencies.embassy-time]
+git = "https://github.com/embassy-rs/embassy"
+branch = "main"
+features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"]
+
+# As bm-phy-adin2111: bm-stack names the crates.io embassy crates, and only one
+# crate may claim `links = "embassy-time"`.
+[patch.crates-io]
+embassy-time = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-futures = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+embassy-sync = { git = "https://github.com/embassy-rs/embassy", branch = "main" }
+
+[profile.dev]
+opt-level = "s"
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"

@@ -89,6 +89,15 @@ A cargo workspace.
   share a dependency graph. Not built by the root `cargo test`. Its `Runner`
   must be spawned by the firmware — it owns the SPI bus, and until it runs no
   frame moves.
+- `bm-devkit/` — board support for the dev kit's mote (STM32U575CI,
+  ADIN2111 on SPI3): `start` powers and brings up the ADIN2111, `node` builds
+  a `Devkit` node with the chip's node id and a RAM config store;
+  `src/bin/bringup.rs` runs one. **Its own workspace**, for
+  bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
+  `.cargo/config.toml` sets the thumb target and a `probe-rs run` runner.
+  `README.md` is the record of bm_protocol's BSP (pins, clocks, ADIN2111
+  sequence, node id, config flash layout), with file and line references —
+  bm_protocol is not vendored, so read it there rather than re-deriving it.
 - `bm-wire-diff/` — the differential harness. Host-only. One comparator per
   surface, shared by the fuzz targets and by ordinary `#[test]`s.
   - `src/frames.rs` — BCMP, UDP and publication frames a peer sends, for
@@ -175,6 +184,7 @@ cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Corte
 cargo build -p bm-stack --target thumbv8m.main-none-eabihf
 cd bm-phy-adin2111 && cargo test                           # own workspace, needs network
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
+cd bm-devkit && cargo build && cargo build --release      # own workspace, thumb only
 cargo +1.97 check --workspace --all-targets                # the declared MSRV
 cargo tree -p bm-wire                                      # only cbor2, serde, serde_core
 ./bm-wire-sys/scripts/check_symbols.sh --check             # only libc may be unresolved
@@ -189,13 +199,13 @@ to a private one — is a warning by default, so a bare `cargo doc` passes where
 CI fails. `bm-wire-sys` is excluded because bindgen re-emits bm_core's own C
 comments as doc comments.
 
-There are three lockfiles — `Cargo.lock`, `bm-wire/fuzz/Cargo.lock` and
-`bm-phy-adin2111/Cargo.lock` — and the other two workspaces depend on the root
-crates by path. **Changing any dependency in `bm-wire`, `bm-stack` or
-`bm-wire-diff` invalidates all three**, and nothing in the root workspace says
-so: CI runs every job with `--locked`, so a stale lockfile fails the build
-before it compiles anything. Run all three verification blocks, not just the
-root one, and commit whichever lockfiles move.
+There are four lockfiles — `Cargo.lock`, `bm-wire/fuzz/Cargo.lock`,
+`bm-phy-adin2111/Cargo.lock` and `bm-devkit/Cargo.lock` — and the other three
+workspaces depend on the root crates by path. **Changing any dependency in
+`bm-wire`, `bm-stack` or `bm-wire-diff` invalidates all four**, and nothing in
+the root workspace says so: CI runs every job with `--locked`, so a stale
+lockfile fails the build before it compiles anything. Run every workspace's
+verification lines, not just the root's, and commit whichever lockfiles move.
 
 CI runs all of this on every push, plus four things this list leaves out:
 `cargo fmt --all --check` twice, since `bm-wire/fuzz` is its own workspace;
@@ -237,7 +247,7 @@ discussion.
 `SessionStart` hook, so on Claude Code on the web it has already run. It checks
 out the `bm_core` submodule tree, updates stable, installs the MSRV toolchain
 (with rustfmt and clippy) and nightly, adds both embedded targets to both,
-installs `cargo-fuzz`, and warms the three workspaces' dependency caches. It
+installs `cargo-fuzz`, and warms the four workspaces' dependency caches. It
 reads the MSRV from `Cargo.toml`, is idempotent, and no-ops outside a remote
 container. Run it by hand with:
 
