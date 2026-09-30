@@ -43,6 +43,7 @@ pub mod pubsub;
 pub mod registry;
 pub mod replay;
 pub mod resource;
+pub mod spotter;
 pub mod stack;
 pub mod time;
 pub mod udp;

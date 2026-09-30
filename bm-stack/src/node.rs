@@ -171,6 +171,7 @@ use bm_wire::l2::{self, TxKind};
 use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::pubsub::{self, SubscriptionError, Subscriptions};
+use bm_wire::spotter::{self, EncodeError, NetworkType};
 use bm_wire::udp;
 use bm_wire::util::BmIpAddr;
 
@@ -241,6 +242,32 @@ pub enum PublishError {
     /// from `bm_middleware_net_tx`. **Local subscribers have already received
     /// it**, as in the C.
     MessageTooLong,
+}
+
+/// Why [`Node::spotter_log`] or [`Node::spotter_tx_data`] sent nothing, with
+/// the `BmErr` `spotter_log` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpotterError {
+    /// The text is empty: `BmENODATA`. Nothing is delivered.
+    NoData,
+    /// The file name, text or data is too long for
+    /// [`spotter::encode_log`] or [`spotter::encode_tx_data`]: `BmEMSGSIZE`.
+    /// Nothing is delivered.
+    MessageSize,
+    /// The publication is longer than [`pubsub::MAX_MESSAGE_LEN`]:
+    /// `BmENETDOWN`, as `spotter_log` reports any `bm_pub` failure. **Local
+    /// subscribers have already received it**, as in the C. Only
+    /// [`Node::spotter_log`] reaches it (divergence #81).
+    NotSent,
+}
+
+/// The body buffers are sized for the largest body, so
+/// [`EncodeError::Truncated`] does not occur.
+fn spotter_error(e: EncodeError) -> SpotterError {
+    match e {
+        EncodeError::NoData => SpotterError::NoData,
+        EncodeError::MessageSize | EncodeError::Truncated => SpotterError::MessageSize,
+    }
 }
 
 /// Why [`Node::bind_udp`] refused.
@@ -2596,6 +2623,98 @@ impl<
         let mask = l2::take_requested_egress_port(frame, self.port_count)
             .map_err(|_| PublishError::MessageTooLong)?;
         Ok(Outbound { frame, mask })
+    }
+
+    /// [`Node::spotter_log_with`], discarding local deliveries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::spotter_log_with`].
+    pub fn spotter_log(
+        &mut self,
+        target_node_id: u64,
+        file_name: Option<&[u8]>,
+        print_time: u8,
+        text: &[u8],
+    ) -> Result<Outbound<'_>, SpotterError> {
+        self.spotter_log_with(target_node_id, file_name, print_time, text, |_| {})
+    }
+
+    /// Publish a line for the Spotter — `spotter_log`, taking the formatted
+    /// text: format into a buffer with [`core::fmt::Write`] first.
+    ///
+    /// [`spotter::encode_log`] of the arguments, published as
+    /// [`Node::publish_with`] does to [`spotter::log_topic`] of `file_name`
+    /// with [`spotter::KIND`] and [`pubsub::COMMON_VERSION`].
+    /// `spotter_log_console` is `file_name` `None` and `print_time`
+    /// [`spotter::USE_TIMESTAMP`]. `target_node_id` 0 is every Spotter.
+    ///
+    /// The body is built in a [`spotter::MAX_LOG_LEN`]-byte buffer on the
+    /// stack for the length of the call.
+    ///
+    /// # Errors
+    ///
+    /// See [`SpotterError`]: only [`SpotterError::NotSent`] comes after the
+    /// local deliveries.
+    pub fn spotter_log_with(
+        &mut self,
+        target_node_id: u64,
+        file_name: Option<&[u8]>,
+        print_time: u8,
+        text: &[u8],
+        events: impl FnMut(Event<'_>),
+    ) -> Result<Outbound<'_>, SpotterError> {
+        let mut body = [0u8; spotter::MAX_LOG_LEN];
+        let len = spotter::encode_log(&mut body, target_node_id, file_name, print_time, text)
+            .map_err(spotter_error)?;
+        self.publish_spotter(spotter::log_topic(file_name), &body[..len], events)
+    }
+
+    /// [`Node::spotter_tx_data_with`], discarding local deliveries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::spotter_tx_data_with`].
+    pub fn spotter_tx_data(
+        &mut self,
+        data: &[u8],
+        network: NetworkType,
+    ) -> Result<Outbound<'_>, SpotterError> {
+        self.spotter_tx_data_with(data, network, |_| {})
+    }
+
+    /// Ask the Spotter to send `data` over satellite or cellular —
+    /// `spotter_tx_data`.
+    ///
+    /// [`spotter::encode_tx_data`], published as [`Node::publish_with`] does
+    /// to [`spotter::TRANSMIT_DATA_TOPIC`] with [`spotter::KIND`] and
+    /// [`pubsub::COMMON_VERSION`]. The body is built in a
+    /// [`spotter::MAX_TX_LEN`]-byte buffer on the stack.
+    ///
+    /// # Errors
+    ///
+    /// [`SpotterError::MessageSize`] if `data` is longer than
+    /// [`NetworkType::max_len`]. Anything shorter fits a publication.
+    pub fn spotter_tx_data_with(
+        &mut self,
+        data: &[u8],
+        network: NetworkType,
+        events: impl FnMut(Event<'_>),
+    ) -> Result<Outbound<'_>, SpotterError> {
+        let mut body = [0u8; spotter::MAX_TX_LEN];
+        let len = spotter::encode_tx_data(&mut body, network, data).map_err(spotter_error)?;
+        self.publish_spotter(spotter::TRANSMIT_DATA_TOPIC, &body[..len], events)
+    }
+
+    fn publish_spotter(
+        &mut self,
+        topic: &[u8],
+        body: &[u8],
+        events: impl FnMut(Event<'_>),
+    ) -> Result<Outbound<'_>, SpotterError> {
+        // Only `MessageTooLong` is reachable: the topics are valid.
+        self.publish_with(topic, spotter::KIND, pubsub::COMMON_VERSION, body, events)
+            .map_err(|_| SpotterError::NotSent)
     }
 
     /// `bm_handle_msg`: one [`Event::Publication`] per matching subscription.
