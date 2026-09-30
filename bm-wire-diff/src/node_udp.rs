@@ -8,7 +8,8 @@
 //! | Step | C | Rust | Asserted |
 //! |---|---|---|---|
 //! | [`Step::Send`] | `bm_udp_tx_perform`, as [`crate::udp::check_send`] | [`Node::send_udp`] | the node's frames are [`udp::build`]'s from [`udp::source_address`] through L2's egress; `check_send` compares that build from `fe80::<id>` with the oracle's; each oracle frame reaches a Rust node's bound port as [`Event::Udp`] |
-//! | [`Step::Receive`] | a Rust peer's frame injected on one port | the same frame to [`Node::on_frame_with`] on the same port | the same relay; the same payload reaching each bound port |
+//! | [`Step::Receive`] | a Rust peer's frame injected on one port | the same frame to [`Node::on_frame_with`] on the same port | the same relay; the same payload reaching each bound port; `bm_handle_msg` reports what [`pubsub::decode`] reads |
+//! | [`Step::Publish`] | `bm_pub_wl` | [`pubsub::encode`] | the oracle's frames are [`as_bm_linux_sends_it`] of the encoding; the local delivery is its decoding; the same refusals |
 //!
 //! Where the oracle delivers a received datagram:
 //!
@@ -18,9 +19,10 @@
 //! | [`MIDDLEWARE_PORT`] | anything else | `bm_middleware_rx`, then nothing: `middleware_net_task` looks the application up by source port (divergence #73) |
 //! | another of [`BOUND_PORTS`] | any | [`crate::udp`]'s callback for it |
 //!
-//! `bm_handle_msg` reads past a payload shorter than its `topic_len`
-//! (suspected, card P1), so [`Arrival`] rewrites the payload of a datagram that
-//! reaches it into a well-formed publication.
+//! `bm_handle_msg` computes a publication's data length without checking it
+//! against the payload (divergence #75). [`Arrival`] keeps the payload of a
+//! datagram that reaches it to what the C reads in bounds; see
+//! [`pubsub_domain`].
 
 use std::sync::{Mutex, Once};
 
@@ -28,14 +30,22 @@ use arbitrary::Arbitrary;
 
 use bm_stack::{Event, Identity, NoRtc, Node};
 use bm_wire::bcmp::DeviceInfo;
-use bm_wire::udp;
+use bm_wire::util::BmIpAddr;
+use bm_wire::{BmWireError, pubsub, udp};
 
 use crate::l2_egress::port_transmit;
-use crate::stack::{self, Captured, NUM_PORTS, capture, drain, inject, oracle};
-use crate::udp::{BOUND_PORTS, Dst, MAX_PAYLOAD, MIDDLEWARE_PORT, Send, bind, take_delivered};
+use crate::stack::{self, Captured, NUM_PORTS, capture, drain, inject, oracle, pump_until_quiet};
+use crate::udp::{
+    BOUND_PORTS, Dst, MAX_PAYLOAD, MIDDLEWARE_PORT, Send, as_bm_linux_sends_it, bind,
+    take_delivered,
+};
 
 /// `sizeof(BmPubSubData)`: type, flags, `topic_len`, ext type, ext version.
-pub const PUBSUB_HEADER_LEN: usize = 5;
+pub const PUBSUB_HEADER_LEN: usize = pubsub::HEADER_LEN;
+
+/// The first topic byte of a publication whose topic runs past its payload.
+/// No oracle subscription starts with it; every comparator here asserts so.
+pub const OFF_PATTERN: u8 = b'#';
 
 /// The ports a Rust node binds: the first [`bm_stack::node::UDP_PORTS`] of
 /// [`BOUND_PORTS`]. The last, `0xFFFF`, is bound in the oracle only.
@@ -97,8 +107,8 @@ pub struct Arrival {
     pub src_port: Result<u8, u16>,
     /// The destination port, as `src_port`.
     pub dst_port: Result<u8, u16>,
-    /// The payload, cut to [`MAX_PAYLOAD`], and rewritten by
-    /// [`publication`] when the datagram reaches `bm_handle_msg`.
+    /// The payload, cut to [`MAX_PAYLOAD`], and passed through
+    /// [`pubsub_domain`] when the datagram reaches `bm_handle_msg`.
     pub payload: Vec<u8>,
 }
 
@@ -129,6 +139,32 @@ pub fn publication(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
+/// `bytes` as a payload `bm_handle_msg` reads nothing past: padded to
+/// [`PUBSUB_HEADER_LEN`], and, where `topic_len` runs past the end, with one
+/// topic byte in bounds set to [`OFF_PATTERN`].
+///
+/// With the topic past the end, `bm_handle_msg` still matches it against every
+/// subscription and calls the matching callbacks with a wrapped data length
+/// (divergence #75). `bm_wildcard_match` reads nothing of the topic against
+/// `*`, and against a pattern starting with any other literal byte reads the
+/// topic's first byte and stops. The `*` callback here reads nothing when the
+/// data length is wrapped. So the C reads in bounds, and the fuzz build's
+/// AddressSanitizer checks that.
+#[must_use]
+pub fn pubsub_domain(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    if out.len() < PUBSUB_HEADER_LEN {
+        out.resize(PUBSUB_HEADER_LEN, 0);
+    }
+    if pubsub::decode(&out).is_err() {
+        match out.get_mut(PUBSUB_HEADER_LEN) {
+            Some(first) => *first = OFF_PATTERN,
+            None => out.push(OFF_PATTERN),
+        }
+    }
+    out
+}
+
 impl Arrival {
     fn ingress(&self) -> u8 {
         self.ingress % NUM_PORTS + 1
@@ -142,7 +178,7 @@ impl Arrival {
         let payload = &self.payload[..self.payload.len().min(MAX_PAYLOAD - PUBSUB_HEADER_LEN)];
         let (src_port, dst_port) = self.ports();
         if reaches_pubsub(src_port, dst_port) {
-            publication(payload)
+            pubsub_domain(payload)
         } else {
             payload.to_vec()
         }
@@ -168,6 +204,8 @@ pub enum Step {
     Send(Send),
     /// A Rust peer's datagram arrives at the oracle and a Rust node.
     Receive(Arrival),
+    /// The oracle publishes, and `bm_wire::pubsub` encodes the same.
+    Publish(Publish),
 }
 
 /// Steps run in order against the one oracle.
@@ -187,13 +225,49 @@ pub fn check(input: &NodeUdpInput) {
         match step {
             Step::Send(send) => check_send(send),
             Step::Receive(arrival) => check_receive(arrival),
+            Step::Publish(publish) => check_publish(publish),
         }
     }
 }
 
-/// A publication `bm_handle_msg` handed the `*` subscription:
-/// `(node id, topic, data, type, version)`.
-pub type Published = (u64, Vec<u8>, Vec<u8>, u8, u8);
+/// A call `bm_handle_msg` made to the `*` subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Published {
+    /// Topic and data within the payload: `(node id, topic, data, type,
+    /// version)`.
+    Read(u64, Vec<u8>, Vec<u8>, u8, u8),
+    /// A data length past [`pubsub::MAX_MESSAGE_LEN`], which no payload here
+    /// reaches, so wrapped (divergence #75); the topic and data are not read.
+    /// `(node id, topic_len, data_len, type, version)`.
+    Wrapped(u64, u16, u16, u8, u8),
+}
+
+/// What `bm_handle_msg` hands a subscriber for `payload` from `node_id`,
+/// computed from [`pubsub::decode`] and, where it refuses, from the C's
+/// `size - sizeof(BmPubSubData) - topic_len` in 16 bits.
+///
+/// # Panics
+///
+/// If `payload` is shorter than [`PUBSUB_HEADER_LEN`].
+#[must_use]
+pub fn expected_publication(node_id: u64, payload: &[u8]) -> Published {
+    match pubsub::decode(payload) {
+        Ok(p) => Published::Read(
+            node_id,
+            p.topic.to_vec(),
+            p.data.to_vec(),
+            p.kind,
+            p.version,
+        ),
+        Err(_) => {
+            let topic_len = u16::from(payload[2]);
+            let data_len = (payload.len() as u16)
+                .wrapping_sub(PUBSUB_HEADER_LEN as u16)
+                .wrapping_sub(topic_len);
+            Published::Wrapped(node_id, topic_len, data_len, payload[3], payload[4])
+        }
+    }
+}
 
 static PUBLISHED: Mutex<Vec<Published>> = Mutex::new(Vec::new());
 
@@ -206,22 +280,31 @@ unsafe extern "C" fn on_publication(
     kind: u8,
     version: u8,
 ) {
-    let (topic, data) = unsafe {
-        (
-            std::slice::from_raw_parts(topic.cast::<u8>(), usize::from(topic_len)).to_vec(),
-            std::slice::from_raw_parts(data, usize::from(data_len)).to_vec(),
-        )
+    let published = if usize::from(data_len) > pubsub::MAX_MESSAGE_LEN {
+        Published::Wrapped(node_id, topic_len, data_len, kind, version)
+    } else {
+        let (topic, data) = unsafe {
+            (
+                std::slice::from_raw_parts(topic.cast::<u8>(), usize::from(topic_len)).to_vec(),
+                std::slice::from_raw_parts(data, usize::from(data_len)).to_vec(),
+            )
+        };
+        Published::Read(node_id, topic, data, kind, version)
     };
     PUBLISHED
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .push((node_id, topic, data, kind, version));
+        .push(published);
 }
 
 static SUBSCRIBED: Once = Once::new();
 
 /// Bind [`BOUND_PORTS`] and subscribe to `*` in the oracle, once per
 /// process. `*` matches every topic `bm_wildcard_match` is given.
+///
+/// Asserts [`pubsub_domain`]'s premise on every call, since a test may have
+/// subscribed since: every oracle subscription but `*` starts with a literal
+/// byte other than [`OFF_PATTERN`].
 fn prepare(guard: &std::sync::MutexGuard<'static, ()>) {
     bind(guard);
     SUBSCRIBED.call_once(|| unsafe {
@@ -230,7 +313,67 @@ fn prepare(guard: &std::sync::MutexGuard<'static, ()>) {
             bm_wire_sys::BmErr_BmOK,
             "bm_sub_wl"
         );
+        seed_pub_list();
     });
+    for topic in subscriptions() {
+        if topic != b"*" {
+            assert!(
+                !matches!(topic.first(), None | Some(b'*' | b'?' | &OFF_PATTERN)),
+                "subscription {:?} breaks pubsub_domain",
+                String::from_utf8_lossy(&topic)
+            );
+        }
+    }
+}
+
+/// Put [`pool_topic`]`(254)` at the head of `resource_discovery.c`'s
+/// `PUB_LIST`, which starts empty.
+///
+/// `bm_pub_wl` looks each topic it sends up in `PUB_LIST` with
+/// `bcmp_resource_discovery_find_resource`, which compares the topic's length
+/// against every entry and so reads past any shorter one (divergence #38).
+/// Every [`Publish`] topic is a prefix of this entry, so the lookup matches it
+/// first and reads nothing past it, and `PUB_LIST` never grows.
+fn seed_pub_list() {
+    let topic = pool_topic(TOPIC_POOL_LEN);
+    unsafe {
+        let mut count = 0u16;
+        assert_eq!(
+            bm_wire_sys::bcmp_resource_discovery_get_num_resources(
+                &mut count,
+                bm_wire_sys::ResourceType_PUB,
+                0,
+            ),
+            bm_wire_sys::BmErr_BmOK
+        );
+        assert_eq!(count, 0, "PUB_LIST is not empty");
+        assert_eq!(
+            bm_wire_sys::bcmp_resource_discovery_add_resource(
+                topic.as_ptr().cast(),
+                topic.len() as u16,
+                bm_wire_sys::ResourceType_PUB,
+                0,
+            ),
+            bm_wire_sys::BmErr_BmOK
+        );
+    }
+}
+
+/// The oracle's subscriptions, from `bm_get_subs`, which joins them with
+/// `" | "`. Its buffer is 256 bytes and unchecked (divergence #78), so the
+/// oracle must hold few.
+fn subscriptions() -> Vec<Vec<u8>> {
+    unsafe {
+        let subs = bm_wire_sys::bm_get_subs();
+        assert!(!subs.is_null(), "bm_get_subs");
+        let out = std::ffi::CStr::from_ptr(subs)
+            .to_bytes()
+            .split(|b| *b == b'|')
+            .map(|t| t.trim_ascii().to_vec())
+            .collect();
+        bm_wire_sys::bm_free(subs.cast());
+        out
+    }
 }
 
 fn take_published() -> Vec<Published> {
@@ -369,17 +512,207 @@ pub fn check_receive(arrival: &Arrival) {
     assert_eq!(delivered, expected, "C delivery ({arrival:?})");
 
     let expected: Vec<Published> = if reaches_pubsub(src_port, dst_port) {
-        let topic_len = usize::from(payload[2]);
-        let rest = &payload[PUBSUB_HEADER_LEN..];
-        vec![(
-            source,
-            rest[..topic_len].to_vec(),
-            rest[topic_len..].to_vec(),
-            payload[3],
-            payload[4],
-        )]
+        vec![expected_publication(source, &payload)]
     } else {
         Vec::new()
     };
     assert_eq!(published, expected, "C publication ({arrival:?})");
+}
+
+/// Topics [`Publish`] draws from: a prefix of this, cycled to its length.
+/// Starts with no oracle subscription's first byte, so only `*` matches a
+/// local delivery. All are prefixes of one so that `bm_pub_wl`'s `PUB_LIST`
+/// lookup matches the entry this module seeds first (divergence #38).
+pub const TOPIC_POOL: &[u8] = b"spotter/printf/sensor/0123456789abcdef/";
+
+/// The longest topic `bm_pub_wl` sends, `BM_TOPIC_MAX_LEN - 1`.
+pub const TOPIC_POOL_LEN: usize = pubsub::TOPIC_MAX_LEN - 1;
+
+/// The topic of `len` bytes [`Publish`] sends.
+#[must_use]
+pub fn pool_topic(len: usize) -> Vec<u8> {
+    TOPIC_POOL.iter().copied().cycle().take(len).collect()
+}
+
+/// A publication the oracle makes with `bm_pub_wl`.
+#[derive(Debug, Clone, Arbitrary)]
+pub struct Publish {
+    /// The topic's length; the topic is [`pool_topic`]'s. 0 and 255 are
+    /// refused.
+    pub topic_len: u8,
+    /// `ext_header.type`.
+    pub kind: u8,
+    /// `ext_header.version`.
+    pub version: u8,
+    /// The data, cut to [`pubsub::MAX_MESSAGE_LEN`], so that a publication
+    /// too long to send is reachable. `bm_pub_wl` takes a `uint16_t` length
+    /// and wraps past 65530 bytes less the topic (divergence #76).
+    pub data: Vec<u8>,
+}
+
+impl Publish {
+    fn data(&self) -> &[u8] {
+        &self.data[..self.data.len().min(pubsub::MAX_MESSAGE_LEN)]
+    }
+}
+
+static PREFIXED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "C" fn count_publication(
+    _: u64,
+    _: *const core::ffi::c_char,
+    _: u16,
+    _: *const u8,
+    _: u16,
+    _: u8,
+    _: u8,
+) {
+    PREFIXED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The oracle's metrics service request topic, `<node id>/metrics/req`: the
+/// one entry in `SUB_LIST` before `*`.
+#[must_use]
+pub fn metrics_request_topic() -> Vec<u8> {
+    format!("{:016x}/metrics/req", stack::NODE_ID).into_bytes()
+}
+
+/// Whether the oracle delivers a local publication on `topic` to a
+/// subscription to `pattern`: subscribe, `bm_pub_wl`, unsubscribe.
+///
+/// `pattern` must be a prefix of [`metrics_request_topic`]: `bm_sub_wl` looks
+/// it up in `SUB_LIST`, which reads past every shorter entry before a match
+/// (divergence #38), and the entry after it is `*`. The publication carries
+/// [`pubsub::MAX_MESSAGE_LEN`] bytes of data, too long to send: `bm_pub_wl`
+/// delivers it locally, then refuses it before it reaches `PUB_LIST`.
+///
+/// # Panics
+///
+/// If `pattern` is not such a prefix, `topic` matches the metrics service's
+/// subscription, or the oracle refuses the subscription or the
+/// unsubscription.
+#[must_use]
+pub fn oracle_delivers(pattern: &[u8], topic: &[u8]) -> bool {
+    let service = metrics_request_topic();
+    assert!(service.starts_with(pattern), "{pattern:?}");
+    assert!(
+        !bm_wire::util::bm_wildcard_match(topic, &service),
+        "{topic:?}"
+    );
+    let data = [0u8; pubsub::MAX_MESSAGE_LEN];
+
+    let guard = oracle();
+    prepare(&guard);
+    PREFIXED.store(0, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+        let ok = bm_wire_sys::BmErr_BmOK;
+        let len = |s: &[u8]| s.len() as u16;
+        assert_eq!(
+            bm_wire_sys::bm_sub_wl(
+                pattern.as_ptr().cast(),
+                len(pattern),
+                Some(count_publication)
+            ),
+            ok,
+            "bm_sub_wl"
+        );
+        assert_eq!(
+            bm_wire_sys::bm_pub_wl(
+                topic.as_ptr().cast(),
+                len(topic),
+                data.as_ptr().cast(),
+                len(&data),
+                1,
+                2
+            ),
+            bm_wire_sys::BmErr_BmEINVAL,
+            "bm_pub_wl"
+        );
+        pump_until_quiet();
+        assert_eq!(
+            bm_wire_sys::bm_unsub_wl(
+                pattern.as_ptr().cast(),
+                len(pattern),
+                Some(count_publication)
+            ),
+            ok,
+            "bm_unsub_wl"
+        );
+    }
+    drain();
+    let _ = take_published();
+    PREFIXED.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
+/// Assert `bm_pub_wl` and [`pubsub::encode`] agree: on refusing, on the frames
+/// the oracle sends, and on what reaches the oracle's own `*` subscription.
+///
+/// | [`pubsub::encode`] | `bm_pub_wl` | Local delivery | Frames |
+/// |---|---|---|---|
+/// | [`BmWireError::Invalid`] | `BmEINVAL`, `BmEMSGSIZE` | none | none |
+/// | longer than [`pubsub::MAX_MESSAGE_LEN`] | `BmEINVAL` | the decoding | none |
+/// | otherwise | `BmOK` | the decoding | [`as_bm_linux_sends_it`] from and to [`pubsub::PORT`] at `ff03::1` |
+///
+/// # Panics
+///
+/// On any divergence.
+pub fn check_publish(publish: &Publish) {
+    let topic = pool_topic(usize::from(publish.topic_len));
+    let data = publish.data();
+
+    let guard = oracle();
+    prepare(&guard);
+    assert!(
+        drain().is_empty(),
+        "the ring was not drained before this run"
+    );
+    let _ = take_published();
+    let err = unsafe {
+        bm_wire_sys::bm_pub_wl(
+            topic.as_ptr().cast(),
+            topic.len() as u16,
+            data.as_ptr().cast(),
+            data.len() as u16,
+            publish.kind,
+            publish.version,
+        )
+    };
+    pump_until_quiet();
+    let c = drain();
+    let published = take_published();
+    drop(guard);
+
+    let mut buf = vec![0u8; PUBSUB_HEADER_LEN + topic.len() + data.len()];
+    match pubsub::encode(&mut buf, &topic, publish.kind, publish.version, data) {
+        Err(e) => {
+            assert_eq!(e, BmWireError::Invalid, "encode ({publish:?})");
+            assert!(
+                [bm_wire_sys::BmErr_BmEINVAL, bm_wire_sys::BmErr_BmEMSGSIZE].contains(&err),
+                "bm_pub_wl returned {err} ({publish:?})"
+            );
+            assert!(published.is_empty(), "local delivery ({publish:?})");
+            assert!(c.is_empty(), "frames ({publish:?})");
+        }
+        Ok(len) => {
+            assert_eq!(len, buf.len());
+            assert_eq!(
+                published,
+                vec![expected_publication(stack::NODE_ID, &buf)],
+                "local delivery ({publish:?})"
+            );
+            if len > pubsub::MAX_MESSAGE_LEN {
+                assert_eq!(err, bm_wire_sys::BmErr_BmEINVAL, "bm_pub_wl ({publish:?})");
+                assert!(c.is_empty(), "frames ({publish:?})");
+            } else {
+                assert_eq!(err, bm_wire_sys::BmErr_BmOK, "bm_pub_wl ({publish:?})");
+                let rs = as_bm_linux_sends_it(
+                    pubsub::PORT,
+                    &BmIpAddr::GLOBAL_MULTICAST,
+                    pubsub::PORT,
+                    &buf,
+                );
+                assert_eq!(c, rs, "frames ({publish:?})");
+            }
+        }
+    }
 }

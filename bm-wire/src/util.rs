@@ -86,6 +86,10 @@ pub fn bm_strnlen(s: &[u8], max_length: usize) -> usize {
 /// `*` matches any run of characters (including none), `?` exactly one. Ported
 /// verbatim from the C backtracking matcher, including its behaviour on an
 /// empty string: an empty `str` matches any all-`*` pattern.
+///
+/// A pattern holding no `*` also matches every `str` it prefixes, the empty
+/// pattern matching everything: the loop stops when the pattern runs out and
+/// the result never checks that `str` did too (divergence #74).
 #[must_use]
 pub fn bm_wildcard_match(s: &[u8], pattern: &[u8]) -> bool {
     let str_len = s.len();
@@ -300,7 +304,12 @@ mod tests {
     fn wildcard_match_handles_stars_and_question_marks() {
         assert!(bm_wildcard_match(b"aaaa", b"a*a"));
         assert!(bm_wildcard_match(b"aaabxc_file.txt", b"*a*b?c*.txt"));
+        assert!(bm_wildcard_match(b"xaxbxc_something.txt", b"*a*b?c*.txt"));
         assert!(bm_wildcard_match(b"alpha_betaXc123.txt", b"*a*b*c*.txt"));
+        assert!(bm_wildcard_match(
+            b"report-2023-Xsummary",
+            b"report-????-*y"
+        ));
         assert!(bm_wildcard_match(b"report-1925-diary", b"report-????-*y"));
 
         assert!(!bm_wildcard_match(b"alpha_betaXc123.txt", b"*a*b?c*.txt"));
