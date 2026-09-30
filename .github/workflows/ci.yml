@@ -1,8 +1,9 @@
 # Everything CLAUDE.md's "Verifying" section runs by hand, run on every push.
 #
-# Three workspaces live here and none of them is reachable from the others:
-# the root one, `bm-wire/fuzz`, and `bm-phy-adin2111` (its own toolchain pin
-# and its own git dependencies). Each needs its own invocation.
+# Four workspaces live here and none of them is reachable from the others:
+# the root one, `bm-wire/fuzz`, and `bm-phy-adin2111` and `bm-devkit` (each
+# with its own toolchain pin and git dependencies). Each needs its own
+# invocation.
 name: CI
 
 on:
@@ -239,3 +240,36 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: cargo build --target thumbv8m.main-none-eabihf --locked
+
+  devkit:
+    name: bm-devkit
+    runs-on: ubuntu-latest
+    # Firmware for the dev kit: its own workspace, the same toolchain pin and
+    # git embassy as bm-phy-adin2111, and only a cross build -- there is no
+    # host target to test on. On-hardware checks are manual.
+    defaults:
+      run:
+        working-directory: bm-devkit
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install the toolchain rust-toolchain.toml pins
+        run: |
+          channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+          echo "pinned channel: $channel"
+          rustup toolchain install "$channel" --profile minimal \
+            --component rustfmt --component clippy \
+            --target thumbv8m.main-none-eabihf --no-self-update
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            bm-devkit/target/
+          key: ${{ runner.os }}-cargo-devkit-${{ hashFiles('bm-devkit/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-devkit-
+      - run: cargo fmt --all --check
+      # `.cargo/config.toml` sets the target, so both run for the Cortex-M33.
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo build --locked
+      - run: cargo build --release --locked

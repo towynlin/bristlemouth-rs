@@ -120,5 +120,7 @@ cargo fetch --locked || log 'root workspace fetch failed; cargo will retry in-se
 # Its own workspace, its own pinned toolchain, and it pulls embassy from git.
 (cd bm-phy-adin2111 && cargo fetch --locked) \
   || log 'bm-phy-adin2111 fetch failed; it needs network, see CLAUDE.md'
+(cd bm-devkit && cargo fetch --locked) \
+  || log 'bm-devkit fetch failed; it needs network, see CLAUDE.md'
 
 log 'ready'

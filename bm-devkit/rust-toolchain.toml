@@ -1,0 +1,4 @@
+# bm-phy-adin2111's pin, for its reason: `xarxa-driver` uses `cfg_select!`.
+[toolchain]
+channel = "1.97"
+targets = ["thumbv8m.main-none-eabihf"]
