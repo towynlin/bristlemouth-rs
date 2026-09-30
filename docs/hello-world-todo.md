@@ -50,7 +50,8 @@ bus with a Spotter and a C dev kit:
 | PHY for the ADIN2111 | Done (`bm-phy-adin2111`), untested on hardware |
 | Application code running beside the node | Done: `bm_stack::App`, run by `Node::run_app`; `bm_stack::channel` for an app in its own task |
 | UDP over IPv6 | Done: `bm_wire::udp`; `Node::bind_udp`, `Node::send_udp`, `Event::Udp` |
-| Pub/sub (`middleware/pubsub.c`, `middleware.c`) | **Missing.** Listed out of scope in `bcmp-port-todo.md`. |
+| Pub/sub codec and topic matching | Done: `bm_wire::pubsub`, `bm_wire::util::bm_wildcard_match` |
+| Pub/sub on the node (`middleware/pubsub.c`, `middleware.c`) | **Missing.** |
 | `spotter_log`, `spotter_tx_data` | **Missing.** |
 | Dev kit board support (MCU HAL, pins, node id, time driver, flash) | **Missing.** No crate targets a board. |
 
@@ -95,12 +96,10 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
 | Where | Suspicion | Card |
 |---|---|---|
-| `bm_wildcard_match` (`common/util.c`) | Returns `j == pattern_len` without requiring `i == str_len`, so a pattern matches any topic it prefixes: a subscription to `spotter` receives `spotter/printf`. Confirmed by compiling the function alone; not yet through the oracle. | P1 |
-| `bm_handle_msg` (`pubsub.c`) | `data_len = size - sizeof(BmPubSubData) - header->topic_len` is unchecked; a UDP payload shorter than its `topic_len` underflows and the callback reads out of bounds. Remote-triggerable. | P1 |
-| `bm_pub_wl` (`pubsub.c`) | `message_size` is `uint16_t`; `5 + topic_len + len` wraps, and the `memcpy`s write `len` bytes into the short buffer before `bm_middleware_net_tx`'s size check runs. | P1 |
+| `bm_sub_wl` (`pubsub.c`) | The duplicate-callback check compares only the topic's **first** callback: `bm_sub(t, A); bm_sub(t, B); bm_sub(t, B)` links `B` twice, and each publication on `t` calls it twice. One `bm_unsub(t, B)` then removes one. | P2 |
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, E0, F1, H0, U1, U2) left for the rest
+## What the landed cards (A1, E0, F1, H0, P1, U1, U2) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -182,10 +181,8 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   `udp::bind` and `udp::take_delivered` expose them. `udp.rs` calls
   `bm_l2_submit` directly; `bm-wire-diff/src/node_udp.rs` injects through L2
   and subscribes the oracle to `*` (`bm_sub_wl`), which matches every topic,
-  to see what reaches `bm_handle_msg`. A datagram from 4321 to 4321 reaches
-  its out-of-bounds read ("Suspected C defects"), so `node_udp` rewrites that
-  payload into a well-formed one with `node_udp::publication`. P2's
-  comparator can reuse `node_udp::Peer`, `receiver` and the subscription.
+  to see what reaches `bm_handle_msg`. P2's comparator can reuse
+  `node_udp::Peer`, `receiver` and the subscription.
 - **Scripted peer frames come from `bm_stack::mock::frames`, comparator
   inputs from `bm_wire_diff::frames`.** Both wrap `tx::build` in a `Vec`.
   Both have `udp(src, dst, src_port, dst_port, payload)`, from
@@ -213,6 +210,51 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   84–86 are the first round (counter 100). The card asked for a publication
   with two-port and one-port egress: the dev kit's own is the first (one
   frame to all ports), a neighbour's relayed copy the second.
+- **`bm_wire::pubsub`, the codec.**
+
+  | Item | Shape |
+  |---|---|
+  | `encode(buf, topic, kind, version, data) -> Result<usize>` | header type 0, flags 0, as `bm_pub_wl`; `Invalid` for an empty topic or one of `TOPIC_MAX_LEN` (255) or more; `Truncated` past `buf` |
+  | `decode(payload) -> Result<Publication>` | `header_type`, `flags`, `topic`, `kind`, `version`, `data`, borrowed; `Truncated` where `bm_handle_msg` would read past the payload (#75); accepts `topic_len` 0 and 255, as the C does |
+  | `PORT`, `HEADER_LEN`, `COMMON_VERSION`, `MAX_MESSAGE_LEN` | 4321; 5; 2; 1452, `max_payload_len_udp` |
+
+  Matching stays `bm_wire::util::bm_wildcard_match`, where `common/util.c`
+  has it, with its prefix match (#74). `capture_h0.rs` re-encodes all 2300
+  captured publications byte for byte.
+- **`bm_pub_wl` is compared as `node_udp::Step::Publish`**, against
+  `pubsub::encode` built into a frame with `udp::as_bm_linux_sends_it`. What
+  P2's `Node::publish` must reproduce; the step asserts every column but the
+  last, which is from reading `bm_pub_wl`:
+
+  | Publication | `bm_pub_wl` | Local subscribers | Frame | `PUB` resource |
+  |---|---|---|---|---|
+  | empty topic, or 255 bytes or more | `BmEINVAL`, `BmEMSGSIZE` | no | no | no |
+  | longer than `MAX_MESSAGE_LEN` | `BmEINVAL` | **yes**, before the refusal | no | no |
+  | otherwise | `BmOK` | yes, with the node's own id | one, to all ports | added |
+
+  P2 adds the Rust node's side to that step rather than a new binary: the
+  oracle's `*` subscription and the constraints below live in `node_udp`.
+- **Divergence #38 constrains every oracle publish and subscribe.**
+  `bm_pub_wl` and `bm_sub_wl` look the topic up in `PUB_LIST`/`SUB_LIST`,
+  which reads past every shorter entry before a match. `node_udp` therefore:
+
+  | List | Holds | Rule |
+  |---|---|---|
+  | `PUB_LIST` | `node_udp::pool_topic(254)`, seeded first, once per process | every published topic is a prefix of it, so the lookup matches the head |
+  | `SUB_LIST` | `<id>/metrics/req` (from `metrics_service_init`), then `*` | a new subscription must be a prefix of `<id>/metrics/req`; `node_udp::oracle_delivers` asserts it |
+
+  `oracle_delivers` publishes with `MAX_MESSAGE_LEN` bytes of data, which is
+  delivered locally and never reaches `PUB_LIST`, so it can use any topic.
+  P2's resource-table comparison has to live inside these rules or in a
+  binary of its own.
+- **Malformed publications reach the oracle only in bounds.**
+  `node_udp::pubsub_domain` pads a payload to the header and, where its topic
+  runs past the end, sets the first topic byte to `OFF_PATTERN` (`#`), which no
+  subscription starts with; `bm_wildcard_match` then reads only that byte.
+  The `*` callback reads nothing when the data length is wrapped, and reports
+  `Published::Wrapped`. A test subscription must not start with `#`, `*` or
+  `?`; every `node_udp` comparator asserts it through `bm_get_subs` (#78: keep
+  the subscriptions few).
 - **`bm-stack/examples/hello_node.rs` is the host twin of E1.** P2 and S1 can
   extend it with a publish, a subscription the scripted neighbour publishes
   to, and a `spotter_log` line. It asserts its outcome, and CI's `test` job runs it:
@@ -220,32 +262,9 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
 ---
 
-## Card P1 — Pub/sub codec and topic matching in `bm-wire`
-
-**Blocks:** P2, S1. **Blocked by:** nothing.
-
-C: `BmPubSubData` and `BmPubSubHeader` (`middleware/pubsub.h`),
-`bm_pub_wl`'s header fill, `bm_handle_msg`, `bm_wildcard_match`
-(`common/util.c`).
-
-Rust: `bm-wire/src/pubsub.rs` — encode and decode the 5-byte header
-(`type` 0, `flags` 0, `topic_len` u8, then `ext_header.type`,
-`ext_header.version`), the topic, the data; `wildcard_match` with the C's
-prefix behaviour. Topics are `< BM_TOPIC_MAX_LEN` (255).
-
-Comparator: `wildcard_match` against `bm_wildcard_match` directly (pure C
-function, no shim state), fuzz target `wildcard`; the codec through P2's
-frame comparator.
-
-Quirks: the three `pubsub.c`/`util.c` rows in "Suspected C defects". The
-out-of-bounds read constrains the comparator's input domain; say so at the
-type.
-
-Done: comparator, fuzz targets, confirmed divergences numbered.
-
 ## Card P2 — Pub/sub on the node
 
-**Blocks:** S1, E1. **Blocked by:** P1.
+**Blocks:** S1, E1. **Blocked by:** nothing.
 
 C: `bm_pubsub_init`, `bm_sub_wl`, `bm_unsub_wl`, `bm_pub_wl`,
 `publish_data_locally`, `bm_handle_msg`.
@@ -292,7 +311,7 @@ Done: comparator, fuzz target `spotter`.
 
 ## Card B1 — Dev kit board support
 
-**Blocks:** E1. **Blocked by:** nothing (can run beside P1–S1).
+**Blocks:** E1. **Blocked by:** nothing (can run beside P2–S1).
 
 The dev kit's mote is an STM32U5 (Cortex-M33, `thumbv8m.main-none-eabihf`)
 with an ADIN2111 on SPI. The pin map, the ADIN2111 power and reset sequence,
@@ -329,12 +348,12 @@ reported individually.
 ## Order
 
 ```
-P1 ─► P2 ─► S1 ─► E1
-                   ▲
-B1 ────────────────┘
+P2 ─► S1 ─► E1
+             ▲
+B1 ──────────┘
 ```
 
-P1 and B1 can start now and run in parallel.
+P2 and B1 can start now and run in parallel.
 
 # Explicitly out of scope
 

@@ -111,6 +111,11 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 71 | `bm_linux.c` writes the UDP checksum byte-swapped, and a zero checksum as zero | replicated | differentially (byte order); reading lwIP (zero) |
 | 72 | `bm_linux.c` delivers a received datagram by its UDP length field; lwIP ignores the field | replicated | reading lwIP, confirmed differentially |
 | 73 | `bm_middleware_rx` dispatches on the datagram's source port | open (P2) | reading, confirmed differentially (card U2) |
+| 74 | `bm_wildcard_match` matches any topic a `*`-free pattern prefixes | replicated | reading, confirmed differentially |
+| 75 | `bm_handle_msg` wraps the data length of a topic longer than the payload | domain-limited | reading, confirmed differentially |
+| 76 | `bm_pub_wl` sizes its buffer in 16 bits and copies past it | domain-limited | reading |
+| 77 | `bm_pub_wl` with NULL data sends uninitialised bytes, and dereferences NULL for a local subscriber | c-only | reading |
+| 78 | `bm_get_subs` writes past its 256-byte buffer | c-only | reading |
 
 ---
 
@@ -2601,3 +2606,117 @@ delivers to its subscriber exactly when both ports are 4321;
 
 Fix upstream by passing the bound port rather than the source port, or by
 keying the lookup on the pcb.
+
+## 74. `bm_wildcard_match` matches any topic a `*`-free pattern prefixes
+
+`common/util.c`, `bm_wildcard_match(str, str_len, pattern, pattern_len)`
+returns `j == pattern_len` without requiring `i == str_len`. The loop stops
+when the pattern runs out and no `*` precedes that point, and the result is
+then true.
+
+| Subscription (`pattern`) | Publication (`str`) | Matches |
+|---|---|---|
+| `spotter` | `spotter/printf` | yes |
+| `spot?er` | `spotter/printf` | yes |
+| empty | anything | yes |
+| `spotter*x` | `spotter/printf` | no: a `*` backtracks |
+| `spotter/printf` | `spotter` | no |
+
+`bm_handle_msg` and `bm_pub_wl`'s local-subscriber check call it with the
+topic as `str` and the subscription as `pattern`, so a node subscribed to
+`spotter` receives `spotter/printf`, and a service subscribed to
+`<id>/metrics/req` receives `<id>/metrics/request`. `bm_sub` refuses an empty
+topic, so the last row is unreachable from the API.
+
+**replicated.** `bm_wire::util::bm_wildcard_match` is the C's loop.
+`bm-wire-diff/src/util.rs` compares it with the C function (`wildcard` fuzz
+target); `a_subscription_receives_topics_it_prefixes`
+(`bm-wire-diff/tests/node_udp.rs`) shows the oracle's `bm_handle_msg`
+delivering by prefix.
+
+Fix upstream by returning `i == str_len && j == pattern_len`. Wire-visible:
+a subscriber stops receiving topics it only prefixes.
+
+## 75. `bm_handle_msg` wraps the data length of a topic longer than the payload
+
+`middleware/pubsub.c`:
+
+```c
+BmPubSubData *header = (BmPubSubData *)bm_udp_get_payload(buf);
+uint16_t data_len = size - sizeof(BmPubSubData) - header->topic_len;
+```
+
+Neither `size >= 5` nor `size >= 5 + topic_len` is checked. With a
+`topic_len` past the payload, `data_len` wraps to at least 65 276, and
+`bm_handle_msg` still:
+
+| Step | Reads past the payload |
+|---|---|
+| `header->topic_len` etc. when `size < 5` | up to 5 bytes |
+| `bm_wildcard_match` against each subscription | up to `topic_len` bytes of topic |
+| each matching callback, given `data_len` | up to 65 535 bytes of data |
+
+Any node on the bus can send such a datagram from and to port 4321 at
+`ff03::1`, and every C node's middleware task parses it.
+
+**domain-limited.** `bm_wire::pubsub::decode` returns
+`BmWireError::Truncated` for both short cases. `bm-wire-diff/src/node_udp.rs`
+sends the oracle such datagrams only where it reads nothing past them
+(`pubsub_domain`: at least five bytes, and a first topic byte no subscription
+starts with), and asserts the `*` subscriber is called with the wrapped
+length; `a_topic_past_the_payload_wraps_the_data_length` covers it.
+
+Fix upstream by dropping a datagram shorter than `sizeof(BmPubSubData) +
+topic_len`. Not wire-visible for well-formed traffic.
+
+## 76. `bm_pub_wl` sizes its buffer in 16 bits and copies past it
+
+`middleware/pubsub.c`:
+
+```c
+uint16_t message_size = sizeof(BmPubSubData) + topic_len + len;
+void *buf = bm_udp_new(message_size);
+/* ... */
+memcpy((void *)header->topic, topic, topic_len);
+if (data && len) {
+  memcpy((void *)&header->topic[header->topic_len], data, len);
+}
+```
+
+`len` is a `uint16_t`, so `5 + topic_len + len` exceeds 65 535 for any `len`
+above `65 530 - topic_len`, and `message_size` wraps below it. Both
+`memcpy`s then write past the allocation, as does the local-subscriber copy.
+`bm_middleware_net_tx`'s check against `max_payload_len_udp` (1452) runs after
+the copies. Reached only by the local caller passing such a length.
+
+**domain-limited.** `bm_wire::pubsub::encode` takes `usize` lengths and
+refuses a buffer too short. `bm-wire-diff/src/node_udp.rs`'s `Publish` caps
+data at `MAX_MESSAGE_LEN` bytes.
+
+Fix upstream by computing `message_size` in `uint32_t` and refusing a message
+longer than `max_payload_len_udp` before allocating.
+
+## 77. `bm_pub_wl` with NULL data sends uninitialised bytes, and dereferences NULL for a local subscriber
+
+`bm_pub_wl(topic, topic_len, NULL, len, ...)` with `len > 0`:
+
+| Copy | Guard | Result |
+|---|---|---|
+| to the network buffer | `if (data && len)` | skipped; `len` bytes of the unzeroed `bm_udp_new` buffer are sent |
+| to the local buffer, when a local subscription matches | none | `memcpy` from NULL |
+
+**c-only.** `bm_wire::pubsub::encode` takes the data as a slice.
+
+Fix upstream by refusing NULL data with a non-zero `len`.
+
+## 78. `bm_get_subs` writes past its 256-byte buffer
+
+`middleware/pubsub.c`, `bm_get_subs`, allocates `max_sub_str_len` (256) bytes
+and appends every subscription's topic and a `" | "` separator with
+`strcat`/`strncat`, checking no length. Topics may be 254 bytes, so two
+subscriptions can overflow it.
+
+**c-only.** No port. `bm-wire-diff/src/node_udp.rs` reads the oracle's
+subscriptions through it and keeps them few.
+
+Fix upstream by bounding each append by the space left.

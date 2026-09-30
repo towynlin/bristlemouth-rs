@@ -108,7 +108,8 @@ pub struct Receive {
     /// The destination port: an index into [`BOUND_PORTS`] when `Ok`, a raw
     /// port when `Err`. [`MIDDLEWARE_PORT`] is replaced by the next port up
     /// either way, because it reaches `bm_middleware_rx`, which parses the
-    /// payload as a publication and reads past it (`bm_handle_msg`, card P1).
+    /// payload as a publication and can read past it (`bm_handle_msg`,
+    /// divergence #75); `crate::node_udp` covers that port.
     pub dst_port: Result<u8, u16>,
     /// The payload, cut to [`MAX_PAYLOAD`].
     pub payload: Vec<u8>,
@@ -301,14 +302,7 @@ pub fn check_send(send: &Send) -> Vec<(u8, Vec<u8>)> {
     };
     drop(guard);
 
-    let src = addr::nodeid_to_ip(LINK_LOCAL_PREFIX, NODE_ID);
-    let mut frame = vec![0u8; udp::PAYLOAD_OFFSET + payload.len()];
-    let len = udp::build(&mut frame, &src, &dst, src_port, send.dst_port, payload)
-        .expect("frame is sized for the payload");
-    assert_eq!(len, frame.len());
-
-    as_bm_linux_writes_it(&mut frame);
-    let rs = port_transmit(&frame);
+    let rs = as_bm_linux_sends_it(src_port, &dst, send.dst_port, payload);
 
     assert_eq!(
         c.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
@@ -322,6 +316,29 @@ pub fn check_send(send: &Send) -> Vec<(u8, Vec<u8>)> {
         );
     }
     c
+}
+
+/// What the oracle transmits for a datagram, per port, as [`udp::build`]
+/// makes it: from `fe80::<`[`NODE_ID`]`>`, with the checksum
+/// [`as_bm_linux_writes_it`], through L2's egress.
+///
+/// # Panics
+///
+/// If `payload` is longer than [`udp::MAX_PAYLOAD_LEN`].
+#[must_use]
+pub fn as_bm_linux_sends_it(
+    src_port: u16,
+    dst: &BmIpAddr,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<(u8, Vec<u8>)> {
+    let src = addr::nodeid_to_ip(LINK_LOCAL_PREFIX, NODE_ID);
+    let mut frame = vec![0u8; udp::PAYLOAD_OFFSET + payload.len()];
+    let len = udp::build(&mut frame, &src, dst, src_port, dst_port, payload)
+        .expect("frame is sized for the payload");
+    assert_eq!(len, frame.len());
+    as_bm_linux_writes_it(&mut frame);
+    port_transmit(&frame)
 }
 
 /// Rewrite the checksum [`udp::build`] wrote as `bm_udp_tx_perform` writes

@@ -193,6 +193,25 @@ fn bm_wire_udp_rebuilds_every_udp_frame() {
     }
 }
 
+/// Every UDP payload in the capture is a publication `bm_wire::pubsub` decodes
+/// and re-encodes byte for byte, from all three nodes' `bm_pub_wl`.
+#[test]
+fn bm_wire_pubsub_reencodes_every_publication() {
+    let mut count = 0;
+    for (i, r) in frames().iter().filter(|r| udp(r.frame)).enumerate() {
+        let f = r.frame;
+        assert_eq!(u16_at(f, UDP_DESTINATION_PORT_OFFSET), MIDDLEWARE_PORT);
+        let payload = &f[bm_wire::udp::PAYLOAD_OFFSET..];
+        let p = bm_wire::pubsub::decode(payload).unwrap();
+        assert_eq!((p.header_type, p.flags), (0, 0), "udp frame {i}");
+        let mut buf = vec![0u8; payload.len()];
+        let len = bm_wire::pubsub::encode(&mut buf, p.topic, p.kind, p.version, p.data).unwrap();
+        assert_eq!(&buf[..len], payload, "udp frame {i}");
+        count += 1;
+    }
+    assert_eq!(count, 2300);
+}
+
 /// BCMP keeps `fe80::<id>`. `ff03::1` goes out once with no port nibble;
 /// `ff02::1` once per port with only the egress nibble set.
 #[test]
