@@ -50,8 +50,8 @@ pub use app::App;
 pub use channel::{ChannelApp, Channels, Command, NodeHandle, Notification};
 pub use config::{Config, Configuration, NoConfig};
 pub use node::{
-    Event, MTU, Node, Outbound, Owed, PublishError, Reflood, SubscribeError, UdpBindError, deliver,
-    transmit,
+    Event, MTU, Node, Outbound, Owed, PublishError, Reflood, SpotterError, SubscribeError,
+    UdpBindError, deliver, transmit,
 };
 pub use port::{
     BootRequests, ConfigStorage, DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy,

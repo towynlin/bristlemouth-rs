@@ -285,3 +285,41 @@ fn own_publications_go_out_once_and_a_neighbours_are_relayed_unchanged() {
     assert_eq!(own, 60);
     assert_eq!(relayed, 1120);
 }
+
+/// `bm_stack::Node::spotter_log` and `spotter_tx_data`, from the dev kit's
+/// identity, rebuild every `spotter_log`, `spotter_log_console` and
+/// `spotter_tx_data` frame the dev kit sent, from the arguments read back out
+/// of each body.
+#[test]
+fn node_spotter_calls_rebuild_the_dev_kits_frames() {
+    use bm_stack::{NoRtc, Node};
+    use bm_wire::spotter::{self, NetworkType};
+    use bm_wire_diff::node_udp::Peer;
+
+    let mut node: Node<Peer, NoRtc, 4> = Node::new(Peer(DEV_KIT), NoRtc, 2);
+    let mut counts = [0; 3];
+    for r in frames()
+        .iter()
+        .filter(|r| udp(r.frame) && src(r.frame).to_node_id() == DEV_KIT)
+    {
+        let p = bm_wire::pubsub::decode(&r.frame[bm_wire::udp::PAYLOAD_OFFSET..]).unwrap();
+        let body = p.data;
+        let rebuilt = if p.topic == spotter::TRANSMIT_DATA_TOPIC {
+            counts[2] += 1;
+            node.spotter_tx_data(&body[1..], NetworkType(body[0]))
+        } else if p.topic == spotter::PRINTF_TOPIC || p.topic == spotter::FPRINTF_TOPIC {
+            let target = u64::from_le_bytes(body[..8].try_into().unwrap());
+            let fname_len = usize::from(u16::from_le_bytes([body[8], body[9]]));
+            let data_len = usize::from(u16::from_le_bytes([body[10], body[11]]));
+            let name = &body[13..13 + fname_len];
+            let text = &body[13 + fname_len..13 + fname_len + data_len];
+            let file_name = (p.topic == spotter::FPRINTF_TOPIC).then_some(name);
+            counts[usize::from(file_name.is_some())] += 1;
+            node.spotter_log(target, file_name, body[12], text)
+        } else {
+            continue;
+        };
+        assert_eq!(rebuilt.unwrap().frame(), r.frame);
+    }
+    assert_eq!(counts, [17, 17, 17]);
+}

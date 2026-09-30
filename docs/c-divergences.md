@@ -118,6 +118,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 78 | `bm_get_subs` writes past its 256-byte buffer | c-only | reading |
 | 79 | `bm_sub_wl` checks only a topic's first callback for a duplicate | c-only | reading, confirmed differentially (card P2) |
 | 80 | `bm_unsub_wl` returns `BmEINVAL` for a topic not subscribed | replicated | reading, confirmed differentially (card P2) |
+| 81 | `spotter_log` budgets its text against `max_payload_len`, not the pub/sub message limit | replicated | reading, confirmed differentially (card S1) |
 
 ---
 
@@ -2767,3 +2768,34 @@ and a node has no second callback to be missing. `bm-wire-diff/src/pubsub.rs`
 maps each `BmErr` to the Rust error it must equal.
 
 Fix upstream by returning `BmENOENT` when `get_sub` finds nothing.
+
+## 81. `spotter_log` budgets its text against `max_payload_len`, not the pub/sub message limit
+
+`integrations/spotter.c`:
+
+```c
+#define max_str_len(fname_len) \
+  (int32_t)(max_payload_len - sizeof(bm_print_publication_t) - fname_len)
+```
+
+`max_payload_len` is 1460, the IPv6 payload of a 1500-byte frame.
+`bm_middleware_net_tx` refuses a publication longer than
+`max_payload_len_udp`, 1452, which also holds the pub/sub header and the
+topic. Text `bm_pub` sends, with a file name of `f` bytes:
+
+| Topic | `max_str_len` allows | `bm_pub` sends |
+|---|---|---|
+| `spotter/printf` | 1447 − `f` | 1419 − `f` |
+| `spotter/fprintf` | 1447 − `f` | 1418 − `f` |
+
+Text between the two passes the check, is delivered to local subscribers by
+`bm_pub_wl`, and is then refused; `spotter_log` returns `BmENETDOWN`, its code
+for any `bm_pub` failure, not `BmEMSGSIZE`.
+
+**replicated.** `bm_wire::spotter::encode_log` checks `max_str_len`;
+`bm_stack::Node::spotter_log` then returns `SpotterError::NotSent` after the
+local deliveries. `text_lengths` (`bm-wire-diff/tests/spotter.rs`) compares
+both sides of each limit.
+
+Fix upstream by budgeting against `max_payload_len_udp` less the pub/sub
+header and the topic, and returning `BmEMSGSIZE`.

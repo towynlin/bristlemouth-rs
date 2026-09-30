@@ -66,6 +66,8 @@ A cargo workspace.
     from `next_dfu_transmission`, as bm_core's runs on its own task.
     Pub/sub (`subscribe`, `unsubscribe`, `publish`, `Event::Publication`)
     holds UDP port 4321; the subscription table is `bm_wire::pubsub::Subscriptions`.
+    `spotter_log` and `spotter_tx_data` wrap `publish`; their bodies are
+    `bm_wire::spotter`.
   - `src/app.rs` — `App`, application code `Node::run_app` runs in the
     node's loop: a cancel-safe `ready` arm, then `act` with `&mut Node`.
   - `src/channel.rs` — behind the `channel` feature: `Channels`, an
@@ -99,6 +101,8 @@ A cargo workspace.
   - `src/node_udp.rs`, `tests/node_udp.rs` — UDP through `bm_stack::Node`
     against the oracle's whole stack: sends, relays, and delivery to bound
     ports and to `bm_middleware_rx`; `bm_pub_wl` against `Node::publish`.
+  - `src/spotter.rs`, `tests/spotter.rs` — `spotter_log` and
+    `spotter_tx_data` against `Node::spotter_log` and `Node::spotter_tx_data`.
   - `src/pubsub.rs`, `tests/pubsub.rs` — `bm_sub_wl`, `bm_unsub_wl`,
     `bm_pub_wl` and `bm_handle_msg` against `Node`'s pub/sub, with one Rust
     node mirroring the oracle's subscription and resource lists for the life
