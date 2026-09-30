@@ -97,6 +97,7 @@ dependencies = [
  "embassy-executor",
  "embassy-stm32",
  "embassy-time",
+ "embedded-hal 1.0.0",
  "embedded-hal-bus",
  "panic-probe",
  "static_cell",

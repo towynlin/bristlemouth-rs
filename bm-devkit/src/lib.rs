@@ -3,8 +3,9 @@
 //!
 //! [`start`] brings the board up and returns a [`Board`]: the ADIN2111 as a
 //! [`bm_stack::Phy`], the driver runner the firmware must spawn, and the node
-//! id the C firmware would use on the same chip. [`Devkit`] is the node type
-//! with this board's identity and a RAM config store.
+//! id the C firmware would use on the same chip, and the NOR flash that holds
+//! the config partitions. [`Devkit`] is the node type with this board's
+//! identity and that config store.
 //!
 //! Every pin, clock and sequence here is taken from bm_protocol's
 //! `bm_mote_v1.0` BSP; `README.md` in this crate records each with its source.
@@ -12,19 +13,22 @@
 #![no_std]
 #![warn(missing_docs)]
 
+pub mod storage;
+pub mod w25;
+
 use bm_phy_adin2111::{Adin2111Phy, Runner, State, Tc6};
 use bm_stack::node::{
     INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, RESOURCE_REQUESTS_DEFAULT, RESOURCES_DEFAULT,
     SUBSCRIPTIONS_DEFAULT,
 };
-use bm_stack::{Config, Identity, Node, RamConfigStorage, SoftRtc};
+use bm_stack::{Config, Identity, Node, SoftRtc};
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::bcmp::info::CACHED_STRING_BYTES;
 use bm_wire::bcmp::resource::RESOURCE_NAME_BYTES;
 use bm_wire::configuration::Layout;
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
-use embassy_stm32::mode::Async;
+use embassy_stm32::mode::{Async, Blocking};
 use embassy_stm32::spi::mode::Master;
 use embassy_stm32::spi::{self, Spi};
 use embassy_stm32::time::Hertz;
@@ -32,6 +36,9 @@ use embassy_stm32::{bind_interrupts, dma, interrupt, peripherals};
 use embassy_time::{Delay, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use static_cell::StaticCell;
+
+use crate::storage::FlashConfigStorage;
+use crate::w25::W25;
 
 /// Bristlemouth ports on the ADIN2111.
 pub const PORTS: u8 = 2;
@@ -44,6 +51,9 @@ pub const ADIN_SPI_HZ: u32 = 20_000_000;
 /// raises `ADIN_PWR` in `bspInit` and pulses reset much later, in
 /// `bcl_power_callback`; this is the settle time the embassy example uses.
 pub const ADIN_POWER_SETTLE_MS: u64 = 90;
+
+/// SPI2 clock: `MX_SPI2_Init` sets it up as SPI3.
+pub const FLASH_SPI_HZ: u32 = 20_000_000;
 
 bind_interrupts!(
     /// The interrupts the ADIN2111 needs: its `INT` line on EXTI8, and the
@@ -64,8 +74,15 @@ pub type AdinReset = Output<'static>;
 /// The ADIN2111 driver's runner. Spawn it: until it runs no frame moves.
 pub type AdinRunner = Runner<'static, Tc6<AdinSpi>, AdinInt, AdinReset>;
 
+/// SPI2, blocking, with `FLASH_CS` as its chip select.
+pub type FlashSpi = ExclusiveDevice<Spi<'static, Blocking, Master>, Output<'static>, Delay>;
+/// The W25Q64JV on SPI2.
+pub type Flash = W25<FlashSpi, Delay>;
+/// The config partitions on [`Flash`].
+pub type DevkitConfigStorage = FlashConfigStorage<FlashSpi, Delay>;
+
 /// A node on this board: [`DevkitIdentity`], a clock set over the network,
-/// and a config store in RAM, lost on reset.
+/// and the config partitions in NOR flash.
 pub type Devkit = Node<
     DevkitIdentity,
     SoftRtc,
@@ -78,7 +95,7 @@ pub type Devkit = Node<
     RESOURCE_NAME_BYTES,
     RESOURCE_REQUESTS_DEFAULT,
     SUBSCRIPTIONS_DEFAULT,
-    Config<RamConfigStorage>,
+    Config<DevkitConfigStorage>,
 >;
 
 /// The brought-up board.
@@ -92,6 +109,8 @@ pub struct Board {
     /// `ADIN_PWR`. Dropping an embassy `Output` disconnects the pin, which
     /// turns the ADIN2111 off, so it is held here.
     pub adin_power: Output<'static>,
+    /// The NOR flash. [`node`] takes it.
+    pub flash: Flash,
 }
 
 /// The clock tree `SystemClock_Config` sets up: MSIS at 48 MHz, PLL1 `/3 *10
@@ -114,7 +133,8 @@ pub fn config() -> embassy_stm32::Config {
     config
 }
 
-/// Initialise the chip with [`config`], power the ADIN2111 and bring it up.
+/// Initialise the chip with [`config`], power the ADIN2111 and bring it up,
+/// and set up SPI2 for the NOR flash.
 ///
 /// Consumes every peripheral; the ones not listed in `README.md` are dropped.
 ///
@@ -153,23 +173,30 @@ pub async fn start() -> Board {
     let (phy, adin_runner) =
         bm_phy_adin2111::for_node(node_id, STATE.init(State::new()), spi, int, reset, false).await;
 
+    let flash_cs = Output::new(p.PA8, Level::High, Speed::High);
+    let mut flash_config = spi::Config::default();
+    flash_config.frequency = Hertz(FLASH_SPI_HZ);
+    let flash_spi = Spi::new_blocking(p.SPI2, p.PB13, p.PB15, p.PB14, flash_config);
+    let flash = W25::new(ExclusiveDevice::new(flash_spi, flash_cs, Delay), Delay);
+
     Board {
         node_id,
         phy,
         adin_runner,
         adin_power,
+        flash,
     }
 }
 
-/// A [`Devkit`] node with id `node_id` and this chip's UID as its name, and
-/// an empty RAM config store in the layout `arm-none-eabi-gcc` gives
-/// bm_protocol's.
+/// A [`Devkit`] node with id `node_id` and this chip's UID as its name, its
+/// config partitions loaded from `flash` in the layout `arm-none-eabi-gcc`
+/// gives bm_protocol's.
 #[must_use]
-pub fn node(node_id: u64) -> Devkit {
+pub fn node(node_id: u64, flash: Flash) -> Devkit {
     Node::with_config(
         DevkitIdentity::new(node_id, embassy_stm32::uid::uid()),
         SoftRtc::new(),
-        Config::load(Layout::ARM_EABI_GCC, RamConfigStorage::new()),
+        Config::load(Layout::ARM_EABI_GCC, FlashConfigStorage::new(flash)),
         PORTS,
     )
 }
