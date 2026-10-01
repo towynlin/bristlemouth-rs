@@ -47,19 +47,21 @@ bus with a Spotter and a C dev kit:
 | Need | State |
 |---|---|
 | BCMP: heartbeat, ping, info, neighbours, resources, time, config, DFU | Done (`bm-wire`, `bm_stack::Node`) |
-| PHY for the ADIN2111 | Done (`bm-phy-adin2111`), untested on hardware |
+| PHY for the ADIN2111 | Done (`bm-phy-adin2111`), run on a dev kit |
 | Application code running beside the node | Done: `bm_stack::App`, run by `Node::run_app`; `bm_stack::channel` for an app in its own task |
 | UDP over IPv6 | Done: `bm_wire::udp`; `Node::bind_udp`, `Node::send_udp`, `Event::Udp` |
 | Pub/sub codec and topic matching | Done: `bm_wire::pubsub`, `bm_wire::util::bm_wildcard_match` |
 | Pub/sub on the node (`middleware/pubsub.c`, `middleware.c`) | Done: `Node::subscribe`, `unsubscribe`, `publish`, `Event::Publication` |
 | `spotter_log`, `spotter_tx_data` | Done: `bm_wire::spotter`; `Node::spotter_log`, `Node::spotter_tx_data` |
-| Dev kit board support (MCU HAL, pins, node id, time driver) | Done (`bm-devkit`), untested on hardware |
+| Dev kit board support (MCU HAL, pins, node id, time driver) | Done (`bm-devkit`), run on a dev kit |
 | Config in the dev kit's NOR flash | Done (`bm-devkit`: `w25`, `storage`), untested on hardware |
+| The hello-world app | Done: `bm-devkit/src/bin/hello_world.rs`; the four checks above passed on a bench |
+| RTC set from the Spotter's `spotter/utc-time` | Not started: card T1 |
 
 A node that heartbeats, is discovered, answers ping and info, publishes,
 subscribes and calls `spotter_log` runs on the mock PHY
-(`bm-stack/examples/hello_node.rs`), and builds for the dev kit
-(`bm-devkit/src/bin/bringup.rs`).
+(`bm-stack/examples/hello_node.rs`) and on a dev kit
+(`bm-devkit/src/bin/hello_world.rs`).
 
 ## The oracle is not the deployed stack for UDP
 
@@ -100,7 +102,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 |---|---|---|
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, B1, B2, E0, F1, H0, P1, P2, S1, U1, U2) left for the rest
+## What the landed cards (A1, B1, B2, E0, E1, F1, H0, P1, P2, S1, U1, U2) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -288,14 +290,14 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   | Decision | Reason |
   |---|---|
   | Own workspace, `Cargo.lock` on bm-phy-adin2111's embassy commit | the git embassy; one commit keeps the two crates from diverging. `cargo update -p embassy-stm32 --precise <rev>` moves it. |
-  | `start` takes every peripheral | E1 needs only the ADIN2111 and the flash; a card needing more (LEDs) splits it |
+  | `start` takes every peripheral | `hello_world` needs only the ADIN2111 and the flash; a card needing more (LEDs) splits it |
   | `memory.x` at `0x08000000`, no bootloader, top 512 bytes of RAM left out | NoDfu needs no MCUboot; the 512 bytes are where the C keeps its no-init block, for a DFU card |
   | Logging is defmt over RTT through probe-rs | the C console is USB CDC, which is not ported |
   | SMPS, watchdog, RTC on LSE, Bristlefin expander and LEDs not configured | not needed to say hello; the embassy example runs without them |
   | No host tests (`test = false`) | the crate builds only for thumb; its pure functions are small and cross-checked by hand |
 
-  Not yet run on a kit: link up on both ports, and heartbeats seen by a C
-  node. E1's bench checks cover both; run `bringup` first if E1's fail.
+  Run on a kit by E1's bench run, below. Run `bringup` first if a later
+  bench check fails at link-up or heartbeats.
   Flashing with `probe-rs run` replaces an installed MCUboot bootloader.
 - **Config in NOR flash (B2).** `bm_devkit::w25::W25` is the driver,
   generic over `embedded-hal` blocking `SpiDevice` and `DelayNs`;
@@ -313,7 +315,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   Not yet run on a kit: a key set (`0xA2`) and committed (`0xA3`) surviving
   the reset, and a partition written by C firmware loading. `bringup` logs
   each partition's keys at start, which is how both are read.
-- **`bm-stack/examples/hello_node.rs` is the host twin of E1.** It subscribes
+- **`bm-stack/examples/hello_node.rs` is the host twin of `hello_world`.** It subscribes
   to `hello/*`, publishes, receives the scripted neighbour's publication, and
   sends `hello world` with `spotter_log`. It asserts its outcome, and CI's
   `test` job runs it: `cargo test` only builds examples.
@@ -332,24 +334,60 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   format can write one; a file name is read to its first NUL, as
   `bm_strnlen` reads it. Each call builds its body in a buffer on the stack
   (`spotter::MAX_LOG_LEN`, 1461 bytes, or `MAX_TX_LEN`, 1001) rather than in
-  the node, so a node carries no second 1.5 KB buffer; E1's node task needs
-  the stack for it. `NetworkType` is a `u8` newtype, not an enum, because the
+  the node, so a node carries no second 1.5 KB buffer; the node task needs
+  the stack for it, which `hello_world` has at the default `memory.x`. `NetworkType` is a `u8` newtype, not an enum, because the
   C sends any byte and gives every value but `CELLULAR_ONLY` the Iridium
   limit.
 
+- **`hello_world` on a bench (E1).** Rust node `0b54ccce5c7978bf` (the
+  capture's dev kit, reflashed) beside a Spotter bridge (`5428d5d73b4e298a`)
+  and a C dev kit (`62326760da4e237a`, `hello_world@ENG-v0.13.12`):
+
+  | Check | Evidence |
+  |---|---|
+  | neighbour table and topology | `bm topo` on the C dev kit: `(root)62326760da4e237a:1 \| 2:0b54ccce5c7978bf:1 \| 1:5428d5d73b4e298a`; `bm info 0` on the Spotter lists the Rust node |
+  | answers a ping | `bm ping` from the C dev kit; defmt `echo request from 62326760da4e237a` |
+  | `hello world` on the Spotter console | `1790825964.886 0b54ccce5c7978bf, hello world` |
+  | receives a publication | `spotter/printf`, `fprintf`, `transmit-data` from the C dev kit |
+
+  It subscribes to `spotter/*` rather than an app topic because that matches
+  what stock C dev kit firmware publishes, so the receive check needs no C
+  change. It also receives the Spotter's `spotter/utc-time` (card T1).
+  `DevkitIdentity` reports the crate version and the first 8 hex digits of
+  `HEAD` (`bm-devkit/build.rs`), as the C reports its version and SHA.
+
 ---
 
-## Card E1 — The hello-world example
+## Card T1 — Set the RTC from `spotter/utc-time`
 
 **Blocks:** nothing. **Blocked by:** nothing.
 
-`bm-devkit/src/bin/hello_world.rs`, beside `bringup.rs`, which shows the
-shape: `bm_devkit::start`, spawn `adin_runner`, `bm_devkit::node`,
-`Node::run_app`. It subscribes to one topic, and every 10 s publishes
-`hello world` via `spotter_log` and logs anything received.
+A Spotter publishes `spotter/utc-time` every 10 s. On the bench (E1) its data
+was 8 bytes, a little-endian `u64` of UTC microseconds:
+`b"\xb0*M.\xbf\\\x06\x00"` is `0x00065CBF2E4D2AB0`, 1790826045.582 s on the
+Spotter console's clock. C dev kits set their RTC from it.
 
-Done: builds in CI; the four checks under "The target" are run on a bench and
-reported individually.
+1. Find the C that subscribes and sets the RTC (bm_protocol at `62d8b5d`,
+   or bm_core's `integrations/`), and record the file, line and anything it
+   checks (length, version, source) in `bm-devkit/README.md` or the module
+   that ports it.
+2. Port it: subscribe on the node and call `Rtc::set` with
+   `RtcTimeAndDate::from_utc_micros`, matching the C's checks. Where it
+   lives (a `bm-wire` decoder plus a `Node` method, or an `App` in
+   `bm-devkit`) follows from where the C has it.
+3. A running clock. `Devkit` uses `SoftRtc`, which does not advance: after a
+   set, every get returns the set time. Implement `Rtc` in `bm-devkit` over
+   the time set plus `embassy_time::Instant` elapsed since, or over the
+   STM32U575's RTC (bm_protocol's choice to be recorded in step 1). Until it
+   is set it fails `get`, as `SoftRtc` does, so a time request is
+   unanswered.
+4. A test feeding the bench's bytes above through `MockPhy` and reading
+   `Node::rtc`.
+
+Done: builds in CI; on a bench, `bm time get` to the Rust node from the C
+dev kit returns the Spotter's time, and a second `get` 10 s later returns a
+time 10 s later, reported as done or not done. `hello_world` logs time
+requests, sets and responses, and the RTC reading every 10 s.
 
 ## Card B3 — Share the dev kit's NOR flash between config and a DFU slot
 
@@ -385,12 +423,12 @@ Done: builds in CI; `bringup` still logs a committed key after the reset
 ## Order
 
 ```
-E1
+T1
 
 B3
 ```
 
-E1 and B3 can start now and run in parallel. B3 is not needed to say hello.
+T1 and B3 can start now and run in parallel.
 
 # Explicitly out of scope
 

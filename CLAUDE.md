@@ -95,7 +95,9 @@ A cargo workspace.
   ADIN2111 on SPI3, W25Q64JV NOR flash on SPI2): `start` powers and brings up
   the ADIN2111 and sets up the flash, `node` builds a `Devkit` node with the
   chip's node id and its config partitions in flash; `src/bin/bringup.rs`
-  runs one and logs the config keys it loaded. **Its own workspace**, for
+  runs one and logs the config keys it loaded; `src/bin/hello_world.rs` is
+  the hello-world app: subscribes to `spotter/*`, sends `hello world` with
+  `spotter_log` every 10 s. **Its own workspace**, for
   bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
   `.cargo/config.toml` sets the thumb target and a `probe-rs run` runner.
   `README.md` is the record of bm_protocol's BSP (pins, clocks, ADIN2111

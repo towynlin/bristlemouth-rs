@@ -22,6 +22,11 @@ name = "bringup"
 test = false
 bench = false
 
+[[bin]]
+name = "hello_world"
+test = false
+bench = false
+
 [dependencies]
 bm-stack = { path = "../bm-stack" }
 bm-wire = { path = "../bm-wire" }

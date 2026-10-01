@@ -243,9 +243,24 @@ pub fn uid_string(uid: &[u8; 12]) -> [u8; 24] {
     out
 }
 
+/// The first 8 hex digits of the commit built, as bm_protocol reports its
+/// own; 0 outside a git checkout.
+const GIT_SHA: u32 = match u32::from_str_radix(env!("BM_DEVKIT_GIT_SHA"), 16) {
+    Ok(sha) => sha,
+    Err(_) => 0,
+};
+
+/// A Cargo version component as a `u8`, saturating, as `DeviceInfo` carries it.
+const fn version_part(part: &str) -> u8 {
+    match u8::from_str_radix(part, 10) {
+        Ok(n) => n,
+        Err(_) => u8::MAX,
+    }
+}
+
 /// What a dev kit says about itself, as `bcl_init` fills `DeviceCfg`: vendor,
 /// product and hardware version 0, the placeholder serial number, and the UID
-/// string as device name.
+/// string as device name. Firmware version and git SHA are this crate's.
 #[derive(Debug, Clone, Copy)]
 pub struct DevkitIdentity {
     node_id: u64,
@@ -271,12 +286,22 @@ impl Identity for DevkitIdentity {
     fn device_info(&self) -> DeviceInfo {
         DeviceInfo {
             serial_num: *b"0123456789abcdef",
+            git_sha: GIT_SHA,
+            ver_major: version_part(env!("CARGO_PKG_VERSION_MAJOR")),
+            ver_minor: version_part(env!("CARGO_PKG_VERSION_MINOR")),
+            ver_rev: version_part(env!("CARGO_PKG_VERSION_PATCH")),
             ..DeviceInfo::default()
         }
     }
 
     fn version_string(&self) -> &[u8] {
-        concat!("bm-devkit ", env!("CARGO_PKG_VERSION")).as_bytes()
+        concat!(
+            "bm-devkit@v",
+            env!("CARGO_PKG_VERSION"),
+            "+",
+            env!("BM_DEVKIT_GIT_SHA")
+        )
+        .as_bytes()
     }
 
     fn device_name(&self) -> &[u8] {
