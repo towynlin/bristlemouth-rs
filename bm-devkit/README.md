@@ -1,11 +1,13 @@
 # bm-devkit
 
 Board support for the Bristlemouth dev kit's mote. `src/lib.rs` brings the
-board up; `src/bin/bringup.rs` runs a node on it.
+board up; `src/bin/bringup.rs` runs a node on it, and `src/bin/hello_world.rs`
+is the hello-world app.
 
 ```
 cd bm-devkit && cargo build --target thumbv8m.main-none-eabihf
 cd bm-devkit && cargo run --release --bin bringup     # probe-rs, defmt over RTT
+cd bm-devkit && cargo run --release --bin hello_world
 ```
 
 Its own workspace, beside `bm-phy-adin2111` and for the same reason (git
