@@ -173,7 +173,41 @@ bootloader and image again. `memory.x` leaves the no-init 512 bytes out of
 `RAM` so a later DFU card can place `NoInitRam` where the C bootloader
 expects it.
 
+## Time
+
+The C sets its RTC from the Spotter's `spotter/utc-time`, and answers BCMP
+time messages from the same RTC.
+
+| Item | C | Here |
+|---|---|---|
+| Subscription | `bm_sub(APP_PUB_SUB_UTC_TOPIC, handle_bm_subscriptions)`, `src/apps/bm_devkit/bmdk_common/app_main.cpp:412` | `hello_world` subscribes to `bm_stack::utc_time::TOPIC` |
+| Handler | `handle_bm_subscriptions`, `app_main.cpp:238-272` | `bm_stack::utc_time::UtcTimeSetter` |
+| Topic check | `strncmp(APP_PUB_SUB_UTC_TOPIC, topic, topic_len) == 0` | the same, in `utc_time::decode` |
+| Type, version | both 1 (`bmdk_common/app_pub_sub.h:10-12`); else prints "Unrecognized version" | `UtcTimeError::Unrecognized` |
+| Data | `bm_common_pub_sub_utc_t` (bm_core `bm_common_messages/bm_common_pub_sub.h:21-23`), a packed `uint64_t` of UTC µs (its comment says ns); `data_len` not checked | first 8 bytes, little-endian; fewer is `UtcTimeError::Short` |
+| Conversion | `dateTimeFromUtc`, `.ms = usec / 1000` | `RtcTimeAndDate::from_utc_micros` |
+| BCMP `bm_rtc_get`/`bm_rtc_set` | `src/lib/drivers/bm_rtc_wrapper.c`, onto `rtcGet`/`rtcSet` | `bm_stack::Rtc` on the node |
+| Clock | the STM32 RTC (`src/lib/drivers/stm32_rtc.c`), below | `bm_stack::RunningRtc`: the time set plus `embassy_time::Instant` elapsed |
+
+`stm32_rtc.c`, started by `rtcInit` from `defaultTask` (`app_main.cpp:346`):
+
+| Item | Value | Source |
+|---|---|---|
+| Clock source | LSE | `stm32_rtc.c:44` |
+| Prescalers | asynchronous 127, synchronous 255: 1 Hz, 1/256 s subseconds | `:51` |
+| "Set" flag | `0x836A20DD` in backup register `DR0`, written after a successful `rtcSet`; `rtcGet` fails without it | `:9`, `:72`, `:261` |
+| Year | two BCD digits, offset 2000 | `:184`, `:239` |
+| Milliseconds | kept: `rtcSet` shifts the subsecond counter by `LL_RTC_TIME_Synchronize` | `:254` |
+
+| `RunningRtc` against `stm32_rtc.c` | Consequence |
+|---|---|
+| In RAM | lost on reset; the C's survives a reset while the backup domain is powered |
+| Timed by the embassy time driver, on PLL1 from MSIS, not LSE | drifts more between sets; a Spotter re-sets it every 10 s |
+| Any year `to_utc_micros` holds | the C's two-digit year cannot hold years before 2000 or after 2099 |
+
+Porting the hardware RTC needs LSE, which `config` does not enable.
+
 ## Not used yet
 
-USB (the C console and pcap), the Bristlefin expander and LEDs, the RTC on
-LSE, the watchdog (`MX_IWDG_Init`), low-power management, and the SMPS.
+USB (the C console and pcap), the Bristlefin expander and LEDs, the RTC
+peripheral and LSE, the watchdog (`MX_IWDG_Init`), low-power management, and the SMPS.

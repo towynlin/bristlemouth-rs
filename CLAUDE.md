@@ -68,6 +68,10 @@ A cargo workspace.
     holds UDP port 4321; the subscription table is `bm_wire::pubsub::Subscriptions`.
     `spotter_log` and `spotter_tx_data` wrap `publish`; their bodies are
     `bm_wire::spotter`.
+  - `src/utc_time.rs` — the Spotter's `spotter/utc-time`, which C nodes set
+    their RTC from (bm_protocol app code, not bm_core): `decode` and
+    `UtcTimeSetter`, for an `App`. `port::RunningRtc` is a clock that
+    advances with `embassy_time::Instant`.
   - `src/app.rs` — `App`, application code `Node::run_app` runs in the
     node's loop: a cancel-safe `ready` arm, then `act` with `&mut Node`.
   - `src/channel.rs` — behind the `channel` feature: `Channels`, an
@@ -97,7 +101,7 @@ A cargo workspace.
   chip's node id and its config partitions in flash; `src/bin/bringup.rs`
   runs one and logs the config keys it loaded; `src/bin/hello_world.rs` is
   the hello-world app: subscribes to `spotter/*`, sends `hello world` with
-  `spotter_log` every 10 s. **Its own workspace**, for
+  `spotter_log` every 10 s, and sets its `RunningRtc` from `spotter/utc-time`. **Its own workspace**, for
   bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
   `.cargo/config.toml` sets the thumb target and a `probe-rs run` runner.
   `README.md` is the record of bm_protocol's BSP (pins, clocks, ADIN2111

@@ -21,7 +21,7 @@ use bm_stack::node::{
     INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, RESOURCE_REQUESTS_DEFAULT, RESOURCES_DEFAULT,
     SUBSCRIPTIONS_DEFAULT,
 };
-use bm_stack::{Config, Identity, Node, SoftRtc};
+use bm_stack::{Config, Identity, Node, RunningRtc};
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::bcmp::info::CACHED_STRING_BYTES;
 use bm_wire::bcmp::resource::RESOURCE_NAME_BYTES;
@@ -81,11 +81,11 @@ pub type Flash = W25<FlashSpi, Delay>;
 /// The config partitions on [`Flash`].
 pub type DevkitConfigStorage = FlashConfigStorage<FlashSpi, Delay>;
 
-/// A node on this board: [`DevkitIdentity`], a clock set over the network,
-/// and the config partitions in NOR flash.
+/// A node on this board: [`DevkitIdentity`], a [`RunningRtc`] set over the
+/// network, and the config partitions in NOR flash.
 pub type Devkit = Node<
     DevkitIdentity,
-    SoftRtc,
+    RunningRtc,
     4,
     4,
     PING_PAYLOAD_BYTES,
@@ -195,7 +195,7 @@ pub async fn start() -> Board {
 pub fn node(node_id: u64, flash: Flash) -> Devkit {
     Node::with_config(
         DevkitIdentity::new(node_id, embassy_stm32::uid::uid()),
-        SoftRtc::new(),
+        RunningRtc::new(),
         Config::load(Layout::ARM_EABI_GCC, FlashConfigStorage::new(flash)),
         PORTS,
     )

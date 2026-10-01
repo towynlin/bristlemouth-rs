@@ -28,6 +28,8 @@
 //!   how application code sends while the node runs.
 //! * [`channel`], behind the `channel` feature, is a [`NodeHandle`] for an
 //!   application running as a task of its own.
+//! * [`utc_time`] decodes the Spotter's `spotter/utc-time` publication, which
+//!   C nodes set their RTC from; [`port::RunningRtc`] is a clock to set.
 //! * [`mock`], behind the `mock` feature, is a PHY that replays a script and
 //!   records what was sent.
 
@@ -44,6 +46,7 @@ pub mod dfu;
 pub mod mock;
 pub mod node;
 pub mod port;
+pub mod utc_time;
 
 pub use app::App;
 #[cfg(feature = "channel")]
@@ -55,5 +58,5 @@ pub use node::{
 };
 pub use port::{
     BootRequests, ConfigStorage, DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy,
-    RamConfigStorage, RamDfuSlot, Rtc, RtcTimeAndDate, SoftRtc,
+    RamConfigStorage, RamDfuSlot, Rtc, RtcTimeAndDate, RunningRtc, SoftRtc,
 };
