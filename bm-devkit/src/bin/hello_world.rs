@@ -1,7 +1,8 @@
 //! The hello-world app: subscribes to [`SUBSCRIPTION`], sends `hello world`
 //! to the Spotter console with `spotter_log` every 10 s, and logs over defmt
 //! what the four checks of `docs/hello-world-todo.md`'s "The target" are read
-//! from: heartbeats, echo requests, and publications received.
+//! from: heartbeats, echo requests, and publications received. It also logs
+//! BCMP time messages and, every 10 s, the node's RTC reading.
 //!
 //! ```text
 //! cd bm-devkit && cargo run --release --bin hello_world
@@ -11,8 +12,9 @@
 #![no_main]
 
 use bm_devkit::{AdinRunner, Devkit};
-use bm_stack::{App, Event, Outbound};
+use bm_stack::{App, Event, Outbound, Rtc};
 use bm_wire::bcmp::MessageType;
+use bm_wire::bcmp::time::{SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
 use bm_wire::spotter::USE_TIMESTAMP;
 use defmt::{info, warn};
 use embassy_executor::Spawner;
@@ -43,6 +45,10 @@ impl App<Devkit> for Hello {
     }
 
     fn act<'n>(&mut self, node: &'n mut Devkit, _now_ms: u32) -> Option<Outbound<'n>> {
+        match node.rtc().get() {
+            Some(time) => info!("rtc: {=u64} us", time.to_utc_micros()),
+            None => info!("rtc: not set"),
+        }
         match node.spotter_log(0, None, USE_TIMESTAMP, HELLO) {
             Ok(outbound) => {
                 info!("spotter_log: {=[u8]:a}", HELLO);
@@ -70,6 +76,48 @@ impl App<Devkit> for Hello {
                 ..
             } if message_type == MessageType::ECHO_REQUEST => {
                 info!("echo request from {=u64:016x}", source);
+            }
+            Event::Message {
+                message_type,
+                source,
+                payload,
+                ..
+            } if message_type == MessageType::SYSTEM_TIME_REQUEST => {
+                match SystemTimeRequest::decode(payload) {
+                    Ok(request) => info!(
+                        "time request from {=u64:016x} for {=u64:016x}",
+                        source, request.header.target_node_id
+                    ),
+                    Err(_) => warn!("short time request from {=u64:016x}", source),
+                }
+            }
+            Event::Message {
+                message_type,
+                source,
+                payload,
+                ..
+            } if message_type == MessageType::SYSTEM_TIME_SET => {
+                match SystemTimeSet::decode(payload) {
+                    Ok(set) => info!(
+                        "time set from {=u64:016x} for {=u64:016x}: {=u64} us",
+                        source, set.header.target_node_id, set.utc_time_us
+                    ),
+                    Err(_) => warn!("short time set from {=u64:016x}", source),
+                }
+            }
+            Event::Message {
+                message_type,
+                source,
+                payload,
+                ..
+            } if message_type == MessageType::SYSTEM_TIME_RESPONSE => {
+                match SystemTimeResponse::decode(payload) {
+                    Ok(response) => info!(
+                        "time response from {=u64:016x}: {=u64} us",
+                        source, response.utc_time_us
+                    ),
+                    Err(_) => warn!("short time response from {=u64:016x}", source),
+                }
             }
             Event::Publication {
                 source,

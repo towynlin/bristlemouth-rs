@@ -375,12 +375,19 @@ Spotter console's clock. C dev kits set their RTC from it.
    `RtcTimeAndDate::from_utc_micros`, matching the C's checks. Where it
    lives (a `bm-wire` decoder plus a `Node` method, or an `App` in
    `bm-devkit`) follows from where the C has it.
-3. A test feeding the bench's bytes above through `MockPhy` and reading
+3. A running clock. `Devkit` uses `SoftRtc`, which does not advance: after a
+   set, every get returns the set time. Implement `Rtc` in `bm-devkit` over
+   the time set plus `embassy_time::Instant` elapsed since, or over the
+   STM32U575's RTC (bm_protocol's choice to be recorded in step 1). Until it
+   is set it fails `get`, as `SoftRtc` does, so a time request is
+   unanswered.
+4. A test feeding the bench's bytes above through `MockPhy` and reading
    `Node::rtc`.
 
-Done: builds in CI; on a bench, `bm time get` (or the C's equivalent) to the
-Rust node from the C dev kit returns the Spotter's time, reported as done or
-not done.
+Done: builds in CI; on a bench, `bm time get` to the Rust node from the C
+dev kit returns the Spotter's time, and a second `get` 10 s later returns a
+time 10 s later, reported as done or not done. `hello_world` logs time
+requests, sets and responses, and the RTC reading every 10 s.
 
 ## Card B3 — Share the dev kit's NOR flash between config and a DFU slot
 
