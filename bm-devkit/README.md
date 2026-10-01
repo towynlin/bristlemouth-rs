@@ -128,12 +128,30 @@ as SPI3 (mode 0, prescaler 8, 20 MHz).
 
 The image layout is `bm_wire::configuration::Layout::ARM_EABI_GCC`: the C is
 built with `arm-none-eabi-gcc` and no `-fno-short-enums`
-(`src/bsp/bm_mote_v1.0/CMakeLists.txt:75`). Not yet checked against a
-kit's flash.
+(`src/bsp/bm_mote_v1.0/CMakeLists.txt:75`), which gives a 4359-byte image.
+Not yet checked against a kit's flash.
 
-This crate starts with `RamConfigStorage`: a node answers config messages
-but forgets them on reset. `ConfigStorage` is synchronous, so a W25 store
-over embassy's blocking SPI is the follow-up.
+Here:
+
+| C | Rust |
+|---|---|
+| `spiflash::W25` | `w25::W25`, over `embedded-hal` blocking `SpiDevice` and `DelayNs`; `start` builds it on SPI2 at 20 MHz with `FLASH_CS` (PA8) |
+| `NvmPartition` + `bm_config_wrapper.cpp` | `storage::FlashConfigStorage`, a `bm_stack::ConfigStorage` |
+| `bm_config_reset`: `resetSystem(RESET_REASON_CONFIG)` | `SCB::sys_reset`; no reset reason, since the no-init block is not placed |
+
+Differences from the C, none visible in flash contents after a completed
+write:
+
+| C | Rust |
+|---|---|
+| `_write` counts `ceil(len / 4096)` sectors, plus one if the write ends inside a later sector: a 4359-byte image rewrites three sectors, the third unchanged | rewrites the two the image overlaps |
+| out-of-range `offset + len` asserts (`configASSERT`) | `read`/`write` return `false` |
+| `timeout_ms` bounds the wait for the driver's mutex | unused: the store owns the part |
+| sector buffer allocated per write | a 4 KB field of `W25`, so it lives in the node's `StaticCell` |
+| status polled back to back until a tick deadline | polled every 10 µs, a timeout counting polls |
+
+A write interrupted between a sector's erase and its last page program loses
+that sector, in both.
 
 ## Flash layout, bootloader, no-init RAM
 

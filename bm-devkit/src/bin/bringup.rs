@@ -2,6 +2,10 @@
 //! hears over defmt. The manual check for card B1 is that a C node on the
 //! same bus lists it as a neighbour.
 //!
+//! At start it logs the keys each config partition loaded from flash, so a
+//! key set and committed over the bus shows up after the reset the commit
+//! causes.
+//!
 //! ```text
 //! cd bm-devkit && cargo run --release --bin bringup
 //! ```
@@ -12,6 +16,7 @@
 use bm_devkit::{AdinRunner, Devkit};
 use bm_stack::{App, Event, Outbound};
 use bm_wire::bcmp::MessageType;
+use bm_wire::configuration::{ConfigStore, Partition};
 use defmt::{info, warn};
 use embassy_executor::Spawner;
 use static_cell::StaticCell;
@@ -55,6 +60,25 @@ impl App<Devkit> for Log {
     }
 }
 
+fn log_config(store: &ConfigStore) {
+    for (partition, name) in [
+        (Partition::User, "user"),
+        (Partition::System, "system"),
+        (Partition::Hardware, "hardware"),
+    ] {
+        let part = store.partition(partition);
+        info!("{=str} config: {=u8} keys", name, part.num_keys());
+        for key in part.stored_keys() {
+            let len = key
+                .key_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(key.key_buf.len());
+            info!("  {=[u8]:a}", key.key_buf[..len]);
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut board = bm_devkit::start().await;
@@ -62,7 +86,8 @@ async fn main(spawner: Spawner) {
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));
 
     static NODE: StaticCell<Devkit> = StaticCell::new();
-    let node = NODE.init_with(|| bm_devkit::node(board.node_id));
+    let node = NODE.init_with(|| bm_devkit::node(board.node_id, board.flash));
+    log_config(&node.config().store);
     let error = node.run_app(&mut board.phy, &mut Log).await;
     warn!("node stopped: {}", defmt::Debug2Format(&error));
 }
