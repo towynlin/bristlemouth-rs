@@ -46,7 +46,7 @@ static_cell = "2"
 [dependencies.embassy-stm32]
 git = "https://github.com/embassy-rs/embassy"
 branch = "main"
-features = ["defmt", "stm32u575ci", "time-driver-any", "exti"]
+features = ["defmt", "stm32u575ci", "time-driver-any", "exti", "unstable-pac"]
 
 [dependencies.embassy-executor]
 git = "https://github.com/embassy-rs/embassy"

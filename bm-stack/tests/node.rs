@@ -4,8 +4,7 @@ use bm_stack::mock::{MockPhy, Script, Sent, frames};
 use bm_stack::node::{EXPIRY_PERIOD_MS, HOP_LIMIT, LINK_LOCAL_PREFIX, NEIGHBOR_REQUEST_TIMEOUT_MS};
 use bm_stack::utc_time::{self, UtcTimeError, UtcTimeSetter};
 use bm_stack::{
-    App, Egress, Event, Identity, Node, Outbound, Rtc, RtcTimeAndDate, RunningRtc, SoftRtc,
-    deliver, transmit,
+    App, Egress, Event, Identity, Node, Outbound, Rtc, RtcTimeAndDate, SoftRtc, deliver, transmit,
 };
 use bm_wire::addr;
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest, InfoRequestKind};
@@ -1875,7 +1874,7 @@ const SPOTTER_ID: u64 = 0x5428_d5d7_3b4e_298a;
 const BENCH_UTC_TIME: &[u8] = b"\xb0*M.\xbf\\\x06\x00";
 const BENCH_UTC_US: u64 = 0x0006_5CBF_2E4D_2AB0;
 
-type ClockNode = Node<TestIdentity, RunningRtc, 4>;
+type ClockNode = Node<TestIdentity, SoftRtc, 4>;
 
 /// An app that only sets the clock, as `hello_world` does beside its ticker.
 struct ClockSetter {
@@ -1915,32 +1914,27 @@ fn time_responses(sent: &[Sent]) -> Vec<u64> {
         .collect()
 }
 
+/// The bench's publication sets the clock; a time request after it is
+/// answered with the time set, once per port. `SoftRtc` does not advance; the
+/// dev kit's RTC does.
 #[test]
-fn a_running_clock_fails_until_set() {
-    assert_eq!(RunningRtc::new().get(), None);
-}
-
-/// The bench's publication sets the clock; a time request 10 s later is
-/// answered 10 s on, once per port.
-#[test]
-fn the_spotters_utc_time_sets_a_running_clock() {
+fn the_spotters_utc_time_sets_the_clock() {
     let _clock = clock_lock();
-    let mut script = vec![
+    let script = vec![
         Script::Receive {
             port: 1,
             frame: frames::publication(SPOTTER_ID, utc_time::TOPIC, 1, 1, BENCH_UTC_TIME),
         },
-        // `select` polls `receive` before the app's arm, so the set lands
-        // after this step: 1 ms after the publication.
+        // `select` polls `receive` before the app's arm: one step for the
+        // set to land before the request.
         Script::Idle { ms: 1 },
+        Script::Receive {
+            port: 1,
+            frame: time_frame(MessageType::SYSTEM_TIME_REQUEST, NODE_ID, 0),
+        },
     ];
-    script.extend(vec![Script::Idle { ms: 1000 }; 10]);
-    script.push(Script::Receive {
-        port: 1,
-        frame: time_frame(MessageType::SYSTEM_TIME_REQUEST, NODE_ID, 0),
-    });
     let mut phy = MockPhy::new(PORTS, script);
-    let mut node: ClockNode = Node::new(TestIdentity, RunningRtc::new(), PORTS);
+    let mut node: ClockNode = Node::new(TestIdentity, SoftRtc::new(), PORTS);
     node.subscribe(utc_time::TOPIC).unwrap();
     let mut app = ClockSetter {
         setter: UtcTimeSetter::new(),
@@ -1959,15 +1953,19 @@ fn the_spotters_utc_time_sets_a_running_clock() {
         (2026, 10, 1, 3, 40, 45, 582),
         "1790826045.582 s"
     );
-    let later = set.to_utc_micros() + 10_000_000;
-    assert_eq!(time_responses(&phy.sent), [later, later]);
-    assert_eq!(node.rtc().get().map(|r| r.to_utc_micros()), Some(later));
+    let utc_us = set.to_utc_micros();
+    assert_eq!(
+        utc_us, BENCH_UTC_US,
+        "whole milliseconds, so nothing dropped"
+    );
+    assert_eq!(time_responses(&phy.sent), [utc_us, utc_us]);
+    assert_eq!(node.rtc().get(), Some(set));
 }
 
 /// The C handler is registered for its own subscription only.
 #[test]
 fn utc_time_through_another_subscription_sets_nothing() {
-    let mut node: ClockNode = Node::new(TestIdentity, RunningRtc::new(), PORTS);
+    let mut node: ClockNode = Node::new(TestIdentity, SoftRtc::new(), PORTS);
     node.subscribe(b"spotter/*").unwrap();
     let mut setter = UtcTimeSetter::new();
     let mut frame = frames::publication(SPOTTER_ID, utc_time::TOPIC, 1, 1, BENCH_UTC_TIME);
@@ -1983,7 +1981,7 @@ fn utc_time_through_another_subscription_sets_nothing() {
 /// Version 2, the pub/sub version `spotter_log` sends, is not the C's 1.
 #[test]
 fn utc_time_with_another_version_sets_nothing() {
-    let mut node: ClockNode = Node::new(TestIdentity, RunningRtc::new(), PORTS);
+    let mut node: ClockNode = Node::new(TestIdentity, SoftRtc::new(), PORTS);
     node.subscribe(utc_time::TOPIC).unwrap();
     let mut setter = UtcTimeSetter::new();
     let mut frame = frames::publication(SPOTTER_ID, utc_time::TOPIC, 1, 2, BENCH_UTC_TIME);

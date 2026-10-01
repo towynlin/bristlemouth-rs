@@ -4,8 +4,8 @@
 //! [`start`] brings the board up and returns a [`Board`]: the ADIN2111 as a
 //! [`bm_stack::Phy`], the driver runner the firmware must spawn, and the node
 //! id the C firmware would use on the same chip, and the NOR flash that holds
-//! the config partitions. [`Devkit`] is the node type with this board's
-//! identity and that config store.
+//! the config partitions, and the RTC. [`Devkit`] is the node type with this
+//! board's identity, clock and config store.
 //!
 //! Every pin, clock and sequence here is taken from bm_protocol's
 //! `bm_mote_v1.0` BSP; `README.md` in this crate records each with its source.
@@ -13,6 +13,7 @@
 #![no_std]
 #![warn(missing_docs)]
 
+pub mod rtc;
 pub mod storage;
 pub mod w25;
 
@@ -21,7 +22,7 @@ use bm_stack::node::{
     INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, RESOURCE_REQUESTS_DEFAULT, RESOURCES_DEFAULT,
     SUBSCRIPTIONS_DEFAULT,
 };
-use bm_stack::{Config, Identity, Node, RunningRtc};
+use bm_stack::{Config, Identity, Node};
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::bcmp::info::CACHED_STRING_BYTES;
 use bm_wire::bcmp::resource::RESOURCE_NAME_BYTES;
@@ -37,6 +38,7 @@ use embassy_time::{Delay, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use static_cell::StaticCell;
 
+use crate::rtc::DevkitRtc;
 use crate::storage::FlashConfigStorage;
 use crate::w25::W25;
 
@@ -81,11 +83,11 @@ pub type Flash = W25<FlashSpi, Delay>;
 /// The config partitions on [`Flash`].
 pub type DevkitConfigStorage = FlashConfigStorage<FlashSpi, Delay>;
 
-/// A node on this board: [`DevkitIdentity`], a [`RunningRtc`] set over the
-/// network, and the config partitions in NOR flash.
+/// A node on this board: [`DevkitIdentity`], the RTC, and the config
+/// partitions in NOR flash.
 pub type Devkit = Node<
     DevkitIdentity,
-    RunningRtc,
+    DevkitRtc,
     4,
     4,
     PING_PAYLOAD_BYTES,
@@ -111,13 +113,17 @@ pub struct Board {
     pub adin_power: Output<'static>,
     /// The NOR flash. [`node`] takes it.
     pub flash: Flash,
+    /// The RTC on LSE. [`node`] takes it.
+    pub rtc: DevkitRtc,
 }
 
 /// The clock tree `SystemClock_Config` sets up: MSIS at 48 MHz, PLL1 `/3 *10
-/// /1`, SYSCLK 160 MHz.
+/// /1`, SYSCLK 160 MHz; LSE on, drive high, clocking the RTC.
 #[must_use]
 pub fn config() -> embassy_stm32::Config {
-    use embassy_stm32::rcc::{MSIRange, Pll, PllDiv, PllMul, PllPreDiv, PllSource, Sysclk};
+    use embassy_stm32::rcc::{
+        LsConfig, LseDrive, LseMode, MSIRange, Pll, PllDiv, PllMul, PllPreDiv, PllSource, Sysclk,
+    };
 
     let mut config = embassy_stm32::Config::default();
     config.rcc.msis = Some(MSIRange::Range48mhz);
@@ -130,11 +136,19 @@ pub fn config() -> embassy_stm32::Config {
         divr: Some(PllDiv::Div1),
     });
     config.rcc.sys = Sysclk::Pll1R;
+    // `RCC_LSE_ON` with `RCC_LSEDRIVE_HIGH`; `RCC_LSE_ON` also sets LSESYSEN.
+    // The C turns LSI on too, for nothing this crate uses.
+    let mut ls = LsConfig::default_lse();
+    if let Some(lse) = ls.lse.as_mut() {
+        lse.mode = LseMode::Oscillator(LseDrive::High);
+        lse.peripherals_clocked = true;
+    }
+    config.rcc.ls = ls;
     config
 }
 
 /// Initialise the chip with [`config`], power the ADIN2111 and bring it up,
-/// and set up SPI2 for the NOR flash.
+/// set up SPI2 for the NOR flash, and start the RTC.
 ///
 /// Consumes every peripheral; the ones not listed in `README.md` are dropped.
 ///
@@ -147,6 +161,7 @@ pub async fn start() -> Board {
 
     let p = embassy_stm32::init(config());
     let node_id = node_id();
+    let rtc = DevkitRtc::new(p.RTC);
 
     // ADIN_PWR (PH1) drives the ADIN2111's load switches.
     let adin_power = Output::new(p.PH1, Level::High, Speed::Low);
@@ -185,6 +200,7 @@ pub async fn start() -> Board {
         adin_runner,
         adin_power,
         flash,
+        rtc,
     }
 }
 
@@ -192,10 +208,10 @@ pub async fn start() -> Board {
 /// config partitions loaded from `flash` in the layout `arm-none-eabi-gcc`
 /// gives bm_protocol's.
 #[must_use]
-pub fn node(node_id: u64, flash: Flash) -> Devkit {
+pub fn node(node_id: u64, flash: Flash, rtc: DevkitRtc) -> Devkit {
     Node::with_config(
         DevkitIdentity::new(node_id, embassy_stm32::uid::uid()),
-        RunningRtc::new(),
+        rtc,
         Config::load(Layout::ARM_EABI_GCC, FlashConfigStorage::new(flash)),
         PORTS,
     )

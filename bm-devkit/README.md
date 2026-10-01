@@ -187,27 +187,36 @@ time messages from the same RTC.
 | Data | `bm_common_pub_sub_utc_t` (bm_core `bm_common_messages/bm_common_pub_sub.h:21-23`), a packed `uint64_t` of UTC µs (its comment says ns); `data_len` not checked | first 8 bytes, little-endian; fewer is `UtcTimeError::Short` |
 | Conversion | `dateTimeFromUtc`, `.ms = usec / 1000` | `RtcTimeAndDate::from_utc_micros` |
 | BCMP `bm_rtc_get`/`bm_rtc_set` | `src/lib/drivers/bm_rtc_wrapper.c`, onto `rtcGet`/`rtcSet` | `bm_stack::Rtc` on the node |
-| Clock | the STM32 RTC (`src/lib/drivers/stm32_rtc.c`), below | `bm_stack::RunningRtc`: the time set plus `embassy_time::Instant` elapsed |
+| Clock | the STM32 RTC (`src/lib/drivers/stm32_rtc.c`), below | `bm_devkit::rtc::DevkitRtc` |
 
-`stm32_rtc.c`, started by `rtcInit` from `defaultTask` (`app_main.cpp:346`):
+`stm32_rtc.c`, started by `rtcInit` from `defaultTask` (`app_main.cpp:346`)
+after `MX_RTC_Init` (`Core/Src/rtc.c:28-66`) has done the same:
 
-| Item | Value | Source |
+| Item | C | `DevkitRtc` |
 |---|---|---|
-| Clock source | LSE | `stm32_rtc.c:44` |
-| Prescalers | asynchronous 127, synchronous 255: 1 Hz, 1/256 s subseconds | `:51` |
-| "Set" flag | `0x836A20DD` in backup register `DR0`, written after a successful `rtcSet`; `rtcGet` fails without it | `:9`, `:72`, `:261` |
-| Year | two BCD digits, offset 2000 | `:184`, `:239` |
-| Milliseconds | kept: `rtcSet` shifts the subsecond counter by `LL_RTC_TIME_Synchronize` | `:254` |
+| Clock source | LSE, `RCC_LSE_ON` (LSESYSEN set), `RCC_LSEDRIVE_HIGH` (`main.c:148-155`); `stm32_rtc.c:44` | `config`: `LsConfig::default_lse()`, drive `High`, `peripherals_clocked` |
+| Prescalers | asynchronous 127, synchronous 255: 1 Hz, 1/256 s subseconds, written on every boot (`:51`) | embassy `Rtc::new` at 256 Hz: the same, written only when they differ |
+| Shadow registers | bypassed (`BYPSHAD`, `:57-60`) | the same |
+| "Set" flag | `0x836A20DD` in backup register `DR0` after a successful `rtcSet`; `rtcGet` fails without it (`:9`, `:72`, `:261`) | the same; `DR0` is `TAMP_BKP0R` on the U5 |
+| Year | two BCD digits, offset 2000 (`:184`, `:239`); a year outside 2000-2099 is written truncated | the same; outside 2000-2099 `set` refuses |
+| Weekday | always Monday (`:235`) | the same |
+| Milliseconds | `SHIFTR` with `ADD1S` and `(1000·256 − ms·256) / 1000`, then waits for `SHPF` (`:250-258`) | the same arithmetic |
+| Read | `TR`/`DR` reread until two reads agree; `calculate_rtc_ms`; one second back while `SSR > PREDIV_S` (`:155-199`) | the same; each register read once per pass |
+| Backup-register protection | `LL_RTC_SetBackupRegProtection(RTC, DR0, DR0)`, `LL_RTC_SetRtcPrivilege` (`rtc.c:59-61`) | not written; they matter only with TrustZone, which neither enables |
 
-| `RunningRtc` against `stm32_rtc.c` | Consequence |
+The calendar and `DR0` are in the backup domain, so a time set before a
+reset still reads after it, and a time set by C firmware reads in Rust
+firmware flashed over it. embassy does not reset the backup domain on the U5.
+
+Two `stm32_rtc.c` quirks, reproduced (bm_protocol application code, so not
+in `docs/c-divergences.md`):
+
+| Quirk | Effect |
 |---|---|
-| In RAM | lost on reset; the C's survives a reset while the backup domain is powered |
-| Timed by the embassy time driver, on PLL1 from MSIS, not LSE | drifts more between sets; a Spotter re-sets it every 10 s |
-| Any year `to_utc_micros` holds | the C's two-digit year cannot hold years before 2000 or after 2099 |
-
-Porting the hardware RTC needs LSE, which `config` does not enable.
+| `calculate_rtc_ms` counts from `2 * PREDIV_S`, not `2 * PREDIV_S + 1`, while `SSR > PREDIV_S` | 1/256 s low; at `SSR` 511 the `uint32_t` wraps and `ms` reads 65531 |
+| `SSR > PREDIV_S` follows every `rtcSet`, since the shift adds `adjust` (up to 256) to `SSR` | the `decrement_one_second` workaround runs for up to a second after each set |
 
 ## Not used yet
 
-USB (the C console and pcap), the Bristlefin expander and LEDs, the RTC
-peripheral and LSE, the watchdog (`MX_IWDG_Init`), low-power management, and the SMPS.
+USB (the C console and pcap), the Bristlefin expander and LEDs, LSI, the
+watchdog (`MX_IWDG_Init`), low-power management, and the SMPS.

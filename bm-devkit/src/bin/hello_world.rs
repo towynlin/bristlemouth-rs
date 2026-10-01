@@ -162,7 +162,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));
 
     static NODE: StaticCell<Devkit> = StaticCell::new();
-    let node = NODE.init_with(|| bm_devkit::node(board.node_id, board.flash));
+    let node = NODE.init_with(|| bm_devkit::node(board.node_id, board.flash, board.rtc));
     for topic in [SUBSCRIPTION, utc_time::TOPIC] {
         if let Err(error) = node.subscribe(topic) {
             warn!(

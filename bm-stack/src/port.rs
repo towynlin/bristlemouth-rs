@@ -263,48 +263,6 @@ impl Rtc for SoftRtc {
     }
 }
 
-/// A clock kept in RAM that advances with [`embassy_time::Instant`].
-///
-/// [`Rtc::set`] records the time set and the instant it was set at;
-/// [`Rtc::get`] adds the time elapsed since. Until the first set, `get` fails,
-/// as [`SoftRtc`] does. Lost on reset.
-///
-/// A reading keeps millisecond resolution, as an STM32 RTC set by
-/// bm_protocol's `rtcSet` does: the set reading carries only `ms`, and the
-/// elapsed time is truncated to milliseconds in [`RtcTimeAndDate::from_utc_micros`].
-/// It is as accurate as the time driver's clock source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct RunningRtc {
-    set: Option<(u64, embassy_time::Instant)>,
-}
-
-impl RunningRtc {
-    /// A clock nothing has set yet.
-    #[must_use]
-    pub fn new() -> Self {
-        Self { set: None }
-    }
-
-    /// Microseconds since the Unix epoch at `now`, or `None` if never set.
-    #[must_use]
-    pub fn utc_micros_at(&self, now: embassy_time::Instant) -> Option<u64> {
-        let (utc_us, at) = self.set?;
-        Some(utc_us + now.saturating_duration_since(at).as_micros())
-    }
-}
-
-impl Rtc for RunningRtc {
-    fn get(&self) -> Option<RtcTimeAndDate> {
-        self.utc_micros_at(embassy_time::Instant::now())
-            .map(RtcTimeAndDate::from_utc_micros)
-    }
-
-    fn set(&mut self, time_and_date: &RtcTimeAndDate) -> bool {
-        self.set = Some((time_and_date.to_utc_micros(), embassy_time::Instant::now()));
-        true
-    }
-}
-
 /// Non-volatile storage for the config partitions, `bcmp/bm_configs_generic.h`.
 ///
 /// bm_core declares `bm_config_read`, `bm_config_write` and `bm_config_reset`
