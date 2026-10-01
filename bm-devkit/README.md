@@ -100,8 +100,10 @@ function of the chip.
 `bcl_init` (`bristlemouth_client.cpp:54-76`) fills `DeviceCfg` with vendor,
 product and hardware version 0, serial number `"0123456789abcdef"`, device
 name `getUIDStr()` (`%08x%08x%08x` of `UID[2]`, `UID[1]`, `UID[0]`,
-`device_info.c:92-101`), and the firmware version. `DevkitIdentity` does the
-same with this crate's version.
+`device_info.c:92-101`), and the firmware version and git SHA.
+`DevkitIdentity` does the same with this crate's version and the first 8 hex
+digits of `HEAD` (`build.rs`); its version string is
+`bm-devkit@v<version>+<sha>`, after the C's `<app>@<describe>+<sha>`.
 
 ## Configuration storage
 
