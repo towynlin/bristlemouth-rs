@@ -349,10 +349,19 @@ calls publish to, so stock C firmware exercises the receive path; sends
 `hello world` with `spotter_log(0, None, USE_TIMESTAMP, …)` every 10 s; and
 logs over defmt heartbeats, echo requests and publications received.
 
-Left: run it on a bench with a Spotter and a C dev kit, and report each of the
-four checks under "The target" as passed or failed, with the defmt log line or
-C console output that shows it. Run `bringup` first if link-up or heartbeats
-fail.
+Bench run, Rust node `0b54ccce5c7978bf` beside a Spotter bridge
+(`5428d5d73b4e298a`) and a C dev kit (`62326760da4e237a`):
+
+| Check | Result | Evidence |
+|---|---|---|
+| neighbour table and topology | not run | `bm info 0` on the Spotter lists the Rust node (`bm-devkit 0.1.0`), which shows info only |
+| answers a ping | not run | no `echo request` line in the defmt log |
+| `hello world` on the Spotter console | passed | `1790825964.886 0b54ccce5c7978bf, hello world` |
+| receives a publication | passed | `spotter/printf`, `fprintf` and `transmit-data` from `62326760da4e237a` logged |
+
+Left: the first two checks. Pinging the Rust node from the C dev kit's console
+and listing neighbours there covers the first two; `bm topo` on the Spotter
+covers topology.
 
 ## Card B3 — Share the dev kit's NOR flash between config and a DFU slot
 
