@@ -56,7 +56,7 @@ bus with a Spotter and a C dev kit:
 | Dev kit board support (MCU HAL, pins, node id, time driver) | Done (`bm-devkit`), run on a dev kit |
 | Config in the dev kit's NOR flash | Done (`bm-devkit`: `w25`, `storage`), untested on hardware |
 | The hello-world app | Done: `bm-devkit/src/bin/hello_world.rs`; the four checks above passed on a bench |
-| RTC set from the Spotter's `spotter/utc-time` | Done: `bm_stack::utc_time`, `bm_stack::RunningRtc`, in `hello_world`; not yet run on a bench: card T1 |
+| RTC set from the Spotter's `spotter/utc-time` | Done: `bm_stack::utc_time`, `bm_devkit::rtc::DevkitRtc`, in `hello_world`; not yet run on a bench: card T1 |
 
 A node that heartbeats, is discovered, answers ping and info, publishes,
 subscribes and calls `spotter_log` runs on the mock PHY
@@ -293,7 +293,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   | `start` takes every peripheral | `hello_world` needs only the ADIN2111 and the flash; a card needing more (LEDs) splits it |
   | `memory.x` at `0x08000000`, no bootloader, top 512 bytes of RAM left out | NoDfu needs no MCUboot; the 512 bytes are where the C keeps its no-init block, for a DFU card |
   | Logging is defmt over RTT through probe-rs | the C console is USB CDC, which is not ported |
-  | SMPS, watchdog, RTC on LSE, Bristlefin expander and LEDs not configured | not needed to say hello; the embassy example runs without them |
+  | SMPS, watchdog, Bristlefin expander and LEDs not configured | not needed to say hello; the embassy example runs without them |
   | No host tests (`test = false`) | the crate builds only for thumb; its pure functions are small and cross-checked by hand |
 
   Run on a kit by E1's bench run, below. Run `bringup` first if a later
@@ -363,13 +363,13 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   |---|---|
   | `bm_stack::utc_time::decode(topic, kind, version, data) -> Result<u64, UtcTimeError>` | the C's checks: `strncmp` topic, type 1 and version 1, then the first 8 bytes little-endian; `Short` where the C reads past `data` |
   | `UtcTimeSetter` | `on_event` holds a time from a publication delivered to the `TOPIC` subscription only; `is_pending` for `ready`; `apply(rtc)` sets it in `act` |
-  | `bm_stack::RunningRtc` | the time set plus `Instant` elapsed; `get` fails until set; `Devkit`'s clock |
+  | `bm_devkit::rtc::DevkitRtc` | `stm32_rtc.c` over the STM32 RTC on LSE: `DR0` magic, two-digit year, `SHIFTR` for milliseconds; `get` fails until set; `Devkit`'s clock, from `Board::rtc` |
 
   | Decision | Reason |
   |---|---|
-  | In `bm-stack`, not `bm-devkit` | `bm-devkit` has no host tests; `the_spotters_utc_time_sets_a_running_clock` feeds the bench's bytes through `MockPhy` |
+  | In `bm-stack`, not `bm-devkit` | `bm-devkit` has no host tests; `the_spotters_utc_time_sets_the_clock` feeds the bench's bytes through `MockPhy` |
   | A helper for an `App`, not a `Node` method | the C has it in the app; `on_event` has no node, so the set waits one loop pass |
-  | `RunningRtc`, not the STM32 RTC the C uses | no LSE or RTC setup in `bm-devkit` yet; a Spotter re-sets it every 10 s. Lost on reset, unlike the C's. |
+  | The STM32 RTC, as the C | survives a reset, and keeps time the C set before a reflash; `config` turns LSE on for it |
 
 ---
 
@@ -377,18 +377,18 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
 **Blocks:** nothing. **Blocked by:** nothing.
 
-The code is in (`bm_stack::utc_time`, `RunningRtc`, `hello_world`); see
+The code is in (`bm_stack::utc_time`, `bm_devkit::rtc`, `hello_world`); see
 "What the landed cards left". What remains is the bench run, on E1's bench.
 
 1. Flash `hello_world`. Its defmt log shows each `spotter/utc-time`
    publication with its type and version, `rtc set to … us` after each, and
    `utc-time: …` when the C's checks refuse one.
 2. From the C dev kit, `bm time get 0b54ccce5c7978bf`, then again 10 s later.
+3. Reset the Rust node and `get` again before the Spotter's next
+   publication: the RTC is in the backup domain, so it still answers.
 
-Done: the first `get` returns the Spotter's time, and the second a time
-10 s later, reported as done or not done. If the log shows the Spotter's
-publication refused as `Unrecognized`, record its type and version here:
-C dev kits would refuse it too.
+Done: the first `get` returns the Spotter's time, the second a time 10 s
+later, and the third answers, each reported as done or not done.
 
 ## Card B3 — Share the dev kit's NOR flash between config and a DFU slot
 
