@@ -343,13 +343,16 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
 **Blocks:** nothing. **Blocked by:** nothing.
 
-`bm-devkit/src/bin/hello_world.rs`, beside `bringup.rs`, which shows the
-shape: `bm_devkit::start`, spawn `adin_runner`, `bm_devkit::node`,
-`Node::run_app`. It subscribes to one topic, and every 10 s publishes
-`hello world` via `spotter_log` and logs anything received.
+`bm-devkit/src/bin/hello_world.rs` is written and builds in CI. It
+subscribes to `spotter/*`, which matches every topic a C dev kit's Spotter
+calls publish to, so stock C firmware exercises the receive path; sends
+`hello world` with `spotter_log(0, None, USE_TIMESTAMP, …)` every 10 s; and
+logs over defmt heartbeats, echo requests and publications received.
 
-Done: builds in CI; the four checks under "The target" are run on a bench and
-reported individually.
+Left: run it on a bench with a Spotter and a C dev kit, and report each of the
+four checks under "The target" as passed or failed, with the defmt log line or
+C console output that shows it. Run `bringup` first if link-up or heartbeats
+fail.
 
 ## Card B3 — Share the dev kit's NOR flash between config and a DFU slot
 
