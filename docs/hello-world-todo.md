@@ -1,10 +1,16 @@
 # Hello world todo
 
-What stands between the current tree and a Rust hello-world app on a
-Bristlemouth dev kit, as dependency-ordered task cards sized for one agent
-each. This is the active plan. Same card format and shared contract as
-`docs/bcmp-port-todo.md`, which is complete and takes no new cards; read that
-file's "The shared contract" first.
+> **Complete and closed. There is no work here.** Every card has landed and
+> the four checks in "The target" passed on a bench. Do not add cards, pick
+> work from this file, or edit it as part of a card. It is kept as
+> documentation: the sections below record what was built, the API shapes,
+> and the reasons for decisions. "Working a card" and the "Order" section
+> describe the process the plan followed and are historical.
+
+What stood between the tree and a Rust hello-world app on a Bristlemouth dev
+kit, as dependency-ordered task cards sized for one agent each. Same card
+format and shared contract as `docs/bcmp-port-todo.md`, which is also
+complete.
 
 ## Working a card
 
