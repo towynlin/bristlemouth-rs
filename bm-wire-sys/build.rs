@@ -36,7 +36,6 @@ mod tiers {
         "third_party/tinycbor/src/cborvalidation.c",
         "third_party/tinycbor/src/cborpretty.c",
         "bcmp/configuration.c",
-        "middleware/cbor_service_helper.c",
         // bm_common_messages ships some types as .c and some as namespaced
         // C++; only the C half is bound for now. sensor_header_msg exists as
         // both -- take the .c.
@@ -45,14 +44,19 @@ mod tiers {
         "bm_common_messages/sensor_header_msg.c",
     ];
 
-    /// T2 message codecs compiled with `NDEBUG`, as a release build of the
-    /// firmware compiles them. Their decoders call tinycbor's
-    /// `cbor_value_get_uint64` without checking the type, and its `assert`
-    /// would abort the oracle on any value that is not an unsigned integer;
-    /// a release node reads the head's argument instead (divergence #82),
-    /// which is what `bm-wire` ports. Only `cbor.h`'s inline accessors are
-    /// affected: tinycbor's own `.c` files stay in T2, with their asserts.
+    /// T2 sources compiled with `NDEBUG`, as a release build of the
+    /// firmware compiles them. They call tinycbor's `cbor_value_get_*`
+    /// without checking the type, and its `assert` would abort the oracle on
+    /// a value of another type; a release node reads the head's argument
+    /// instead (divergence #82), which is what `bm-wire` ports. Only
+    /// `cbor.h`'s inline accessors are affected: tinycbor's own `.c` files
+    /// stay in T2, with their asserts.
+    ///
+    /// `cbor_service_helper.c` reads each config value by its key's stored
+    /// type, which a refused typed set can leave disagreeing with the slot
+    /// (divergence #88).
     pub const T2_RELEASE: &[&str] = &[
+        "middleware/cbor_service_helper.c",
         "bm_common_messages/config_cbor_map_srv_reply_msg.c",
         "bm_common_messages/config_cbor_map_srv_request_msg.c",
         "bm_common_messages/sys_info_svc_reply_msg.c",

@@ -79,7 +79,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 39 | `bcmp/resource_discovery.c` mishandles four allocations | c-only | reading |
 | 40 | A failed `cbor_parser_init` still reports a type, and still reports valid | c-only | reading, confirmed differentially |
 | 41 | `cbor_value_get_int64` overflows on the one negative integer it cannot hold | c-only | reading, confirmed differentially |
-| 42 | `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read | c-only | reading |
+| 42 | `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read | replicated; domain-limited (first key) | reading, confirmed differentially (card C1) |
 | 43 | bm_core reads only the 5-byte float encoding, so a preferred-serialization float is unreadable to it | replicated | reading, confirmed differentially |
 | 44 | The saved config partition's layout is the compiler's | replicated | reading, measured |
 | 45 | Storing a config key ignores `key_len`; looking one up stops at a NUL | replicated | reading, confirmed differentially |
@@ -125,8 +125,9 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 85 | `BM_FIELD_STRING` is unimplemented in both field-table functions | replicated | reading, confirmed differentially (card M2) |
 | 86 | `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL | replicated | reading, confirmed differentially (card M2) |
 | 87 | A tagged field value makes `bm_decode_fields_from_table` advance past its map | domain-limited | `cargo fuzz run metrics_codec` (card M2) |
-| 88 | `bm_service.c` matches services by `strncmp` prefix, and reads a request's header unchecked | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially (card S1) |
-| 89 | `echo_service_handler` copies a request of any length into its 1008-byte reply buffer | domain-limited | reading (card S1) |
+| 88 | `services_cbor_as_map` reads each value by its key's stored type | replicated (release build); domain-limited (failed `cbor_assert`) | reading, confirmed differentially (card C1) |
+| 89 | `bm_service.c` matches services by `strncmp` prefix, and reads a request's header unchecked | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially (card S1) |
+| 90 | `echo_service_handler` copies a request of any length into its 1008-byte reply buffer | domain-limited | reading (card S1) |
 
 ---
 
@@ -1742,15 +1743,26 @@ wire-visible.
 short-circuits, so when `get_config_cbor` fails `cbor_parser_init` never runs
 and `it` is whatever it was:
 
-| Which key | What `cbor_value_is_valid(&it)` reads |
+| Which key | What `it` is |
 |---|---|
 | The first one in the loop | uninitialised stack |
-| Any later one | the **previous** key's value |
+| Any later one | the last parsed key's iterator, over `tmpB` |
 
-In the second case the `switch` below then decodes the previous key's buffer
-and writes it into the map under the current key's name, and the encoded map
-is what `services_cbor_encoded_as_crc32` hashes — so two nodes with the same
-configuration can publish different CRC32s depending on which key failed.
+`tmpB` is `memset` to zero before `get_config_cbor`, which fails before
+copying, so in the second case the iterator keeps its cached head (`type`,
+`flags`, `extra`) and reads zeros for everything else. The `switch` then
+reads it by the current key's `value_type`:
+
+| Previous head | Read as | Value written under the current key |
+|---|---|---|
+| uint or int with an argument up to `0xffff` | `UINT32` or `INT32` | the previous key's value, from `extra` |
+| any head with a 4- or 8-byte argument | `UINT32`, `INT32` or `FLOAT` | 0, from the zeroed bytes |
+| a string | `STR` or `BYTES` | none: the chunk head reads `0x00`, `CborErrorIllegalType` |
+
+A key with no value leaves the map a value short, so the last row returns
+`NULL`. The encoded map is what `services_cbor_encoded_as_crc32` hashes — so
+two nodes with the same configuration can publish different CRC32s depending
+on which key failed.
 
 The intent is plainly `||`: every other error check in the file breaks out of
 the loop, and the `if` reads as "and the parse failed" only because the call
@@ -1792,13 +1804,22 @@ One smaller fault, in `bcmp/configuration.c:366`: `get_config_cbor` tests
 `value_len == 0` — the pointer, not `*value_len` — in the same expression that
 has already dereferenced it.
 
-**c-only.** `bm-wire` has no counterpart yet — `services_cbor_as_map` is part
-of card C3, and the port will not have an uninitialised parser to read because
-`bm_wire::cbor::parse` returns its value rather than filling one in.
+`sys_info_service_handler` publishes `services_cbor_encoded_as_crc32` of the
+system partition as `sys_config_crc`, so a node holding an `ARRAY` there
+reports 0.
 
-Fix by turning the `&&` into `if (!get_config_cbor(...) || cbor_parser_init(...) != CborNoError)`.
-Not wire-visible in itself; it changes which CRC32 a misconfigured node
-publishes.
+**replicated; domain-limited** for the first key.
+`bm_wire::configuration::ConfigPartition::cbor_map` keeps the last parsed
+`parser::Value` and reads a failed key through `Value::rebind` over 50 zero
+bytes; with none it returns `MapError::Unreachable`, and
+`bm-wire-diff/src/configuration.rs` does not call the C. An `ARRAY` value
+gives `MapError::NoMap` and a CRC of 0. `an_unparseable_slot_reads_the_previous_iterator`
+and `an_array_value_means_no_map` confirm both differentially.
+
+Fix by turning the `&&` into `if (!get_config_cbor(...) || cbor_parser_init(...) != CborNoError)`,
+and by encoding an `ARRAY` value with `cbor_encode_*` or skipping its key.
+Wire-visible: it changes the CRC32 a node with an array or an unreadable slot
+publishes, and makes a node with an array answer `config_map`.
 
 ## 43. bm_core reads only the 5-byte float encoding, so a preferred-serialization float is unreadable to it
 
@@ -2758,7 +2779,7 @@ callback that is not first is appended again on every call:
 
 Reachable through the service layer: a node whose application subscribed
 `<name>/req` before `bm_service_register(name)` lists the service callback
-again on every registration, and replies once per listing (#88).
+again on every registration, and replies once per listing (#89).
 
 **replicated.** `bm_wire::pubsub::Subscriptions` keeps each topic's
 callbacks, of two kinds (the application and the service layer), and
@@ -2987,7 +3008,40 @@ the C for a body the port decodes to that, and asserts the body holds a tag.
 Fix upstream by `cbor_value_skip_tag` before reading a key or value, or by
 refusing a tag.
 
-## 88. `bm_service.c` matches services by `strncmp` prefix, and reads a request's header unchecked
+## 88. `services_cbor_as_map` reads each value by its key's stored type
+
+`middleware/cbor_service_helper.c` switches on `key.value_type` and calls the
+matching `cbor_value_get_*` without checking the slot's head. The two can
+disagree without a crafted image: divergence #46 leaves the head of a refused
+`set_config_string` or `set_config_buffer` over an existing key of any type.
+After `set_config_uint(k, 7)` then a 60-byte `set_config_string(k, ...)`,
+`k` is `UINT32` over `78 3c`:
+
+| `value_type` | Head | Debug build | Release build (`NDEBUG`) |
+|---|---|---|---|
+| `UINT32`, `INT32` | any | `cbor.h` `assert` fails: abort | the head's argument, as #82: `k: 60` |
+| `FLOAT` | 4- or 8-byte argument | abort | the argument's low 32 bits as a float |
+| `FLOAT` | shorter argument | abort | `_cbor_value_decode_int64_internal`'s `cbor_assert`: undefined |
+| `STR` | byte string | abort | copied as text |
+| `BYTES` | text string | abort | copied as bytes |
+| `STR`, `BYTES` | anything else | abort | `iterate_string_chunks`'s `cbor_assert`: undefined |
+
+`sys_info_service_handler` calls this for the system partition on every
+`sys_info` request, and `config_map_service_handler` for any partition a
+requester names, so on a debug build (#82: the dev kit and Bridge firmware)
+such a key aborts the node on the next request.
+
+**replicated** as a release build: `bm-wire-sys/build.rs` compiles
+`cbor_service_helper.c` with `NDEBUG` (`T2_RELEASE`), and `ConfigPartition::cbor_map`
+reads through `parser::Value::extract`, `get_int64` and `get_float`.
+**domain-limited** where a `cbor_assert` fails: the port returns
+`MapError::Unreachable` and the comparator does not call the C.
+`values_are_read_by_their_key_type` confirms it differentially.
+
+Fix upstream by testing the head's type before each read, or by fixing #46 so
+that a key's type and its slot cannot disagree.
+
+## 89. `bm_service.c` matches services by `strncmp` prefix, and reads a request's header unchecked
 
 `middleware/bm_service.c`. `_service_request_received_cb` walks
 `BM_SERVICE_CONTEXT.service_list` for every publication reaching a service
@@ -3039,7 +3093,7 @@ service_strlen + 4 && memcmp`), checking `data_len >= 8` before reading the
 header, `continue` rather than `break` on a mismatch, and removing by exact
 name. Wire-visible: a request a shadowing service swallows is answered.
 
-## 89. `echo_service_handler` copies a request of any length into its 1008-byte reply buffer
+## 90. `echo_service_handler` copies a request of any length into its 1008-byte reply buffer
 
 `middleware/echo_service.c`:
 

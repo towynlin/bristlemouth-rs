@@ -13,11 +13,11 @@
 //!
 //! | C behaviour | Here | Divergence |
 //! |---|---|---|
-//! | The walk stops at the first service whose name `strncmp`-prefixes the topic, and a length mismatch there ends it: a service whose name prefixes another's request topic shadows it | [`ServiceTable::lookup`] does the same | #88 |
-//! | `strncmp` reads the topic past its end, into the data and past that | [`Lookup::OverRead`] where it leaves the publication | #88 |
-//! | The header is read before `data_len >= 8` is checked | [`Lookup::ShortRequest`] | #88 |
-//! | `_service_list_remove_service` removes the first service its argument prefixes | [`ServiceTable::remove`] does the same | #88 |
-//! | `echo_service_handler` copies a request of any length into a 1008-byte buffer | [`echo`] refuses one longer than the buffer | #89 |
+//! | The walk stops at the first service whose name `strncmp`-prefixes the topic, and a length mismatch there ends it: a service whose name prefixes another's request topic shadows it | [`ServiceTable::lookup`] does the same | #89 |
+//! | `strncmp` reads the topic past its end, into the data and past that | [`Lookup::OverRead`] where it leaves the publication | #89 |
+//! | The header is read before `data_len >= 8` is checked | [`Lookup::ShortRequest`] | #89 |
+//! | `_service_list_remove_service` removes the first service its argument prefixes | [`ServiceTable::remove`] does the same | #89 |
+//! | `echo_service_handler` copies a request of any length into a 1008-byte buffer | [`echo`] refuses one longer than the buffer | #90 |
 
 use crate::BmWireError;
 use crate::pubsub::TOPIC_MAX_LEN;
@@ -162,7 +162,7 @@ pub fn topic(out: &mut [u8], service: &[u8], suffix: &[u8]) -> Result<usize, BmW
 /// Returns `None` for a request longer than `reply`. The C's check is
 /// `*buffer_len <= MAX_BM_SERVICE_DATA_SIZE`, which is always true, and it
 /// copies the request into its 1008 bytes whatever its length (divergence
-/// #89).
+/// #90).
 #[must_use]
 pub fn echo(request: &[u8], reply: &mut [u8]) -> Option<usize> {
     reply.get_mut(..request.len())?.copy_from_slice(request);
@@ -192,7 +192,7 @@ pub enum Lookup<'a, H> {
     /// No service's name `strncmp`-matches the topic: nothing is called.
     NoService,
     /// `strncmp` against service `index` would read past the publication's
-    /// data: undefined in the C (divergence #88).
+    /// data: undefined in the C (divergence #89).
     OverRead {
         /// The service being compared.
         index: usize,
@@ -200,7 +200,7 @@ pub enum Lookup<'a, H> {
     /// Service `index` matched, and the body is shorter than
     /// [`RequestHeader::LEN`]. The C reads `data_size` past the body before
     /// the length check, which on a 64-bit host then always fails
-    /// (divergence #88). Nothing is called.
+    /// (divergence #89). Nothing is called.
     ShortRequest {
         /// The service that matched.
         index: usize,
@@ -323,7 +323,7 @@ impl<H: Copy, const N: usize, const NAME: usize> ServiceTable<H, N, NAME> {
     /// whether one was removed.
     ///
     /// So removing `a` removes `ab` if it comes first, and removing the empty
-    /// name removes the first service (divergence #88).
+    /// name removes the first service (divergence #89).
     pub fn remove(&mut self, name: &[u8]) -> bool {
         let found = self.services[..self.len].iter().flatten().position(|s| {
             // A held name reads as NUL past its end, so this never fails.
@@ -465,7 +465,7 @@ mod tests {
         assert_eq!(table.lookup(b"other/req", &body[..len]), Lookup::NoService);
     }
 
-    /// Divergence #88: the first name that prefixes the topic decides.
+    /// Divergence #89: the first name that prefixes the topic decides.
     #[test]
     fn a_prefixing_name_shadows_a_later_service() {
         let mut table: ServiceTable<u8, 4, 16> = ServiceTable::new();
@@ -497,7 +497,7 @@ mod tests {
         );
     }
 
-    /// Divergence #88: `strncmp` reads past the topic into the data, and
+    /// Divergence #89: `strncmp` reads past the topic into the data, and
     /// stops at a NUL both sides share.
     #[test]
     fn the_name_is_compared_into_the_data() {
@@ -516,7 +516,7 @@ mod tests {
         assert_eq!(nul.lookup(b"a", b"x"), Lookup::NoService);
     }
 
-    /// Divergence #88: removal is by prefix, first match.
+    /// Divergence #89: removal is by prefix, first match.
     #[test]
     fn removal_takes_the_first_service_the_name_prefixes() {
         let mut table: ServiceTable<u8, 4, 16> = ServiceTable::new();
@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(table.add(b"a", 1), Err(TableFull));
     }
 
-    /// Divergence #89: the C copies past its buffer.
+    /// Divergence #90: the C copies past its buffer.
     #[test]
     fn echo_copies_and_refuses_what_does_not_fit() {
         let mut reply = [0u8; 4];

@@ -88,7 +88,7 @@ fn echo_and_an_application_service() {
     assert_eq!(summary.replies, 4);
 }
 
-/// Divergence #89 is outside the domain: echo would copy past its buffer.
+/// Divergence #90 is outside the domain: echo would copy past its buffer.
 #[test]
 fn echo_past_its_buffer_is_skipped() {
     let summary = run(vec![
@@ -121,7 +121,7 @@ fn malformed_requests() {
     assert_eq!(summary.replies, 0);
 }
 
-/// Divergence #88: the C reads a short body's header past the datagram, so
+/// Divergence #89: the C reads a short body's header past the datagram, so
 /// it is skipped. A name compared past the datagram needs a topic shorter
 /// than a listed name that still reaches a `/req` subscription, which no pool
 /// name allows; `bm_wire::service`'s unit tests cover it.
@@ -138,7 +138,7 @@ fn a_short_body_is_skipped() {
 }
 
 /// Unregistering a name that prefixes an earlier listed service removes that
-/// service instead (divergence #88). `svc` was listed first, so `s` stays
+/// service instead (divergence #89). `svc` was listed first, so `s` stays
 /// listed and `svc/req` stays subscribed.
 #[test]
 fn unregistering_a_prefix_removes_an_earlier_service() {
@@ -165,7 +165,7 @@ fn unregistering_a_prefix_removes_an_earlier_service() {
     assert_eq!(summary.replies, 1);
 }
 
-/// Divergence #88: `<id>/e` prefixes `<id>/echo/req`, so listed first it
+/// Divergence #89: `<id>/e` prefixes `<id>/echo/req`, so listed first it
 /// shadows echo; listed after, it does not.
 #[test]
 fn a_prefixing_name_shadows_a_later_service() {

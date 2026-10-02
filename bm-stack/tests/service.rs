@@ -157,7 +157,7 @@ fn echo_answers_with_the_request() {
     );
 }
 
-/// Divergence #89: the C copies past its buffer; here there is no reply.
+/// Divergence #90: the C copies past its buffer; here there is no reply.
 #[test]
 fn echo_refuses_what_does_not_fit_the_reply() {
     let mut node = node();
@@ -208,7 +208,7 @@ fn a_malformed_request_calls_nothing() {
     assert!(node.services().calls.is_empty());
 }
 
-/// Divergence #88: `a` prefixes `ab/req`, and is listed first.
+/// Divergence #89: `a` prefixes `ab/req`, and is listed first.
 #[test]
 fn a_prefixing_name_shadows_a_later_service() {
     let mut node = node();
@@ -221,7 +221,7 @@ fn a_prefixing_name_shadows_a_later_service() {
     assert!(reply.is_some());
 }
 
-/// Divergence #88: unregistering `a` removes `ab`, and leaves `ab/req`
+/// Divergence #89: unregistering `a` removes `ab`, and leaves `ab/req`
 /// subscribed with nothing listed to answer it.
 #[test]
 fn unregistering_removes_the_first_service_the_name_prefixes() {

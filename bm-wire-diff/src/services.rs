@@ -23,7 +23,7 @@
 //! Where the C calls the service callback `k` times for one publication
 //! (divergence #79, or two service subscriptions matching one topic), it
 //! sends `k` identical replies, calls the handler `k` times and delivers the
-//! reply locally `k` times; the Rust node does each once (divergence #88).
+//! reply locally `k` times; the Rust node does each once (divergence #89).
 //! The comparison asserts exactly that.
 //!
 //! # The domain
@@ -32,8 +32,8 @@
 //! |---|---|
 //! | Service names are [`NAMES`], application topics [`APP_TOPICS`]; none holds a NUL, `/req` or `/rep` | `bm_get_subs` stops at a NUL; no service subscription then matches a reply topic, so a local reply delivery calls no service |
 //! | Every `SUB` and `PUB` resource is added once at start-up, longest first | divergence #38: a later lookup of a longer name reads past a shorter entry |
-//! | No request whose lookup is [`Lookup::OverRead`] or [`Lookup::ShortRequest`] | the C reads past the datagram (divergence #88) |
-//! | No request answered by echo with more than [`REPLY_DATA_LEN`] bytes | the C copies past its buffer (divergence #89) |
+//! | No request whose lookup is [`Lookup::OverRead`] or [`Lookup::ShortRequest`] | the C reads past the datagram (divergence #89) |
+//! | No request answered by echo with more than [`REPLY_DATA_LEN`] bytes | the C copies past its buffer (divergence #90) |
 //! | No request answered by the metrics service | `bm_shim_stack_init` registers it, and its reply is card E4's; the Rust node lists [`METRICS`] with [`StandIn`] so the list walks agree |
 //! | At most [`LEAK_BUDGET`] steps per process that leave a listed service nothing can unlist, and only for `x` | see below |
 //! | Fewer than [`SERVICES`] services listed, [`CALLBACKS`] callbacks per topic | the Rust node's ceilings |
@@ -44,7 +44,7 @@
 //! removes one callback and at most one entry. So a step that adds an entry
 //! without a callback (registering a name whose request topic's first callback
 //! is already the service layer's, divergence #79), or that removes an entry
-//! other than the one named (divergence #88), leaves an entry nothing can
+//! other than the one named (divergence #89), leaves an entry nothing can
 //! remove. `reset` unregisters everything else at the start of each input;
 //! [`LEAK_BUDGET`] bounds the rest. A stuck entry ends the walk for every
 //! topic its name prefixes, and is what unregistering any name prefixing it
@@ -90,7 +90,7 @@ pub const ECHO: &[u8] = b"c0ffee0012345678/echo";
 /// it is the one name [`LEAK_BUDGET`] may leave listed.
 ///
 /// Not the empty name: it prefixes [`METRICS`], which is listed first, so
-/// unregistering it removes the metrics service instead (divergence #88), and
+/// unregistering it removes the metrics service instead (divergence #89), and
 /// nothing can then remove it. Listed first, it ends the walk for every
 /// request. `bm_wire::service`'s unit tests cover it.
 pub const NAMES: [&[u8]; 9] = [

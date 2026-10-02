@@ -83,6 +83,6 @@ pub enum UnregisterError {
     /// changed.
     Unsubscribe(SubscriptionError),
     /// `<name>/req` was unsubscribed, and no listed service starts with
-    /// `name` (divergence #88).
+    /// `name` (divergence #89).
     NotListed,
 }

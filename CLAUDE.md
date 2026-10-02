@@ -168,8 +168,8 @@ A cargo workspace.
   - `csrc/` — the platform layer bm_core leaves to the integrator, implemented
     deterministically. This is ours.
   - `build.rs` — tiered source lists, the generated guarded header tree,
-    bindgen. `T2_RELEASE` compiles four message codecs with `NDEBUG`, as a
-    release build does (divergence #82).
+    bindgen. `T2_RELEASE` compiles `cbor_service_helper.c` and four message
+    codecs with `NDEBUG`, as a release build does (divergences #82, #88).
   - `scripts/check_symbols.sh` — what `libbm_core.a` and
     `libbm_core_release.a` reference but nothing defines; everything left
     should be libc. Run from the workspace root. `--check` fails on anything

@@ -34,10 +34,19 @@
 //! [`copy_string`] is `iterate_string_chunks` including its partial copies.
 //! Writing uses [`cbor2`] for integer heads and
 //! [`crate::cbor::push_f32_wide`] for floats.
+//!
+//! # A partition as a map
+//!
+//! [`ConfigPartition::cbor_map`] and [`ConfigPartition::cbor_map_crc32`] are
+//! `middleware/cbor_service_helper.c`'s `services_cbor_as_map` and
+//! `services_cbor_encoded_as_crc32`, which `sys_info` and `config_map`
+//! publish. They read each value with [`crate::cbor::parser::Value`], as a
+//! build with `NDEBUG` does (divergence #82), and reproduce divergence #42.
 
 use cbor2::core::{Encoder, Header};
 
-use crate::crc::crc32_ieee;
+use crate::cbor::parser::{CborError, Value};
+use crate::crc::{crc32_ieee, crc32_ieee_update};
 
 /// Keys a partition can hold. `MAX_NUM_KV`.
 pub const MAX_NUM_KV: usize = 50;
@@ -428,6 +437,68 @@ pub fn copy_string(slot: &[u8], out: &mut [u8]) -> Result<usize, CopyError> {
     }
 }
 
+/// Why [`ConfigPartition::cbor_map`] wrote no map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapError {
+    /// `services_cbor_as_map` returns `NULL`: a key got no value, so closing
+    /// the map fails with `CborErrorTooFewItems`. Every `ARRAY` key does
+    /// this (divergence #42), as does a `STR` or `BYTES` value that does not
+    /// copy into 49 bytes and a `value_type` outside `ConfigDataTypes`.
+    NoMap,
+    /// The map is this many bytes and the buffer is shorter. The C allocates
+    /// what it needs.
+    TooSmall(usize),
+    /// The C is undefined here:
+    ///
+    /// * a stored `key_len` over [`MAX_KEY_LEN_BYTES`], which the C reads
+    ///   past `key_buf` to encode;
+    /// * a value read with an unset iterator: the slot does not parse, and no
+    ///   key before it in the map parsed (divergence #42);
+    /// * a value read with a `cbor_assert` that fails: see
+    ///   [`Value::get_float`] and [`Value::copy_string`].
+    Unreachable,
+}
+
+/// Where [`ConfigPartition::cbor_map`]'s bytes go.
+trait Sink {
+    fn put(&mut self, bytes: &[u8]);
+}
+
+/// A caller's buffer, counting what does not fit.
+struct BufSink<'o> {
+    out: &'o mut [u8],
+    len: usize,
+}
+
+impl Sink for BufSink<'_> {
+    fn put(&mut self, bytes: &[u8]) {
+        let end = self.len + bytes.len();
+        if let Some(dst) = self.out.get_mut(self.len..end) {
+            dst.copy_from_slice(bytes);
+        }
+        self.len = end;
+    }
+}
+
+/// A running CRC-32.
+struct CrcSink(u32);
+
+impl Sink for CrcSink {
+    fn put(&mut self, bytes: &[u8]) {
+        self.0 = crc32_ieee_update(self.0, bytes);
+    }
+}
+
+/// A minimal-length head, as tinycbor's `encode_number_no_update` writes it.
+fn put_head(sink: &mut impl Sink, header: Header) {
+    let mut head = [0u8; 9];
+    let mut tail: &mut [u8] = &mut head;
+    // Nine bytes hold any integer or length head.
+    let _ = Encoder::from(&mut tail).push(header);
+    let len = 9 - tail.len();
+    sink.put(&head[..len]);
+}
+
 /// One partition as bm_core keeps it in RAM: `CONFIGS[partition]`.
 #[derive(Clone)]
 pub struct ConfigPartition {
@@ -744,6 +815,121 @@ impl ConfigPartition {
     /// The second half of `save_config`, after a successful write.
     pub fn mark_saved(&mut self) {
         self.needs_commit = false;
+    }
+
+    /// `services_cbor_as_map`: every stored key and its value as one CBOR
+    /// map, written to `out`. Returns its length.
+    ///
+    /// Keys are encoded as `key_buf`'s first `key_len` bytes and looked up by
+    /// the same two fields, so a key stored twice gets the first one's value
+    /// both times. Each value is read according to the key's `value_type`,
+    /// not the slot's head, and re-encoded at minimal length; a float as the
+    /// 5-byte form.
+    ///
+    /// A key whose slot does not parse is given the value the previous one
+    /// read, through the C's stale `CborValue` over a zeroed buffer
+    /// (divergence #42).
+    ///
+    /// # Errors
+    ///
+    /// See [`MapError`].
+    pub fn cbor_map(&self, out: &mut [u8]) -> Result<usize, MapError> {
+        let mut sink = BufSink { out, len: 0 };
+        self.encode_map(&mut sink)?;
+        if sink.len > sink.out.len() {
+            return Err(MapError::TooSmall(sink.len));
+        }
+        Ok(sink.len)
+    }
+
+    /// `services_cbor_encoded_as_crc32`: CRC-32/IEEE over
+    /// [`Self::cbor_map`], or 0 where it writes no map.
+    #[must_use]
+    pub fn cbor_map_crc32(&self) -> u32 {
+        let mut sink = CrcSink(0);
+        match self.encode_map(&mut sink) {
+            Ok(()) => sink.0,
+            Err(_) => 0,
+        }
+    }
+
+    fn encode_map(&self, sink: &mut impl Sink) -> Result<(), MapError> {
+        /// `tmpB` after `memset`, as a stale iterator reads it.
+        const ZEROED: [u8; SLOT] = [0; SLOT];
+
+        put_head(sink, Header::Map(Some(usize::from(self.num_keys()))));
+        // `it`. The C declares it once, uninitialised, outside the loop.
+        let mut it: Option<Value<'_>> = None;
+        let mut complete = true;
+        for stored in self.stored_keys() {
+            let key_len = usize::try_from(stored.key_len)
+                .ok()
+                .filter(|&n| n <= KEY_BUF_LEN)
+                .ok_or(MapError::Unreachable)?;
+            let key_text = &stored.key_buf[..key_len];
+            put_head(sink, Header::Text(Some(key_len)));
+            sink.put(key_text);
+
+            // `get_config_cbor`, then `cbor_parser_init` on its copy, which
+            // parses whenever `get_config_cbor` did.
+            let fresh = self
+                .parsed(Key::with_len(&stored.key_buf, key_len))
+                .and_then(|(idx, _)| Value::parse(self.slot(idx)).ok());
+            let value = match fresh {
+                Some(v) => {
+                    it = Some(v);
+                    v
+                }
+                None => it.ok_or(MapError::Unreachable)?.rebind(&ZEROED),
+            };
+
+            match stored.value_type {
+                0 => put_head(sink, Header::Positive(u64::from(value.extract() as u32))),
+                1 => {
+                    let v = i64::from(value.get_int64() as i32);
+                    let header = if v < 0 {
+                        Header::Negative(!v as u64)
+                    } else {
+                        Header::Positive(v as u64)
+                    };
+                    put_head(sink, header);
+                }
+                2 => {
+                    let bits = value.get_float().map_err(|_| MapError::Unreachable)?;
+                    sink.put(&[0xfa]);
+                    sink.put(&bits.to_be_bytes());
+                }
+                ty @ (3 | 4) => {
+                    let mut tmp = [0u8; SLOT];
+                    let copied = value.copy_string(SLOT, |at, chunk| {
+                        tmp[at..at + chunk.len()].copy_from_slice(chunk);
+                    });
+                    match copied {
+                        // `tmpSSize >= MAX_CONFIG_BUFFER_SIZE_BYTES` is refused.
+                        Ok(c) if c.all && c.total < SLOT => {
+                            let header = if ty == 3 {
+                                Header::Text(Some(c.total))
+                            } else {
+                                Header::Bytes(Some(c.total))
+                            };
+                            put_head(sink, header);
+                            sink.put(&tmp[..c.total]);
+                        }
+                        Err(CborError::Unreachable) => return Err(MapError::Unreachable),
+                        _ => complete = false,
+                    }
+                }
+                // `ARRAY` copies the slot behind the encoder's back, and any
+                // other value is not a `ConfigDataTypes`: either way the map
+                // is a value short.
+                _ => complete = false,
+            }
+        }
+        if complete {
+            Ok(())
+        } else {
+            Err(MapError::NoMap)
+        }
     }
 
     /// `prepare_cbor_parser`: the key's index and its slot's head.
@@ -1141,6 +1327,122 @@ mod tests {
         assert!(p.set_uint(key, 2));
         assert_eq!(p.num_keys(), 2);
         assert_eq!(p.get_uint(key), None);
+    }
+
+    /// `cbor_service_helper_test.cpp`'s map: 91 bytes, values set through
+    /// `set_config_cbor` with the 50-byte buffer the gtest passes.
+    #[test]
+    fn the_cbor_service_helper_gold_map() {
+        let mut p = fresh();
+        let slot = |head: &[u8], body: &[u8]| {
+            let mut v = [0u8; 50];
+            v[..head.len()].copy_from_slice(head);
+            v[head.len()..head.len() + body.len()].copy_from_slice(body);
+            v
+        };
+        assert!(p.set_cbor(Key::new(b"foo"), &slot(&[0x18, 0x2a], &[])));
+        assert!(p.set_cbor(Key::new(b"bar"), &slot(&[0x39, 0x03, 0xe7], &[])));
+        assert!(p.set_cbor(
+            Key::new(b"baz"),
+            &slot(&[0xfa, 0x40, 0x49, 0x0f, 0xd0], &[])
+        ));
+        assert!(p.set_cbor(Key::new(b"silly"), &slot(&[0x78, 0x2b], SILLY)));
+        assert!(p.set_cbor(Key::new(b"bytes"), &slot(&[0x4a], BYTES)));
+
+        let mut expected = [0u8; 91];
+        let mut at = 0;
+        for part in [
+            &[0xa5, 0x63, b'f', b'o', b'o', 0x18, 0x2a][..],
+            &[0x63, b'b', b'a', b'r', 0x39, 0x03, 0xe7],
+            &[0x63, b'b', b'a', b'z', 0xfa, 0x40, 0x49, 0x0f, 0xd0],
+            &[0x65, b's', b'i', b'l', b'l', b'y', 0x78, 0x2b],
+            SILLY,
+            &[0x65, b'b', b'y', b't', b'e', b's', 0x4a],
+            BYTES,
+        ] {
+            expected[at..at + part.len()].copy_from_slice(part);
+            at += part.len();
+        }
+        assert_eq!(at, 91);
+
+        let mut out = [0u8; 128];
+        assert_eq!(p.cbor_map(&mut out), Ok(91));
+        assert_eq!(out[..91], expected);
+        assert_eq!(p.cbor_map_crc32(), crc32_ieee(&expected));
+        assert_eq!(p.cbor_map(&mut out[..90]), Err(MapError::TooSmall(91)));
+    }
+
+    #[test]
+    fn an_empty_partition_is_an_empty_map() {
+        let p = fresh();
+        let mut out = [0u8; 1];
+        assert_eq!(p.cbor_map(&mut out), Ok(1));
+        assert_eq!(out, [0xa0]);
+        assert_eq!(p.cbor_map_crc32(), crc32_ieee(&[0xa0]));
+    }
+
+    /// Divergence #42: an `ARRAY` value leaves the map a value short.
+    #[test]
+    fn an_array_value_means_no_map() {
+        let mut p = fresh();
+        assert!(p.set_uint(Key::new(b"a"), 1));
+        assert!(p.set_cbor(Key::new(b"b"), &[0x81, 0x01]));
+        assert_eq!(p.cbor_map(&mut [0u8; 64]), Err(MapError::NoMap));
+        assert_eq!(p.cbor_map_crc32(), 0);
+    }
+
+    /// Divergence #46 leaves a `UINT32` key over a string head; the map reads
+    /// the head's argument, as a build with `NDEBUG` does.
+    #[test]
+    fn a_value_is_read_by_its_key_type() {
+        let mut p = fresh();
+        assert!(p.set_uint(Key::new(b"u"), 7));
+        assert!(!p.set_string(Key::new(b"u"), &[b'x'; 60]));
+        let mut out = [0u8; 8];
+        assert_eq!(p.cbor_map(&mut out), Ok(5));
+        assert_eq!(out[..5], [0xa1, 0x61, b'u', 0x18, 60]);
+    }
+
+    /// Divergence #42: a slot that does not parse is read through the
+    /// previous key's iterator over a zeroed buffer. With no previous key the
+    /// iterator is uninitialised.
+    #[test]
+    fn an_unparseable_slot_reads_the_previous_iterator() {
+        let mut p = fresh();
+        assert!(p.set_uint(Key::new(b"a"), 300));
+        assert!(p.set_uint(Key::new(b"b"), 0x1_0000));
+        assert!(p.set_uint(Key::new(b"c"), 1));
+        let mut image = p.seal().to_vec();
+        // `b` and `c` become `1c`, a reserved additional-information value.
+        image[Layout::LP64.value_offset(1)] = 0x1c;
+        image[Layout::LP64.value_offset(2)] = 0x1c;
+        let crc = crc32_ieee(&image[4..]);
+        image[..4].copy_from_slice(&crc.to_le_bytes());
+        let mut q = ConfigPartition::new(Layout::LP64);
+        assert!(q.load_with(|buf| {
+            buf.copy_from_slice(&image);
+            true
+        }));
+        // `a`'s 300 is in the iterator's `extra`, so `b` and `c` read it again.
+        let mut out = [0u8; 32];
+        let n = q.cbor_map(&mut out).unwrap();
+        assert_eq!(
+            out[..n],
+            [
+                0xa3, 0x61, b'a', 0x19, 1, 44, 0x61, b'b', 0x19, 1, 44, 0x61, b'c', 0x19, 1, 44
+            ]
+        );
+
+        // `a` itself unparseable: nothing has set the iterator.
+        image[Layout::LP64.value_offset(0)] = 0x1c;
+        let crc = crc32_ieee(&image[4..]);
+        image[..4].copy_from_slice(&crc.to_le_bytes());
+        assert!(q.load_with(|buf| {
+            buf.copy_from_slice(&image);
+            true
+        }));
+        assert_eq!(q.cbor_map(&mut out), Err(MapError::Unreachable));
+        assert_eq!(q.cbor_map_crc32(), 0);
     }
 
     /// Divergence #46: the head of a refused string replaces the old value's.

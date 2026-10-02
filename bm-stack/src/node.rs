@@ -134,7 +134,7 @@
 //! against the list by [`ServiceTable::lookup`], answered, and the reply
 //! published to `<name>/rep` comes back in [`Owed::reply`], as the C builds
 //! it inside the subscriber callback. One reply per received publication;
-//! see [`Node::on_frame_with`] and divergence #88.
+//! see [`Node::on_frame_with`] and divergence #89.
 //!
 //! A publication this node makes is not dispatched to its own services.
 //!
@@ -1299,7 +1299,7 @@ impl<
     /// service callback once for each time it is listed on a matching
     /// subscription and publishes one reply per call; each call finds the
     /// same service, so this calls the handler once and sends one reply
-    /// (divergence #88).
+    /// (divergence #89).
     ///
     /// `frame` is mutated in place, as bm_core mutates it. When a relay is owed
     /// the frame comes back as the C's forwarded copy — the whole ports byte
@@ -2824,7 +2824,7 @@ impl<
     /// listed on matching subscriptions. Each of the C's calls walks the same
     /// list with the same topic, so each reaches the same handler and
     /// publishes the same reply; a C requester takes the first and drops the
-    /// rest (divergence #88).
+    /// rest (divergence #89).
     fn deliver_publication(
         &mut self,
         source: u64,
@@ -2976,7 +2976,7 @@ impl<
     ///
     /// Appends `name` to the list, then subscribes the service layer to
     /// `<name>/req` as [`Node::subscribe`] does, `SUB` resource included. A
-    /// name already listed is listed again (divergence #88). Requests then
+    /// name already listed is listed again (divergence #89). Requests then
     /// arrive through [`Node::on_frame`], and the reply comes back in
     /// [`Owed::reply`].
     ///
@@ -3018,7 +3018,7 @@ impl<
     ///
     /// Unsubscribes the service layer from `<name>/req`, then removes the
     /// first listed service whose name starts with `name`, which need not be
-    /// `name` itself (divergence #88).
+    /// `name` itself (divergence #89).
     ///
     /// # Errors
     ///
