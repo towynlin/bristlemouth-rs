@@ -32,8 +32,9 @@ Before starting:
    out to be two, split it here in that commit.
 2. Read "Services contract" and "What the landed cards left for the rest".
 
-One branch and one PR per card. When the code is done and verified, edit this
-file in a separate commit, the last of the branch:
+One branch and one PR per card; open the PR without being asked
+(`CLAUDE.md`, "Pull requests"). When the code is done and verified, edit
+this file in a separate commit, the last of the branch:
 
 | Section | Edit |
 |---|---|

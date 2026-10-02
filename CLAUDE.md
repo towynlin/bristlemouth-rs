@@ -20,6 +20,16 @@ paragraph. Cite file and symbol names rather than describing them.
 Apply the same rule to reports: say what changed, what was verified, and what
 was not.
 
+## Pull requests
+
+Open a pull request against `main` when the work on a branch is done and
+verified. Do not wait to be asked: this file is the standing request. One PR
+per branch; a plan card's PR follows its "Working a card" section. Push
+fixes for CI failures and review comments to the same branch.
+
+The description reports, per "Writing style": what changed, each verify
+command run, fuzz minutes per target, and what was not verified.
+
 ## The point of this repo
 
 `bm-wire` is a Rust port of bm_core's wire format and protocol logic;
@@ -151,8 +161,9 @@ A cargo workspace.
     release build does (divergence #82).
   - `scripts/check_symbols.sh` — what `libbm_core.a` and
     `libbm_core_release.a` reference but nothing defines; everything left
-    should be libc. Run from the workspace root. `--check` fails on anything outside its libc allowlist, which deliberately
-    omits `rand` and `time`, so a non-deterministic reach from `csrc/` trips it.
+    should be libc. Run from the workspace root. `--check` fails on anything
+    outside its libc allowlist, which deliberately omits `rand` and `time`, so
+    a non-deterministic reach from `csrc/` trips it.
 - `docs/c-divergences.md` — the upstream defect list.
 - `docs/hello-world-todo.md` — the plan for a Rust hello-world app on a dev
   kit (UDP, pub/sub, `spotter_log`, board support). **Complete and closed; no
