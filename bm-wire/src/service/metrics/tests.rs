@@ -139,3 +139,13 @@ fn fields_match_up_to_a_nul_and_mismatches_win() {
     assert_eq!(entries[0].field, Field::U32(7));
     assert_eq!(entries[1].field, Field::Double(0.0));
 }
+
+/// Divergence #84: the tag is stepped over alone, its text read as a key,
+/// and the advance over that key's value runs past the map.
+#[test]
+fn a_tagged_field_value_runs_past_the_component() {
+    // {"k": 1("s")}
+    let map = [0xa1, 0x61, b'k', 0xc1, 0x61, b's'];
+    let mut it = Value::init(&map).unwrap().enter_container().unwrap();
+    assert_eq!(decode_fields(&mut it, &mut []), Err(Error::AdvancePastEof));
+}

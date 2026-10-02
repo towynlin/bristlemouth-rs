@@ -121,6 +121,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 81 | `spotter_log` budgets its text against `max_payload_len`, not the pub/sub message limit | replicated | reading, confirmed differentially (card S1) |
 | 82 | `BM_FIELD_STRING` is unimplemented in both field-table functions | replicated | reading, confirmed differentially (card M2) |
 | 83 | `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL | replicated | reading, confirmed differentially (card M2) |
+| 84 | A tagged field value makes `bm_decode_fields_from_table` advance past its map | domain-limited | `cargo fuzz run metrics_codec` (card M2) |
 
 ---
 
@@ -2846,3 +2847,29 @@ fuzz target compare the error and every destination after each decode.
 
 Fix upstream by comparing each top-level key with `key_expected`, and by
 comparing field keys by length (`cbor_value_text_string_equals`).
+
+## 84. A tagged field value makes `bm_decode_fields_from_table` advance past its map
+
+`bm_decode_fields_from_table` steps over each value with one
+`cbor_value_advance`. On a tag, that steps over the tag alone; tags do not
+count as items, so the iterator is then at the tagged item, which the loop
+reads as the next key. If it is a text string, the advance over "its value"
+starts at the end of the map. `cbor_value_advance` asserts
+`it->type != CborInvalidType` first:
+
+| Build | Effect |
+|---|---|
+| asserts on (the oracle) | abort |
+| `NDEBUG` | `cbor_assert` is `unreachable()`: undefined behaviour |
+
+Reached by `{"k": 1("s")}` in any component a requester decodes; the body
+comes from the node being asked.
+
+**domain-limited.** `bm_wire::service::metrics::decode_fields` returns
+`CborErrorAdvancePastEOF`, the code after the assertion. The comparator
+(`bm-wire-diff/src/metrics_codec.rs`) does not call the C for a body the port
+decodes to that error, and asserts the body holds a tag.
+`seeds/metrics_codec/tag-on-field-value` is the fuzzer's input.
+
+Fix upstream by `cbor_value_skip_tag` before reading a key or value, or by
+refusing a tag.

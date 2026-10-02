@@ -14,7 +14,7 @@
 //! into the [`Field`] of the matching entry.
 //!
 //! Divergences reproduced here: #82 (a `String` field), #83 (what decode
-//! checks and what it skips).
+//! checks and what it skips), #84 (a tagged field value).
 
 use crate::cbor::tinycbor::{Error, Value};
 use crate::service::messages::{

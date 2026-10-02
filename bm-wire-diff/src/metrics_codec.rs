@@ -15,6 +15,16 @@
 //! the encoder wrote, and include an interior NUL, a 63-byte and a 64-byte
 //! key. A key is passed to the C with a NUL appended, so the C sees it up to
 //! its first NUL, as the port does.
+//!
+//! # Input domain
+//!
+//! A tag on a field value makes `bm_decode_fields_from_table` advance past
+//! the end of the component's map, which is a tinycbor precondition
+//! violation: `assert` with asserts on, `unreachable()` under `NDEBUG`
+//! (divergence #84). The port returns `AdvancePastEof`, the code after the
+//! assertion. For a body where it does, the C is not called; the comparator
+//! asserts only that the body holds a tag head (major type 6), the one way
+//! to reach it.
 
 use arbitrary::Arbitrary;
 use bm_wire::cbor::tinycbor::Error;
@@ -320,8 +330,16 @@ fn check_decode(input: &MetricsCodecInput, body: &[u8]) {
         node_id,
         uptime_ms,
     };
-    let rs = code(metrics::decode(body, &mut reply, &mut comps));
+    let rs = metrics::decode(body, &mut reply, &mut comps);
     drop(comps);
+    if rs == Err(Error::AdvancePastEof) {
+        assert!(
+            body.iter().any(|b| b >> 5 == 6),
+            "decode: AdvancePastEof without a tag in {body:02x?}"
+        );
+        return;
+    }
+    let rs = code(rs);
 
     // C.
     let keys: Vec<(Vec<u8>, Vec<Vec<u8>>)> = input
