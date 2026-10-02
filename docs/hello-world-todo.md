@@ -369,13 +369,13 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   |---|---|
   | In `bm-stack`, not `bm-devkit` | `bm-devkit` has no host tests; `the_spotters_utc_time_sets_the_clock` feeds the bench's bytes through `MockPhy` |
   | A helper for an `App`, not a `Node` method | the C has it in the app; `on_event` has no node, so the set waits one loop pass |
-  | The STM32 RTC, as the C | survives a reset, and keeps time the C set before a reflash; `config` turns LSE on for it |
+  | The STM32 RTC, as the C | survives a reset; same `DR0` flag and calendar as the C, so time the C set should survive a reflash; `config` turns LSE on for it |
 
-  On E1's bench every check in PR #45 passed: LSE starts; an unset clock
-  leaves `bm time get` unanswered; the Spotter publishes type 1, version 1
-  and the clock is set from it; `get` returns the Spotter's time and 10 s
-  later a time 10 s later; the clock answers after a reset, and after a
-  reflash over C firmware that had set it; `bringup` runs.
+  On E1's bench (PR #45): LSE starts; an unset clock leaves `bm time get`
+  unanswered; the Spotter publishes type 1, version 1 and the clock is set
+  from it; `get` returns the Spotter's time and 10 s later a time 10 s
+  later; the clock answers after a reset; `bringup` runs. Not run: a
+  reflash over C firmware that had set its clock.
 
 ---
 

@@ -205,8 +205,9 @@ after `MX_RTC_Init` (`Core/Src/rtc.c:28-66`) has done the same:
 | Backup-register protection | `LL_RTC_SetBackupRegProtection(RTC, DR0, DR0)`, `LL_RTC_SetRtcPrivilege` (`rtc.c:59-61`) | not written; they matter only with TrustZone, which neither enables |
 
 The calendar and `DR0` are in the backup domain, so a time set before a
-reset still reads after it, and a time set by C firmware reads in Rust
-firmware flashed over it. embassy does not reset the backup domain on the U5.
+reset still reads after it (checked on a bench). A time set by C firmware
+should read in Rust firmware flashed over it, since embassy does not reset
+the backup domain on the U5; not yet run.
 
 Two `stm32_rtc.c` quirks, reproduced (bm_protocol application code, so not
 in `docs/c-divergences.md`):
