@@ -388,17 +388,3 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 ## Order
 
 No cards remain.
-
-# Explicitly out of scope
-
-- **`bm_service*.c` and the built-in services** (sys_info, power_info,
-  metrics, config CBOR map, echo). Request/reply over pub/sub; not needed to
-  say hello. A natural next plan.
-- **`integrations/topology.c`**, as in `bcmp-port-todo.md`.
-- **DFU slot and no-init RAM on the dev kit.** `bm-devkit` has `NoDfu`;
-  `README.md` there records the C's MCUboot layout, no-init block and where
-  each DFU hook keeps its image. A `DfuSlot` matching the C writes MCUboot
-  slot 2 in internal flash and reads the W25 `dfu` partition only in
-  `DfuSlot::read`. The W25 is then shared, but DFU only reads it:
-  `&'static RefCell<Flash>` in the node's task is enough, and no
-  program-only `W25` method is needed.
