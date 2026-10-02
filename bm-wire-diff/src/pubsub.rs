@@ -38,9 +38,10 @@
 //!
 //! # One subscriber per topic
 //!
-//! Every oracle subscription here uses one callback, as a Rust node has one
-//! subscriber. [`duplicate_callbacks`] uses two, to show what the C does with
-//! more (divergence #79).
+//! Every oracle subscription here uses one callback, the application's.
+//! [`duplicate_callbacks`] uses two, to show what the C does with more
+//! (divergence #79); `crate::services` compares a node's second kind, the
+//! service layer.
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -251,7 +252,11 @@ fn state() -> (MutexGuard<'static, ()>, MutexGuard<'static, Option<State>>) {
 
 /// `bm_get_subs`, split. Its buffer is 256 bytes and unchecked (divergence
 /// #78); [`SUBSCRIPTIONS`] patterns and the metrics topic fit it.
-fn oracle_subscriptions() -> Vec<Vec<u8>> {
+///
+/// The caller holds [`oracle`]'s lock, and keeps the subscriptions few
+/// enough to fit.
+#[must_use]
+pub fn oracle_subscriptions() -> Vec<Vec<u8>> {
     unsafe {
         let subs = bm_wire_sys::bm_get_subs();
         assert!(!subs.is_null(), "bm_get_subs");
@@ -637,7 +642,8 @@ pub enum Call {
 /// Run `calls` against [`DUPLICATE_PATTERN`] with two callbacks, `a` and `b`,
 /// then inject one publication on it, and return how often each was called.
 ///
-/// Oracle only: the Rust node has one subscriber per topic. Its resource list
+/// Oracle only: a Rust node's two kinds of subscriber are compared in
+/// `crate::services`. Its resource list
 /// takes the `SUB` entry `bm_sub_wl` adds, and every callback is unlinked
 /// before returning, so the two sides' lists still agree.
 ///

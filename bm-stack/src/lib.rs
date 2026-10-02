@@ -20,6 +20,8 @@
 //!   node reaches it.
 //! * [`dfu`] is the DFU client on a node, over [`port::DfuSlot`] and
 //!   [`port::NoInitRam`].
+//! * [`service`] is the service layer's application side: [`Services`], the
+//!   handlers a node's `S` supplies.
 //! * [`node::Node`] is the protocol. Its three receive/timer entry points are
 //!   synchronous and take the current time, so they are testable without an
 //!   executor.
@@ -46,6 +48,7 @@ pub mod dfu;
 pub mod mock;
 pub mod node;
 pub mod port;
+pub mod service;
 pub mod utc_time;
 
 pub use app::App;
@@ -60,3 +63,4 @@ pub use port::{
     BootRequests, ConfigStorage, DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy,
     RamConfigStorage, RamDfuSlot, Rtc, RtcTimeAndDate, SoftRtc,
 };
+pub use service::{NoServices, Services};

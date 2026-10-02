@@ -116,7 +116,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 76 | `bm_pub_wl` sizes its buffer in 16 bits and copies past it | domain-limited | reading |
 | 77 | `bm_pub_wl` with NULL data sends uninitialised bytes, and dereferences NULL for a local subscriber | c-only | reading |
 | 78 | `bm_get_subs` writes past its 256-byte buffer | c-only | reading |
-| 79 | `bm_sub_wl` checks only a topic's first callback for a duplicate | c-only | reading, confirmed differentially (card P2) |
+| 79 | `bm_sub_wl` checks only a topic's first callback for a duplicate | replicated | reading, confirmed differentially (cards P2, S1) |
 | 80 | `bm_unsub_wl` returns `BmEINVAL` for a topic not subscribed | replicated | reading, confirmed differentially (card P2) |
 | 81 | `spotter_log` budgets its text against `max_payload_len`, not the pub/sub message limit | replicated | reading, confirmed differentially (card S1) |
 | 82 | Service body decoders read uints with an unchecked `cbor_value_get_uint64` | replicated (release build); domain-limited (tags) | reading, confirmed differentially (card M1) |
@@ -125,6 +125,8 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 85 | `BM_FIELD_STRING` is unimplemented in both field-table functions | replicated | reading, confirmed differentially (card M2) |
 | 86 | `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL | replicated | reading, confirmed differentially (card M2) |
 | 87 | A tagged field value makes `bm_decode_fields_from_table` advance past its map | domain-limited | `cargo fuzz run metrics_codec` (card M2) |
+| 88 | `bm_service.c` matches services by `strncmp` prefix, and reads a request's header unchecked | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially (card S1) |
+| 89 | `echo_service_handler` copies a request of any length into its 1008-byte reply buffer | domain-limited | reading (card S1) |
 
 ---
 
@@ -2754,10 +2756,16 @@ callback that is not first is appended again on every call:
 | `bm_sub(t, A)`, `bm_sub(t, B)` twice | `A` once, `B` twice |
 | the same, then `bm_unsub(t, B)` | `A` once, `B` once |
 
-**c-only.** A `bm_stack::Node` has one subscriber per topic, its application,
-and a second `Node::subscribe` of a topic changes nothing.
-`a_second_callback_subscribed_twice_is_called_twice`
-(`bm-wire-diff/tests/pubsub.rs`) asserts the table against the oracle.
+Reachable through the service layer: a node whose application subscribed
+`<name>/req` before `bm_service_register(name)` lists the service callback
+again on every registration, and replies once per listing (#88).
+
+**replicated.** `bm_wire::pubsub::Subscriptions` keeps each topic's
+callbacks, of two kinds (the application and the service layer), and
+`subscribe_as` tests only the head. `a_second_callback_subscribed_twice_is_called_twice`
+(`bm-wire-diff/tests/pubsub.rs`) measures the oracle with two C callbacks;
+`a_service_registered_twice_after_the_application`
+(`bm-wire-diff/tests/services.rs`) compares a node against it.
 
 Fix upstream by testing `last_cb_node->callback_fn` in both places.
 
@@ -2978,3 +2986,83 @@ the C for a body the port decodes to that, and asserts the body holds a tag.
 
 Fix upstream by `cbor_value_skip_tag` before reading a key or value, or by
 refusing a tag.
+
+## 88. `bm_service.c` matches services by `strncmp` prefix, and reads a request's header unchecked
+
+`middleware/bm_service.c`. `_service_request_received_cb` walks
+`BM_SERVICE_CONTEXT.service_list` for every publication reaching a service
+subscription:
+
+```c
+if (strncmp(current->service, topic, current->service_strlen) == 0) {
+  BmServiceRequestDataHeader *request_header = (BmServiceRequestDataHeader *)data;
+  if (data_len != sizeof(BmServiceRequestDataHeader) + request_header->data_size) {
+    break;
+  }
+  if (topic_len != current->service_strlen + strlen(BM_SERVICE_REQ_STR)) {
+    break;
+  }
+```
+
+| Step | Effect |
+|---|---|
+| `strncmp` over the service's length | the first service whose name prefixes the topic decides; a mismatch after it `break`s, so service `a` listed before `ab` leaves `ab/req` unanswered |
+| `strncmp` past `topic_len` | reads the data that follows the topic in the datagram, then past the datagram if the name is longer still |
+| `request_header->data_size` | read before `data_len >= 8` is checked: up to 8 bytes past the datagram |
+| `break` on either length check | no later service is tried |
+
+`_service_list_remove_service` removes the first service with
+`strncmp(current->service, service, service_strlen) == 0`, the unregistered
+name's length: unregistering `a` removes `ab` if it is listed first, and the
+empty name removes the first service. `bm_service_unregister` unsubscribes
+`<name>/req` before that, so the removed service's subscription stays and the
+named service stays listed with none. The list has no de-duplication and no
+reset; an entry left without its subscription can never be removed.
+
+The callback is called once per listing on each matching subscription
+(#74, #79), and each call walks the same list and publishes the same reply. A
+C requester takes the first and drops the rest.
+
+**replicated**, except where it reads past the datagram.
+`bm_wire::service::ServiceTable::lookup` and `remove` are the C's walks;
+`Lookup::OverRead` and `Lookup::ShortRequest` are the out-of-bounds cases.
+`bm_stack::Node` calls the handler once per publication and sends one reply,
+however many times the C would. `bm-wire-diff/src/services.rs` (`services`
+fuzz target) asserts the C's `k` replies, handler calls and local deliveries
+are the Rust node's one repeated, and skips requests the lookup reports as
+out of bounds. `a_prefixing_name_shadows_a_later_service` and
+`unregistering_a_prefix_removes_an_earlier_service`
+(`bm-wire-diff/tests/services.rs`) cover the two prefix matches.
+
+Fix upstream by comparing names by length and bytes (`topic_len ==
+service_strlen + 4 && memcmp`), checking `data_len >= 8` before reading the
+header, `continue` rather than `break` on a mismatch, and removing by exact
+name. Wire-visible: a request a shadowing service swallows is answered.
+
+## 89. `echo_service_handler` copies a request of any length into its 1008-byte reply buffer
+
+`middleware/echo_service.c`:
+
+```c
+if (*buffer_len <= MAX_BM_SERVICE_DATA_SIZE) {
+  *buffer_len = req_data_len;
+  memcpy(reply_data, req_data, req_data_len);
+```
+
+`*buffer_len` is `MAX_BM_SERVICE_DATA_SIZE - 16` (1008) on entry, so the test
+always passes, and the request's length is never compared. A request carries
+up to 1414 bytes (a 1452-byte publication less the header, the 25-byte topic
+and 8 bytes of request header), so `memcpy` writes up to 406 bytes past the
+1024-byte `bm_malloc` in `_service_request_received_cb`, and `bm_pub_wl` then
+reads the same span to send the reply. Any node on the bus can send one; a
+dev kit's firmware registers echo (bm_protocol
+`src/apps/bm_devkit/bmdk_common/app_main.cpp:413-415`).
+
+**domain-limited.** `bm_wire::service::echo` returns `None` for a request
+longer than the buffer, and the node sends no reply.
+`bm-wire-diff/src/services.rs` does not send the oracle such a request;
+`echo_past_its_buffer_is_skipped` (`bm-wire-diff/tests/services.rs`) shows the
+domain check, and `echo_refuses_what_does_not_fit_the_reply`
+(`bm-stack/tests/service.rs`) the port's behaviour.
+
+Fix upstream by testing `req_data_len <= *buffer_len`.

@@ -304,6 +304,15 @@ test = false
 doc = false
 bench = false
 
+# Stack-backed. Mirrors the oracle's service list, subscriptions and resource
+# lists in one Rust node for the life of the process.
+[[bin]]
+name = "services"
+path = "fuzz_targets/services.rs"
+test = false
+doc = false
+bench = false
+
 # Stack-backed. Subscribes to `*` and seeds `PUB_LIST` with the three Spotter
 # topics once per process.
 [[bin]]
