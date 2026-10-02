@@ -136,16 +136,24 @@
 //! it inside the subscriber callback. One reply per received publication;
 //! see [`Node::on_frame_with`] and divergence #89.
 //!
-//! A publication this node makes is not dispatched to its own services.
+//! A publication this node makes is not dispatched to its own services, so
+//! a request to one of them goes unanswered and times out, where a C node
+//! answers it from its middleware task.
 //!
-//! # Two timers, not one
+//! `middleware/bm_service_request.c` is [`Node::service_request`]: it lists
+//! the request in [`Node::service_requests`], subscribes `<service>/rep` and
+//! publishes `<service>/req`. A reply reaching that subscription arrives as
+//! [`Event::ServiceReply`], and silence as [`Event::ServiceTimeout`] from
+//! [`Node::on_service_expiry`].
+//!
+//! # Three timers, not one
 //!
 //! The 10-second heartbeat timer is [`Node::on_tick`]; `packet.c`'s 150 ms
-//! expiry sweep is [`Node::on_expiry`]. The sweep carries its own phase (see
-//! divergence #22), so [`Node::on_expiry`] only has to be called at least
-//! every [`EXPIRY_PERIOD_MS`]. Putting it on a grid of the port's own would
-//! make the port retry and give up on requests at different moments from a C
-//! node.
+//! expiry sweep is [`Node::on_expiry`]; `bm_service_request.c`'s 500 ms
+//! sweep is [`Node::on_service_expiry`]. Each sweep carries its own phase
+//! (see divergence #22), so it only has to be called at least once per
+//! period. Putting either on a grid of the port's own would make the port
+//! retry and give up on requests at different moments from a C node.
 
 use bm_wire::BmWireError;
 use bm_wire::addr;
@@ -184,7 +192,9 @@ use bm_wire::l2::{self, TxKind};
 use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError, Subscriptions};
-use bm_wire::service::{self as service_wire, Lookup, ReplyHeader, ServiceTable};
+use bm_wire::service::{
+    self as service_wire, Lookup, ReplyHeader, ReplyOutcome, RequestHeader, ServiceTable,
+};
 use bm_wire::spotter::{self, EncodeError, NetworkType};
 use bm_wire::udp;
 use bm_wire::util::BmIpAddr;
@@ -194,8 +204,8 @@ use crate::config::{Configuration, NoConfig};
 use crate::dfu::{DfuFinished, HostRequest, NodeDfu};
 use crate::port::{DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy, Rtc, RtcTimeAndDate};
 use crate::service::{
-    NoServices, RegisterError, SERVICE_NAME_BYTES, SERVICES, ServiceHandler, Services,
-    UnregisterError,
+    NoServices, RegisterError, SERVICE_NAME_BYTES, SERVICES, ServiceHandler, ServiceRequestError,
+    ServiceRequests, Services, UnregisterError,
 };
 
 /// Largest frame the node will build or accept.
@@ -498,6 +508,30 @@ pub enum Event<'a> {
         version: u8,
         /// Everything after the topic.
         data: &'a [u8],
+    },
+    /// A reply answered a request [`Node::service_request`] made, which is
+    /// no longer waiting: the `BmServiceReplyCb` with `ack` true.
+    ///
+    /// Matched on the reply's `id` and `target_node_id` alone, so a reply
+    /// on another service's reply topic answers a request whose id it
+    /// carries (divergence #92).
+    ServiceReply {
+        /// The request's id.
+        id: u32,
+        /// The service the request named.
+        service: &'a [u8],
+        /// The reply's data: `data_size` bytes, or what arrived if fewer
+        /// (divergence #92).
+        data: &'a [u8],
+    },
+    /// A request [`Node::service_request`] made expired unanswered: the
+    /// `BmServiceReplyCb` with `ack` false. Reported by
+    /// [`Node::on_service_expiry`].
+    ServiceTimeout {
+        /// The request's id.
+        id: u32,
+        /// The service the request named.
+        service: &'a [u8],
     },
 }
 
@@ -933,6 +967,8 @@ pub struct Node<
     service_table: ServiceTable<ServiceHandler, SERVICES, SERVICE_NAME_BYTES>,
     /// The application's service handlers.
     services: S,
+    /// `CTX.service_request_list` and its expiry timer.
+    service_requests: ServiceRequests,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -1106,7 +1142,7 @@ impl<
     /// [`Node::on_tick`]'s uptime clock starts. The DFU machine comes up in
     /// `Init` with the reboot info [`NoInitRam::load`] returns, and moves on
     /// from it at the first [`Node::next_dfu_transmission`]. No service is
-    /// listed.
+    /// listed, and the service request sweep is phased from zero too.
     pub fn with_services(
         identity: I,
         rtc: R,
@@ -1179,6 +1215,7 @@ impl<
             dfu,
             service_table: ServiceTable::new(),
             services,
+            service_requests: ServiceRequests::new(),
             port_count,
             link_mask: 0,
             udp_ports: [None; UDP_PORTS],
@@ -2003,8 +2040,9 @@ impl<
     /// outstanding requests — `packet.c` has [`Node::on_expiry`] for that. The
     /// sweep runs here too, so a node driven only by this entry point still
     /// retries and gives up on requests; drain [`Node::next_retransmission`]
-    /// after it. A node that also calls [`Node::on_expiry`] on time is
-    /// unaffected: the phase decides when a sweep happens, not the call.
+    /// after it. [`Node::on_service_expiry`] runs here for the same reason.
+    /// A node that also calls the sweeps on time is unaffected: the phase
+    /// decides when a sweep happens, not the call.
     pub fn on_tick_with(
         &mut self,
         uptime_ms: u32,
@@ -2015,6 +2053,7 @@ impl<
         self.neighbors.check(uptime_ms, |_| {});
         self.sweep(uptime_ms, &mut events);
         self.on_neighbor_request_timer(uptime_ms, &mut events);
+        self.on_service_expiry(uptime_ms, &mut events);
         self.build_heartbeat(uptime_ms)
     }
 
@@ -2664,8 +2703,9 @@ impl<
     ///
     /// 1. each application callback on this node's subscriptions matching
     ///    `topic` is reported to `events` as [`Event::Publication`] from this
-    ///    node's own id. A service callback is not called: the C queues the
-    ///    publication to its own middleware task, which would;
+    ///    node's own id, and a service request callback may report
+    ///    [`Event::ServiceReply`]. A service callback is not called: the C
+    ///    queues the publication to its own middleware task, which would;
     /// 2. the publication is built as [`pubsub::encode`] into a datagram to
     ///    `FF03::1` from and to [`pubsub::PORT`], as [`Node::send_udp`] builds
     ///    one;
@@ -2694,6 +2734,7 @@ impl<
         let node_id = self.identity.node_id();
         Self::deliver_locally(
             &self.subscriptions,
+            &mut self.service_requests,
             node_id,
             topic,
             kind,
@@ -2818,13 +2859,15 @@ impl<
     /// `bm_handle_msg`: every callback on every matching subscription, in
     /// list order. An application callback is an [`Event::Publication`]; the
     /// service callback is `_service_request_received_cb`, which may build a
-    /// reply into the transmit buffer.
+    /// reply into the transmit buffer; the reply callback is
+    /// `_service_request_cb`, which may report an [`Event::ServiceReply`].
     ///
     /// The service callback runs once per publication, however often it is
     /// listed on matching subscriptions. Each of the C's calls walks the same
     /// list with the same topic, so each reaches the same handler and
     /// publishes the same reply; a C requester takes the first and drops the
-    /// rest (divergence #89).
+    /// rest (divergence #89). The reply callback runs once too: the C's first
+    /// call removes the request the reply answers, and the rest find none.
     fn deliver_publication(
         &mut self,
         source: u64,
@@ -2833,6 +2876,7 @@ impl<
     ) -> Option<Outbound<'_>> {
         let node_id = self.identity.node_id();
         let mut served = false;
+        let mut replied = false;
         let mut reply_end = None;
         for (subscription, callbacks) in self.subscriptions.matching_callbacks(publication.topic) {
             for callback in callbacks {
@@ -2857,6 +2901,16 @@ impl<
                         );
                     }
                     Subscriber::Service => {}
+                    Subscriber::Reply if !replied => {
+                        replied = true;
+                        Self::answer_request(
+                            &mut self.service_requests,
+                            node_id,
+                            publication.data,
+                            events,
+                        );
+                    }
+                    Subscriber::Reply => {}
                 }
             }
         }
@@ -2867,6 +2921,7 @@ impl<
         let reply = pubsub::decode(payload).ok()?;
         Self::deliver_locally(
             &self.subscriptions,
+            &mut self.service_requests,
             node_id,
             reply.topic,
             reply.kind,
@@ -2945,9 +3000,12 @@ impl<
     }
 
     /// A local delivery of a publication this node made: each application
-    /// callback on a matching subscription, from this node's own id.
+    /// callback on a matching subscription, from this node's own id, and
+    /// the reply callback once. Service callbacks are not called.
+    #[allow(clippy::too_many_arguments)]
     fn deliver_locally(
         subscriptions: &Subscriptions<SUBSCRIPTIONS, RESOURCE_NAME>,
+        requests: &mut ServiceRequests,
         node_id: u64,
         topic: &[u8],
         kind: u8,
@@ -2955,19 +3013,41 @@ impl<
         data: &[u8],
         events: &mut impl FnMut(Event<'_>),
     ) {
+        let mut replied = false;
         for (subscription, callbacks) in subscriptions.matching_callbacks(topic) {
             for callback in callbacks {
-                if *callback == Subscriber::Application {
-                    events(Event::Publication {
+                match callback {
+                    Subscriber::Application => events(Event::Publication {
                         source: node_id,
                         subscription,
                         topic,
                         kind,
                         version,
                         data,
-                    });
+                    }),
+                    Subscriber::Reply if !replied => {
+                        replied = true;
+                        Self::answer_request(requests, node_id, data, events);
+                    }
+                    Subscriber::Reply | Subscriber::Service => {}
                 }
             }
+        }
+    }
+
+    /// `_service_request_cb`: report the request `body` answers, if any.
+    fn answer_request(
+        requests: &mut ServiceRequests,
+        node_id: u64,
+        body: &[u8],
+        events: &mut impl FnMut(Event<'_>),
+    ) {
+        if let ReplyOutcome::Answered { request, data } = requests.on_reply(node_id, body) {
+            events(Event::ServiceReply {
+                id: request.id(),
+                service: request.service(),
+                data,
+            });
         }
     }
 
@@ -3049,6 +3129,139 @@ impl<
         } else {
             Err(UnregisterError::NotListed)
         }
+    }
+
+    /// [`Node::service_request_with`], discarding local deliveries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::service_request_with`].
+    pub fn service_request(
+        &mut self,
+        now_ms: u32,
+        service: &[u8],
+        data: &[u8],
+        timeout_s: u32,
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        self.service_request_with(now_ms, service, data, timeout_s, |_| {})
+    }
+
+    /// Ask `service` — `bm_service_request`. Returns the request's id and
+    /// the frame to send.
+    ///
+    /// In the C's order:
+    ///
+    /// 1. the request is listed in [`Node::service_requests`] with the next
+    ///    id, made at `now_ms`, timing out `timeout_s` seconds later, wrapped
+    ///    to 32 bits of milliseconds (divergence #91);
+    /// 2. the service request layer subscribes `<service>/rep`, as
+    ///    [`Node::subscribe`] does, `SUB` resource included;
+    /// 3. `<service>/req` is published as [`Node::publish_with`] publishes,
+    ///    carrying a [`RequestHeader`] and `data`, with type 0 and
+    ///    [`pubsub::COMMON_VERSION`]. A local service is not called (see the
+    ///    module docs).
+    ///
+    /// The reply arrives as [`Event::ServiceReply`] from
+    /// [`Node::on_frame_with`]; silence as [`Event::ServiceTimeout`] from
+    /// [`Node::on_service_expiry`].
+    ///
+    /// # Errors
+    ///
+    /// See [`ServiceRequestError`]. After
+    /// [`ServiceRequestError::NotSubscribed`] and
+    /// [`ServiceRequestError::NotSent`] the request stays listed and times
+    /// out, as in the C (divergence #91).
+    pub fn service_request_with(
+        &mut self,
+        now_ms: u32,
+        service: &[u8],
+        data: &[u8],
+        timeout_s: u32,
+        mut events: impl FnMut(Event<'_>),
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        if data.len() > service_wire::MAX_DATA_SIZE {
+            return Err(ServiceRequestError::TooLarge);
+        }
+        let id = self
+            .service_requests
+            .add(service, timeout_s, now_ms)
+            .map_err(|_| ServiceRequestError::Full)?;
+        let mut topic = [0u8; SERVICE_NAME_BYTES + service_wire::REPLY_SUFFIX.len()];
+        // Cannot fail: `add` holds no longer name.
+        let len = service_wire::topic(&mut topic, service, service_wire::REPLY_SUFFIX)
+            .map_err(|_| ServiceRequestError::NotSent { id })?;
+        self.subscribe_as(&topic[..len], Subscriber::Reply)
+            .map_err(|error| ServiceRequestError::NotSubscribed { id, error })?;
+        let len = service_wire::topic(&mut topic, service, service_wire::REQUEST_SUFFIX)
+            .map_err(|_| ServiceRequestError::NotSent { id })?;
+        let topic = &topic[..len];
+
+        let node_id = self.identity.node_id();
+        let dst = BmIpAddr::GLOBAL_MULTICAST;
+        let src = udp::source_address(node_id, &dst);
+        let header = RequestHeader {
+            id,
+            data_size: data.len() as u32,
+        };
+        // At most 52 bytes of topic and 1032 of body: within
+        // `MAX_MESSAGE_LEN`, so the C's `bm_middleware_net_tx` sends it too.
+        let end = udp::build_with(
+            &mut self.tx,
+            &src,
+            &dst,
+            pubsub::PORT,
+            pubsub::PORT,
+            |buf| {
+                let head = pubsub::encode(buf, topic, 0, pubsub::COMMON_VERSION, &[])?;
+                let body = buf
+                    .get_mut(head..head + RequestHeader::LEN + data.len())
+                    .ok_or(BmWireError::Truncated)?;
+                header.encode(body)?;
+                body[RequestHeader::LEN..].copy_from_slice(data);
+                Ok(head + body.len())
+            },
+        )
+        .map_err(|_| ServiceRequestError::NotSent { id })?;
+
+        let payload = &self.tx[udp::PAYLOAD_OFFSET..end];
+        let request = pubsub::decode(payload).map_err(|_| ServiceRequestError::NotSent { id })?;
+        Self::deliver_locally(
+            &self.subscriptions,
+            &mut self.service_requests,
+            node_id,
+            request.topic,
+            request.kind,
+            request.version,
+            request.data,
+            &mut events,
+        );
+        let _ = self.resources.add(topic, ResourceType::Publisher);
+        let frame = &mut self.tx[..end];
+        let mask = l2::take_requested_egress_port(frame, self.port_count)
+            .map_err(|_| ServiceRequestError::NotSent { id })?;
+        Ok((id, Outbound { frame, mask }))
+    }
+
+    /// Run `bm_service_request.c`'s expiry sweep, reporting each request that
+    /// expired as [`Event::ServiceTimeout`].
+    ///
+    /// Call it at least every [`service_wire::EXPIRY_PERIOD_MS`]. The sweep
+    /// runs on that grid from construction, as the C's timer runs from
+    /// `bm_service_request_init`, and a request expires at the first sweep at
+    /// least its timeout after it was made. Calling early, late or twice
+    /// changes nothing.
+    pub fn on_service_expiry(&mut self, now_ms: u32, mut events: impl FnMut(Event<'_>)) {
+        self.service_requests.on_tick(now_ms, |request| {
+            events(Event::ServiceTimeout {
+                id: request.id(),
+                service: request.service(),
+            });
+        });
+    }
+
+    /// `CTX.service_request_list`: the requests waiting on a reply.
+    pub fn service_requests(&self) -> &ServiceRequests {
+        &self.service_requests
     }
 
     /// `BM_SERVICE_CONTEXT.service_list`: the services listed, in the order a
@@ -3822,11 +4035,12 @@ impl<
 
     /// Run the node and `app` until the PHY fails.
     ///
-    /// Waits on whichever comes first — a frame, the heartbeat tick, the
-    /// expiry sweep, a one-shot node timer, or [`App::ready`] — handles it, and
-    /// transmits anything owed. Both periodic timers are bm_core's:
+    /// Waits on whichever comes first — a frame, the heartbeat tick, either
+    /// expiry sweep, a one-shot node timer, or [`App::ready`] — handles it,
+    /// and transmits anything owed. The three periodic timers are bm_core's:
     /// `bcmp_heartbeat_s`, which also ages the neighbour table in that order,
-    /// and `packet.c`'s [`EXPIRY_PERIOD_MS`] sweep. Keeping them apart is what
+    /// `packet.c`'s [`EXPIRY_PERIOD_MS`] sweep and `bm_service_request.c`'s
+    /// [`service_wire::EXPIRY_PERIOD_MS`] sweep. Keeping them apart is what
     /// lets a request time out on the C's grid while heartbeats stay ten
     /// seconds apart.
     ///
@@ -3841,12 +4055,15 @@ impl<
     ///
     /// The first error the PHY reports, from either direction.
     pub async fn run_app<P: Phy, A: App<Self>>(&mut self, phy: &mut P, app: &mut A) -> P::Error {
-        use embassy_futures::select::{Either5, select5};
+        use embassy_futures::select::{Either6, select6};
         use embassy_time::{Duration, Instant, Ticker, Timer};
 
         let started = Instant::now();
         let mut ticker = Ticker::every(Duration::from_secs(u64::from(HEARTBEAT_PERIOD_S)));
         let mut expiry = Ticker::every(Duration::from_millis(u64::from(EXPIRY_PERIOD_MS)));
+        let mut service_expiry = Ticker::every(Duration::from_millis(u64::from(
+            service_wire::EXPIRY_PERIOD_MS,
+        )));
         let mut rx = [0u8; MTU];
         let port_count = self.port_count;
 
@@ -3872,7 +4089,7 @@ impl<
             // `NEIGHBOR_TIMER` and the DFU chunk timer: one-shots armed by
             // what they time rather than tickers, so they share an arm that
             // waits exactly as long as the sooner has left. Nothing running
-            // means nothing to wait for, and the other three arms are the
+            // means nothing to wait for, and the other arms are the
             // only way out.
             let now = uptime_ms(());
             let neighbor_wait = match (
@@ -3889,16 +4106,17 @@ impl<
                 }
             };
 
-            match select5(
+            match select6(
                 phy.receive(&mut rx),
                 ticker.next(),
                 expiry.next(),
+                service_expiry.next(),
                 neighbor_timer,
                 app.ready(),
             )
             .await
             {
-                Either5::First(Ok((port, len))) => {
+                Either6::First(Ok((port, len))) => {
                     let now = uptime_ms(());
                     let owed =
                         self.on_frame_with(now, port, &mut rx[..len], |event| app.on_event(event));
@@ -3914,8 +4132,8 @@ impl<
                         return error;
                     }
                 }
-                Either5::First(Err(error)) => return error,
-                Either5::Second(()) => {
+                Either6::First(Err(error)) => return error,
+                Either6::Second(()) => {
                     let now = uptime_ms(());
                     if let Some(outbound) = self.on_tick_with(now, |event| app.on_event(event))
                         && let Err(error) = transmit(phy, outbound, port_count).await
@@ -3926,18 +4144,22 @@ impl<
                         return error;
                     }
                 }
-                Either5::Third(()) => {
+                Either6::Third(()) => {
                     let now = uptime_ms(());
                     self.on_expiry(now, |event| app.on_event(event));
                     if let Err(error) = self.retransmit(phy).await {
                         return error;
                     }
                 }
-                Either5::Fourth(()) => {
+                Either6::Fourth(()) => {
+                    let now = uptime_ms(());
+                    self.on_service_expiry(now, |event| app.on_event(event));
+                }
+                Either6::Fifth(()) => {
                     let now = uptime_ms(());
                     self.on_neighbor_request_timer(now, |event| app.on_event(event));
                 }
-                Either5::Fifth(()) => {
+                Either6::Sixth(()) => {
                     let now = uptime_ms(());
                     if let Some(outbound) = app.act(self, now)
                         && let Err(error) = transmit(phy, outbound, port_count).await
