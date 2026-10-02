@@ -34,6 +34,7 @@ pub mod info;
 pub mod l2_egress;
 pub mod l2_policy;
 pub mod ll;
+pub mod metrics_codec;
 pub mod neighbor;
 pub mod neighbor_table;
 pub mod node_udp;

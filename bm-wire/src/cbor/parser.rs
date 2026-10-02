@@ -36,10 +36,16 @@ pub enum CborError {
     IllegalNumber,
     /// `CborErrorIllegalSimpleType`.
     IllegalSimpleType,
+    /// `CborErrorImproperValue`.
+    ImproperValue,
+    /// `CborErrorTooFewItems`, from closing an encoder's container.
+    TooFewItems,
     /// `CborErrorDataTooLarge`.
     DataTooLarge,
     /// `CborErrorNestingTooDeep`.
     NestingTooDeep,
+    /// `CborErrorUnsupportedType`.
+    UnsupportedType,
     /// `CborErrorOutOfMemory`.
     OutOfMemory,
     /// No C value: tinycbor's precondition (`assert` or `cbor_assert`) does
@@ -62,8 +68,11 @@ impl CborError {
             Self::IllegalType => 260,
             Self::IllegalNumber => 261,
             Self::IllegalSimpleType => 262,
+            Self::ImproperValue => 519,
+            Self::TooFewItems => 769,
             Self::DataTooLarge => 1024,
             Self::NestingTooDeep => 1025,
+            Self::UnsupportedType => 1026,
             Self::OutOfMemory => i32::MIN,
             Self::Unreachable => return None,
         })
@@ -91,6 +100,7 @@ const TAG: u8 = 0xc0;
 const SIMPLE: u8 = 0xe0;
 const BOOLEAN: u8 = 0xf5;
 const FLOAT: u8 = 0xfa;
+const DOUBLE: u8 = 0xfb;
 const INVALID: u8 = 0xff;
 
 // `CborIteratorFlag_*`. 0x04 is both `NegativeInteger` and
@@ -435,6 +445,97 @@ impl<'a> Value<'a> {
     #[must_use]
     pub fn is_float(&self) -> bool {
         self.ty == FLOAT
+    }
+
+    /// `cbor_value_is_double`: the 9-byte form only.
+    #[must_use]
+    pub fn is_double(&self) -> bool {
+        self.ty == DOUBLE
+    }
+
+    /// `cbor_value_is_tag`.
+    #[must_use]
+    pub fn is_tag(&self) -> bool {
+        self.ty == TAG
+    }
+
+    /// `cbor_value_skip_tag`: step over tags to the item they qualify.
+    ///
+    /// # Errors
+    ///
+    /// [`CborError::AdvancePastEof`] at the end of a container, else what
+    /// parsing the next item returns.
+    pub fn skip_tag(&mut self) -> Result<(), CborError> {
+        while self.is_tag() {
+            // `cbor_value_advance_fixed`.
+            if self.remaining == 0 {
+                return Err(CborError::AdvancePastEof);
+            }
+            self.advance_internal()?;
+        }
+        Ok(())
+    }
+
+    /// `cbor_value_get_string_length`.
+    ///
+    /// # Errors
+    ///
+    /// [`CborError::Unreachable`] if this is not a string;
+    /// [`CborError::UnknownLength`] for a chunked one;
+    /// [`CborError::DataTooLarge`] if the length does not fit a `usize`.
+    pub fn string_length(&self) -> Result<usize, CborError> {
+        if !self.is_text_string() && !self.is_byte_string() {
+            return Err(CborError::Unreachable);
+        }
+        if !self.is_length_known() {
+            return Err(CborError::UnknownLength);
+        }
+        usize::try_from(self.extract()).map_err(|_| CborError::DataTooLarge)
+    }
+
+    /// `cbor_value_map_find_value`: the value under the first text key whose
+    /// bytes are exactly `key`, or an iterator that is not
+    /// [`valid`](Self::is_valid) if there is none. Tags before a key or a
+    /// value are skipped; keys of other types are stepped over.
+    ///
+    /// # Errors
+    ///
+    /// [`CborError::Unreachable`] if this is not a map; a parse error met
+    /// while searching.
+    pub fn map_find_value(&self, key: &[u8]) -> Result<Self, CborError> {
+        if !self.is_map() {
+            return Err(CborError::Unreachable);
+        }
+        let mut element = self.enter_container()?;
+        while !element.at_end() {
+            element.skip_tag()?;
+            if element.is_text_string() {
+                // `iterate_string_chunks` with `iterate_memcmp` over
+                // `strlen(key)` bytes: equal only if every chunk fits and
+                // matches and the total is exactly that length.
+                let mut equal = true;
+                let (copied, next) = element.iterate_string(key.len(), |at, chunk| {
+                    equal &= key[at..at + chunk.len()] == *chunk;
+                })?;
+                element = next;
+                if equal && copied.all && copied.total == key.len() {
+                    element.preparse_value()?;
+                    return Ok(element);
+                }
+            } else {
+                element.advance()?;
+            }
+            element.skip_tag()?;
+            element.advance()?;
+        }
+        element.ty = INVALID;
+        Ok(element)
+    }
+
+    /// `cbor_value_is_valid`.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.ty != INVALID
     }
 
     /// `cbor_value_is_length_known`.

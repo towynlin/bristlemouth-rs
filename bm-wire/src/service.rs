@@ -10,6 +10,7 @@
 //! string; the key's bytes are never compared.
 
 pub mod config_map;
+pub mod metrics;
 pub mod power_info;
 pub mod sys_info;
 
@@ -57,6 +58,28 @@ impl<'o, 'b> MapWriter<'o, 'b> {
     fn text(&mut self, text: &[u8]) {
         self.push(Header::Text(Some(text.len())));
         self.write(text);
+    }
+
+    /// `cbor_encode_uint`.
+    fn positive(&mut self, value: u64) {
+        self.push(Header::Positive(value));
+    }
+
+    /// `cbor_encoder_create_map` with a definite length.
+    fn map(&mut self, len: usize) {
+        self.push(Header::Map(Some(len)));
+    }
+
+    /// `cbor_encode_float`: always the 5-byte `fa` form (divergence #43).
+    fn float(&mut self, value: f32) {
+        self.write(&[0xfa]);
+        self.write(&value.to_bits().to_be_bytes());
+    }
+
+    /// `cbor_encode_double`: always the 9-byte `fb` form.
+    fn double(&mut self, value: f64) {
+        self.write(&[0xfb]);
+        self.write(&value.to_bits().to_be_bytes());
     }
 
     /// `cbor_encode_byte_string`.

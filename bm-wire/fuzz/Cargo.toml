@@ -312,3 +312,12 @@ path = "fuzz_targets/spotter.rs"
 test = false
 doc = false
 bench = false
+
+# Pure: `metrics_reply_encode` and `metrics_reply_decode` touch only their
+# arguments.
+[[bin]]
+name = "metrics_codec"
+path = "fuzz_targets/metrics_codec.rs"
+test = false
+doc = false
+bench = false

@@ -58,7 +58,7 @@ A cargo workspace.
     `CborValue`. For decoders whose outcomes are tinycbor's error codes and
     item counting rather than CBOR's.
   - `src/service/` — the services' bodies: `sys_info`, `config_map`,
-    `power_info`, each encode and decode.
+    `power_info`, `metrics`, each encode and decode.
   - `fuzz/` — a `cargo fuzz` crate, its own workspace. Targets are ~6 lines
     each; the work is in `bm-wire-diff`.
   - `fuzz/seeds/` — committed seed corpora, one directory per target, replayed
@@ -147,6 +147,8 @@ A cargo workspace.
     of the process.
   - `src/service_codecs.rs` — the service bodies against
     `bm_common_messages`, in-process; what it skips is listed at the top.
+  - `src/metrics_codec.rs` — the metrics body against `metrics_reply_msg.c`,
+    in-process; destinations are compared after every decode, failed or not.
   - `testdata/` — pcaps from C dev kits. `hello-pub-card-h0.pcap` is card
     H0's; `tests/capture_h0.rs` documents it and asserts the header fields
     where deployed nodes differ from `bm_linux.c` (divergence #70).

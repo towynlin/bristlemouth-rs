@@ -122,6 +122,9 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 82 | Service body decoders read uints with an unchecked `cbor_value_get_uint64` | replicated (release build); domain-limited (tags) | reading, confirmed differentially (card M1) |
 | 83 | `sys_info_reply_decode` sizes `app_name` from the sender's `app_name_strlen` | replicated; c-only (terminator, leak) | reading, confirmed differentially (card M1) |
 | 84 | `config_cbor_map_reply_decode` reads `cbor_data` only when `success` and a length are set | replicated; domain-limited (not a byte string) | reading, confirmed differentially (card M1) |
+| 85 | `BM_FIELD_STRING` is unimplemented in both field-table functions | replicated | reading, confirmed differentially (card M2) |
+| 86 | `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL | replicated | reading, confirmed differentially (card M2) |
+| 87 | A tagged field value makes `bm_decode_fields_from_table` advance past its map | domain-limited | `cargo fuzz run metrics_codec` (card M2) |
 
 ---
 
@@ -2904,3 +2907,74 @@ shim refuses is skipped.
 Fix upstream by checking `cbor_value_is_byte_string` and the length before
 allocating, reading the value in every case, and failing when the
 allocation fails.
+
+## 85. `BM_FIELD_STRING` is unimplemented in both field-table functions
+
+`bm_common_messages/bm_messages_helper.c`. `bm_encode_fields_from_table`
+encodes each entry's key, then its value in a `switch` whose `default:` sets
+`CborErrorUnsupportedType`; the next entry's key encode overwrites `err`. The
+per-entry error check sits inside the `switch` after `default:`'s `break`, so
+it never runs. `bm_decode_fields_from_table` has the `STRING` case commented
+out ("TODO"); its `default:` sets `CborErrorUnsupportedType`, which the
+`cbor_value_advance` after the `switch` overwrites.
+
+| A `STRING` entry | Effect |
+|---|---|
+| encoded, last in its table | `metrics_reply_encode` returns `CborErrorUnsupportedType` |
+| encoded, elsewhere | its key is written with no value; closing the component's map returns `CborErrorTooFewItems` |
+| decoded | its key matches, nothing is written, and the key is not counted as unknown |
+
+**replicated.** `bm_wire::service::metrics::Field::String`;
+`string_fields` (`bm-wire-diff/src/metrics_codec.rs`) compares each row.
+
+Fix upstream by implementing the type, or by refusing it before encoding the
+key.
+
+## 86. `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL
+
+`bm_common_messages/metrics_reply_msg.c` and `bm_messages_helper.c`:
+
+| Step | The C |
+|---|---|
+| `version`, `node_id`, `uptime_ms`, `data` | takes any four text keys in that position; `decode_key_value_uint*` never reads `key_expected` except to log |
+| component lookup | `cbor_value_map_find_value`: exact match, first wins |
+| field lookup | `cbor_value_copy_text_string` into `key[64]`, then `strcmp`: a wire key `"a\0x"` fills the entry `"a"` |
+| a field key over 63 bytes | skipped, and not counted as unknown |
+| a field of the wrong type | not written; the component returns `CborErrorImproperValue`, which ends the decode, so later components are not read |
+| a field key not in the table | skipped; `CborErrorUnsupportedType`, which the caller ignores |
+
+Every write happens as the pair is read, so a decode that fails leaves what
+it decoded before the failure.
+
+**replicated.** `bm_wire::service::metrics::decode` and `decode_fields`;
+`key_quirks` (`bm-wire-diff/src/metrics_codec.rs`) and the `metrics_codec`
+fuzz target compare the error and every destination after each decode.
+
+Fix upstream by comparing each top-level key with `key_expected`, and by
+comparing field keys by length (`cbor_value_text_string_equals`).
+
+## 87. A tagged field value makes `bm_decode_fields_from_table` advance past its map
+
+`bm_decode_fields_from_table` steps over each value with one
+`cbor_value_advance`. On a tag, that steps over the tag alone; tags do not
+count as items, so the iterator is then at the tagged item, which the loop
+reads as the next key. If it is a text string, the advance over "its value"
+starts at the end of the map. `cbor_value_advance` asserts
+`it->type != CborInvalidType` first:
+
+| Build | Effect |
+|---|---|
+| asserts on (the oracle) | abort |
+| `NDEBUG` | `cbor_assert` is `unreachable()`: undefined behaviour |
+
+Reached by `{"k": 1("s")}` in any component a requester decodes; the body
+comes from the node being asked.
+
+**domain-limited.** `bm_wire::service::metrics::decode_fields` returns
+`CborError::Unreachable`, as `bm_wire::cbor::parser` does at every tinycbor
+assertion. The comparator (`bm-wire-diff/src/metrics_codec.rs`) does not call
+the C for a body the port decodes to that, and asserts the body holds a tag.
+`seeds/metrics_codec/tag-on-field-value` is the fuzzer's input.
+
+Fix upstream by `cbor_value_skip_tag` before reading a key or value, or by
+refusing a tag.

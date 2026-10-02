@@ -127,18 +127,6 @@ From reading the source; not yet run.
 
 ## Cards
 
-### M2 — Metrics body
-
-- **C:** `metrics_reply_msg.c`, `bm_encode_fields_from_table`,
-  `bm_decode_fields_from_table`.
-- **Rust:** `bm_wire::service::metrics`: a field enum (`BM_FIELD_*`), encode
-  from slices of fields, decode by key lookup. An absent component leaves its
-  destination untouched.
-- **Comparator:** `bm-wire-diff/src/metrics_codec.rs`, in-process.
-- **Blocked by:** nothing. **Blocks:** E4.
-- **Done:** fuzz target `metrics_codec` clean; `metrics_reply_msg_test.cpp`'s
-  values asserted in a `bm-wire` unit test.
-
 ### C1 — Config partition as a CBOR map
 
 - **C:** `services_cbor_as_map`, `services_cbor_encoded_as_crc32`.
@@ -208,7 +196,7 @@ From reading the source; not yet run.
   components through `Services::metrics`; `uptime_ms` from the time the node
   is given.
 - **Comparator:** extends `services`.
-- **Blocked by:** M2, S2. **Blocks:** E5.
+- **Blocked by:** S2. **Blocks:** E5.
 
 ### E5 — On a bus
 
@@ -226,23 +214,31 @@ From reading the source; not yet run.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | M2, C1, S1 | nothing |
+| 1 | C1, S1 | nothing |
 | 2 | S2 | S1 |
 | 3 | E1, E2, E3, E4 | S2 and its codec cards (see **Blocked by**) |
 | 4 | E5 | E1–E4 |
 
 Cards within a wave can run in parallel.
 
-## What the landed cards left for the rest (M1)
+## What the landed cards left for the rest (M1, M2)
 
 - **`bm_wire::cbor::parser` is tinycbor's parser.** `Value` is `CborValue`
   and each method the C function it names, including error codes, tags not
   counting as items, and `cbor_value_validate_basic` reading only the
-  top-level item. M2's `bm_decode_fields_from_table` should build on it
-  rather than on `cbor2`'s decoder; it will need `cbor_value_get_string_length`
-  and the float and double getters added. Where tinycbor would fail a
-  `cbor_assert`, a method returns `CborError::Unreachable`, and a comparator
-  does not call the C on that input.
+  top-level item. M2 added `string_length`, `map_find_value`, `skip_tag`,
+  `is_double` and the codes `ImproperValue`, `TooFewItems` and
+  `UnsupportedType`; floats are read as `extract()`'s bits. Where tinycbor
+  would fail a `cbor_assert`, a method returns `CborError::Unreachable`, and
+  a comparator does not call the C on that input.
+- **The metrics body: `bm_wire::service::metrics`** (E4). `encode(&Reply,
+  &[Component], buf)`; a component is a key and `&[Entry]`, an entry a key
+  and a `Field`. Contract 8's "over 1008 bytes is no reply" is
+  `Err(CborError::OutOfMemory)` from `encode` into the handler's 1008-byte
+  buffer. `Field::String` fails the encode (divergence #85), so
+  `Services::metrics` should not offer it. `metrics_reply_msg.c` and
+  `bm_messages_helper.c` are not in `T2_RELEASE`: the oracle's metrics codec
+  keeps its asserts, which #87 reaches.
 - **The oracle's codecs are a release build.** `bm-wire-sys/build.rs`
   `T2_RELEASE` compiles `sys_info_svc_reply_msg.c`,
   `config_cbor_map_srv_{request,reply}_msg.c` and `power_info_reply_msg.c`
