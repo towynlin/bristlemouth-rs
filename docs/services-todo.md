@@ -128,6 +128,8 @@ From reading the source; not yet run.
 
 ### M1 — Fixed-shape service bodies
 
+**Taken:** claude/services-m1-bodies
+
 - **C:** `sys_info_svc_reply_msg.c`, `config_cbor_map_srv_request_msg.c`,
   `config_cbor_map_srv_reply_msg.c`, `power_info_reply_msg.c`, and the
   `bm_messages_helper.c` functions they call.
