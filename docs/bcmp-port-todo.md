@@ -1,9 +1,9 @@
 # BCMP porting todo
 
 > **Complete and closed.** Every card has landed. Do not add cards here or
-> edit this file as part of a card; new work goes in
-> `docs/hello-world-todo.md`. "The shared contract" below still applies to
-> that file's cards.
+> edit this file as part of a card. `docs/hello-world-todo.md` is also
+> complete and closed. "The shared contract" below is the record of the
+> porting rules.
 
 What of BCMP was ported, and the rules the port followed.
 

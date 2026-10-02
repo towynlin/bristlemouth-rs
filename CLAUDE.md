@@ -146,11 +146,11 @@ A cargo workspace.
     `--check` fails on anything outside its libc allowlist, which deliberately
     omits `rand` and `time`, so a non-deterministic reach from `csrc/` trips it.
 - `docs/c-divergences.md` — the upstream defect list.
-- `docs/hello-world-todo.md` — **the active plan**: what stands between the
-  tree and a Rust hello-world app on a dev kit (UDP, pub/sub, `spotter_log`,
-  board support), as task cards. Its "Working a card" says how to edit it.
+- `docs/hello-world-todo.md` — the plan for a Rust hello-world app on a dev
+  kit (UDP, pub/sub, `spotter_log`, board support). **Complete and closed; no
+  work there.** Kept as documentation of what was built and why.
 - `docs/bcmp-port-todo.md` — the BCMP port. Complete and closed to new
-  cards; its shared contract still governs hello-world cards.
+  cards; its shared contract is the record of the porting rules.
 - `docs/embassy-port-tracking-prompt.md` — the brief that produced
   embassy#7024, which made `embassy-net-adin1110` report the ingress port and
   take an egress port per frame. Merged; kept as the record of the design.

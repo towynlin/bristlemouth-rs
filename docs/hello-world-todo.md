@@ -1,10 +1,16 @@
 # Hello world todo
 
-What stands between the current tree and a Rust hello-world app on a
-Bristlemouth dev kit, as dependency-ordered task cards sized for one agent
-each. This is the active plan. Same card format and shared contract as
-`docs/bcmp-port-todo.md`, which is complete and takes no new cards; read that
-file's "The shared contract" first.
+> **Complete and closed. There is no work here.** Every card has landed and
+> the four checks in "The target" passed on a bench. Do not add cards, pick
+> work from this file, or edit it as part of a card. It is kept as
+> documentation: the sections below record what was built, the API shapes,
+> and the reasons for decisions. "Working a card" and the "Order" section
+> describe the process the plan followed and are historical.
+
+What stood between the tree and a Rust hello-world app on a Bristlemouth dev
+kit, as dependency-ordered task cards sized for one agent each. Same card
+format and shared contract as `docs/bcmp-port-todo.md`, which is also
+complete.
 
 ## Working a card
 
@@ -382,17 +388,3 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 ## Order
 
 No cards remain.
-
-# Explicitly out of scope
-
-- **`bm_service*.c` and the built-in services** (sys_info, power_info,
-  metrics, config CBOR map, echo). Request/reply over pub/sub; not needed to
-  say hello. A natural next plan.
-- **`integrations/topology.c`**, as in `bcmp-port-todo.md`.
-- **DFU slot and no-init RAM on the dev kit.** `bm-devkit` has `NoDfu`;
-  `README.md` there records the C's MCUboot layout, no-init block and where
-  each DFU hook keeps its image. A `DfuSlot` matching the C writes MCUboot
-  slot 2 in internal flash and reads the W25 `dfu` partition only in
-  `DfuSlot::read`. The W25 is then shared, but DFU only reads it:
-  `&'static RefCell<Flash>` in the node's task is enough, and no
-  program-only `W25` method is needed.
