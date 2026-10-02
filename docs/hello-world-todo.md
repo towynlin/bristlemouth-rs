@@ -56,7 +56,7 @@ bus with a Spotter and a C dev kit:
 | Dev kit board support (MCU HAL, pins, node id, time driver) | Done (`bm-devkit`), run on a dev kit |
 | Config in the dev kit's NOR flash | Done (`bm-devkit`: `w25`, `storage`), untested on hardware |
 | The hello-world app | Done: `bm-devkit/src/bin/hello_world.rs`; the four checks above passed on a bench |
-| RTC set from the Spotter's `spotter/utc-time` | Not started: card T1 |
+| RTC set from the Spotter's `spotter/utc-time` | Done: `bm_stack::utc_time`, `bm_devkit::rtc::DevkitRtc`, in `hello_world`; run on a bench |
 
 A node that heartbeats, is discovered, answers ping and info, publishes,
 subscribes and calls `spotter_log` runs on the mock PHY
@@ -102,7 +102,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 |---|---|---|
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, B1, B2, E0, E1, F1, H0, P1, P2, S1, U1, U2) left for the rest
+## What the landed cards (A1, B1, B2, E0, E1, F1, H0, P1, P2, S1, T1, U1, U2) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -293,7 +293,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   | `start` takes every peripheral | `hello_world` needs only the ADIN2111 and the flash; a card needing more (LEDs) splits it |
   | `memory.x` at `0x08000000`, no bootloader, top 512 bytes of RAM left out | NoDfu needs no MCUboot; the 512 bytes are where the C keeps its no-init block, for a DFU card |
   | Logging is defmt over RTT through probe-rs | the C console is USB CDC, which is not ported |
-  | SMPS, watchdog, RTC on LSE, Bristlefin expander and LEDs not configured | not needed to say hello; the embassy example runs without them |
+  | SMPS, watchdog, Bristlefin expander and LEDs not configured | not needed to say hello; the embassy example runs without them |
   | No host tests (`test = false`) | the crate builds only for thumb; its pure functions are small and cross-checked by hand |
 
   Run on a kit by E1's bench run, below. Run `bringup` first if a later
@@ -352,42 +352,32 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
   It subscribes to `spotter/*` rather than an app topic because that matches
   what stock C dev kit firmware publishes, so the receive check needs no C
-  change. It also receives the Spotter's `spotter/utc-time` (card T1).
+  change. It also receives the Spotter's `spotter/utc-time` (T1, below).
   `DevkitIdentity` reports the crate version and the first 8 hex digits of
   `HEAD` (`bm-devkit/build.rs`), as the C reports its version and SHA.
+- **`spotter/utc-time` (T1).** The handler is bm_protocol application code
+  (`bmdk_common/app_main.cpp:238-272`), not bm_core; `bm-devkit/README.md`
+  "Time" records it and `stm32_rtc.c`.
+
+  | Item | Shape |
+  |---|---|
+  | `bm_stack::utc_time::decode(topic, kind, version, data) -> Result<u64, UtcTimeError>` | the C's checks: `strncmp` topic, type 1 and version 1, then the first 8 bytes little-endian; `Short` where the C reads past `data` |
+  | `UtcTimeSetter` | `on_event` holds a time from a publication delivered to the `TOPIC` subscription only; `is_pending` for `ready`; `apply(rtc)` sets it in `act` |
+  | `bm_devkit::rtc::DevkitRtc` | `stm32_rtc.c` over the STM32 RTC on LSE: `DR0` magic, two-digit year, `SHIFTR` for milliseconds; `get` fails until set; `Devkit`'s clock, from `Board::rtc` |
+
+  | Decision | Reason |
+  |---|---|
+  | In `bm-stack`, not `bm-devkit` | `bm-devkit` has no host tests; `the_spotters_utc_time_sets_the_clock` feeds the bench's bytes through `MockPhy` |
+  | A helper for an `App`, not a `Node` method | the C has it in the app; `on_event` has no node, so the set waits one loop pass |
+  | The STM32 RTC, as the C | survives a reset; same `DR0` flag and calendar as the C, so time the C set should survive a reflash; `config` turns LSE on for it |
+
+  On E1's bench (PR #45): LSE starts; an unset clock leaves `bm time get`
+  unanswered; the Spotter publishes type 1, version 1 and the clock is set
+  from it; `get` returns the Spotter's time and 10 s later a time 10 s
+  later; the clock answers after a reset; `bringup` runs. Not run: a
+  reflash over C firmware that had set its clock.
 
 ---
-
-## Card T1 — Set the RTC from `spotter/utc-time`
-
-**Blocks:** nothing. **Blocked by:** nothing.
-
-A Spotter publishes `spotter/utc-time` every 10 s. On the bench (E1) its data
-was 8 bytes, a little-endian `u64` of UTC microseconds:
-`b"\xb0*M.\xbf\\\x06\x00"` is `0x00065CBF2E4D2AB0`, 1790826045.582 s on the
-Spotter console's clock. C dev kits set their RTC from it.
-
-1. Find the C that subscribes and sets the RTC (bm_protocol at `62d8b5d`,
-   or bm_core's `integrations/`), and record the file, line and anything it
-   checks (length, version, source) in `bm-devkit/README.md` or the module
-   that ports it.
-2. Port it: subscribe on the node and call `Rtc::set` with
-   `RtcTimeAndDate::from_utc_micros`, matching the C's checks. Where it
-   lives (a `bm-wire` decoder plus a `Node` method, or an `App` in
-   `bm-devkit`) follows from where the C has it.
-3. A running clock. `Devkit` uses `SoftRtc`, which does not advance: after a
-   set, every get returns the set time. Implement `Rtc` in `bm-devkit` over
-   the time set plus `embassy_time::Instant` elapsed since, or over the
-   STM32U575's RTC (bm_protocol's choice to be recorded in step 1). Until it
-   is set it fails `get`, as `SoftRtc` does, so a time request is
-   unanswered.
-4. A test feeding the bench's bytes above through `MockPhy` and reading
-   `Node::rtc`.
-
-Done: builds in CI; on a bench, `bm time get` to the Rust node from the C
-dev kit returns the Spotter's time, and a second `get` 10 s later returns a
-time 10 s later, reported as done or not done. `hello_world` logs time
-requests, sets and responses, and the RTC reading every 10 s.
 
 ## Card B3 — Share the dev kit's NOR flash between config and a DFU slot
 
@@ -423,12 +413,10 @@ Done: builds in CI; `bringup` still logs a committed key after the reset
 ## Order
 
 ```
-T1
-
 B3
 ```
 
-T1 and B3 can start now and run in parallel.
+B3 can start now.
 
 # Explicitly out of scope
 

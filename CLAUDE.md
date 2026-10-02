@@ -68,6 +68,9 @@ A cargo workspace.
     holds UDP port 4321; the subscription table is `bm_wire::pubsub::Subscriptions`.
     `spotter_log` and `spotter_tx_data` wrap `publish`; their bodies are
     `bm_wire::spotter`.
+  - `src/utc_time.rs` — the Spotter's `spotter/utc-time`, which C nodes set
+    their RTC from (bm_protocol app code, not bm_core): `decode` and
+    `UtcTimeSetter`, for an `App`.
   - `src/app.rs` — `App`, application code `Node::run_app` runs in the
     node's loop: a cancel-safe `ready` arm, then `act` with `&mut Node`.
   - `src/channel.rs` — behind the `channel` feature: `Channels`, an
@@ -93,11 +96,13 @@ A cargo workspace.
   frame moves.
 - `bm-devkit/` — board support for the dev kit's mote (STM32U575CI,
   ADIN2111 on SPI3, W25Q64JV NOR flash on SPI2): `start` powers and brings up
-  the ADIN2111 and sets up the flash, `node` builds a `Devkit` node with the
-  chip's node id and its config partitions in flash; `src/bin/bringup.rs`
+  the ADIN2111, sets up the flash and starts the RTC, `node` builds a
+  `Devkit` node with the chip's node id, the RTC and its config partitions
+  in flash; `src/bin/bringup.rs`
   runs one and logs the config keys it loaded; `src/bin/hello_world.rs` is
   the hello-world app: subscribes to `spotter/*`, sends `hello world` with
-  `spotter_log` every 10 s. **Its own workspace**, for
+  `spotter_log` every 10 s, and sets the RTC from `spotter/utc-time`.
+  **Its own workspace**, for
   bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
   `.cargo/config.toml` sets the thumb target and a `probe-rs run` runner.
   `README.md` is the record of bm_protocol's BSP (pins, clocks, ADIN2111
@@ -105,6 +110,8 @@ A cargo workspace.
   bm_protocol is not vendored, so read it there rather than re-deriving it.
   - `src/w25.rs` — the flash driver, bm_protocol's `spiflash::W25`, over
     `embedded-hal` traits only.
+  - `src/rtc.rs` — `DevkitRtc`, `bm_stack::Rtc` over the STM32 RTC on LSE,
+    as bm_protocol's `stm32_rtc.c`.
   - `src/storage.rs` — `FlashConfigStorage`, `bm_stack::ConfigStorage` at
     bm_protocol's partition offsets.
 - `bm-wire-diff/` — the differential harness. Host-only. One comparator per

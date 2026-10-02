@@ -1,8 +1,10 @@
 //! The hello-world app: subscribes to [`SUBSCRIPTION`], sends `hello world`
 //! to the Spotter console with `spotter_log` every 10 s, and logs over defmt
 //! what the four checks of `docs/hello-world-todo.md`'s "The target" are read
-//! from: heartbeats, echo requests, and publications received. It also logs
-//! BCMP time messages and, every 10 s, the node's RTC reading.
+//! from: heartbeats, echo requests, and publications received. It also
+//! subscribes to [`utc_time::TOPIC`] and sets the node's clock from it, as C
+//! dev kits do, and logs BCMP time messages, each set, and every 10 s the
+//! node's RTC reading.
 //!
 //! ```text
 //! cd bm-devkit && cargo run --release --bin hello_world
@@ -12,6 +14,7 @@
 #![no_main]
 
 use bm_devkit::{AdinRunner, Devkit};
+use bm_stack::utc_time::{self, UtcTimeSetter};
 use bm_stack::{App, Event, Outbound, Rtc};
 use bm_wire::bcmp::MessageType;
 use bm_wire::bcmp::time::{SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
@@ -36,15 +39,27 @@ async fn adin(runner: AdinRunner) -> ! {
 
 struct Hello {
     ticker: Ticker,
+    utc_time: UtcTimeSetter,
 }
 
 impl App<Devkit> for Hello {
     async fn ready(&mut self) {
+        if self.utc_time.is_pending() {
+            return;
+        }
         // Cancel-safe: the deadline lives in the ticker.
         self.ticker.next().await;
     }
 
     fn act<'n>(&mut self, node: &'n mut Devkit, _now_ms: u32) -> Option<Outbound<'n>> {
+        if let Some((time, set)) = self.utc_time.apply(node.rtc_mut()) {
+            if set {
+                info!("rtc set to {=u64} us", time.to_utc_micros());
+            } else {
+                warn!("rtc refused {=u64} us", time.to_utc_micros());
+            }
+            return None;
+        }
         match node.rtc().get() {
             Some(time) => info!("rtc: {=u64} us", time.to_utc_micros()),
             None => info!("rtc: not set"),
@@ -62,6 +77,9 @@ impl App<Devkit> for Hello {
     }
 
     fn on_event(&mut self, event: Event<'_>) {
+        if let Some(Err(error)) = self.utc_time.on_event(&event) {
+            warn!("utc-time: {}", defmt::Debug2Format(&error));
+        }
         match event {
             Event::Message {
                 message_type,
@@ -121,13 +139,15 @@ impl App<Devkit> for Hello {
             }
             Event::Publication {
                 source,
+                subscription,
                 topic,
+                kind,
+                version,
                 data,
-                ..
             } => {
                 info!(
-                    "publication from {=u64:016x} on {=[u8]:a}: {=[u8]:a}",
-                    source, topic, data
+                    "publication from {=u64:016x} on {=[u8]:a} via {=[u8]:a}, type {=u8} version {=u8}: {=[u8]:a}",
+                    source, topic, subscription, kind, version, data
                 );
             }
             _ => {}
@@ -142,12 +162,19 @@ async fn main(spawner: Spawner) {
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));
 
     static NODE: StaticCell<Devkit> = StaticCell::new();
-    let node = NODE.init_with(|| bm_devkit::node(board.node_id, board.flash));
-    if let Err(error) = node.subscribe(SUBSCRIPTION) {
-        warn!("subscribe: {}", defmt::Debug2Format(&error));
+    let node = NODE.init_with(|| bm_devkit::node(board.node_id, board.flash, board.rtc));
+    for topic in [SUBSCRIPTION, utc_time::TOPIC] {
+        if let Err(error) = node.subscribe(topic) {
+            warn!(
+                "subscribe {=[u8]:a}: {}",
+                topic,
+                defmt::Debug2Format(&error)
+            );
+        }
     }
     let mut app = Hello {
         ticker: Ticker::every(Duration::from_secs(10)),
+        utc_time: UtcTimeSetter::new(),
     };
     let error = node.run_app(&mut board.phy, &mut app).await;
     warn!("node stopped: {}", defmt::Debug2Format(&error));

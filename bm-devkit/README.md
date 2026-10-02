@@ -173,7 +173,51 @@ bootloader and image again. `memory.x` leaves the no-init 512 bytes out of
 `RAM` so a later DFU card can place `NoInitRam` where the C bootloader
 expects it.
 
+## Time
+
+The C sets its RTC from the Spotter's `spotter/utc-time`, and answers BCMP
+time messages from the same RTC.
+
+| Item | C | Here |
+|---|---|---|
+| Subscription | `bm_sub(APP_PUB_SUB_UTC_TOPIC, handle_bm_subscriptions)`, `src/apps/bm_devkit/bmdk_common/app_main.cpp:412` | `hello_world` subscribes to `bm_stack::utc_time::TOPIC` |
+| Handler | `handle_bm_subscriptions`, `app_main.cpp:238-272` | `bm_stack::utc_time::UtcTimeSetter` |
+| Topic check | `strncmp(APP_PUB_SUB_UTC_TOPIC, topic, topic_len) == 0` | the same, in `utc_time::decode` |
+| Type, version | both 1 (`bmdk_common/app_pub_sub.h:10-12`); else prints "Unrecognized version" | `UtcTimeError::Unrecognized` |
+| Data | `bm_common_pub_sub_utc_t` (bm_core `bm_common_messages/bm_common_pub_sub.h:21-23`), a packed `uint64_t` of UTC µs (its comment says ns); `data_len` not checked | first 8 bytes, little-endian; fewer is `UtcTimeError::Short` |
+| Conversion | `dateTimeFromUtc`, `.ms = usec / 1000` | `RtcTimeAndDate::from_utc_micros` |
+| BCMP `bm_rtc_get`/`bm_rtc_set` | `src/lib/drivers/bm_rtc_wrapper.c`, onto `rtcGet`/`rtcSet` | `bm_stack::Rtc` on the node |
+| Clock | the STM32 RTC (`src/lib/drivers/stm32_rtc.c`), below | `bm_devkit::rtc::DevkitRtc` |
+
+`stm32_rtc.c`, started by `rtcInit` from `defaultTask` (`app_main.cpp:346`)
+after `MX_RTC_Init` (`Core/Src/rtc.c:28-66`) has done the same:
+
+| Item | C | `DevkitRtc` |
+|---|---|---|
+| Clock source | LSE, `RCC_LSE_ON` (LSESYSEN set), `RCC_LSEDRIVE_HIGH` (`main.c:148-155`); `stm32_rtc.c:44` | `config`: `LsConfig::default_lse()`, drive `High`, `peripherals_clocked` |
+| Prescalers | asynchronous 127, synchronous 255: 1 Hz, 1/256 s subseconds, written on every boot (`:51`) | embassy `Rtc::new` at 256 Hz: the same, written only when they differ |
+| Shadow registers | bypassed (`BYPSHAD`, `:57-60`) | the same |
+| "Set" flag | `0x836A20DD` in backup register `DR0` after a successful `rtcSet`; `rtcGet` fails without it (`:9`, `:72`, `:261`) | the same; `DR0` is `TAMP_BKP0R` on the U5 |
+| Year | two BCD digits, offset 2000 (`:184`, `:239`); a year outside 2000-2099 is written truncated | the same; outside 2000-2099 `set` refuses |
+| Weekday | always Monday (`:235`) | the same |
+| Milliseconds | `SHIFTR` with `ADD1S` and `(1000·256 − ms·256) / 1000`, then waits for `SHPF` (`:250-258`) | the same arithmetic |
+| Read | `TR`/`DR` reread until two reads agree; `calculate_rtc_ms`; one second back while `SSR > PREDIV_S` (`:155-199`) | the same; each register read once per pass |
+| Backup-register protection | `LL_RTC_SetBackupRegProtection(RTC, DR0, DR0)`, `LL_RTC_SetRtcPrivilege` (`rtc.c:59-61`) | not written; they matter only with TrustZone, which neither enables |
+
+The calendar and `DR0` are in the backup domain, so a time set before a
+reset still reads after it (checked on a bench). A time set by C firmware
+should read in Rust firmware flashed over it, since embassy does not reset
+the backup domain on the U5; not yet run.
+
+Two `stm32_rtc.c` quirks, reproduced (bm_protocol application code, so not
+in `docs/c-divergences.md`):
+
+| Quirk | Effect |
+|---|---|
+| `calculate_rtc_ms` counts from `2 * PREDIV_S`, not `2 * PREDIV_S + 1`, while `SSR > PREDIV_S` | 1/256 s low; at `SSR` 511 the `uint32_t` wraps and `ms` reads 65531 |
+| `SSR > PREDIV_S` follows every `rtcSet`, since the shift adds `adjust` (up to 256) to `SSR` | the `decrement_one_second` workaround runs for up to a second after each set |
+
 ## Not used yet
 
-USB (the C console and pcap), the Bristlefin expander and LEDs, the RTC on
-LSE, the watchdog (`MX_IWDG_Init`), low-power management, and the SMPS.
+USB (the C console and pcap), the Bristlefin expander and LEDs, LSI, the
+watchdog (`MX_IWDG_Init`), low-power management, and the SMPS.
