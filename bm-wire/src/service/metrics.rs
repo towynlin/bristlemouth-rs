@@ -13,13 +13,14 @@
 //! The decoder looks components up by key and fields by key, writing each
 //! into the [`Field`] of the matching entry.
 //!
-//! Divergences reproduced here: #82 (a `String` field), #83 (what decode
-//! checks and what it skips), #84 (a tagged field value).
+//! Divergences reproduced here: #85 (a `String` field), #86 (what decode
+//! checks and what it skips), #87 (a tagged field value).
 
-use crate::cbor::tinycbor::{Error, Value};
-use crate::service::messages::{
-    Encoder, MAX_KEY_LEN, c_str, decode_key_value_uint, decoder_message_enter,
-};
+use super::{MapWriter, encode_map, enter_map, skip_key};
+use crate::cbor::parser::{CborError, Value};
+
+/// `max_key_len`: `bm_decode_fields_from_table`'s key buffer, NUL included.
+pub const MAX_KEY_LEN: usize = 64;
 
 /// `METRICS_REPLY_VERSION`.
 pub const VERSION: u8 = 1;
@@ -44,7 +45,7 @@ pub enum Field {
     /// `BM_FIELD_DOUBLE`, on the wire as `fb` only.
     Double(f64),
     /// `BM_FIELD_STRING`, which neither table function implements: encoding
-    /// one fails and decoding one skips it (divergence #82).
+    /// one fails and decoding one skips it (divergence #85).
     String,
 }
 
@@ -99,54 +100,83 @@ pub struct Reply {
 /// | `TooFewItems` | a component has a [`Field::String`] elsewhere |
 /// | `OutOfMemory` | the body does not fit `buf` |
 ///
-/// On error `buf` holds a partial body.
-pub fn encode(reply: &Reply, components: &[Component<'_>], buf: &mut [u8]) -> Result<usize, Error> {
-    let mut enc = Encoder::new(buf);
-    enc.map(NUM_FIELDS);
-    enc.text_stringz("version");
-    enc.uint(reply.version.into());
-    enc.text_stringz("node_id");
-    enc.uint(reply.node_id);
-    enc.text_stringz("uptime_ms");
-    enc.uint(reply.uptime_ms.into());
-    enc.text_stringz("data");
-    enc.map(components.len());
+/// On error `buf`'s contents are unspecified; the C sends nothing.
+pub fn encode(
+    reply: &Reply,
+    components: &[Component<'_>],
+    buf: &mut [u8],
+) -> Result<usize, CborError> {
+    // The C meets these while encoding, but they depend only on the tables
+    // and win over `OutOfMemory`, so they are checked first.
     for c in components {
-        enc.text_stringz(c.key);
-        enc.map(c.fields.len());
-        encode_fields(&mut enc, c.fields)?;
+        string_entries(c.fields)?;
     }
-    enc.finish()
+    encode_map(buf, NUM_FIELDS, |w| {
+        w.uint("version", reply.version.into());
+        w.uint("node_id", reply.node_id);
+        w.uint("uptime_ms", reply.uptime_ms.into());
+        w.text(b"data");
+        w.map(components.len());
+        for c in components {
+            w.text(c_str(c.key));
+            w.map(c.fields.len());
+            encode_fields(w, c.fields);
+        }
+    })
 }
 
-/// `bm_encode_fields_from_table`, then closing the component's map.
+/// What `bm_encode_fields_from_table` and closing the component's map make
+/// of [`Field::String`] entries.
 ///
 /// A `String` entry writes its key and no value, and sets `UnsupportedType`,
 /// which the next entry's key overwrites. So a trailing `String` returns
 /// `UnsupportedType`, and any other leaves the map one item short, which
 /// `cbor_encoder_close_container` reports as `TooFewItems`.
-fn encode_fields(enc: &mut Encoder<'_>, entries: &[Entry<'_>]) -> Result<(), Error> {
-    let mut short = false;
-    for e in entries {
-        enc.text_stringz(e.key);
-        match e.field {
-            Field::U8(v) => enc.uint(v.into()),
-            Field::U16(v) => enc.uint(v.into()),
-            Field::U32(v) => enc.uint(v.into()),
-            Field::U64(v) => enc.uint(v),
-            Field::Float(v) => enc.float(v),
-            Field::Double(v) => enc.double(v),
-            Field::String => short = true,
-        }
-    }
+fn string_entries(entries: &[Entry<'_>]) -> Result<(), CborError> {
     match entries.last() {
         Some(Entry {
             field: Field::String,
             ..
-        }) => Err(Error::UnsupportedType),
-        _ if short => Err(Error::TooFewItems),
+        }) => Err(CborError::UnsupportedType),
+        _ if entries.iter().any(|e| e.field == Field::String) => Err(CborError::TooFewItems),
         _ => Ok(()),
     }
+}
+
+/// `bm_encode_fields_from_table`, for a table [`string_entries`] accepts.
+fn encode_fields(w: &mut MapWriter<'_, '_>, entries: &[Entry<'_>]) {
+    for e in entries {
+        w.text(c_str(e.key));
+        match e.field {
+            Field::U8(v) => w.positive(v.into()),
+            Field::U16(v) => w.positive(v.into()),
+            Field::U32(v) => w.positive(v.into()),
+            Field::U64(v) => w.positive(v),
+            Field::Float(v) => w.float(v),
+            Field::Double(v) => w.double(v),
+            Field::String => {}
+        }
+    }
+}
+
+/// `key` as `strlen` and `strcmp` see it: up to its first NUL.
+fn c_str(key: &str) -> &[u8] {
+    let key = key.as_bytes();
+    let end = key.iter().position(|&b| b == 0).unwrap_or(key.len());
+    &key[..end]
+}
+
+/// `decode_key_value_uint8`, `_uint32` and `_uint64` before the narrowing
+/// cast: a text key, of any content (divergence #86), then an unsigned
+/// integer.
+fn key_value_uint(value: &mut Value<'_>) -> Result<u64, CborError> {
+    skip_key(value)?;
+    if !value.is_unsigned_integer() {
+        return Err(CborError::IllegalType);
+    }
+    let v = value.extract();
+    value.advance()?;
+    Ok(v)
 }
 
 /// `metrics_reply_decode`: fill `reply` and each component's fields from
@@ -169,23 +199,24 @@ fn encode_fields(enc: &mut Encoder<'_>, entries: &[Entry<'_>]) -> Result<(), Err
 ///
 /// A tinycbor parse error, `IllegalType` or `UnknownLength` from the shape
 /// above, or `ImproperValue`, `UnknownLength` or `IllegalType` from a
-/// component's fields.
+/// component's fields. `Unreachable` where the C fails a tinycbor assertion
+/// (divergence #87).
 pub fn decode(
     buf: &[u8],
     reply: &mut Reply,
     components: &mut [ComponentMut<'_, '_>],
-) -> Result<(), Error> {
-    let mut value = decoder_message_enter(buf, NUM_FIELDS)?;
-    reply.version = decode_key_value_uint(&mut value)? as u8;
-    reply.node_id = decode_key_value_uint(&mut value)?;
-    reply.uptime_ms = decode_key_value_uint(&mut value)? as u32;
+) -> Result<(), CborError> {
+    let (_, mut value) = enter_map(buf, NUM_FIELDS)?;
+    reply.version = key_value_uint(&mut value)? as u8;
+    reply.node_id = key_value_uint(&mut value)?;
+    reply.uptime_ms = key_value_uint(&mut value)? as u32;
 
     if !value.is_text_string() {
-        return Err(Error::IllegalType);
+        return Err(CborError::IllegalType);
     }
     value.advance()?;
     if !value.is_map() {
-        return Err(Error::IllegalType);
+        return Err(CborError::IllegalType);
     }
     let data = value;
 
@@ -195,11 +226,11 @@ pub fn decode(
             continue;
         }
         if !comp.is_map() {
-            return Err(Error::IllegalType);
+            return Err(CborError::IllegalType);
         }
         let mut field = comp.enter_container()?;
         match decode_fields(&mut field, c.fields) {
-            Ok(()) | Err(Error::UnsupportedType) => {}
+            Ok(()) | Err(CborError::UnsupportedType) => {}
             Err(e) => return Err(e),
         }
     }
@@ -226,16 +257,16 @@ pub fn decode(
 ///
 /// # Errors
 ///
-/// As in the table.
-pub fn decode_fields(value: &mut Value<'_>, entries: &mut [Entry<'_>]) -> Result<(), Error> {
+/// As in the table; `Unreachable` for a tagged value (divergence #87).
+pub fn decode_fields(value: &mut Value<'_>, entries: &mut [Entry<'_>]) -> Result<(), CborError> {
     let mut unknown_key = false;
     let mut type_mismatch = false;
 
     while !value.at_end() {
         if !value.is_text_string() {
-            return Err(Error::IllegalType);
+            return Err(CborError::IllegalType);
         }
-        let key_len = value.get_length()?;
+        let key_len = value.string_length()?;
         if key_len > MAX_KEY_LEN - 1 {
             value.advance()?;
             value.advance()?;
@@ -243,7 +274,12 @@ pub fn decode_fields(value: &mut Value<'_>, entries: &mut [Entry<'_>]) -> Result
         }
         let mut key = [0u8; MAX_KEY_LEN];
         // `key_len` bytes into `key_len` bytes of room: no NUL, never short.
-        value.copy_string(&mut key[..key_len])?;
+        let copied = value.copy_string(key_len, |at, chunk| {
+            key[at..at + chunk.len()].copy_from_slice(chunk);
+        })?;
+        if !copied.all {
+            return Err(CborError::OutOfMemory);
+        }
         let key = &key[..key.iter().position(|&b| b == 0).unwrap_or(key_len)];
         value.advance()?;
 
@@ -252,12 +288,12 @@ pub fn decode_fields(value: &mut Value<'_>, entries: &mut [Entry<'_>]) -> Result
                 let v = &*value;
                 let uint = v.is_unsigned_integer();
                 match &mut entry.field {
-                    Field::U8(d) if uint => *d = v.get_uint64() as u8,
-                    Field::U16(d) if uint => *d = v.get_uint64() as u16,
-                    Field::U32(d) if uint => *d = v.get_uint64() as u32,
-                    Field::U64(d) if uint => *d = v.get_uint64(),
-                    Field::Float(d) if v.is_float() => *d = v.get_float(),
-                    Field::Double(d) if v.is_double() => *d = v.get_double(),
+                    Field::U8(d) if uint => *d = v.extract() as u8,
+                    Field::U16(d) if uint => *d = v.extract() as u16,
+                    Field::U32(d) if uint => *d = v.extract() as u32,
+                    Field::U64(d) if uint => *d = v.extract(),
+                    Field::Float(d) if v.is_float() => *d = f32::from_bits(v.extract() as u32),
+                    Field::Double(d) if v.is_double() => *d = f64::from_bits(v.extract()),
                     // The C sets `UnsupportedType` and the advance below
                     // overwrites it.
                     Field::String => {}
@@ -270,9 +306,9 @@ pub fn decode_fields(value: &mut Value<'_>, entries: &mut [Entry<'_>]) -> Result
     }
 
     if type_mismatch {
-        Err(Error::ImproperValue)
+        Err(CborError::ImproperValue)
     } else if unknown_key {
-        Err(Error::UnsupportedType)
+        Err(CborError::UnsupportedType)
     } else {
         Ok(())
     }

@@ -23,9 +23,9 @@
 //! [`push_f32_wide`]. RFC 8949 permits the wider encoding; it is only
 //! *preferred* serialization that does not.
 
-pub use cbor2;
+pub mod parser;
 
-pub mod tinycbor;
+pub use cbor2;
 
 use cbor2::core::Encoder;
 use cbor2::io::{Error, Write};

@@ -21,13 +21,13 @@
 //! A tag on a field value makes `bm_decode_fields_from_table` advance past
 //! the end of the component's map, which is a tinycbor precondition
 //! violation: `assert` with asserts on, `unreachable()` under `NDEBUG`
-//! (divergence #84). The port returns `AdvancePastEof`, the code after the
-//! assertion. For a body where it does, the C is not called; the comparator
-//! asserts only that the body holds a tag head (major type 6), the one way
-//! to reach it.
+//! (divergence #87). The port returns `CborError::Unreachable` there, as
+//! `bm_wire::cbor::parser` does for every such assertion. For a body where
+//! it does, the C is not called; the comparator asserts only that the body
+//! holds a tag head (major type 6), the one way to reach it.
 
 use arbitrary::Arbitrary;
-use bm_wire::cbor::tinycbor::Error;
+use bm_wire::cbor::parser::CborError;
 use bm_wire::service::metrics::{self, Component, ComponentMut, Entry, Field, Reply};
 use bm_wire_sys as sys;
 
@@ -190,8 +190,11 @@ fn slot_bits(f: FieldIn, slot: u64) -> (u8, u64) {
     }
 }
 
-fn code(r: Result<(), Error>) -> i32 {
-    r.err().map_or(0, Error::code)
+/// The C value of an outcome that is not `Unreachable`.
+fn code(r: Result<(), CborError>) -> i32 {
+    r.err()
+        .map_or(Some(0), CborError::code)
+        .expect("Unreachable is filtered out before comparing")
 }
 
 /// Encode `input`'s components both sides. Returns the C's bytes on success.
@@ -292,7 +295,7 @@ fn check_encode(input: &MetricsCodecInput) -> Option<Vec<u8>> {
             Some(c_buf[..len].to_vec())
         }
         Err(e) => {
-            assert_eq!(e.code(), err, "encode: Rust returned {e:?}, C {err}");
+            assert_eq!(e.code(), Some(err), "encode: Rust returned {e:?}, C {err}");
             None
         }
     }
@@ -332,10 +335,10 @@ fn check_decode(input: &MetricsCodecInput, body: &[u8]) {
     };
     let rs = metrics::decode(body, &mut reply, &mut comps);
     drop(comps);
-    if rs == Err(Error::AdvancePastEof) {
+    if rs == Err(CborError::Unreachable) {
         assert!(
             body.iter().any(|b| b >> 5 == 6),
-            "decode: AdvancePastEof without a tag in {body:02x?}"
+            "decode: Unreachable without a tag in {body:02x?}"
         );
         return;
     }

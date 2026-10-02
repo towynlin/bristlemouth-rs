@@ -119,9 +119,12 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 79 | `bm_sub_wl` checks only a topic's first callback for a duplicate | c-only | reading, confirmed differentially (card P2) |
 | 80 | `bm_unsub_wl` returns `BmEINVAL` for a topic not subscribed | replicated | reading, confirmed differentially (card P2) |
 | 81 | `spotter_log` budgets its text against `max_payload_len`, not the pub/sub message limit | replicated | reading, confirmed differentially (card S1) |
-| 82 | `BM_FIELD_STRING` is unimplemented in both field-table functions | replicated | reading, confirmed differentially (card M2) |
-| 83 | `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL | replicated | reading, confirmed differentially (card M2) |
-| 84 | A tagged field value makes `bm_decode_fields_from_table` advance past its map | domain-limited | `cargo fuzz run metrics_codec` (card M2) |
+| 82 | Service body decoders read uints with an unchecked `cbor_value_get_uint64` | replicated (release build); domain-limited (tags) | reading, confirmed differentially (card M1) |
+| 83 | `sys_info_reply_decode` sizes `app_name` from the sender's `app_name_strlen` | replicated; c-only (terminator, leak) | reading, confirmed differentially (card M1) |
+| 84 | `config_cbor_map_reply_decode` reads `cbor_data` only when `success` and a length are set | replicated; domain-limited (not a byte string) | reading, confirmed differentially (card M1) |
+| 85 | `BM_FIELD_STRING` is unimplemented in both field-table functions | replicated | reading, confirmed differentially (card M2) |
+| 86 | `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL | replicated | reading, confirmed differentially (card M2) |
+| 87 | A tagged field value makes `bm_decode_fields_from_table` advance past its map | domain-limited | `cargo fuzz run metrics_codec` (card M2) |
 
 ---
 
@@ -2803,7 +2806,109 @@ both sides of each limit.
 Fix upstream by budgeting against `max_payload_len_udp` less the pub/sub
 header and the topic, and returning `BmEMSGSIZE`.
 
-## 82. `BM_FIELD_STRING` is unimplemented in both field-table functions
+## 82. Service body decoders read uints with an unchecked `cbor_value_get_uint64`
+
+`sys_info_reply_decode` (four fields), `config_cbor_map_request_decode` (one)
+and `config_cbor_map_reply_decode` (four) check that each key is a text
+string, then call `cbor_value_get_uint64` on the value without
+`cbor_value_is_unsigned_integer`. `cbor_value_get_uint64` is a `cbor.h`
+inline that `assert`s the type:
+
+| Value | Debug build | Release build (`NDEBUG`) |
+|---|---|---|
+| unsigned integer | the integer | the integer |
+| any other item | `assert` fails: the node aborts | the head's argument: a string's or container's length, 31 for an indefinite length, 0 for `false`, 21 for `true`, a float's bits, a tag's number |
+| a tag | aborts, as above | the tag's number; the iterator then sits on the tagged item, which does not count as a map entry, so `cbor_value_leave_container` fails its `cbor_assert`: `unreachable()`, undefined |
+
+`config_cbor_map_request_decode` runs in `config_map_service_handler`, on
+every node that registers `config_map` (a dev kit's `app_main.cpp` does), for
+any node's request. `{"p": "ab"}`, six bytes, aborts a debug build; bm_protocol
+builds the dev kit `hello_world` and the Bridge as `Debug`
+(`tools/scripts/release/configs/default.yml`). `power_info_reply_decode`
+goes through `bm_messages_helper.c`'s `decode_key_value_uint32`, which checks
+the type, and is not affected.
+
+**replicated**, as a release build: `bm_wire::cbor::parser::Value::extract`
+is `_cbor_value_extract_int64_helper`, and `bm-wire-sys/build.rs` compiles
+the four codecs with `NDEBUG` (`T2_RELEASE`) so the oracle can be called on
+these inputs. **domain-limited** for a tag: the port returns
+`CborError::Unreachable` and `bm-wire-diff/src/service_codecs.rs` does not
+call the C.
+
+Fix upstream by checking `cbor_value_is_unsigned_integer` before each read,
+as `decode_key_value_uint32` does.
+
+## 83. `sys_info_reply_decode` sizes `app_name` from the sender's `app_name_strlen`
+
+```c
+size_t buflen = d->app_name_strlen + 1;
+char *buf = (char *)bm_malloc(sizeof(char) * buflen);
+...
+err = cbor_value_copy_text_string(&value, buf, &buflen, NULL);
+if (err != CborNoError) {
+  break;
+}
+d->app_name = buf;
+```
+
+`app_name_strlen` is read from the body, not from the string. With a name of
+`n` bytes:
+
+| `app_name_strlen` | Result |
+|---|---|
+| ≥ `n` | success, NUL-terminated |
+| `n − 1` | success, **no terminator**: the copy fills the buffer and `cbor_value_copy_text_string` writes a NUL only if there is room |
+| < `n − 1` | `CborErrorOutOfMemory`; `buf` is **leaked** |
+| `UINT32_MAX` | the `+ 1` wraps in 32 bits to a 0-byte allocation: `malloc(0)` on a hosted libc, NULL on FreeRTOS's heaps |
+| larger than the free heap | `CborErrorOutOfMemory` |
+
+The decoder runs on the requester (a Bridge's `topology_sampler.cpp`), which
+then reads `app_name` as a C string.
+
+**replicated** for success and failure: `bm_wire::service::sys_info::DecodedSysInfoReply::decode_into`
+refuses a name longer than `app_name_strlen + 1` and returns the name as a
+`CborString`, with its length. **c-only** for the terminator and the leak.
+`bm-wire-diff/src/service_codecs.rs` checks the C's terminator where it has
+room for one, frees the leaked buffer, and skips inputs whose allocation the
+shim refuses (zero bytes or over 64 KiB, `bm_shim_heap_watch_begin`).
+
+Fix upstream by sizing the buffer with `cbor_value_calculate_string_length`
+and freeing it on failure.
+
+## 84. `config_cbor_map_reply_decode` reads `cbor_data` only when `success` and a length are set
+
+After the `cbor_data` key:
+
+```c
+if (d->cbor_encoded_map_len && d->success) {
+  ... copy, advance, leave the map ...
+}
+```
+
+| `success`, `cbor_encoded_map_len` | Value | Result |
+|---|---|---|
+| either zero | anything well-formed | `CborNoError`; the value is not read and the map is not left |
+| both set | byte string of exactly that length | `CborNoError`, data copied |
+| both set | shorter byte string | `CborErrorIllegalType`, with the copy left in `cbor_data` |
+| both set | longer byte string | `CborErrorOutOfMemory`, with the chunks that fitted left in `cbor_data` |
+| both set | not a byte string | `cbor_value_copy_byte_string` fails its `assert` (debug) or reaches `iterate_string_chunks`' `cbor_assert` (release, undefined) |
+| both set, length larger than the free heap | anything | `CborNoError` with `cbor_data` NULL |
+
+`success` is any non-zero value (`(bool)tmp_uint64`), and both fields are
+read as #82 describes.
+
+**replicated**, assuming the allocation succeeds:
+`bm_wire::service::config_map::DecodedConfigMapReply::decode_into`.
+**domain-limited** where the value is not a byte string: the port returns
+`CborError::Unreachable` and the comparator does not call the C. The C's
+`cbor_data` on failure is not compared, and an input whose allocation the
+shim refuses is skipped.
+
+Fix upstream by checking `cbor_value_is_byte_string` and the length before
+allocating, reading the value in every case, and failing when the
+allocation fails.
+
+## 85. `BM_FIELD_STRING` is unimplemented in both field-table functions
 
 `bm_common_messages/bm_messages_helper.c`. `bm_encode_fields_from_table`
 encodes each entry's key, then its value in a `switch` whose `default:` sets
@@ -2825,7 +2930,7 @@ out ("TODO"); its `default:` sets `CborErrorUnsupportedType`, which the
 Fix upstream by implementing the type, or by refusing it before encoding the
 key.
 
-## 83. `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL
+## 86. `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL
 
 `bm_common_messages/metrics_reply_msg.c` and `bm_messages_helper.c`:
 
@@ -2848,7 +2953,7 @@ fuzz target compare the error and every destination after each decode.
 Fix upstream by comparing each top-level key with `key_expected`, and by
 comparing field keys by length (`cbor_value_text_string_equals`).
 
-## 84. A tagged field value makes `bm_decode_fields_from_table` advance past its map
+## 87. A tagged field value makes `bm_decode_fields_from_table` advance past its map
 
 `bm_decode_fields_from_table` steps over each value with one
 `cbor_value_advance`. On a tag, that steps over the tag alone; tags do not
@@ -2866,9 +2971,9 @@ Reached by `{"k": 1("s")}` in any component a requester decodes; the body
 comes from the node being asked.
 
 **domain-limited.** `bm_wire::service::metrics::decode_fields` returns
-`CborErrorAdvancePastEOF`, the code after the assertion. The comparator
-(`bm-wire-diff/src/metrics_codec.rs`) does not call the C for a body the port
-decodes to that error, and asserts the body holds a tag.
+`CborError::Unreachable`, as `bm_wire::cbor::parser` does at every tinycbor
+assertion. The comparator (`bm-wire-diff/src/metrics_codec.rs`) does not call
+the C for a body the port decodes to that, and asserts the body holds a tag.
 `seeds/metrics_codec/tag-on-field-value` is the fuzzer's input.
 
 Fix upstream by `cbor_value_skip_tag` before reading a key or value, or by

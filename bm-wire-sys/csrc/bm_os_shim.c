@@ -115,7 +115,38 @@ void bm_shim_debug_printf(const char *format, ...) {
 // Memory
 // ---------------------------------------------------------------------------
 
-void *bm_malloc(size_t size) { return malloc(size); }
+static _Thread_local struct {
+  bool on;
+  size_t limit;
+  BmShimHeapWatch seen;
+} HEAP_WATCH;
+
+void bm_shim_heap_watch_begin(size_t limit) {
+  HEAP_WATCH.on = true;
+  HEAP_WATCH.limit = limit;
+  HEAP_WATCH.seen = (BmShimHeapWatch){0};
+}
+
+BmShimHeapWatch bm_shim_heap_watch_end(void) {
+  HEAP_WATCH.on = false;
+  return HEAP_WATCH.seen;
+}
+
+void *bm_malloc(size_t size) {
+  if (!HEAP_WATCH.on) {
+    return malloc(size);
+  }
+  if (size == 0 || size > HEAP_WATCH.limit) {
+    HEAP_WATCH.seen.refused++;
+    return NULL;
+  }
+  void *p = malloc(size);
+  if (p) {
+    HEAP_WATCH.seen.allocations++;
+    HEAP_WATCH.seen.last = p;
+  }
+  return p;
+}
 void bm_free(void *ptr) { free(ptr); }
 
 // ---------------------------------------------------------------------------

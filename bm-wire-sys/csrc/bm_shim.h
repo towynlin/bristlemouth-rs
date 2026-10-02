@@ -67,6 +67,23 @@ bool bm_shim_dfu_load(uint32_t offset, const uint8_t *data, uint32_t len);
 void bm_shim_set_debug(bool on);
 void bm_shim_debug_printf(const char *format, ...);
 
+// --- the heap (bm_malloc) ---
+
+// What bm_malloc did on this thread while a watch was open.
+typedef struct {
+  uint32_t allocations; // calls that returned memory
+  uint32_t refused;     // calls refused for their size
+  void *last;           // the last memory returned, or NULL
+} BmShimHeapWatch;
+
+// Start watching bm_malloc on the calling thread, refusing any request of
+// zero bytes or more than `limit`, as a small embedded heap would. bm_malloc
+// is plain malloc otherwise. Thread-local, so tests running in parallel do
+// not see each other's watches.
+void bm_shim_heap_watch_begin(size_t limit);
+// Stop watching and report what happened since bm_shim_heap_watch_begin.
+BmShimHeapWatch bm_shim_heap_watch_end(void);
+
 // --- bringing the stack up ---
 
 // Initialise L2, the IP layer, BCMP, topology, services, pubsub and

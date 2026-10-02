@@ -121,6 +121,10 @@ pub fn replay_target(target: &str) -> usize {
                 crate::time::check(i);
             }),
             "udp" => replay_one::<crate::udp::UdpInput, _>(&bytes, crate::udp::check),
+            "service_codecs" => replay_one::<crate::service_codecs::ServiceCodecsInput, _>(
+                &bytes,
+                crate::service_codecs::check,
+            ),
             "pubsub" => replay_one::<crate::pubsub::PubSubInput, _>(&bytes, crate::pubsub::check),
             "node_udp" => {
                 replay_one::<crate::node_udp::NodeUdpInput, _>(&bytes, crate::node_udp::check)
@@ -169,6 +173,7 @@ pub const TARGETS: &[&str] = &[
     "dfu_codec",
     "l2_policy",
     "metrics_codec",
+    "service_codecs",
     "strnlen",
     "time_remaining",
     "wildcard",

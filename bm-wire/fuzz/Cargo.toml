@@ -35,6 +35,15 @@ bench = false
 # `check` resets both through `config_init` at the start of every iteration,
 # so a crash leaves nothing the next iteration does not undo. Nothing else in
 # this process touches them.
+# tinycbor and the service body codecs keep no state; the shim's heap watch
+# is thread-local and closed before `check` returns.
+[[bin]]
+name = "service_codecs"
+path = "fuzz_targets/service_codecs.rs"
+test = false
+doc = false
+bench = false
+
 [[bin]]
 name = "configuration"
 path = "fuzz_targets/configuration.rs"

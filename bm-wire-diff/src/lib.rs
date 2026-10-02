@@ -44,6 +44,7 @@ pub mod pubsub;
 pub mod registry;
 pub mod replay;
 pub mod resource;
+pub mod service_codecs;
 pub mod spotter;
 pub mod stack;
 pub mod time;
