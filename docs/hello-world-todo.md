@@ -56,7 +56,7 @@ bus with a Spotter and a C dev kit:
 | Dev kit board support (MCU HAL, pins, node id, time driver) | Done (`bm-devkit`), run on a dev kit |
 | Config in the dev kit's NOR flash | Done (`bm-devkit`: `w25`, `storage`), untested on hardware |
 | The hello-world app | Done: `bm-devkit/src/bin/hello_world.rs`; the four checks above passed on a bench |
-| RTC set from the Spotter's `spotter/utc-time` | Done: `bm_stack::utc_time`, `bm_devkit::rtc::DevkitRtc`, in `hello_world`; not yet run on a bench: card T1 |
+| RTC set from the Spotter's `spotter/utc-time` | Done: `bm_stack::utc_time`, `bm_devkit::rtc::DevkitRtc`, in `hello_world`; run on a bench |
 
 A node that heartbeats, is discovered, answers ping and info, publishes,
 subscribes and calls `spotter_log` runs on the mock PHY
@@ -102,7 +102,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 |---|---|---|
 | `network_add_egress_port` UDP branch | Already divergence #12; latent because global multicast is never egress-stamped. Stays latent here. | — |
 
-## What the landed cards (A1, B1, B2, E0, E1, F1, H0, P1, P2, S1, U1, U2) and T1's code left for the rest
+## What the landed cards (A1, B1, B2, E0, E1, F1, H0, P1, P2, S1, T1, U1, U2) left for the rest
 
 - **Two ways for application code to reach the node, and why.** Some
   applications need a task of their own and some fit in the node's loop, so
@@ -352,7 +352,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
   It subscribes to `spotter/*` rather than an app topic because that matches
   what stock C dev kit firmware publishes, so the receive check needs no C
-  change. It also receives the Spotter's `spotter/utc-time` (card T1).
+  change. It also receives the Spotter's `spotter/utc-time` (T1, below).
   `DevkitIdentity` reports the crate version and the first 8 hex digits of
   `HEAD` (`bm-devkit/build.rs`), as the C reports its version and SHA.
 - **`spotter/utc-time` (T1).** The handler is bm_protocol application code
@@ -371,24 +371,13 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   | A helper for an `App`, not a `Node` method | the C has it in the app; `on_event` has no node, so the set waits one loop pass |
   | The STM32 RTC, as the C | survives a reset, and keeps time the C set before a reflash; `config` turns LSE on for it |
 
+  On E1's bench every check in PR #45 passed: LSE starts; an unset clock
+  leaves `bm time get` unanswered; the Spotter publishes type 1, version 1
+  and the clock is set from it; `get` returns the Spotter's time and 10 s
+  later a time 10 s later; the clock answers after a reset, and after a
+  reflash over C firmware that had set it; `bringup` runs.
+
 ---
-
-## Card T1 — Set the RTC from `spotter/utc-time`: the bench check
-
-**Blocks:** nothing. **Blocked by:** nothing.
-
-The code is in (`bm_stack::utc_time`, `bm_devkit::rtc`, `hello_world`); see
-"What the landed cards left". What remains is the bench run, on E1's bench.
-
-1. Flash `hello_world`. Its defmt log shows each `spotter/utc-time`
-   publication with its type and version, `rtc set to … us` after each, and
-   `utc-time: …` when the C's checks refuse one.
-2. From the C dev kit, `bm time get 0b54ccce5c7978bf`, then again 10 s later.
-3. Reset the Rust node and `get` again before the Spotter's next
-   publication: the RTC is in the backup domain, so it still answers.
-
-Done: the first `get` returns the Spotter's time, the second a time 10 s
-later, and the third answers, each reported as done or not done.
 
 ## Card B3 — Share the dev kit's NOR flash between config and a DFU slot
 
@@ -424,12 +413,10 @@ Done: builds in CI; `bringup` still logs a committed key after the reset
 ## Order
 
 ```
-T1
-
 B3
 ```
 
-T1 and B3 can start now and run in parallel.
+B3 can start now.
 
 # Explicitly out of scope
 
