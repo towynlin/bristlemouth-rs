@@ -44,6 +44,12 @@ A cargo workspace.
   CBOR values. **Must never depend on `bm-wire-sys`**, in any configuration:
   that keeps the host-only oracle out of firmware builds. The `std` feature is
   for tests and fuzzing only, and must not forward to `cbor2`.
+  - `src/cbor/tinycbor.rs` — tinycbor's parser, ported line for line, at
+    bm_core's `CBOR_PARSER_MAX_RECURSIONS` of 10. Decode `bm_common_messages`
+    bodies with it rather than `cbor2::core::Decoder`: their error codes and
+    partial writes are observable.
+  - `src/service/` — the service layer. `messages.rs` is
+    `bm_messages_helper.c`; `metrics.rs` is the `metrics` reply body.
   - `fuzz/` — a `cargo fuzz` crate, its own workspace. Targets are ~6 lines
     each; the work is in `bm-wire-diff`.
   - `fuzz/seeds/` — committed seed corpora, one directory per target, replayed

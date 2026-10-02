@@ -25,6 +25,8 @@
 
 pub use cbor2;
 
+pub mod tinycbor;
+
 use cbor2::core::Encoder;
 use cbor2::io::{Error, Write};
 
