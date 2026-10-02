@@ -120,10 +120,23 @@
 //! | `bm_pub_wl` | [`Node::publish`]: local delivery first, then the frame to `FF03::1` from and to [`pubsub::PORT`]; adds a `PUB` resource once the frame is built |
 //! | `middleware_net_task`, then `bm_handle_msg` | [`Node::on_frame`]: a datagram to [`pubsub::PORT`] **from** [`pubsub::PORT`] is decoded and reported as one [`Event::Publication`] per matching subscription; from any other port it is dropped (divergence #73) |
 //!
-//! The C has a list of callbacks per topic; a node here has one subscriber,
-//! its application, so a topic is subscribed or not. A publication
-//! [`pubsub::decode`] refuses is dropped, where `bm_handle_msg` reads past it
-//! (divergence #75).
+//! The C has a list of callbacks per topic; a node here has two, its
+//! application and the service layer, listed per topic as the C lists them
+//! ([`Subscriptions`], divergence #79). A publication [`pubsub::decode`]
+//! refuses is dropped, where `bm_handle_msg` reads past it (divergence #75).
+//!
+//! # Services
+//!
+//! `middleware/bm_service.c` and `echo_service.c`. [`Node::register_service`]
+//! lists a service answered by the application's [`Services`], and
+//! [`Node::register_echo_service`] lists echo; each subscribes the service
+//! layer to `<name>/req`. A request reaching that subscription is matched
+//! against the list by [`ServiceTable::lookup`], answered, and the reply
+//! published to `<name>/rep` comes back in [`Owed::reply`], as the C builds
+//! it inside the subscriber callback. One reply per received publication;
+//! see [`Node::on_frame_with`] and divergence #89.
+//!
+//! A publication this node makes is not dispatched to its own services.
 //!
 //! # Two timers, not one
 //!
@@ -170,7 +183,8 @@ use bm_wire::frame::{
 use bm_wire::l2::{self, TxKind};
 use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
-use bm_wire::pubsub::{self, SubscriptionError, Subscriptions};
+use bm_wire::pubsub::{self, Subscriber, SubscriptionError, Subscriptions};
+use bm_wire::service::{self as service_wire, Lookup, ReplyHeader, ServiceTable};
 use bm_wire::spotter::{self, EncodeError, NetworkType};
 use bm_wire::udp;
 use bm_wire::util::BmIpAddr;
@@ -179,6 +193,10 @@ use crate::app::{App, Observer};
 use crate::config::{Configuration, NoConfig};
 use crate::dfu::{DfuFinished, HostRequest, NodeDfu};
 use crate::port::{DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy, Rtc, RtcTimeAndDate};
+use crate::service::{
+    NoServices, RegisterError, SERVICE_NAME_BYTES, SERVICES, ServiceHandler, Services,
+    UnregisterError,
+};
 
 /// Largest frame the node will build or accept.
 ///
@@ -460,10 +478,12 @@ pub enum Event<'a> {
     /// A publication reached a subscription — `bm_handle_msg` calling a
     /// subscriber's `BmPubSubCb`.
     ///
-    /// Reported once per matching subscription, in the order they were made,
-    /// so a publication matching two is reported twice. Received from the
-    /// network by [`Node::on_frame_with`], or delivered locally by
-    /// [`Node::publish_with`].
+    /// Reported once per application callback on each matching subscription,
+    /// in the order they were made, so a publication matching two is
+    /// reported twice; a subscription the service layer made first can list
+    /// the application twice (divergence #79). Received from the network by
+    /// [`Node::on_frame_with`], or delivered locally by
+    /// [`Node::publish_with`] and by a service reply.
     Publication {
         /// Node id the publication came from: the source address's low half,
         /// or this node's own id for a local delivery.
@@ -881,6 +901,7 @@ pub struct Node<
     const SUBSCRIPTIONS: usize = SUBSCRIPTIONS_DEFAULT,
     C = NoConfig,
     D = NoDfu,
+    S = NoServices,
 > {
     identity: I,
     rtc: R,
@@ -908,6 +929,10 @@ pub struct Node<
     config: C,
     /// `dfu_core.c` and `dfu_client.c`, their update slot and no-init RAM.
     dfu: NodeDfu<D>,
+    /// `BM_SERVICE_CONTEXT.service_list`.
+    service_table: ServiceTable<ServiceHandler, SERVICES, SERVICE_NAME_BYTES>,
+    /// The application's service handlers.
+    services: S,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -1032,12 +1057,64 @@ impl<
     /// A node answering config messages from `config` and DFU requests
     /// into `dfu`, with an empty neighbour table, at time zero.
     ///
+    /// [`Node::with_services`] with [`NoServices`]: a service
+    /// [`Node::register_service`] lists goes unanswered.
+    pub fn with_dfu(identity: I, rtc: R, config: C, dfu: D, port_count: u8) -> Self {
+        Self::with_services(identity, rtc, config, dfu, NoServices, port_count)
+    }
+}
+
+impl<
+    I: Identity,
+    R: Rtc,
+    const NEIGHBORS: usize,
+    const PENDING: usize,
+    const PING_PAYLOAD: usize,
+    const INFO_REQUESTS: usize,
+    const INFO_STRINGS: usize,
+    const RESOURCES: usize,
+    const RESOURCE_NAME: usize,
+    const RESOURCE_REQUESTS: usize,
+    const SUBSCRIPTIONS: usize,
+    C: Configuration,
+    D: DfuSlot + NoInitRam,
+    S: Services,
+>
+    Node<
+        I,
+        R,
+        NEIGHBORS,
+        PENDING,
+        PING_PAYLOAD,
+        INFO_REQUESTS,
+        INFO_STRINGS,
+        RESOURCES,
+        RESOURCE_NAME,
+        RESOURCE_REQUESTS,
+        SUBSCRIPTIONS,
+        C,
+        D,
+        S,
+    >
+{
+    /// A node answering config messages from `config`, DFU requests into
+    /// `dfu` and application services from `services`, with an empty
+    /// neighbour table, at time zero.
+    ///
     /// The registry comes up holding what `bcmp_init` registers for the ported
     /// modules, with the expiry sweep phased from zero — where
     /// [`Node::on_tick`]'s uptime clock starts. The DFU machine comes up in
     /// `Init` with the reboot info [`NoInitRam::load`] returns, and moves on
-    /// from it at the first [`Node::next_dfu_transmission`].
-    pub fn with_dfu(identity: I, rtc: R, config: C, dfu: D, port_count: u8) -> Self {
+    /// from it at the first [`Node::next_dfu_transmission`]. No service is
+    /// listed.
+    pub fn with_services(
+        identity: I,
+        rtc: R,
+        config: C,
+        dfu: D,
+        services: S,
+        port_count: u8,
+    ) -> Self {
         let mut registry = Registry::new();
         // heartbeat.c, ping.c, time.c, dfu_core.c, config.c, neighbors.c,
         // info.c and resource_discovery.c, in the order `bcmp_init` calls
@@ -1100,6 +1177,8 @@ impl<
             subscriptions: Subscriptions::new(),
             config,
             dfu,
+            service_table: ServiceTable::new(),
+            services,
             port_count,
             link_mask: 0,
             udp_ports: [None; UDP_PORTS],
@@ -1212,7 +1291,15 @@ impl<
     ///    frame's source address and decides which ports the frame is relayed
     ///    to, and whether it also goes up the local stack;
     /// 2. if it does, a UDP datagram to a bound port is reported as
-    ///    [`Event::Udp`], and anything else is validated as BCMP and answered.
+    ///    [`Event::Udp`], a publication reaches its subscribers, and anything
+    ///    else is validated as BCMP and answered.
+    ///
+    /// A publication reaching the service layer's subscription is a service
+    /// request, and [`Owed::reply`] carries the reply. The C calls the
+    /// service callback once for each time it is listed on a matching
+    /// subscription and publishes one reply per call; each call finds the
+    /// same service, so this calls the handler once and sends one reply
+    /// (divergence #89).
     ///
     /// `frame` is mutated in place, as bm_core mutates it. When a relay is owed
     /// the frame comes back as the C's forwarded copy — the whole ports byte
@@ -1305,7 +1392,8 @@ impl<
                 if datagram.src_port == pubsub::PORT
                     && let Ok(publication) = pubsub::decode(datagram.payload)
                 {
-                    self.deliver_publication(datagram.source, &publication, events);
+                    let reply = self.deliver_publication(datagram.source, &publication, events);
+                    return (reply, None);
                 }
             } else if self.udp_bound(datagram.dst_port) {
                 events(Event::Udp {
@@ -2510,20 +2598,27 @@ impl<
     ///
     /// Publications matching it arrive as [`Event::Publication`]. `topic` may
     /// hold `*` and `?`, and matches every topic it prefixes (divergence #74).
-    /// Subscribing to a topic already subscribed changes nothing. Either way
-    /// `topic` is then advertised as a `SUB` resource, which a topic already
-    /// covered does not change (divergence #38).
+    /// Subscribing to a topic already subscribed changes nothing, unless the
+    /// service layer subscribed it first: then the application is listed
+    /// again, and hears each publication once more (divergence #79). Either
+    /// way `topic` is then advertised as a `SUB` resource, which a topic
+    /// already covered does not change (divergence #38).
     ///
     /// # Errors
     ///
     /// [`SubscribeError::Refused`] with nothing changed, for an empty topic,
     /// one of [`pubsub::TOPIC_MAX_LEN`] bytes or more, one longer than
-    /// `RESOURCE_NAME`, or `SUBSCRIPTIONS` already held.
+    /// `RESOURCE_NAME`, `SUBSCRIPTIONS` already held, or
+    /// [`pubsub::CALLBACKS`] on the topic.
     /// [`SubscribeError::NotAdvertised`] when subscribed but the resource
     /// table is full.
     pub fn subscribe(&mut self, topic: &[u8]) -> Result<(), SubscribeError> {
+        self.subscribe_as(topic, Subscriber::Application)
+    }
+
+    fn subscribe_as(&mut self, topic: &[u8], subscriber: Subscriber) -> Result<(), SubscribeError> {
         self.subscriptions
-            .subscribe(topic)
+            .subscribe_as(topic, subscriber)
             .map_err(SubscribeError::Refused)?;
         match self.resources.add(topic, ResourceType::Subscriber) {
             Ok(()) | Err(ResourceAddError::AlreadyPresent) => Ok(()),
@@ -2537,6 +2632,8 @@ impl<
     /// # Errors
     ///
     /// As [`Subscriptions::unsubscribe`]; nothing changes.
+    /// [`SubscriptionError::NoSuchSubscriber`] for a topic only a service
+    /// subscribed.
     pub fn unsubscribe(&mut self, topic: &[u8]) -> Result<(), SubscriptionError> {
         self.subscriptions.unsubscribe(topic)
     }
@@ -2565,8 +2662,10 @@ impl<
     ///
     /// In the C's order:
     ///
-    /// 1. each of this node's subscriptions matching `topic` is reported to
-    ///    `events` as [`Event::Publication`] from this node's own id;
+    /// 1. each application callback on this node's subscriptions matching
+    ///    `topic` is reported to `events` as [`Event::Publication`] from this
+    ///    node's own id. A service callback is not called: the C queues the
+    ///    publication to its own middleware task, which would;
     /// 2. the publication is built as [`pubsub::encode`] into a datagram to
     ///    `FF03::1` from and to [`pubsub::PORT`], as [`Node::send_udp`] builds
     ///    one;
@@ -2593,16 +2692,15 @@ impl<
             _ => PublishError::TopicTooLong,
         })?;
         let node_id = self.identity.node_id();
-        for subscription in self.subscriptions.matching(topic) {
-            events(Event::Publication {
-                source: node_id,
-                subscription,
-                topic,
-                kind,
-                version,
-                data,
-            });
-        }
+        Self::deliver_locally(
+            &self.subscriptions,
+            node_id,
+            topic,
+            kind,
+            version,
+            data,
+            &mut events,
+        );
         if pubsub::HEADER_LEN + topic.len() + data.len() > pubsub::MAX_MESSAGE_LEN {
             return Err(PublishError::MessageTooLong);
         }
@@ -2717,23 +2815,256 @@ impl<
             .map_err(|_| SpotterError::NotSent)
     }
 
-    /// `bm_handle_msg`: one [`Event::Publication`] per matching subscription.
+    /// `bm_handle_msg`: every callback on every matching subscription, in
+    /// list order. An application callback is an [`Event::Publication`]; the
+    /// service callback is `_service_request_received_cb`, which may build a
+    /// reply into the transmit buffer.
+    ///
+    /// The service callback runs once per publication, however often it is
+    /// listed on matching subscriptions. Each of the C's calls walks the same
+    /// list with the same topic, so each reaches the same handler and
+    /// publishes the same reply; a C requester takes the first and drops the
+    /// rest (divergence #89).
     fn deliver_publication(
-        &self,
+        &mut self,
         source: u64,
         publication: &pubsub::Publication<'_>,
         events: &mut impl FnMut(Event<'_>),
-    ) {
-        for subscription in self.subscriptions.matching(publication.topic) {
-            events(Event::Publication {
-                source,
-                subscription,
-                topic: publication.topic,
-                kind: publication.kind,
-                version: publication.version,
-                data: publication.data,
-            });
+    ) -> Option<Outbound<'_>> {
+        let node_id = self.identity.node_id();
+        let mut served = false;
+        let mut reply_end = None;
+        for (subscription, callbacks) in self.subscriptions.matching_callbacks(publication.topic) {
+            for callback in callbacks {
+                match callback {
+                    Subscriber::Application => events(Event::Publication {
+                        source,
+                        subscription,
+                        topic: publication.topic,
+                        kind: publication.kind,
+                        version: publication.version,
+                        data: publication.data,
+                    }),
+                    Subscriber::Service if !served => {
+                        served = true;
+                        reply_end = Self::serve(
+                            &self.service_table,
+                            &mut self.services,
+                            &mut self.tx,
+                            node_id,
+                            source,
+                            publication,
+                        );
+                    }
+                    Subscriber::Service => {}
+                }
+            }
         }
+        let end = reply_end?;
+
+        // `bm_pub_wl` of the reply: local delivery, then the resource.
+        let payload = &self.tx[udp::PAYLOAD_OFFSET..end];
+        let reply = pubsub::decode(payload).ok()?;
+        Self::deliver_locally(
+            &self.subscriptions,
+            node_id,
+            reply.topic,
+            reply.kind,
+            reply.version,
+            reply.data,
+            events,
+        );
+        let mut topic = [0u8; SERVICE_NAME_BYTES + service_wire::REPLY_SUFFIX.len()];
+        topic[..reply.topic.len()].copy_from_slice(reply.topic);
+        let topic = &topic[..reply.topic.len()];
+        let _ = self.resources.add(topic, ResourceType::Publisher);
+        let frame = &mut self.tx[..end];
+        let mask = l2::take_requested_egress_port(frame, self.port_count).ok()?;
+        Some(Outbound { frame, mask })
+    }
+
+    /// `_service_request_received_cb`, up to the `bm_pub_wl` of its reply:
+    /// find the service, call its handler, and build the reply frame into
+    /// `tx`. Returns the frame's length, or `None` for no reply.
+    fn serve(
+        table: &ServiceTable<ServiceHandler, SERVICES, SERVICE_NAME_BYTES>,
+        services: &mut S,
+        tx: &mut [u8; MTU],
+        node_id: u64,
+        source: u64,
+        publication: &pubsub::Publication<'_>,
+    ) -> Option<usize> {
+        let Lookup::Call {
+            name,
+            handler,
+            header,
+            data,
+            ..
+        } = table.lookup(publication.topic, publication.data)
+        else {
+            return None;
+        };
+        let dst = BmIpAddr::GLOBAL_MULTICAST;
+        let src = udp::source_address(node_id, &dst);
+        let topic_len = name.len() + service_wire::REPLY_SUFFIX.len();
+        let head = pubsub::HEADER_LEN + topic_len;
+        udp::build_with(tx, &src, &dst, pubsub::PORT, pubsub::PORT, |buf| {
+            let body = buf
+                .get_mut(head..head + service_wire::MAX_DATA_SIZE)
+                .ok_or(BmWireError::Truncated)?;
+            body.fill(0);
+            let (reply_header, reply) = body.split_at_mut(ReplyHeader::LEN);
+            let len = match handler {
+                ServiceHandler::Echo => service_wire::echo(data, reply),
+                ServiceHandler::Application => services.handle(name, data, reply),
+            }
+            .filter(|len| *len <= reply.len())
+            .ok_or(BmWireError::Invalid)?;
+            ReplyHeader {
+                target_node_id: source,
+                id: header.id,
+                data_size: len as u32,
+            }
+            .encode(reply_header)?;
+            // `bm_pub_wl`'s header, type 0 and `BM_COMMON_PUB_SUB_VERSION`.
+            buf[..pubsub::HEADER_LEN].copy_from_slice(&[
+                0,
+                0,
+                topic_len as u8,
+                0,
+                pubsub::COMMON_VERSION,
+            ]);
+            service_wire::topic(
+                &mut buf[pubsub::HEADER_LEN..head],
+                name,
+                service_wire::REPLY_SUFFIX,
+            )?;
+            Ok(head + ReplyHeader::LEN + len)
+        })
+        .ok()
+    }
+
+    /// A local delivery of a publication this node made: each application
+    /// callback on a matching subscription, from this node's own id.
+    fn deliver_locally(
+        subscriptions: &Subscriptions<SUBSCRIPTIONS, RESOURCE_NAME>,
+        node_id: u64,
+        topic: &[u8],
+        kind: u8,
+        version: u8,
+        data: &[u8],
+        events: &mut impl FnMut(Event<'_>),
+    ) {
+        for (subscription, callbacks) in subscriptions.matching_callbacks(topic) {
+            for callback in callbacks {
+                if *callback == Subscriber::Application {
+                    events(Event::Publication {
+                        source: node_id,
+                        subscription,
+                        topic,
+                        kind,
+                        version,
+                        data,
+                    });
+                }
+            }
+        }
+    }
+
+    /// List the service `name`, answered by [`Services::handle`] —
+    /// `bm_service_register`.
+    ///
+    /// Appends `name` to the list, then subscribes the service layer to
+    /// `<name>/req` as [`Node::subscribe`] does, `SUB` resource included. A
+    /// name already listed is listed again (divergence #89). Requests then
+    /// arrive through [`Node::on_frame`], and the reply comes back in
+    /// [`Owed::reply`].
+    ///
+    /// # Errors
+    ///
+    /// [`RegisterError::Full`] with nothing changed;
+    /// [`RegisterError::Subscribe`] with the service listed.
+    pub fn register_service(&mut self, name: &[u8]) -> Result<(), RegisterError> {
+        self.list_service(name, ServiceHandler::Application)
+    }
+
+    /// List the echo service, `<node id>/echo` — `echo_service_init`. A
+    /// request's data comes back as its reply.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::register_service`].
+    pub fn register_echo_service(&mut self) -> Result<(), RegisterError> {
+        let mut name = [0u8; SERVICE_NAME_BYTES];
+        // Cannot fail: 21 bytes.
+        let len = service_wire::service_name(&mut name, self.identity.node_id(), b"/echo")
+            .map_err(|_| RegisterError::Full)?;
+        self.list_service(&name[..len], ServiceHandler::Echo)
+    }
+
+    fn list_service(&mut self, name: &[u8], handler: ServiceHandler) -> Result<(), RegisterError> {
+        self.service_table
+            .add(name, handler)
+            .map_err(|_| RegisterError::Full)?;
+        let mut topic = [0u8; SERVICE_NAME_BYTES + service_wire::REQUEST_SUFFIX.len()];
+        // Cannot fail: the table holds no longer name.
+        let len = service_wire::topic(&mut topic, name, service_wire::REQUEST_SUFFIX)
+            .map_err(|_| RegisterError::Full)?;
+        self.subscribe_as(&topic[..len], Subscriber::Service)
+            .map_err(RegisterError::Subscribe)
+    }
+
+    /// Unlist a service — `bm_service_unregister`.
+    ///
+    /// Unsubscribes the service layer from `<name>/req`, then removes the
+    /// first listed service whose name starts with `name`, which need not be
+    /// `name` itself (divergence #89).
+    ///
+    /// # Errors
+    ///
+    /// [`UnregisterError::Unsubscribe`] with nothing changed;
+    /// [`UnregisterError::NotListed`] when unsubscribed but nothing was
+    /// removed.
+    pub fn unregister_service(&mut self, name: &[u8]) -> Result<(), UnregisterError> {
+        let mut topic = [0u8; SERVICE_NAME_BYTES + service_wire::REQUEST_SUFFIX.len()];
+        let topic = match service_wire::topic(&mut topic, name, service_wire::REQUEST_SUFFIX) {
+            Ok(len) => &topic[..len],
+            // Longer than any topic a service subscribes.
+            Err(_) => {
+                let len = name.len() + service_wire::REQUEST_SUFFIX.len();
+                return Err(UnregisterError::Unsubscribe(
+                    if len >= pubsub::TOPIC_MAX_LEN {
+                        SubscriptionError::TopicTooLong
+                    } else {
+                        SubscriptionError::NotSubscribed
+                    },
+                ));
+            }
+        };
+        self.subscriptions
+            .unsubscribe_as(topic, Subscriber::Service)
+            .map_err(UnregisterError::Unsubscribe)?;
+        if self.service_table.remove(name) {
+            Ok(())
+        } else {
+            Err(UnregisterError::NotListed)
+        }
+    }
+
+    /// `BM_SERVICE_CONTEXT.service_list`: the services listed, in the order a
+    /// request is matched against them.
+    pub fn service_table(&self) -> &ServiceTable<ServiceHandler, SERVICES, SERVICE_NAME_BYTES> {
+        &self.service_table
+    }
+
+    /// The application's service handlers.
+    pub fn services(&self) -> &S {
+        &self.services
+    }
+
+    /// The application's service handlers, mutably.
+    pub fn services_mut(&mut self) -> &mut S {
+        &mut self.services
     }
 
     /// Advertise a resource — `bcmp_resource_discovery_add_resource`.
@@ -3382,6 +3713,7 @@ impl<
     const SUBSCRIPTIONS: usize,
     C: Configuration,
     D: DfuSlot + NoInitRam,
+    S: Services,
 >
     Node<
         I,
@@ -3397,6 +3729,7 @@ impl<
         SUBSCRIPTIONS,
         C,
         D,
+        S,
     >
 {
     /// Run the node until the PHY fails, discarding every [`Event`].

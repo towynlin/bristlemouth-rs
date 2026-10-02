@@ -21,7 +21,8 @@
 //! | `bm_handle_msg` computes the data length unchecked; a `topic_len` past the payload wraps it and the callback reads out of bounds | [`decode`] refuses | #75 |
 //! | `bm_pub_wl` sizes its buffer in a `uint16_t` that wraps, then copies past it | [`encode`] takes `usize` lengths and a caller buffer | #76 |
 //!
-//! [`Subscriptions`] is `CTX.subscription_list` with one callback per topic.
+//! [`Subscriptions`] is `CTX.subscription_list`, with two possible callbacks
+//! per topic: the application and the service layer.
 
 use crate::BmWireError;
 
@@ -121,26 +122,69 @@ pub enum SubscriptionError {
     EmptyTopic,
     /// The topic is [`TOPIC_MAX_LEN`] bytes or longer: `BmEMSGSIZE`.
     TopicTooLong,
-    /// `N` topics are held, or the topic is longer than `TOPIC`: ceilings
-    /// bm_core does not have. The C's nearest is `BmENOMEM` from `bm_malloc`.
+    /// `N` topics are held, the topic is longer than `TOPIC`, or the topic
+    /// holds [`CALLBACKS`] callbacks: ceilings bm_core does not have. The C's
+    /// nearest is `BmENOMEM` from `bm_malloc`.
     Full,
     /// [`Subscriptions::unsubscribe`] of a topic not subscribed. `bm_unsub_wl`
     /// returns `BmEINVAL`: its `err` is never reassigned on that path.
     NotSubscribed,
+    /// [`Subscriptions::unsubscribe_as`] of a topic subscribed, but not by
+    /// that subscriber: `BmENOENT`.
+    NoSuchSubscriber,
 }
 
-/// `middleware/pubsub.c`'s `CTX.subscription_list`, holding one subscriber
-/// per topic.
+/// A callback on a topic: what `BmPubSubNode::callback_fn` points at.
 ///
-/// The C keeps a list of callbacks per topic. A node here has one subscriber,
-/// its application, so a topic is subscribed or not:
+/// A node has two: its application, and `bm_service.c`'s
+/// `_service_request_received_cb`, which every service shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subscriber {
+    /// The application, through `Event::Publication` in `bm-stack`.
+    Application,
+    /// The service layer, through `bm_wire::service::ServiceTable`.
+    Service,
+}
+
+/// How many callbacks one topic holds, a ceiling bm_core does not have.
+/// Divergence #79 is what fills a list past two.
+pub const CALLBACKS: usize = 4;
+
+#[derive(Debug, Clone, Copy)]
+struct Entry<const TOPIC: usize> {
+    topic: [u8; TOPIC],
+    len: usize,
+    callbacks: [Subscriber; CALLBACKS],
+    callbacks_len: usize,
+}
+
+impl<const TOPIC: usize> Entry<TOPIC> {
+    const EMPTY: Self = Self {
+        topic: [0; TOPIC],
+        len: 0,
+        callbacks: [Subscriber::Application; CALLBACKS],
+        callbacks_len: 0,
+    };
+
+    fn topic(&self) -> &[u8] {
+        &self.topic[..self.len]
+    }
+
+    fn callbacks(&self) -> &[Subscriber] {
+        &self.callbacks[..self.callbacks_len]
+    }
+}
+
+/// `middleware/pubsub.c`'s `CTX.subscription_list`: topics, each with its
+/// list of callbacks.
 ///
 /// | C | Here |
 /// |---|---|
-/// | `bm_sub_wl` of a new topic appends it | [`Self::subscribe`] appends it |
-/// | `bm_sub_wl` of a topic already held with the same callback: `BmOK`, no change | [`Self::subscribe`]: `Ok`, no change |
-/// | `bm_unsub_wl` of its last callback deletes the topic | [`Self::unsubscribe`] deletes it |
-/// | `bm_handle_msg` calls the callbacks of every matching topic, in list order | [`Self::matching`], in list order |
+/// | `bm_sub_wl` of a new topic appends it | [`Self::subscribe_as`] appends it |
+/// | `bm_sub_wl` of a topic whose **first** callback is the one given: `BmOK`, no change | [`Self::subscribe_as`]: `Ok`, no change |
+/// | `bm_sub_wl` of a topic whose first callback is another: appended, even if already listed (divergence #79) | [`Self::subscribe_as`] appends it |
+/// | `bm_unsub_wl` removes the first matching callback, and deletes the topic with its last | [`Self::unsubscribe_as`] |
+/// | `bm_handle_msg` calls every callback of every matching topic, in list order | [`Self::matching_callbacks`] |
 /// | `get_sub(topic, len, true)`: whether any topic matches | [`Self::any_match`] |
 ///
 /// Topics are compared exactly for subscribing, and matched with
@@ -149,10 +193,10 @@ pub enum SubscriptionError {
 /// unsubscribed and subscribed again goes to the end.
 ///
 /// `N` is how many topics are held and `TOPIC` the longest; bm_core has
-/// neither ceiling.
+/// neither ceiling, nor [`CALLBACKS`].
 #[derive(Debug, Clone)]
 pub struct Subscriptions<const N: usize, const TOPIC: usize> {
-    entries: [([u8; TOPIC], usize); N],
+    entries: [Entry<TOPIC>; N],
     len: usize,
 }
 
@@ -167,7 +211,7 @@ impl<const N: usize, const TOPIC: usize> Subscriptions<N, TOPIC> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            entries: [([0; TOPIC], 0); N],
+            entries: [Entry::EMPTY; N],
             len: 0,
         }
     }
@@ -186,9 +230,7 @@ impl<const N: usize, const TOPIC: usize> Subscriptions<N, TOPIC> {
 
     /// The subscribed topics, in list order.
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
-        self.entries[..self.len]
-            .iter()
-            .map(|(topic, len)| &topic[..*len])
+        self.entries[..self.len].iter().map(Entry::topic)
     }
 
     /// Whether `topic` itself is subscribed: `get_sub(topic, len, false)`.
@@ -197,52 +239,123 @@ impl<const N: usize, const TOPIC: usize> Subscriptions<N, TOPIC> {
         self.position(topic).is_some()
     }
 
+    /// `topic`'s callbacks, in the order `bm_handle_msg` calls them, or
+    /// `None` if it is not subscribed.
+    #[must_use]
+    pub fn callbacks(&self, topic: &[u8]) -> Option<&[Subscriber]> {
+        self.position(topic).map(|i| self.entries[i].callbacks())
+    }
+
     fn position(&self, topic: &[u8]) -> Option<usize> {
         self.iter().position(|held| held == topic)
     }
 
-    /// Subscribe to `topic`, as `bm_sub_wl` up to its resource-table call.
+    /// Subscribe the application to `topic`:
+    /// [`Self::subscribe_as`]`(topic, Subscriber::Application)`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::subscribe_as`].
+    pub fn subscribe(&mut self, topic: &[u8]) -> Result<(), SubscriptionError> {
+        self.subscribe_as(topic, Subscriber::Application)
+    }
+
+    /// Subscribe `subscriber` to `topic`, as `bm_sub_wl` up to its
+    /// resource-table call.
     ///
     /// # Errors
     ///
     /// [`SubscriptionError::EmptyTopic`], [`SubscriptionError::TopicTooLong`]
     /// or [`SubscriptionError::Full`]; nothing changes.
-    pub fn subscribe(&mut self, topic: &[u8]) -> Result<(), SubscriptionError> {
+    pub fn subscribe_as(
+        &mut self,
+        topic: &[u8],
+        subscriber: Subscriber,
+    ) -> Result<(), SubscriptionError> {
         check_topic(topic)?;
-        if self.contains(topic) {
+        if let Some(index) = self.position(topic) {
+            let entry = &mut self.entries[index];
+            // Divergence #79: only the head is compared.
+            if entry.callbacks[0] == subscriber {
+                return Ok(());
+            }
+            if entry.callbacks_len == CALLBACKS {
+                return Err(SubscriptionError::Full);
+            }
+            entry.callbacks[entry.callbacks_len] = subscriber;
+            entry.callbacks_len += 1;
             return Ok(());
         }
         if self.len == N || topic.len() > TOPIC {
             return Err(SubscriptionError::Full);
         }
-        let (held, len) = &mut self.entries[self.len];
-        held[..topic.len()].copy_from_slice(topic);
-        *len = topic.len();
+        let entry = &mut self.entries[self.len];
+        entry.topic[..topic.len()].copy_from_slice(topic);
+        entry.len = topic.len();
+        entry.callbacks[0] = subscriber;
+        entry.callbacks_len = 1;
         self.len += 1;
         Ok(())
     }
 
-    /// Unsubscribe from `topic`, as `bm_unsub_wl`.
+    /// Unsubscribe the application from `topic`:
+    /// [`Self::unsubscribe_as`]`(topic, Subscriber::Application)`.
     ///
     /// # Errors
     ///
-    /// [`SubscriptionError::EmptyTopic`], [`SubscriptionError::TopicTooLong`]
-    /// or [`SubscriptionError::NotSubscribed`]; nothing changes.
+    /// As [`Self::unsubscribe_as`].
     pub fn unsubscribe(&mut self, topic: &[u8]) -> Result<(), SubscriptionError> {
+        self.unsubscribe_as(topic, Subscriber::Application)
+    }
+
+    /// Unsubscribe `subscriber` from `topic`, as `bm_unsub_wl`: its first
+    /// callback in the list goes, and the topic goes with its last.
+    ///
+    /// # Errors
+    ///
+    /// [`SubscriptionError::EmptyTopic`], [`SubscriptionError::TopicTooLong`],
+    /// [`SubscriptionError::NotSubscribed`] or
+    /// [`SubscriptionError::NoSuchSubscriber`]; nothing changes.
+    pub fn unsubscribe_as(
+        &mut self,
+        topic: &[u8],
+        subscriber: Subscriber,
+    ) -> Result<(), SubscriptionError> {
         check_topic(topic)?;
         let index = self
             .position(topic)
             .ok_or(SubscriptionError::NotSubscribed)?;
-        self.entries[index..self.len].rotate_left(1);
-        self.len -= 1;
+        let entry = &mut self.entries[index];
+        let at = entry
+            .callbacks()
+            .iter()
+            .position(|held| *held == subscriber)
+            .ok_or(SubscriptionError::NoSuchSubscriber)?;
+        entry.callbacks[at..entry.callbacks_len].rotate_left(1);
+        entry.callbacks_len -= 1;
+        if entry.callbacks_len == 0 {
+            self.entries[index..self.len].rotate_left(1);
+            self.len -= 1;
+        }
         Ok(())
     }
 
     /// The subscribed topics a publication on `topic` is delivered to, in the
-    /// order `bm_handle_msg` calls them.
+    /// order `bm_handle_msg` visits them.
     pub fn matching<'a>(&'a self, topic: &'a [u8]) -> impl Iterator<Item = &'a [u8]> + 'a {
-        self.iter()
-            .filter(move |pattern| crate::util::bm_wildcard_match(topic, pattern))
+        self.matching_callbacks(topic).map(|(held, _)| held)
+    }
+
+    /// [`Self::matching`], with each topic's callbacks: `bm_handle_msg` calls
+    /// every one, in this order.
+    pub fn matching_callbacks<'a>(
+        &'a self,
+        topic: &'a [u8],
+    ) -> impl Iterator<Item = (&'a [u8], &'a [Subscriber])> + 'a {
+        self.entries[..self.len]
+            .iter()
+            .filter(move |entry| crate::util::bm_wildcard_match(topic, entry.topic()))
+            .map(|entry| (entry.topic(), entry.callbacks()))
     }
 
     /// Whether a publication on `topic` reaches any subscription:
@@ -461,5 +574,38 @@ mod tests {
         assert!(subs.any_match(b"x"));
         subs.unsubscribe(b"*").unwrap();
         assert!(!subs.any_match(b"x"));
+    }
+
+    /// Divergence #79, as `a_second_callback_subscribed_twice_is_called_twice`
+    /// (`bm-wire-diff/tests/pubsub.rs`) measures it on the oracle.
+    #[test]
+    fn only_the_first_callback_is_checked_for_a_duplicate() {
+        use Subscriber::{Application as A, Service as S};
+        let mut subs: Subscriptions<2, 8> = Subscriptions::new();
+        subs.subscribe_as(b"t", A).unwrap();
+        subs.subscribe_as(b"t", A).unwrap();
+        assert_eq!(subs.callbacks(b"t"), Some(&[A][..]));
+        subs.subscribe_as(b"t", S).unwrap();
+        subs.subscribe_as(b"t", S).unwrap();
+        assert_eq!(subs.callbacks(b"t"), Some(&[A, S, S][..]));
+        subs.unsubscribe_as(b"t", S).unwrap();
+        assert_eq!(subs.callbacks(b"t"), Some(&[A, S][..]));
+        subs.unsubscribe_as(b"t", A).unwrap();
+        assert_eq!(
+            subs.unsubscribe_as(b"t", A),
+            Err(SubscriptionError::NoSuchSubscriber)
+        );
+        subs.subscribe_as(b"t", S).unwrap();
+        assert_eq!(subs.callbacks(b"t"), Some(&[S][..]), "S is now the head");
+        subs.subscribe_as(b"u", S).unwrap();
+        subs.unsubscribe_as(b"t", S).unwrap();
+        assert!(
+            subs.iter().eq([&b"u"[..]]),
+            "the last callback takes the topic"
+        );
+        assert!(
+            subs.matching_callbacks(b"uv").eq([(&b"u"[..], &[S][..])]),
+            "prefix match, #74"
+        );
     }
 }

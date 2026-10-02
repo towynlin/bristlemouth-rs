@@ -24,6 +24,7 @@ use crate::app::App;
 use crate::config::Configuration;
 use crate::node::{Event, Node, Outbound, PING_PAYLOAD_BYTES};
 use crate::port::{DfuSlot, Identity, NoInitRam, Rtc};
+use crate::service::Services;
 
 /// Longest topic a [`Command`] or [`Notification`] carries: the default
 /// `RESOURCE_NAME`, which bounds a [`Node`] subscription's topic.
@@ -398,6 +399,7 @@ impl<
     const SUBSCRIPTIONS: usize,
     C: Configuration,
     D: DfuSlot + NoInitRam,
+    S: Services,
 >
     App<
         Node<
@@ -414,6 +416,7 @@ impl<
             SUBSCRIPTIONS,
             C,
             D,
+            S,
         >,
     > for ChannelApp<'_, M, DEPTH>
 {
@@ -441,6 +444,7 @@ impl<
             SUBSCRIPTIONS,
             C,
             D,
+            S,
         >,
         now_ms: u32,
     ) -> Option<Outbound<'n>> {

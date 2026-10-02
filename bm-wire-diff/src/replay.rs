@@ -126,6 +126,9 @@ pub fn replay_target(target: &str) -> usize {
                 crate::service_codecs::check,
             ),
             "pubsub" => replay_one::<crate::pubsub::PubSubInput, _>(&bytes, crate::pubsub::check),
+            "services" => replay_one::<crate::services::ServicesInput, _>(&bytes, |i| {
+                crate::services::check(i);
+            }),
             "node_udp" => {
                 replay_one::<crate::node_udp::NodeUdpInput, _>(&bytes, crate::node_udp::check)
             }
@@ -201,6 +204,7 @@ pub const STACK_TARGETS: &[&str] = &[
     "pubsub",
     "registry",
     "resource",
+    "services",
     "spotter",
     "time",
     "udp",

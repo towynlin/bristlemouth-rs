@@ -1,6 +1,9 @@
 //! bm_core's service layer: `middleware/bm_service*.c` and the built-in
 //! services' bodies.
 //!
+//! The service list, request dispatch and echo are [`ServiceTable`] and
+//! [`echo`]; `bm_stack::Node` runs them.
+//!
 //! A body is a CBOR map with fixed keys in a fixed order, built and read by
 //! `bm_common_messages/*_msg.c` through tinycbor. Encoding uses [`cbor2`];
 //! decoding goes through [`crate::cbor::parser`], tinycbor's parser ported,
@@ -13,6 +16,12 @@ pub mod config_map;
 pub mod metrics;
 pub mod power_info;
 pub mod sys_info;
+mod table;
+
+pub use table::{
+    Lookup, MAX_DATA_SIZE, MAX_SERVICE_LEN, REPLY_DATA_LEN, REPLY_SUFFIX, REQUEST_SUFFIX,
+    ReplyHeader, RequestHeader, ServiceTable, TableFull, echo, service_name, topic,
+};
 
 use cbor2::core::{Encoder, Header};
 

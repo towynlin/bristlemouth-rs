@@ -58,7 +58,9 @@ A cargo workspace.
     `CborValue`. For decoders whose outcomes are tinycbor's error codes and
     item counting rather than CBOR's.
   - `src/service/` — the services' bodies: `sys_info`, `config_map`,
-    `power_info`, `metrics`, each encode and decode.
+    `power_info`, `metrics`, each encode and decode; `table.rs` is
+    `bm_service.c`'s list and request walk (`ServiceTable`), the request and
+    reply headers, and echo's handler.
   - `fuzz/` — a `cargo fuzz` crate, its own workspace. Targets are ~6 lines
     each; the work is in `bm-wire-diff`.
   - `fuzz/seeds/` — committed seed corpora, one directory per target, replayed
@@ -83,6 +85,10 @@ A cargo workspace.
     holds UDP port 4321; the subscription table is `bm_wire::pubsub::Subscriptions`.
     `spotter_log` and `spotter_tx_data` wrap `publish`; their bodies are
     `bm_wire::spotter`.
+  - `src/service.rs` — `Services`, the application's service handlers, a
+    `Node`'s `S`. `Node::register_service`, `register_echo_service` and
+    `unregister_service` list them; `on_frame` answers a request in
+    `Owed::reply`.
   - `src/utc_time.rs` — the Spotter's `spotter/utc-time`, which C nodes set
     their RTC from (bm_protocol app code, not bm_core): `decode` and
     `UtcTimeSetter`, for an `App`.
@@ -145,6 +151,9 @@ A cargo workspace.
     `bm_pub_wl` and `bm_handle_msg` against `Node`'s pub/sub, with one Rust
     node mirroring the oracle's subscription and resource lists for the life
     of the process.
+  - `src/services.rs`, `tests/services.rs` — `bm_service.c` and echo against
+    `Node`'s services, with one Rust node mirroring the oracle's service
+    list, subscriptions and resources for the life of the process.
   - `src/service_codecs.rs` — the service bodies against
     `bm_common_messages`, in-process; what it skips is listed at the top.
   - `src/metrics_codec.rs` — the metrics body against `metrics_reply_msg.c`,

@@ -148,6 +148,29 @@ pub fn publication(src: u64, topic: &[u8], kind: u8, version: u8, data: &[u8]) -
     )
 }
 
+/// A service request from node `src`, as `bm_service_request` sends it: a
+/// [`publication`] to `<service>/req` of a
+/// [`bm_wire::service::RequestHeader`] and `data`, type 0 and
+/// [`pubsub::COMMON_VERSION`].
+///
+/// # Panics
+///
+/// If the topic is [`pubsub::TOPIC_MAX_LEN`] bytes or longer.
+#[must_use]
+pub fn service_request(src: u64, service: &[u8], id: u32, data: &[u8]) -> Vec<u8> {
+    use bm_wire::service::{REQUEST_SUFFIX, RequestHeader};
+    let topic = [service, REQUEST_SUFFIX].concat();
+    let mut body = vec![0u8; RequestHeader::LEN];
+    RequestHeader {
+        id,
+        data_size: data.len() as u32,
+    }
+    .encode(&mut body)
+    .expect("eight bytes");
+    body.extend_from_slice(data);
+    publication(src, &topic, 0, pubsub::COMMON_VERSION, &body)
+}
+
 /// A `spotter_log` publication from node `src`: [`spotter::encode_log`] in
 /// [`publication`] to [`spotter::log_topic`].
 ///
