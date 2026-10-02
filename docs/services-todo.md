@@ -129,6 +129,8 @@ From reading the source; not yet run.
 
 ### C1 — Config partition as a CBOR map
 
+**Taken:** claude/services-c1-cbor-map
+
 - **C:** `services_cbor_as_map`, `services_cbor_encoded_as_crc32`.
 - **Rust:** `bm_wire::configuration::ConfigPartition::cbor_map` and
   `cbor_map_crc32`, reading the byte image as the C does, #42 included (an
