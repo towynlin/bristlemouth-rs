@@ -113,8 +113,6 @@ From reading the source; not yet run.
 
 | Where | Suspicion | Card |
 |---|---|---|
-| `bm_service_request` | The inner `node` shadows the outer: after a failed subscribe or send the request stays listed and later times out with `ack = false`; an id is consumed either way. | S2 |
-| `_service_request_cb` | No length check on the header or `data_size`; matches id and target only, not topic. | S2 |
 | `config_map_service_handler` | An invalid partition still replies, `success = 0`; a map over 1008 bytes gets no reply. | E2 |
 | `power_info_reply_cb` | Callbacks are dequeued FIFO, not by id; a failed send leaves its callback queued and shifts every later pairing. | E3 |
 | `power_info_service_init` | Stores the callback when registration fails. | E3 |
@@ -123,27 +121,13 @@ From reading the source; not yet run.
 ## Cards
 
 
-### S2 — Service requests
-
-**Taken:** claude/services-s2-requests
-
-- **C:** `bm_service_request.c`.
-- **Rust:** `bm_wire::service::Requests<N>` (id counter, deadlines, the
-  500 ms sweep); `Node::service_request(service, data, timeout_s)`,
-  `Event::ServiceReply { id, service, data }`, `Event::ServiceTimeout`.
-- **Comparator:** extends `services`. Each node requests the other's echo;
-  the peer injects replies with arbitrary target, id and length. Compare
-  request frames, callbacks, the expiry instant and resources. Assert the
-  request table kept a slot free.
-- **Blocked by:** nothing. **Blocks:** E1, E2, E3, E4.
-
 ### E1 — sys_info
 
 - **C:** `sys_info_service.c`.
 - **Rust:** the handler, `Node::sys_info_request`; `Identity::app_name`,
   `git_sha`. The CRC is `cbor_map_crc32` over the system partition.
 - **Comparator:** extends `services`.
-- **Blocked by:** S2. **Blocks:** E5.
+- **Blocked by:** nothing. **Blocks:** E5.
 
 ### E2 — config_map
 
@@ -152,7 +136,7 @@ From reading the source; not yet run.
   `Node::config_map_request`.
 - **Comparator:** extends `services`; seed both stores as
   `bm-wire-diff/src/config.rs` does.
-- **Blocked by:** S2. **Blocks:** E5.
+- **Blocked by:** nothing. **Blocks:** E5.
 
 ### E3 — power_info
 
@@ -160,7 +144,7 @@ From reading the source; not yet run.
 - **Rust:** the server through `Services::power_info`; the requester, with
   the FIFO pairing reproduced in what `Event::PowerInfoReply` reports.
 - **Comparator:** extends `services`.
-- **Blocked by:** S2. **Blocks:** E5.
+- **Blocked by:** nothing. **Blocks:** E5.
 
 ### E4 — metrics
 
@@ -169,7 +153,7 @@ From reading the source; not yet run.
   components through `Services::metrics`; `uptime_ms` from the time the node
   is given.
 - **Comparator:** extends `services`.
-- **Blocked by:** S2. **Blocks:** E5.
+- **Blocked by:** nothing. **Blocks:** E5.
 
 ### E5 — On a bus
 
@@ -187,13 +171,12 @@ From reading the source; not yet run.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | S2 | nothing |
-| 2 | E1, E2, E3, E4 | S2 |
-| 3 | E5 | E1–E4 |
+| 1 | E1, E2, E3, E4 | nothing |
+| 2 | E5 | E1–E4 |
 
 Cards within a wave can run in parallel.
 
-## What the landed cards left for the rest (M1, M2, C1, S1)
+## What the landed cards left for the rest (M1, M2, C1, S1, S2)
 
 - **The service list is `bm_wire::service::ServiceTable<H, N, NAME>`**, the
   C's walk included (#89): `lookup` returns the first service whose name
@@ -212,20 +195,22 @@ Cards within a wave can run in parallel.
   `<id>/metrics` first, so the walks agree, and never sends it a request
   it would answer.
 - **A topic's subscribers are a list.** `bm_wire::pubsub::Subscriptions`
-  keeps `Subscriber::Application` and `Subscriber::Service` callbacks per
-  topic as the C does, #79 included. S2's reply subscription,
-  `_service_request_cb` on `<svc>/rep`, is a third callback: add a variant,
-  and handle it in `Node::deliver_publication` beside the other two.
+  keeps `Subscriber::Application`, `Subscriber::Service` and
+  `Subscriber::Reply` (`_service_request_cb` on `<svc>/rep`) callbacks per
+  topic as the C does, #79 included. `Node::deliver_publication` calls each
+  service and reply callback once per publication.
 - **One reply per received publication**, in `Owed::reply`, built in the
   node's transmit buffer. The C calls the service callback once per listing
   on each matching subscription and replies each time (#89); the comparator
   asserts the C's replies, handler calls and local deliveries are the Rust
   node's one repeated.
-- **A node's own publication is not dispatched to its services.**
-  `Node::publish_with` delivers only to application callbacks; the C queues
-  the publication to its middleware task, which calls every callback,
-  services included. S2 decides what a request to the node's own service
-  does (the C answers it, a pump later).
+- **A node's own publication is not dispatched to its services**, so
+  `Node::service_request` to the node's own service times out where the C
+  answers it a pump later. Decided in S2: answering would owe a second frame
+  (request, then reply) from one call, and the node has one transmit buffer
+  and no queue for it; no caller needs it. Local deliveries reach
+  application and reply callbacks only (`Node::deliver_locally`). The
+  comparator skips such a request.
 - **The C's service list cannot be reset.** Registering adds one entry and
   at most one callback; unregistering removes one callback and at most one
   entry, so an entry left without its callback (#79's re-registration, #89's
@@ -234,13 +219,47 @@ Cards within a wave can run in parallel.
   `LEAK_BUDGET` lets four steps per process leave an entry, only for `x`, a
   name sharing a prefix with no other: a stuck entry stops every request it
   prefixes and is removed by unregistering any name that prefixes it, which
-  then strands that name too. S2's comparator extends the same mirror.
+  then strands that name too. S2 extends the same mirror to requests.
 - **Every resource is advertised once at start-up, longest first** (#38):
-  `advertise_everything` subscribes and unsubscribes each request and
-  application topic and publishes nothing to each reply topic. S2 adds its
-  `/rep` subscriptions and `/req` publications there.
-- **`bm_stack::mock::frames::service_request`** builds a peer's request
-  frame.
+  `advertise_everything` subscribes and unsubscribes each request,
+  application and asked reply topic, and publishes nothing to each reply and
+  asked request topic. A card adding a topic adds it there.
+- **`bm_stack::mock::frames::service_request`** and `service_reply` build a
+  peer's request and reply frames.
+- **Requests: `Node::service_request(now_ms, service, data, timeout_s)`**
+  returns `(id, Outbound)`; the answer is `Event::ServiceReply { id,
+  service, data }` from `on_frame_with` or `Event::ServiceTimeout { id,
+  service }` from `Node::on_service_expiry`. The C's per-request
+  `reply_cb` is not carried: E1–E4's requesters (`Node::sys_info_request`
+  and the rest) build their service name, call `service_request`, and the
+  application tells their replies apart by `service` or by the id it kept.
+  `service` is the request's, not the reply's topic (#92). `data` is
+  `data_size` bytes or what arrived if fewer (#92), so a decoder sees a
+  short body where the C reads past the publication.
+- **Ceilings:** `bm_stack::service::SERVICE_REQUESTS` (8) requests, names of
+  `SERVICE_NAME_BYTES`. `bm_wire::service::Requests<N, NAME>` is the list,
+  id counter and sweep phase; `resuming(next_id, next_sweep_ms)` lines one up
+  with a running C.
+- **The request sweep is the third timer**, `Node::on_service_expiry`, with
+  its own arm in `Node::run_app` and phased from construction. `on_tick`
+  runs it too. An `App` ticker on a multiple of 500 ms now loses its tie to
+  that arm, as one on the 150 ms grid already did.
+- **The oracle's sweep needs `stack::start_timer_callback_handler`.**
+  `bm_service_request.c` hands expiries to `timer_callback_handler.c`'s task,
+  which `bm_shim_stack_init` does not start, because `dfu_host.c`'s
+  heartbeats go through it too and `dfu_core`'s comparator does not expect
+  them. The `services` comparator starts it at bring-up.
+- **Time in the `services` comparator** moves only in `Step::Wait`, one sweep
+  at a time, and at each input's start, which waits out every request (the
+  C's list has no reset). `Timeout` keeps every timeout within seconds.
+  `Step::Ask` asks an `ASKED` service; `Step::Reply` injects a peer's reply.
+  E1–E4 add their requests as `Step` variants and their decoded replies to
+  `Answer`.
+- **The comparator's subscriptions are near `bm_get_subs`'s 256 bytes**
+  (#78): at most 237 joined, and reply subscriptions are never removed.
+  `assert_lists` fails before the C overflows. A card adding a subscribed
+  topic, or a service E1–E4 asks, has about 18 bytes left; past that,
+  shorten names or drop pool entries.
 
 - **`bm_wire::cbor::parser` is tinycbor's parser.** `Value` is `CborValue`
   and each method the C function it names, including error codes, tags not
