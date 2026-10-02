@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Report symbols libbm_core.a references but no object in it defines.
+# Report symbols libbm_core.a and libbm_core_release.a (the codecs build.rs
+# compiles with NDEBUG) reference but neither defines.
 #
 # Everything left should be libc. Anything else is an integrator hook the shim
 # in csrc/ forgot to implement; it would otherwise surface much later as a
@@ -16,11 +17,12 @@ if [[ ${1:-} == --check ]]; then
   check=true
 fi
 
-archive=$(ls -t target/debug/build/bm-wire-sys-*/out/libbm_core.a | head -1)
-echo "archive: $archive"
+out=$(dirname "$(ls -t target/debug/build/bm-wire-sys-*/out/libbm_core.a | head -1)")
+archives=("$out/libbm_core.a" "$out/libbm_core_release.a")
+echo "archives: ${archives[*]}"
 
-defined=$(nm --defined-only "$archive" | awk '{print $NF}' | sort -u)
-undefined=$(nm -u "$archive" | awk '/^ +U/ {print $NF}' | sort -u)
+defined=$(nm --defined-only "${archives[@]}" | awk 'NF >= 3 {print $NF}' | sort -u)
+undefined=$(nm -u "${archives[@]}" | awk '/^ +U/ {print $NF}' | sort -u)
 
 leftover=$(comm -23 <(echo "$undefined") <(echo "$defined"))
 echo "$leftover"

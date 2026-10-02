@@ -44,6 +44,11 @@ A cargo workspace.
   CBOR values. **Must never depend on `bm-wire-sys`**, in any configuration:
   that keeps the host-only oracle out of firmware builds. The `std` feature is
   for tests and fuzzing only, and must not forward to `cbor2`.
+  - `src/cbor/parser.rs` — tinycbor's parser, ported: `Value` is
+    `CborValue`. For decoders whose outcomes are tinycbor's error codes and
+    item counting rather than CBOR's.
+  - `src/service/` — the services' bodies: `sys_info`, `config_map`,
+    `power_info`, each encode and decode.
   - `fuzz/` — a `cargo fuzz` crate, its own workspace. Targets are ~6 lines
     each; the work is in `bm-wire-diff`.
   - `fuzz/seeds/` — committed seed corpora, one directory per target, replayed
@@ -130,6 +135,8 @@ A cargo workspace.
     `bm_pub_wl` and `bm_handle_msg` against `Node`'s pub/sub, with one Rust
     node mirroring the oracle's subscription and resource lists for the life
     of the process.
+  - `src/service_codecs.rs` — the service bodies against
+    `bm_common_messages`, in-process; what it skips is listed at the top.
   - `testdata/` — pcaps from C dev kits. `hello-pub-card-h0.pcap` is card
     H0's; `tests/capture_h0.rs` documents it and asserts the header fields
     where deployed nodes differ from `bm_linux.c` (divergence #70).
@@ -140,10 +147,11 @@ A cargo workspace.
   - `csrc/` — the platform layer bm_core leaves to the integrator, implemented
     deterministically. This is ours.
   - `build.rs` — tiered source lists, the generated guarded header tree,
-    bindgen.
-  - `scripts/check_symbols.sh` — what `libbm_core.a` references but nothing
-    defines; everything left should be libc. Run from the workspace root.
-    `--check` fails on anything outside its libc allowlist, which deliberately
+    bindgen. `T2_RELEASE` compiles four message codecs with `NDEBUG`, as a
+    release build does (divergence #82).
+  - `scripts/check_symbols.sh` — what `libbm_core.a` and
+    `libbm_core_release.a` reference but nothing defines; everything left
+    should be libc. Run from the workspace root. `--check` fails on anything outside its libc allowlist, which deliberately
     omits `rand` and `time`, so a non-deterministic reach from `csrc/` trips it.
 - `docs/c-divergences.md` — the upstream defect list.
 - `docs/hello-world-todo.md` — the plan for a Rust hello-world app on a dev
