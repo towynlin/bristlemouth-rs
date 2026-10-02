@@ -117,7 +117,7 @@ digits of `HEAD` (`build.rs`); its version string is
 | system | `0x03000` | 10240 | `BM_CFG_PARTITION_SYSTEM` |
 | user | `0x06000` | 10240 | `BM_CFG_PARTITION_USER` |
 | cli | `0x09000` | 10240 | — |
-| dfu | `0x0C000` | 2048000 | the DFU slot |
+| dfu | `0x0C000` | 2048000 | — (the DFU host's image, below) |
 
 Offsets from `src/lib/common/external_flash_partitions.c`, whose
 `END + (END % 4096)` rounding happens to land on 4 KB boundaries for 10 KB
@@ -172,6 +172,28 @@ installed, bootloader included. Restoring C firmware means flashing its
 bootloader and image again. `memory.x` leaves the no-init 512 bytes out of
 `RAM` so a later DFU card can place `NoInitRam` where the C bootloader
 expects it.
+
+## DFU image locations
+
+The client receives into internal flash; only the host reads the NOR flash.
+
+| `bm_dfu_generic.h` hook | C (`src/lib/drivers/bm_dfu_wrapper.cpp`) | Storage |
+|---|---|---|
+| `bm_dfu_client_flash_area_open`, `_erase`, `_write`, `_get_size` | `flash_area_*` on `FLASH_AREA_IMAGE_SECONDARY(0)` (`:35-65`) | MCUboot slot 2, internal flash: `secondary_img0`, `FLASH_DEVICE_INTERNAL_FLASH` (`src/lib/mcuboot/port_flash.c:43-48`), at `0x080FE000`, `0xF2000` bytes (`src/CMakeLists.txt:114-121`) |
+| `bm_dfu_host_get_chunk` | `dfu_partition_global->read` (`:66-74`) | the W25 `dfu` partition (`src/apps/bm_devkit/bmdk_common/app_main.cpp:390-391`) |
+
+On the client side, `port_flash.c` erases only whole 8 KB internal pages
+(`FLASH_PAGE_SIZE`, `port_flash.c:145-149`) and checks every write and erase
+by reading back (`MCUBOOT_VERIFY_WE`). bm_core erases the whole slot before the first
+chunk (`bcmp/dfu_client.c:297-302`).
+
+The host side is the debug CLI's: `nvm b64write dfu …` writes an image (a
+`BmDfuImgInfo` header, then the image) into the `dfu` partition, and `dfu
+start <node> <filter_key> <timeout>` checks its CRC and calls
+`bm_dfu_initiate_update` with `internal` set
+(`src/lib/debug/debug_dfu.cpp:91-106`).
+So the NOR flash is shared between config and DFU only for
+`bm_stack::DfuSlot::read`, which never writes.
 
 ## Time
 
