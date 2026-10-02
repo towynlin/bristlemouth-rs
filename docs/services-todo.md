@@ -113,10 +113,6 @@ From reading the source; not yet run.
 
 | Where | Suspicion | Card |
 |---|---|---|
-| `_service_request_received_cb` | Reads `data_size` before checking `data_len >= 8`. | S1 |
-| `_service_request_received_cb` | `strncmp` over the service's length, then `break` on a topic-length mismatch: a service whose name prefixes a later one's shadows it. | S1 |
-| `_service_list_remove_service` | Prefix match: unregistering `a` removes `ab`. | S1 |
-| `echo_service_handler` | `*buffer_len <= MAX_BM_SERVICE_DATA_SIZE` is always true; a request over 1008 bytes overflows the reply buffer. | S1 |
 | `bm_service_request` | The inner `node` shadows the outer: after a failed subscribe or send the request stays listed and later times out with `ack = false`; an id is consumed either way. | S2 |
 | `_service_request_cb` | No length check on the header or `data_size`; matches id and target only, not topic. | S2 |
 | `config_map_service_handler` | An invalid partition still replies, `success = 0`; a map over 1008 bytes gets no reply. | E2 |
@@ -138,22 +134,6 @@ From reading the source; not yet run.
 - **Blocked by:** nothing. **Blocks:** E1, E2.
 - **Done:** `configuration` fuzz target clean with map and CRC compared.
 
-### S1 — Service table, dispatch, echo
-
-**Taken:** claude/services-s1-table-echo
-
-- **C:** `bm_service.c`, `echo_service.c`.
-- **Rust:** `bm_wire::service::{RequestHeader, ReplyHeader, topic,
-  ServiceTable<N>}` with the C's matching; `Node`'s `S: Services` generic;
-  `Node::register_service`, `unregister_service`; the reply published from
-  `on_frame`; echo as the first built-in.
-- **Comparator:** stack target `services` (`bm-wire-diff/src/services.rs`,
-  `tests/services.rs`, `replay::STACK_TARGETS`). A scripted peer publishes
-  arbitrary bodies on arbitrary `/req` topics to both nodes; compare reply
-  frames, handler calls and resources.
-- **Blocked by:** nothing. **Blocks:** S2, E1, E2, E3, E4.
-- **Done:** fuzz target `services` clean; `hello_node` unchanged and passing.
-
 ### S2 — Service requests
 
 - **C:** `bm_service_request.c`.
@@ -164,7 +144,7 @@ From reading the source; not yet run.
   the peer injects replies with arbitrary target, id and length. Compare
   request frames, callbacks, the expiry instant and resources. Assert the
   request table kept a slot free.
-- **Blocked by:** S1. **Blocks:** E1, E2, E3, E4.
+- **Blocked by:** nothing. **Blocks:** E1, E2, E3, E4.
 
 ### E1 — sys_info
 
@@ -216,14 +196,59 @@ From reading the source; not yet run.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | C1, S1 | nothing |
-| 2 | S2 | S1 |
-| 3 | E1, E2, E3, E4 | S2 and its codec cards (see **Blocked by**) |
-| 4 | E5 | E1–E4 |
+| 1 | C1, S2 | nothing |
+| 2 | E1, E2, E3, E4 | S2 and its codec cards (see **Blocked by**) |
+| 3 | E5 | E1–E4 |
 
 Cards within a wave can run in parallel.
 
-## What the landed cards left for the rest (M1, M2)
+## What the landed cards left for the rest (M1, M2, S1)
+
+- **The service list is `bm_wire::service::ServiceTable<H, N, NAME>`**, the
+  C's walk included (#88): `lookup` returns the first service whose name
+  `strncmp`-prefixes the topic and what its checks made of the request;
+  `remove` is the prefix removal. `bm_stack::Node` holds one with `H =
+  bm_stack::service::ServiceHandler`, `SERVICES` (16) names of up to 48 bytes.
+- **Built-ins are `ServiceHandler` variants; the application's are
+  `Services::handle`.** Echo is `ServiceHandler::Echo`, answered in
+  `Node::serve`. E1–E4 add a variant each and its arm there, rather than
+  going through `S`, because their handlers read the node's own state
+  (`Identity`, `C: Configuration`, the uptime). `Services` has one method;
+  E3 and E4 add theirs with defaults (contract 3).
+- **Metrics is not registered at construction yet.** E4 registers it in
+  `Node::with_services`, first, as `bristlemouth_init` does. Until then
+  `bm-wire-diff/src/services.rs` lists a stand-in named
+  `<id>/metrics` first, so the walks agree, and never sends it a request
+  it would answer.
+- **A topic's subscribers are a list.** `bm_wire::pubsub::Subscriptions`
+  keeps `Subscriber::Application` and `Subscriber::Service` callbacks per
+  topic as the C does, #79 included. S2's reply subscription,
+  `_service_request_cb` on `<svc>/rep`, is a third callback: add a variant,
+  and handle it in `Node::deliver_publication` beside the other two.
+- **One reply per received publication**, in `Owed::reply`, built in the
+  node's transmit buffer. The C calls the service callback once per listing
+  on each matching subscription and replies each time (#88); the comparator
+  asserts the C's replies, handler calls and local deliveries are the Rust
+  node's one repeated.
+- **A node's own publication is not dispatched to its services.**
+  `Node::publish_with` delivers only to application callbacks; the C queues
+  the publication to its middleware task, which calls every callback,
+  services included. S2 decides what a request to the node's own service
+  does (the C answers it, a pump later).
+- **The C's service list cannot be reset.** Registering adds one entry and
+  at most one callback; unregistering removes one callback and at most one
+  entry, so an entry left without its callback (#79's re-registration, #88's
+  prefix removal) stays for the life of the process. The comparator's
+  `reset` unregisters what it can at the start of each input, and
+  `LEAK_BUDGET` lets four steps per process leave an entry, only for names
+  that prefix no other pool name's request topic. S2's comparator extends the
+  same mirror.
+- **Every resource is advertised once at start-up, longest first** (#38):
+  `advertise_everything` subscribes and unsubscribes each request and
+  application topic and publishes nothing to each reply topic. S2 adds its
+  `/rep` subscriptions and `/req` publications there.
+- **`bm_stack::mock::frames::service_request`** builds a peer's request
+  frame.
 
 - **`bm_wire::cbor::parser` is tinycbor's parser.** `Value` is `CborValue`
   and each method the C function it names, including error codes, tags not
