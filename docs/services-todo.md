@@ -140,20 +140,6 @@ From reading the source; not yet run.
 - **Done:** fuzz target `service_codecs` clean; `power_info_ut.cpp`'s values
   asserted in a `bm-wire` unit test.
 
-### M2 — Metrics body
-
-**Taken:** claude/services-m2-metrics-body
-
-- **C:** `metrics_reply_msg.c`, `bm_encode_fields_from_table`,
-  `bm_decode_fields_from_table`.
-- **Rust:** `bm_wire::service::metrics`: a field enum (`BM_FIELD_*`), encode
-  from slices of fields, decode by key lookup. An absent component leaves its
-  destination untouched.
-- **Comparator:** `bm-wire-diff/src/metrics_codec.rs`, in-process.
-- **Blocked by:** nothing. **Blocks:** E4.
-- **Done:** fuzz target `metrics_codec` clean; `metrics_reply_msg_test.cpp`'s
-  values asserted in a `bm-wire` unit test.
-
 ### C1 — Config partition as a CBOR map
 
 - **C:** `services_cbor_as_map`, `services_cbor_encoded_as_crc32`.
@@ -223,7 +209,7 @@ From reading the source; not yet run.
   components through `Services::metrics`; `uptime_ms` from the time the node
   is given.
 - **Comparator:** extends `services`.
-- **Blocked by:** M2, S2. **Blocks:** E5.
+- **Blocked by:** S2. **Blocks:** E5.
 
 ### E5 — On a bus
 
@@ -241,13 +227,31 @@ From reading the source; not yet run.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | M1, M2, C1, S1 | nothing |
+| 1 | M1, C1, S1 | nothing |
 | 2 | S2 | S1 |
 | 3 | E1, E2, E3, E4 | S2 and its codec cards (see **Blocked by**) |
 | 4 | E5 | E1–E4 |
 
 Cards within a wave can run in parallel.
 
-## What the landed cards left for the rest
+## What the landed cards left for the rest (M2)
 
-Nothing has landed.
+- **Parsing a body: `bm_wire::cbor::tinycbor`** (M1, E1–E4). A line-for-line
+  port of tinycbor's `CborValue`, with `Error::code()` equal to `CborError`.
+  Chosen over `cbor2::core::Decoder` because the message decoders return
+  tinycbor's codes and write fields as they go, so the first error and where
+  it falls are observable. `CBOR_PARSER_MAX_RECURSIONS` is 10, from bm_core's
+  `CMakeLists.txt`, not tinycbor's 1024; the oracle builds with 10 too.
+- **`bm_messages_helper.c`: `bm_wire::service::messages`** (M1). `Encoder`
+  is tinycbor's encoder over a fixed buffer: shortest-form heads, `fa`/`fb`
+  floats, keys up to their first NUL, and `finish()` returning
+  `OutOfMemory` when anything did not fit. `decoder_message_enter` and
+  `decode_key_value_uint` are the shared decode steps; the C's
+  `decode_key_value_*` never compare the key with `key_expected`
+  (divergence #83).
+- **The metrics body: `bm_wire::service::metrics`** (E4). `encode(&Reply,
+  &[Component], buf)`; a component is a key and `&[Entry]`, an entry a key
+  and a `Field`. Contract 8's "over 1008 bytes is no reply" is
+  `Err(Error::OutOfMemory)` from `encode` into the handler's 1008-byte
+  buffer. `Field::String` fails the encode (divergence #82), so
+  `Services::metrics` should not offer it.
