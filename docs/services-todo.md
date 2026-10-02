@@ -140,6 +140,8 @@ From reading the source; not yet run.
 
 ### S1 — Service table, dispatch, echo
 
+**Taken:** claude/services-s1-table-echo
+
 - **C:** `bm_service.c`, `echo_service.c`.
 - **Rust:** `bm_wire::service::{RequestHeader, ReplyHeader, topic,
   ServiceTable<N>}` with the C's matching; `Node`'s `S: Services` generic;
