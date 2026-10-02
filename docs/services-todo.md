@@ -240,9 +240,10 @@ Cards within a wave can run in parallel.
   entry, so an entry left without its callback (#79's re-registration, #88's
   prefix removal) stays for the life of the process. The comparator's
   `reset` unregisters what it can at the start of each input, and
-  `LEAK_BUDGET` lets four steps per process leave an entry, only for names
-  that prefix no other pool name's request topic. S2's comparator extends the
-  same mirror.
+  `LEAK_BUDGET` lets four steps per process leave an entry, only for `x`, a
+  name sharing a prefix with no other: a stuck entry stops every request it
+  prefixes and is removed by unregistering any name that prefixes it, which
+  then strands that name too. S2's comparator extends the same mirror.
 - **Every resource is advertised once at start-up, longest first** (#38):
   `advertise_everything` subscribes and unsubscribes each request and
   application topic and publishes nothing to each reply topic. S2 adds its

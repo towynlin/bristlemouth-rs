@@ -35,7 +35,7 @@
 //! | No request whose lookup is [`Lookup::OverRead`] or [`Lookup::ShortRequest`] | the C reads past the datagram (divergence #88) |
 //! | No request answered by echo with more than [`REPLY_DATA_LEN`] bytes | the C copies past its buffer (divergence #89) |
 //! | No request answered by the metrics service | `bm_shim_stack_init` registers it, and its reply is card E4's; the Rust node lists [`METRICS`] with [`StandIn`] so the list walks agree |
-//! | At most [`LEAK_BUDGET`] steps per process that leave a listed service no request can unlist, and only for a name that prefixes no other pool name's request topic | see below |
+//! | At most [`LEAK_BUDGET`] steps per process that leave a listed service nothing can unlist, and only for `x` | see below |
 //! | Fewer than [`SERVICES`] services listed, [`CALLBACKS`] callbacks per topic | the Rust node's ceilings |
 //!
 //! # The service list cannot be reset
@@ -47,8 +47,9 @@
 //! other than the one named (divergence #88), leaves an entry nothing can
 //! remove. `reset` unregisters everything else at the start of each input;
 //! [`LEAK_BUDGET`] bounds the rest. A stuck entry ends the walk for every
-//! topic its name prefixes, so only names that prefix no other pool name's
-//! request topic (`harmless_if_stuck`) may be left stuck.
+//! topic its name prefixes, and is what unregistering any name prefixing it
+//! removes, so only a name sharing a prefix with no other (`x`) may be left
+//! stuck (`harmless_if_stuck`).
 
 use std::ffi::CString;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -85,13 +86,14 @@ pub const ECHO: &[u8] = b"c0ffee0012345678/echo";
 ///
 /// `<id>/e` prefixes echo's name and `<id>/echo/x` is prefixed by it; `s`,
 /// `sv` and `svc` prefix each other; `s*` and `s?c` subscribe patterns that
-/// match other services' request topics.
+/// match other services' request topics; `x` shares a prefix with none, so
+/// it is the one name [`LEAK_BUDGET`] may leave listed.
 ///
 /// Not the empty name: it prefixes [`METRICS`], which is listed first, so
 /// unregistering it removes the metrics service instead (divergence #88), and
 /// nothing can then remove it. Listed first, it ends the walk for every
 /// request. `bm_wire::service`'s unit tests cover it.
-pub const NAMES: [&[u8]; 8] = [
+pub const NAMES: [&[u8]; 9] = [
     ECHO,
     b"c0ffee0012345678/e",
     b"c0ffee0012345678/echo/x",
@@ -100,6 +102,7 @@ pub const NAMES: [&[u8]; 8] = [
     b"s",
     b"s*",
     b"s?c",
+    b"x",
 ];
 
 /// Topics the application subscribes: a service's request topic, a prefix,
@@ -557,12 +560,14 @@ fn first_prefixed<'a>(node: &'a ServicesNode, name: &[u8]) -> Option<&'a [u8]> {
         .find(|listed| listed.starts_with(name))
 }
 
-/// Whether `name`, listed for good, would shadow no other pool name.
+/// Whether `name`, listed for good, would leave every other pool name
+/// answerable and unregistrable: it prefixes no other name's request topic,
+/// so no request stops at it, and no other name prefixes it, so no other
+/// name's unregistration removes it instead.
 fn harmless_if_stuck(name: &[u8]) -> bool {
-    NAMES
-        .iter()
-        .chain([&METRICS])
-        .all(|other| *other == name || !request_topic(other).starts_with(name))
+    NAMES.iter().chain([&METRICS]).all(|other| {
+        *other == name || !(request_topic(other).starts_with(name) || name.starts_with(other))
+    })
 }
 
 fn has_service_callback(node: &ServicesNode, name: &[u8]) -> bool {

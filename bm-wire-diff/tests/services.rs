@@ -152,13 +152,14 @@ fn unregistering_a_prefix_removes_an_earlier_service() {
     // `s` would be left stuck, shadowing `sv` and `svc`: outside the budget.
     assert_eq!(summary.skipped, 1);
     assert_eq!(summary.replies, 2);
-    // `s?c` registered twice leaves one entry stuck; it shadows nothing, so
-    // it runs while the budget lasts. Seeds replayed first may have spent it.
+    // `x` registered twice leaves one entry stuck; it shares a prefix with
+    // no other name, so it runs while the budget lasts. Seeds replayed first
+    // may have spent it.
     let budget = budget();
     let summary = run(vec![
-        Step::Register(index(b"s?c")),
-        Step::Register(index(b"s?c")),
-        request(b"s?c", b"z"),
+        Step::Register(index(b"x")),
+        Step::Register(index(b"x")),
+        request(b"x", b"z"),
     ]);
     assert_eq!(summary.skipped, usize::from(budget == 0));
     assert_eq!(summary.replies, 1);
