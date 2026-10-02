@@ -50,6 +50,11 @@ and its behaviour differs from an RTOS deliberately:
   `bm_shim_dfu_load` writes it the same way, to store a host's image.
 - **Leak-visible.** Every allocation is plain `malloc`, so ASan and
   LeakSanitizer see the whole graph.
+- **A heap watch.** Between `bm_shim_heap_watch_begin(limit)` and
+  `bm_shim_heap_watch_end`, `bm_malloc` on the calling thread refuses zero
+  bytes or more than `limit`, as a small embedded heap would, and counts what
+  it granted and refused. For decoders that allocate a size the sender
+  chooses.
 
 `csrc/bm_stack_shim.c` brings the stack up on the capture device in the order
 `middleware/bristlemouth.c` uses.
@@ -85,7 +90,7 @@ failure points at a tier instead of a wall of errors.
 |---|---|---|
 | T0 | nothing | `crc16/32`, `util`, `lib_state_machine`, `device`, `l2_policy` |
 | T1 | the `bm_os` shim | `aligned_malloc`, `ll`, `q`, `pcap`, `cb_queue`, `timer_callback_handler`, `bcmp/packet` |
-| T2 | tinycbor | `configuration`, `cbor_service_helper`, and the C half of `bm_common_messages` |
+| T2 | tinycbor | `configuration`, `cbor_service_helper`, and the C half of `bm_common_messages`; four of its codecs with `NDEBUG` (`T2_RELEASE`, divergence #82) |
 | T3 | `bm_ip` + a NetworkDevice | `bm_linux`, `l2`, all of `bcmp/`, `middleware/`, `integrations/` |
 | T4 | the DFU flash shim | `dfu_core`, `dfu_client`, `dfu_host`, `bm_mavlink` |
 

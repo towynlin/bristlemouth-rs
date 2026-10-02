@@ -32,8 +32,9 @@ Before starting:
    out to be two, split it here in that commit.
 2. Read "Services contract" and "What the landed cards left for the rest".
 
-One branch and one PR per card. When the code is done and verified, edit this
-file in a separate commit, the last of the branch:
+One branch and one PR per card; open the PR without being asked
+(`CLAUDE.md`, "Pull requests"). When the code is done and verified, edit
+this file in a separate commit, the last of the branch:
 
 | Section | Edit |
 |---|---|
@@ -126,20 +127,6 @@ From reading the source; not yet run.
 
 ## Cards
 
-### M1 — Fixed-shape service bodies
-
-- **C:** `sys_info_svc_reply_msg.c`, `config_cbor_map_srv_request_msg.c`,
-  `config_cbor_map_srv_reply_msg.c`, `power_info_reply_msg.c`, and the
-  `bm_messages_helper.c` functions they call.
-- **Rust:** `bm_wire::service::{sys_info, config_map, power_info}`, encode
-  and decode each.
-- **Comparator:** `bm-wire-diff/src/service_codecs.rs`, in-process
-  (`replay::TARGETS`). Encode one value both sides: identical bytes, or both
-  fail. Decode arbitrary bytes both sides: identical result.
-- **Blocked by:** nothing. **Blocks:** E1, E2, E3.
-- **Done:** fuzz target `service_codecs` clean; `power_info_ut.cpp`'s values
-  asserted in a `bm-wire` unit test.
-
 ### M2 — Metrics body
 
 - **C:** `metrics_reply_msg.c`, `bm_encode_fields_from_table`,
@@ -195,7 +182,7 @@ From reading the source; not yet run.
 - **Rust:** the handler, `Node::sys_info_request`; `Identity::app_name`,
   `git_sha`. The CRC is C1's over the system partition.
 - **Comparator:** extends `services`.
-- **Blocked by:** M1, C1, S2. **Blocks:** E5.
+- **Blocked by:** C1, S2. **Blocks:** E5.
 
 ### E2 — config_map
 
@@ -204,7 +191,7 @@ From reading the source; not yet run.
   `Node::config_map_request`.
 - **Comparator:** extends `services`; seed both stores as
   `bm-wire-diff/src/config.rs` does.
-- **Blocked by:** M1, C1, S2. **Blocks:** E5.
+- **Blocked by:** C1, S2. **Blocks:** E5.
 
 ### E3 — power_info
 
@@ -212,7 +199,7 @@ From reading the source; not yet run.
 - **Rust:** the server through `Services::power_info`; the requester, with
   the FIFO pairing reproduced in what `Event::PowerInfoReply` reports.
 - **Comparator:** extends `services`.
-- **Blocked by:** M1, S2. **Blocks:** E5.
+- **Blocked by:** S2. **Blocks:** E5.
 
 ### E4 — metrics
 
@@ -239,13 +226,46 @@ From reading the source; not yet run.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | M1, M2, C1, S1 | nothing |
+| 1 | M2, C1, S1 | nothing |
 | 2 | S2 | S1 |
 | 3 | E1, E2, E3, E4 | S2 and its codec cards (see **Blocked by**) |
 | 4 | E5 | E1–E4 |
 
 Cards within a wave can run in parallel.
 
-## What the landed cards left for the rest
+## What the landed cards left for the rest (M1)
 
-Nothing has landed.
+- **`bm_wire::cbor::parser` is tinycbor's parser.** `Value` is `CborValue`
+  and each method the C function it names, including error codes, tags not
+  counting as items, and `cbor_value_validate_basic` reading only the
+  top-level item. M2's `bm_decode_fields_from_table` should build on it
+  rather than on `cbor2`'s decoder; it will need `cbor_value_get_string_length`
+  and the float and double getters added. Where tinycbor would fail a
+  `cbor_assert`, a method returns `CborError::Unreachable`, and a comparator
+  does not call the C on that input.
+- **The oracle's codecs are a release build.** `bm-wire-sys/build.rs`
+  `T2_RELEASE` compiles `sys_info_svc_reply_msg.c`,
+  `config_cbor_map_srv_{request,reply}_msg.c` and `power_info_reply_msg.c`
+  with `NDEBUG`, because a debug build aborts on a non-uint value (#82).
+  `config_cbor_map_service.c`, in T3, calls the release decoder, so the
+  `services` stack target sees release behaviour too. A debug-built C node
+  aborts on a `config_map` request such as `{"p": "ab"}`; E2's Rust server
+  does what a release node does.
+- **Decoders write into `&mut self`** (`decode_into`) rather than returning a
+  value, because the C writes fields as it reads them and
+  `power_info_reply_cb` passes the partly decoded struct to the requester's
+  callback whether or not decoding succeeded. E3 reports that struct.
+- **Encoders return `Err(CborError::OutOfMemory)` where the C's handler
+  returns false**: no reply (contract 8). E1–E3 encode into the handler's
+  1008 bytes. `ConfigMapReply::encode` takes the map as a slice and writes
+  its length as `cbor_encoded_map_len`; `config_map_service_handler` sends
+  an empty one with `success` false. `config_map::PARTITION_ID_*` are the
+  request's partition ids.
+- **Decoded strings are `CborString`s**, borrowed from the body, chunked or
+  not; `copy_to` and `eq_bytes` read them. No allocation.
+- **Allocation is a seam.** `sys_info_reply_decode` and
+  `config_cbor_map_reply_decode` `bm_malloc` a size the sender chooses
+  (#83, #84). The port assumes the allocation succeeds.
+  `bm_shim_heap_watch_begin(limit)` refuses zero bytes or more than `limit`
+  on the calling thread and counts what it granted, so a comparator can skip
+  heap-dependent inputs and free what the C leaks.

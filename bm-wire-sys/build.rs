@@ -41,10 +41,20 @@ mod tiers {
         // C++; only the C half is bound for now. sensor_header_msg exists as
         // both -- take the .c.
         "bm_common_messages/bm_messages_helper.c",
-        "bm_common_messages/config_cbor_map_srv_reply_msg.c",
-        "bm_common_messages/config_cbor_map_srv_request_msg.c",
         "bm_common_messages/metrics_reply_msg.c",
         "bm_common_messages/sensor_header_msg.c",
+    ];
+
+    /// T2 message codecs compiled with `NDEBUG`, as a release build of the
+    /// firmware compiles them. Their decoders call tinycbor's
+    /// `cbor_value_get_uint64` without checking the type, and its `assert`
+    /// would abort the oracle on any value that is not an unsigned integer;
+    /// a release node reads the head's argument instead (divergence #82),
+    /// which is what `bm-wire` ports. Only `cbor.h`'s inline accessors are
+    /// affected: tinycbor's own `.c` files stay in T2, with their asserts.
+    pub const T2_RELEASE: &[&str] = &[
+        "bm_common_messages/config_cbor_map_srv_reply_msg.c",
+        "bm_common_messages/config_cbor_map_srv_request_msg.c",
         "bm_common_messages/sys_info_svc_reply_msg.c",
         "bm_common_messages/power_info_reply_msg.c",
     ];
@@ -146,6 +156,13 @@ fn main() {
         build.file(csrc.join(src));
     }
     build.compile("bm_core"); // emits libbm_core.a and the link flags
+
+    let mut release = bm_core_build(&module_dirs);
+    release.define("NDEBUG", None);
+    for src in tiers::T2_RELEASE {
+        release.file(root.join(src));
+    }
+    release.compile("bm_core_release");
 
     // The mavlink headers take the address of packed members all over, which
     // gcc warns about 60 times over. bm_core suppresses exactly this on its
