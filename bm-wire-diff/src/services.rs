@@ -1,8 +1,10 @@
 //! Differential comparator for the service layer on the node:
-//! `bm_service_register`, `bm_service_unregister`, `echo_service_init` and
-//! `_service_request_received_cb` against [`Node::register_service`],
-//! [`Node::unregister_service`], [`Node::register_echo_service`] and
-//! [`Node::on_frame_with`].
+//! `bm_service_register`, `bm_service_unregister`, `echo_service_init`,
+//! `_service_request_received_cb`, `bm_service_request`, `_service_request_cb`
+//! and the request expiry sweep against [`Node::register_service`],
+//! [`Node::unregister_service`], [`Node::register_echo_service`],
+//! [`Node::on_frame_with`], [`Node::service_request_with`] and
+//! [`Node::on_service_expiry`].
 //!
 //! A stack target, for the reason [`crate::stack`] gives. Driven from
 //! `tests/services.rs`.
@@ -19,7 +21,14 @@
 //! | Frames a request provokes | the relay, then one reply per service callback called | [`Owed::relay`](bm_stack::Owed::relay), then [`Owed::reply`](bm_stack::Owed::reply) |
 //! | Handler calls | [`c_handler`]'s, one per service callback called | [`StandIn`]'s, one |
 //! | Deliveries to the application | `on_publication`'s: the request's, then the replies' | [`Event::Publication`]: the request's, then the reply's |
+//! | A request this node makes | `bm_service_request`'s result, its frame and local deliveries | [`Node::service_request_with`]'s |
+//! | Answers to requests this node made | [`c_reply_cb`]'s, with `ack` true from a reply and false from the sweep | [`Event::ServiceReply`], [`Event::ServiceTimeout`] |
 //!
+//! Time moves only in [`Step::Wait`], one 500 ms sweep at a time, and at the
+//! start of each input, which waits until no request is outstanding
+//! (`CTX.service_request_list` has no reset either). The oracle's sweep runs
+//! on `timer_callback_handler.c`'s task, which
+//! [`stack::start_timer_callback_handler`] starts.//!
 //! Where the C calls the service callback `k` times for one publication
 //! (divergence #79, or two service subscriptions matching one topic), it
 //! sends `k` identical replies, calls the handler `k` times and delivers the
@@ -33,6 +42,11 @@
 //! | Service names are [`NAMES`], application topics [`APP_TOPICS`]; none holds a NUL, `/req` or `/rep` | `bm_get_subs` stops at a NUL; no service subscription then matches a reply topic, so a local reply delivery calls no service |
 //! | Every `SUB` and `PUB` resource is added once at start-up, longest first | divergence #38: a later lookup of a longer name reads past a shorter entry |
 //! | No request whose lookup is [`Lookup::OverRead`] or [`Lookup::ShortRequest`] | the C reads past the datagram (divergence #89) |
+//! | No publication shorter than a [`ReplyHeader`] reaching a reply subscription | `_service_request_cb` reads past it (divergence #92) |
+//! | A reply's data is compared up to what arrived | the C passes `data_size` unchecked; [`c_reply_cb`] reads no further (divergence #92) |
+//! | No [`Step::Ask`] that the node's own service would answer | the C answers it from its middleware task; the Rust node does not dispatch its own publications to its services |
+//! | Fewer than [`SERVICE_REQUESTS`] requests outstanding; asserted after every step | the Rust node's ceiling |
+//! | Timeouts that expire within seconds ([`Timeout`]) | the start of each input waits them out |
 //! | No request answered by echo with more than [`REPLY_DATA_LEN`] bytes | the C copies past its buffer (divergence #90) |
 //! | No request answered by the metrics service | `bm_shim_stack_init` registers it, and its reply is card E4's; the Rust node lists [`METRICS`] with [`StandIn`] so the list walks agree |
 //! | At most [`LEAK_BUDGET`] steps per process that leave a listed service nothing can unlist, and only for `x` | see below |
@@ -57,13 +71,13 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use arbitrary::Arbitrary;
 
 use bm_stack::node::{INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, RESOURCE_REQUESTS_DEFAULT};
-use bm_stack::service::{SERVICES, ServiceHandler};
+use bm_stack::service::{SERVICE_REQUESTS, SERVICES, ServiceHandler, ServiceRequestError};
 use bm_stack::{Event, NoConfig, NoDfu, Node, Services, SoftRtc};
 use bm_wire::bcmp::info::CACHED_STRING_BYTES;
 use bm_wire::bcmp::resource::{RESOURCE_NAME_BYTES, ResourceType};
 use bm_wire::pubsub::{self as codec, CALLBACKS, Subscriber, SubscriptionError};
 use bm_wire::service::{
-    Lookup, REPLY_DATA_LEN, REPLY_SUFFIX, REQUEST_SUFFIX, ReplyHeader, RequestHeader,
+    Lookup, MAX_DATA_SIZE, REPLY_DATA_LEN, REPLY_SUFFIX, REQUEST_SUFFIX, ReplyHeader, RequestHeader,
 };
 use bm_wire::udp;
 use bm_wire::util::BmIpAddr;
@@ -71,7 +85,10 @@ use bm_wire::util::BmIpAddr;
 use crate::l2_egress::port_transmit;
 use crate::pubsub::oracle_subscriptions;
 use crate::resource::oracle_local_resources;
-use crate::stack::{self, NUM_PORTS, OracleIdentity, capture, drain, inject, oracle};
+use crate::stack::{
+    self, NUM_PORTS, OracleIdentity, capture, captured_message_type, drain, inject, oracle,
+    tick_count,
+};
 use crate::udp::as_bm_linux_sends_it;
 
 /// The metrics service `bm_shim_stack_init` registers, `<node id>/metrics`.
@@ -106,17 +123,34 @@ pub const NAMES: [&[u8]; 9] = [
 ];
 
 /// Topics the application subscribes: a service's request topic, a prefix,
-/// everything, and echo's request topic.
-pub const APP_TOPICS: [&[u8]; 4] = [b"svc/req", b"s", b"*", b"c0ffee0012345678/echo/req"];
+/// everything, echo's request topic, and a peer's echo reply topic.
+pub const APP_TOPICS: [&[u8]; 5] = [
+    b"svc/req",
+    b"s",
+    b"*",
+    b"c0ffee0012345678/echo/req",
+    b"0b54ccce5c7978bf/echo/rep",
+];
+
+/// Services this node asks: each peer's echo, a pattern whose reply topic
+/// matches the first peer's other reply topics (divergence #74), and a
+/// [`NAMES`] entry the node may itself list.
+pub const ASKED: [&[u8]; 4] = [
+    b"0b54ccce5c7978bf/echo",
+    b"777777775c7978bf/echo",
+    b"0b54ccce5c7978bf/*",
+    b"svc",
+];
 
 /// Steps per process that may leave a listed service no request can unlist.
 pub const LEAK_BUDGET: u32 = 4;
 
-/// Topics the Rust node holds: every request topic and application topic.
-pub const SUBSCRIPTIONS: usize = 16;
+/// Topics the Rust node holds: every request, application and asked reply
+/// topic.
+pub const SUBSCRIPTIONS: usize = 24;
 
 /// Resources the Rust node holds: every request, reply and application topic.
-pub const RESOURCES: usize = 32;
+pub const RESOURCES: usize = 40;
 
 /// The node ids requests come from. The second shares the first's low 32
 /// bits.
@@ -145,6 +179,9 @@ pub type Call = (Vec<u8>, Vec<u8>);
 
 /// A delivery: `(node id, topic, data, type, version)`.
 pub type Delivery = (u64, Vec<u8>, Vec<u8>, u8, u8);
+
+/// An answer to a request this node made: `(ack, id, service, data)`.
+pub type Answer = (bool, u32, Vec<u8>, Vec<u8>);
 
 /// The answer both sides' application handlers give: the request reversed,
 /// no reply to one starting `!`, and no reply to one longer than the buffer.
@@ -175,6 +212,10 @@ impl Services for StandIn {
 
 static C_CALLS: Mutex<Vec<Call>> = Mutex::new(Vec::new());
 static DELIVERED: Mutex<Vec<Delivery>> = Mutex::new(Vec::new());
+static C_ANSWERS: Mutex<Vec<Answer>> = Mutex::new(Vec::new());
+/// The bytes after the reply header in the publication being injected:
+/// what [`c_reply_cb`] may read.
+static AVAILABLE: Mutex<usize> = Mutex::new(0);
 
 fn lock<T>(mutex: &'static Mutex<T>) -> MutexGuard<'static, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
@@ -212,6 +253,34 @@ pub unsafe extern "C" fn c_handler(
         }
         None => false,
     }
+}
+
+/// The oracle's `BmServiceReplyCb` for every request: records the answer,
+/// reading a reply no further than the publication being injected (divergence #92).
+///
+/// # Safety
+///
+/// Called by `_service_request_cb` or the expiry sweep with their own
+/// arguments.
+pub unsafe extern "C" fn c_reply_cb(
+    ack: bool,
+    msg_id: u32,
+    service_strlen: usize,
+    service: *const core::ffi::c_char,
+    reply_len: usize,
+    reply_data: *mut u8,
+) -> bool {
+    let service =
+        unsafe { std::slice::from_raw_parts(service.cast::<u8>(), service_strlen) }.to_vec();
+    let data = if ack {
+        let len = reply_len.min(*lock(&AVAILABLE));
+        unsafe { std::slice::from_raw_parts(reply_data, len) }.to_vec()
+    } else {
+        assert!(reply_data.is_null() && reply_len == 0, "a timeout's data");
+        Vec::new()
+    };
+    lock(&C_ANSWERS).push((ack, msg_id, service, data));
+    true
 }
 
 unsafe extern "C" fn on_publication(
@@ -297,6 +366,16 @@ pub enum Size {
     Raw(u32),
 }
 
+impl Size {
+    fn of(self, len: usize) -> u32 {
+        match self {
+            Self::Exact => len as u32,
+            Self::Off(off) => (len as i64 + i64::from(off)).clamp(0, i64::from(u32::MAX)) as u32,
+            Self::Raw(size) => size,
+        }
+    }
+}
+
 /// A peer's service request.
 #[derive(Debug, Clone, Arbitrary)]
 pub struct Request {
@@ -322,13 +401,7 @@ impl Request {
         let topic = self.topic.bytes();
         let room = codec::MAX_MESSAGE_LEN - codec::HEADER_LEN - topic.len() - RequestHeader::LEN;
         let data = &self.data[..self.data.len().min(room)];
-        let data_size = match self.size {
-            Size::Exact => data.len() as u32,
-            Size::Off(off) => {
-                (data.len() as i64 + i64::from(off)).clamp(0, i64::from(u32::MAX)) as u32
-            }
-            Size::Raw(size) => size,
-        };
+        let data_size = self.size.of(data.len());
         let mut body = vec![0u8; RequestHeader::LEN];
         RequestHeader {
             id: self.id,
@@ -348,6 +421,130 @@ impl Request {
     }
 }
 
+/// `timeout_s` for a request: one that expires within seconds.
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum Timeout {
+    /// 0 to 3 seconds.
+    Seconds(u8),
+    /// 4 294 968 to 4 294 970 seconds, which wrap to 704 to 2704 ms
+    /// (divergence #91).
+    Wrapped(u8),
+    /// 2 147 486 to 4 294 966 seconds: more than 2^31 ms, which
+    /// `time_remaining` reads as overdue at the next sweep (divergence #91).
+    Overdue(u32),
+}
+
+impl Timeout {
+    fn seconds(self) -> u32 {
+        match self {
+            Self::Seconds(s) => u32::from(s % 4),
+            Self::Wrapped(k) => 4_294_968 + u32::from(k % 3),
+            Self::Overdue(x) => 2_147_486 + x % 2_147_481,
+        }
+    }
+}
+
+/// A request this node makes.
+#[derive(Debug, Clone, Arbitrary)]
+pub struct Ask {
+    /// An [`ASKED`] entry.
+    pub service: u8,
+    /// The data, cut to [`MAX_DATA_SIZE`] + 8 bytes.
+    pub data: Vec<u8>,
+    /// The timeout.
+    pub timeout: Timeout,
+}
+
+/// A reply's `target_node_id`.
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum Target {
+    /// This node.
+    Us,
+    /// One of [`PEERS`].
+    Peer(bool),
+    /// Any id.
+    Raw(u64),
+}
+
+/// A reply's `id`.
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum ReplyId {
+    /// An outstanding request's, reduced modulo how many there are; the
+    /// next id if there are none.
+    Waiting(u8),
+    /// Any id.
+    Raw(u32),
+}
+
+/// A topic a reply is published on.
+#[derive(Debug, Clone, Arbitrary)]
+pub enum ReplyTopic {
+    /// `<name>/rep` of an [`ASKED`] entry.
+    Asked(u8),
+    /// Any bytes (cut to 32).
+    Raw(Vec<u8>),
+}
+
+/// A peer's reply to a request this node made.
+#[derive(Debug, Clone, Arbitrary)]
+pub struct Reply {
+    /// The port it arrives on, reduced to 1..=[`NUM_PORTS`].
+    pub ingress: u8,
+    /// Which of [`PEERS`] sends it.
+    pub peer: bool,
+    /// The topic.
+    pub topic: ReplyTopic,
+    /// The header's `target_node_id`.
+    pub target: Target,
+    /// The header's `id`.
+    pub id: ReplyId,
+    /// The header's `data_size`.
+    pub size: Size,
+    /// The data, cut to what fits [`codec::MAX_MESSAGE_LEN`].
+    pub data: Vec<u8>,
+    /// Cut the body (header and data) to this many bytes.
+    pub cut: Option<u16>,
+}
+
+impl Reply {
+    fn publication(&self, node: &ServicesNode) -> (Vec<u8>, Vec<u8>) {
+        let topic = match &self.topic {
+            ReplyTopic::Asked(i) => reply_topic(ASKED[usize::from(*i) % ASKED.len()]),
+            ReplyTopic::Raw(bytes) => bytes[..bytes.len().min(32)].to_vec(),
+        };
+        let room = codec::MAX_MESSAGE_LEN - codec::HEADER_LEN - topic.len() - ReplyHeader::LEN;
+        let data = &self.data[..self.data.len().min(room)];
+        let target_node_id = match self.target {
+            Target::Us => stack::NODE_ID,
+            Target::Peer(peer) => PEERS[usize::from(peer)],
+            Target::Raw(id) => id,
+        };
+        let requests = node.service_requests();
+        let id = match self.id {
+            ReplyId::Waiting(i) if !requests.is_empty() => requests
+                .iter()
+                .nth(usize::from(i) % requests.len())
+                .expect("in range")
+                .id(),
+            ReplyId::Waiting(_) => requests.next_id(),
+            ReplyId::Raw(id) => id,
+        };
+        let mut body = vec![0u8; ReplyHeader::LEN];
+        ReplyHeader {
+            target_node_id,
+            id,
+            data_size: self.size.of(data.len()),
+        }
+        .encode(&mut body)
+        .expect("sixteen bytes");
+        body.extend_from_slice(data);
+        if let Some(cut) = self.cut {
+            body.truncate(usize::from(cut));
+        }
+        (topic, body)
+    }
+}
+
 /// One step, applied to the oracle and the Rust node.
 #[derive(Debug, Clone, Arbitrary)]
 pub enum Step {
@@ -361,6 +558,12 @@ pub enum Step {
     Unsubscribe(u8),
     /// A peer's request.
     Request(Request),
+    /// This node asks a service.
+    Ask(Ask),
+    /// A peer's reply.
+    Reply(Reply),
+    /// Let this many milliseconds pass, modulo 2000.
+    Wait(u16),
 }
 
 /// Steps run in order, after `reset`.
@@ -379,6 +582,12 @@ pub struct Summary {
     pub replies: usize,
     /// The most service callbacks one request reached on the oracle.
     pub most_calls: usize,
+    /// Requests this node made.
+    pub asked: usize,
+    /// Answers with `ack` true.
+    pub answered: usize,
+    /// Answers with `ack` false.
+    pub timeouts: usize,
 }
 
 /// What the oracle and the Rust node hold between inputs.
@@ -400,6 +609,12 @@ fn state() -> (MutexGuard<'static, ()>, MutexGuard<'static, Option<State>>) {
     let guard = oracle();
     let mut state = lock(&STATE);
     if state.is_none() {
+        stack::start_timer_callback_handler();
+        assert_eq!(
+            tick_count(),
+            0,
+            "both request sweeps are phased from bring-up"
+        );
         let metrics_request = request_topic(METRICS);
         let (pubs, subs, _) = oracle_local_resources();
         assert!(pubs.is_empty(), "PUB_LIST: {pubs:?}");
@@ -434,6 +649,7 @@ fn advertise_everything(state: &mut State) {
         .iter()
         .map(|n| request_topic(n))
         .chain(APP_TOPICS.iter().map(|t| t.to_vec()))
+        .chain(ASKED.iter().map(|n| reply_topic(n)))
         .collect();
     subs.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
     subs.dedup();
@@ -442,8 +658,13 @@ fn advertise_everything(state: &mut State) {
         assert_eq!(app_unsubscribe(state, topic), Ok(()), "{topic:?}");
     }
 
-    let mut pubs: Vec<Vec<u8>> = NAMES.iter().map(|n| reply_topic(n)).collect();
+    let mut pubs: Vec<Vec<u8>> = NAMES
+        .iter()
+        .map(|n| reply_topic(n))
+        .chain(ASKED.iter().map(|n| request_topic(n)))
+        .collect();
     pubs.sort_by(|a, b| b.len().cmp(&a.len()).then(a.cmp(b)));
+    pubs.dedup();
     for topic in &pubs {
         let err = unsafe {
             bm_wire_sys::bm_pub_wl(
@@ -536,17 +757,36 @@ pub fn check(input: &ServicesInput) -> Summary {
                 let _ = app_unsubscribe(state, topic);
                 true
             }
-            Step::Request(request) => match receive(state, request) {
-                Some(calls) => {
-                    summary.most_calls = summary.most_calls.max(calls.0);
-                    summary.replies += usize::from(calls.1);
-                    true
-                }
-                None => false,
-            },
+            Step::Request(request) => {
+                let (topic, body) = request.publication();
+                let ingress = request.ingress % NUM_PORTS + 1;
+                receive(
+                    state,
+                    ingress,
+                    request.source(),
+                    &topic,
+                    &body,
+                    &mut summary,
+                )
+            }
+            Step::Reply(reply) => {
+                let (topic, body) = reply.publication(&state.node);
+                let ingress = reply.ingress % NUM_PORTS + 1;
+                let source = PEERS[usize::from(reply.peer)];
+                receive(state, ingress, source, &topic, &body, &mut summary)
+            }
+            Step::Ask(ask) => self::ask(state, ask, &mut summary),
+            Step::Wait(ms) => {
+                wait(state, u32::from(*ms % 2000), &mut summary);
+                true
+            }
         };
         summary.skipped += usize::from(!ran);
         assert_lists(state, &format!("{step:?}"));
+        assert!(
+            state.node.service_requests().len() < SERVICE_REQUESTS,
+            "the request table kept a slot free"
+        );
     }
     summary
 }
@@ -586,7 +826,21 @@ fn reset(state: &mut State) {
     assert!(drain().is_empty(), "the ring was not drained");
     let _ = take_delivered();
     let _ = take_c_calls();
+    assert!(lock(&C_ANSWERS).is_empty(), "an answer was not compared");
     state.node.services_mut().calls.clear();
+
+    // Every timeout `Timeout` allows has passed within 3 s of its request.
+    let mut summary = Summary::default();
+    for _ in 0..8 {
+        if state.node.service_requests().is_empty() {
+            break;
+        }
+        wait(state, 500, &mut summary);
+    }
+    assert!(
+        state.node.service_requests().is_empty(),
+        "requests outlived their timeouts"
+    );
 
     for topic in APP_TOPICS {
         while state
@@ -704,12 +958,51 @@ fn unregister(state: &mut State, name: &[u8]) -> bool {
     true
 }
 
-/// Inject `request` into both. Returns how many service callbacks it reached
-/// and whether it was answered, or `None` if it is outside the domain.
-fn receive(state: &mut State, request: &Request) -> Option<(usize, bool)> {
-    let (topic, body) = request.publication();
-    let source = request.source();
+/// Whether a publication on `topic` reaches a reply subscription.
+fn reaches_reply(node: &ServicesNode, topic: &[u8]) -> bool {
+    node.subscriptions()
+        .matching_callbacks(topic)
+        .any(|(_, c)| c.contains(&Subscriber::Reply))
+}
+
+/// Inject a peer's publication of `body` on `topic` into both. Returns
+/// whether it ran: `false` if it is outside the domain.
+fn receive(
+    state: &mut State,
+    ingress: u8,
+    source: u64,
+    topic: &[u8],
+    body: &[u8],
+    summary: &mut Summary,
+) -> bool {
+    let what = format!("{topic:?} from {source:#x}, body {body:?}");
+    let Some((calls, replied, answers)) =
+        receive_publication(state, ingress, source, topic, body, &what)
+    else {
+        return false;
+    };
+    summary.most_calls = summary.most_calls.max(calls);
+    summary.replies += usize::from(replied);
+    count(summary, &answers);
+    true
+}
+
+/// [`receive`]'s comparison. Returns how many service callbacks the
+/// publication reached, whether it was answered and the answers it gave
+/// requests this node made, or `None` if it is outside the domain.
+fn receive_publication(
+    state: &mut State,
+    ingress: u8,
+    source: u64,
+    topic: &[u8],
+    body: &[u8],
+    what: &str,
+) -> Option<(usize, bool, Vec<Answer>)> {
+    let (topic, body) = (topic.to_vec(), body.to_vec());
     let node = &state.node;
+    if reaches_reply(node, &topic) && body.len() < ReplyHeader::LEN {
+        return None;
+    }
     let calls: usize = node
         .subscriptions()
         .matching_callbacks(&topic)
@@ -775,36 +1068,29 @@ fn receive(state: &mut State, request: &Request) -> Option<(usize, bool)> {
         codec::PORT,
         &payload,
     );
-    let ingress = request.ingress % NUM_PORTS + 1;
 
+    *lock(&AVAILABLE) = body.len().saturating_sub(ReplyHeader::LEN);
     inject(ingress, &frame);
     let c_frames = drain();
     let c_delivered = take_delivered();
     let c_calls = take_c_calls();
+    let c_answers = take_c_answers();
 
     let mut rs_frame = frame.clone();
     let mut rs_delivered = Vec::new();
+    let mut rs_answers = Vec::new();
     let owed = state
         .node
-        .on_frame_with(0, ingress, &mut rs_frame, |event| {
-            if let Event::Publication {
-                source,
-                topic,
-                kind,
-                version,
-                data,
-                ..
-            } = event
-            {
-                rs_delivered.push((source, topic.to_vec(), data.to_vec(), kind, version));
-            }
+        .on_frame_with(tick_count(), ingress, &mut rs_frame, |event| {
+            record(event, &mut rs_delivered, &mut rs_answers);
         });
     assert!(owed.forward.is_none());
     let rs_relay = owed.relay.map(capture).unwrap_or_default();
     let rs_reply = owed.reply.map(capture);
     let rs_calls = std::mem::take(&mut state.node.services_mut().calls);
 
-    let what = format!("{request:?}: topic {topic:?}, {calls} service callbacks");
+    let what = format!("{what}: {calls} service callbacks");
+    assert_eq!(rs_answers, c_answers, "answers, {what}");
     let expected_reply = reply.as_ref().map(|p| rust_sends(p));
     assert_eq!(rs_reply, expected_reply, "Rust reply, {what}");
     assert_eq!(
@@ -851,7 +1137,7 @@ fn receive(state: &mut State, request: &Request) -> Option<(usize, bool)> {
         expected_c.extend(replied.iter().cloned());
     }
     assert_eq!(c_delivered, expected_c, "C deliveries, {what}");
-    Some((calls, reply.is_some()))
+    Some((calls, reply.is_some(), c_answers))
 }
 
 /// A publication's deliveries to the application: one per application
@@ -871,6 +1157,184 @@ fn deliveries(node: &ServicesNode, source: u64, topic: &[u8], data: &[u8]) -> Ve
             )
         })
         .collect()
+}
+
+fn take_c_answers() -> Vec<Answer> {
+    std::mem::take(&mut *lock(&C_ANSWERS))
+}
+
+/// File a Rust event as a delivery or an answer.
+fn record(event: Event<'_>, delivered: &mut Vec<Delivery>, answers: &mut Vec<Answer>) {
+    match event {
+        Event::Publication {
+            source,
+            topic,
+            kind,
+            version,
+            data,
+            ..
+        } => delivered.push((source, topic.to_vec(), data.to_vec(), kind, version)),
+        Event::ServiceReply { id, service, data } => {
+            answers.push((true, id, service.to_vec(), data.to_vec()));
+        }
+        Event::ServiceTimeout { id, service } => {
+            answers.push((false, id, service.to_vec(), Vec::new()));
+        }
+        _ => {}
+    }
+}
+
+/// `bm_service_request` and [`Node::service_request_with`]. Returns whether
+/// it ran.
+fn ask(state: &mut State, ask: &Ask, summary: &mut Summary) -> bool {
+    let service = ASKED[usize::from(ask.service) % ASKED.len()];
+    let data = &ask.data[..ask.data.len().min(MAX_DATA_SIZE + 8)];
+    let timeout_s = ask.timeout.seconds();
+    let node = &state.node;
+    let id = node.service_requests().next_id();
+    let topic = request_topic(service);
+    let mut body = vec![0u8; RequestHeader::LEN];
+    RequestHeader {
+        id,
+        data_size: data.len() as u32,
+    }
+    .encode(&mut body)
+    .expect("eight bytes");
+    body.extend_from_slice(data);
+
+    // The Rust node's ceilings.
+    if node.service_requests().len() + 1 == SERVICE_REQUESTS {
+        return false;
+    }
+    let rep = reply_topic(service);
+    if node
+        .subscriptions()
+        .callbacks(&rep)
+        .is_some_and(|c| c.len() == CALLBACKS && c[0] != Subscriber::Reply)
+    {
+        return false;
+    }
+    // A local service the C would call, or read past the request for.
+    let serves = node
+        .subscriptions()
+        .matching_callbacks(&topic)
+        .any(|(_, c)| c.contains(&Subscriber::Service));
+    if serves
+        && matches!(
+            node.service_table().lookup(&topic, &body),
+            Lookup::Call { .. } | Lookup::OverRead { .. } | Lookup::ShortRequest { .. }
+        )
+    {
+        return false;
+    }
+    let too_large = data.len() > MAX_DATA_SIZE;
+    if !too_large && reaches_reply(node, &topic) && body.len() < ReplyHeader::LEN {
+        return false;
+    }
+
+    *lock(&AVAILABLE) = body.len().saturating_sub(ReplyHeader::LEN);
+    let c_ok = unsafe {
+        bm_wire_sys::bm_service_request(
+            service.len(),
+            service.as_ptr().cast(),
+            data.len(),
+            data.as_ptr(),
+            Some(c_reply_cb),
+            timeout_s,
+        )
+    };
+    stack::pump_until_quiet();
+    let c_frames = drain();
+    let c_delivered = take_delivered();
+    let c_answers = take_c_answers();
+    assert!(take_c_calls().is_empty(), "no handler is called");
+
+    let mut rs_delivered = Vec::new();
+    let mut rs_answers = Vec::new();
+    let rs = state
+        .node
+        .service_request_with(tick_count(), service, data, timeout_s, |event| {
+            record(event, &mut rs_delivered, &mut rs_answers);
+        })
+        .map(|(id, outbound)| (id, capture(outbound)));
+    let what = format!("{ask:?}");
+    assert_eq!(c_ok, rs.is_ok(), "the result, {what}: {rs:?}");
+    assert_eq!(rs_answers, c_answers, "local answers, {what}");
+    match rs {
+        Err(ServiceRequestError::TooLarge) => {
+            assert!(too_large, "{what}");
+            assert!(c_frames.is_empty() && c_delivered.is_empty(), "{what}");
+            assert!(rs_delivered.is_empty(), "{what}");
+        }
+        Err(e) => panic!("{e:?} outside the domain, {what}"),
+        Ok((rs_id, rs_frames)) => {
+            summary.asked += 1;
+            assert_eq!(rs_id, id, "{what}");
+            let mut payload = vec![0u8; codec::HEADER_LEN + topic.len() + body.len()];
+            codec::encode(&mut payload, &topic, 0, codec::COMMON_VERSION, &body).expect("a topic");
+            assert_eq!(
+                c_frames,
+                as_bm_linux_sends_it(
+                    codec::PORT,
+                    &BmIpAddr::GLOBAL_MULTICAST,
+                    codec::PORT,
+                    &payload
+                ),
+                "C frames, {what}"
+            );
+            assert_eq!(rs_frames, rust_sends(&payload), "Rust frames, {what}");
+            let expected = deliveries(&state.node, stack::NODE_ID, &topic, &body);
+            assert_eq!(c_delivered, expected, "C deliveries, {what}");
+            assert_eq!(rs_delivered, expected, "Rust deliveries, {what}");
+        }
+    }
+    count(summary, &c_answers);
+    true
+}
+
+fn count(summary: &mut Summary, answers: &[Answer]) {
+    for (ack, ..) in answers {
+        if *ack {
+            summary.answered += 1;
+        } else {
+            summary.timeouts += 1;
+        }
+    }
+}
+
+/// Let `ms` pass on both, one request sweep at a time, comparing what each
+/// sweep expires. The oracle's other timers run too; their frames are BCMP
+/// (heartbeats), and are dropped.
+fn wait(state: &mut State, ms: u32, summary: &mut Summary) {
+    let target = tick_count().wrapping_add(ms);
+    loop {
+        let now = tick_count();
+        let next = state.node.service_requests().next_sweep_ms();
+        let to = if next.wrapping_sub(now) <= target.wrapping_sub(now) {
+            next
+        } else {
+            target
+        };
+        unsafe { bm_wire_sys::bm_shim_advance_ticks(to.wrapping_sub(now)) };
+        stack::pump_until_quiet();
+        for (_, frame) in drain() {
+            assert!(
+                captured_message_type(&frame).is_some(),
+                "only BCMP while waiting: {frame:?}"
+            );
+        }
+        assert!(take_delivered().is_empty() && take_c_calls().is_empty());
+        let c_answers = take_c_answers();
+        let mut rs_answers = Vec::new();
+        state.node.on_service_expiry(to, |event| {
+            record(event, &mut Vec::new(), &mut rs_answers);
+        });
+        assert_eq!(rs_answers, c_answers, "the sweep at {to}");
+        count(summary, &c_answers);
+        if to == target {
+            return;
+        }
+    }
 }
 
 fn assert_lists(state: &State, after: &str) {

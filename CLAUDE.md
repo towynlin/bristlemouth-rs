@@ -60,7 +60,8 @@ A cargo workspace.
   - `src/service/` — the services' bodies: `sys_info`, `config_map`,
     `power_info`, `metrics`, each encode and decode; `table.rs` is
     `bm_service.c`'s list and request walk (`ServiceTable`), the request and
-    reply headers, and echo's handler.
+    reply headers, and echo's handler; `request.rs` is
+    `bm_service_request.c`'s list, id counter and 500 ms sweep (`Requests`).
   - `fuzz/` — a `cargo fuzz` crate, its own workspace. Targets are ~6 lines
     each; the work is in `bm-wire-diff`.
   - `fuzz/seeds/` — committed seed corpora, one directory per target, replayed
@@ -77,9 +78,10 @@ A cargo workspace.
     `bm_wire::configuration`.
   - `src/node.rs` — `Node::on_frame`, `on_tick` and `on_expiry` are
     synchronous and take the current time; `Node::run` is the only async code.
-    Each has a `_with` twin that reports `Event`s. The two timers are
-    bm_core's: the 10 s heartbeat and `packet.c`'s 150 ms expiry sweep, which
-    must not be put on a grid of the port's own (divergence #22). DFU runs
+    Each has a `_with` twin that reports `Event`s. The three timers are
+    bm_core's: the 10 s heartbeat, `packet.c`'s 150 ms expiry sweep and
+    `bm_service_request.c`'s 500 ms sweep (`on_service_expiry`), which must
+    not be put on a grid of the port's own (divergence #22). DFU runs
     from `next_dfu_transmission`, as bm_core's runs on its own task.
     Pub/sub (`subscribe`, `unsubscribe`, `publish`, `Event::Publication`)
     holds UDP port 4321; the subscription table is `bm_wire::pubsub::Subscriptions`.
@@ -88,7 +90,8 @@ A cargo workspace.
   - `src/service.rs` — `Services`, the application's service handlers, a
     `Node`'s `S`. `Node::register_service`, `register_echo_service` and
     `unregister_service` list them; `on_frame` answers a request in
-    `Owed::reply`.
+    `Owed::reply`. `Node::service_request` asks another node's service;
+    the answer is `Event::ServiceReply` or `Event::ServiceTimeout`.
   - `src/utc_time.rs` — the Spotter's `spotter/utc-time`, which C nodes set
     their RTC from (bm_protocol app code, not bm_core): `decode` and
     `UtcTimeSetter`, for an `App`.
@@ -151,9 +154,13 @@ A cargo workspace.
     `bm_pub_wl` and `bm_handle_msg` against `Node`'s pub/sub, with one Rust
     node mirroring the oracle's subscription and resource lists for the life
     of the process.
-  - `src/services.rs`, `tests/services.rs` — `bm_service.c` and echo against
-    `Node`'s services, with one Rust node mirroring the oracle's service
-    list, subscriptions and resources for the life of the process.
+  - `src/services.rs`, `tests/services.rs` — `bm_service.c`, echo and
+    `bm_service_request.c` against `Node`'s services and requests, with one
+    Rust node mirroring the oracle's service list, request list,
+    subscriptions and resources for the life of the process.
+  - `tests/service_request_failures.rs` — `bm_service_request`'s failure
+    paths on the oracle alone (divergence #91), which the Rust node's
+    ceilings refuse earlier.
   - `src/service_codecs.rs` — the service bodies against
     `bm_common_messages`, in-process; what it skips is listed at the top.
   - `src/metrics_codec.rs` — the metrics body against `metrics_reply_msg.c`,
