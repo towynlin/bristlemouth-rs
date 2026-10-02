@@ -309,7 +309,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   |---|---|
   | The driver takes `embedded-hal` traits, not embassy types | keeps it off the HAL, so a simulated part on a host can drive it; nothing in the repo does yet, since `bm-devkit` has no host tests |
   | Blocking SPI | `ConfigStorage` is synchronous. A write blocks the node's loop for two sector erases and 32 page programs, about 100 ms typical (W25Q64JV datasheet), and the only write, a commit, resets the MCU after it |
-  | `W25` owns SPI2 through `ExclusiveDevice` | only config uses the flash; card B3 shares it with a DFU slot |
+  | `W25` owns SPI2 through `ExclusiveDevice` | only config uses the flash. The C's DFU client writes to internal flash; only the DFU host reads the W25 (`bm-devkit/README.md`, "DFU image locations") |
   | 4 KB sector buffer in `W25` | off the node task's stack, which the Spotter calls already need |
 
   Not yet run on a kit: a key set (`0xA2`) and committed (`0xA3`) surviving
@@ -379,44 +379,9 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
 
 ---
 
-## Card B3 — Share the dev kit's NOR flash between config and a DFU slot
-
-**Blocks:** a DFU slot on the dev kit (out of scope, below). **Blocked by:**
-nothing. Not needed to say hello.
-
-`Devkit`'s `Config<DevkitConfigStorage>` owns the only `bm_devkit::Flash`,
-which owns SPI2 and `FLASH_CS` through `ExclusiveDevice`. A `bm_stack::DfuSlot`
-on the same part would be the node's `D` beside its `C`: two fields of one
-`Node`, so neither can borrow the other's `W25`.
-
-1. Confirm where bm_protocol (`62d8b5d`, as `bm-devkit/README.md`) keeps
-   the image `bm_dfu_client_flash_area_*` receives: the W25's `dfu`
-   partition (`0x0C000`, 2048000 bytes) or MCUboot's slot 2 in internal
-   flash. Record it in `bm-devkit/README.md`. If it is internal flash, the
-   config store keeps the part to itself: delete this card and say why in
-   the commit message.
-2. Give config and the DFU slot one `W25` and one 4 KB sector buffer. Both
-   run in the node's task, so `&'static RefCell<Flash>` (or an embassy-sync
-   blocking `Mutex<NoopRawMutex, _>`) is enough; no cross-task lock. Keep
-   `FlashConfigStorage`'s behaviour; `node`'s signature may change.
-3. `DfuSlot::write` arrives in 2048-byte pages. `W25::write` erases the
-   4 KB sector around each, so every sector would be erased twice. The slot
-   should erase its range in `DfuSlot::erase` and program pages without
-   erasing, which needs a program-only method on `W25` (`0x06`, `0x02`, wait
-   for `WEL` clear, as `W25::write`'s page loop).
-
-Done: builds in CI; `bringup` still logs a committed key after the reset
-(card B2's check), reported as done or not done.
-
----
-
 ## Order
 
-```
-B3
-```
-
-B3 can start now.
+No cards remain.
 
 # Explicitly out of scope
 
@@ -425,5 +390,9 @@ B3 can start now.
   say hello. A natural next plan.
 - **`integrations/topology.c`**, as in `bcmp-port-todo.md`.
 - **DFU slot and no-init RAM on the dev kit.** `bm-devkit` has `NoDfu`;
-  `README.md` there records the C's MCUboot layout and no-init block. Card
-  B3 prepares the flash for it.
+  `README.md` there records the C's MCUboot layout, no-init block and where
+  each DFU hook keeps its image. A `DfuSlot` matching the C writes MCUboot
+  slot 2 in internal flash and reads the W25 `dfu` partition only in
+  `DfuSlot::read`. The W25 is then shared, but DFU only reads it:
+  `&'static RefCell<Flash>` in the node's task is enough, and no
+  program-only `W25` method is needed.
