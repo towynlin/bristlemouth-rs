@@ -3,9 +3,11 @@
 //!
 //! A script of store operations runs against both. After every step the
 //! comparator asserts the same return value and outputs, then the same three
-//! RAM partition images byte for byte, the same `needs_commit` flags, and the
-//! same three flash images. The RAM image is read through `get_stored_keys`,
-//! whose pointer is `HEADER_LEN` bytes into the C's `ConfigPartition`.
+//! RAM partition images byte for byte, the same `needs_commit` flags, the
+//! same three flash images, and the same three partitions as a CBOR map and
+//! its CRC-32 (`services_cbor_as_map`, `services_cbor_encoded_as_crc32`). The
+//! RAM image is read through `get_stored_keys`, whose pointer is
+//! `HEADER_LEN` bytes into the C's `ConfigPartition`.
 //!
 //! # State
 //!
@@ -32,7 +34,13 @@
 //!   presented: the C reads past its key array (divergence #48).
 //!   [`Op::FixCrc`] clamps `numKeys` before it computes the CRC.
 //! * `get_config_int` is not called on `3b 8000000000000000`, where the C
-//!   negates `INT64_MIN` (divergence #41).
+//!   negates `INT64_MIN` (divergence #41). Nor is `services_cbor_as_map`
+//!   while any listed key's slot holds it: a later key can read it through
+//!   the stale iterator of divergence #42, whatever its own type.
+//! * `services_cbor_as_map` is not called where
+//!   [`ConfigPartition::cbor_map`] returns [`MapError::Unreachable`]: the C
+//!   reads past a `key_buf`, reads an uninitialised `CborValue`, or fails a
+//!   `cbor_assert`.
 
 use std::sync::{Mutex, PoisonError};
 
@@ -40,7 +48,8 @@ use arbitrary::{Arbitrary, Result, Unstructured};
 use bm_stack::RamConfigStorage;
 use bm_stack::config::{config_init, save_config};
 use bm_wire::configuration::{
-    ConfigStore, CopyError, HEADER_LEN, Head, Key, Layout, MAX_NUM_KV, Partition,
+    ConfigPartition, ConfigStore, CopyError, HEADER_LEN, Head, Key, Layout, MAX_NUM_KV, MapError,
+    Partition,
 };
 use bm_wire::crc::crc32_ieee;
 
@@ -372,6 +381,58 @@ pub(crate) fn c_config_init() {
     unsafe { bm_wire_sys::config_init() };
 }
 
+/// The C's map of `p`, or `None` where it returns `NULL`.
+pub(crate) fn c_cbor_map(p: Partition) -> Option<Vec<u8>> {
+    let mut len = 0usize;
+    // SAFETY: `services_cbor_as_map` returns a `bm_malloc`'d buffer of `len`
+    // bytes or NULL; the copy is taken before it is freed.
+    unsafe {
+        let buf = bm_wire_sys::services_cbor_as_map(&raw mut len, c_partition(p));
+        if buf.is_null() {
+            return None;
+        }
+        let map = std::slice::from_raw_parts(buf, len).to_vec();
+        bm_wire_sys::bm_free(buf.cast());
+        Some(map)
+    }
+}
+
+/// Whether one of `part`'s listed slots holds `3b 8000000000000000`, which
+/// the C's `cbor_value_get_int64` negates (divergence #41).
+fn holds_int64_min_minus_one(part: &ConfigPartition) -> bool {
+    (0..usize::from(part.num_keys())).any(|i| {
+        let off = LAYOUT.value_offset(i);
+        Head::parse(&part.image()[off..off + 50]).is_some_and(|h| h.major == 1 && h.arg == 1 << 63)
+    })
+}
+
+/// Assert both sides map `p` alike.
+fn compare_map(rust: &ConfigPartition, p: Partition, after: &str) {
+    // A map of 50 keys is at most 50 * (1 + 32 + 2 + 49) + 2 bytes.
+    let mut buf = [0u8; 4352];
+    let map = match rust.cbor_map(&mut buf) {
+        Ok(n) => Some(&buf[..n]),
+        Err(MapError::NoMap) => None,
+        Err(MapError::Unreachable) => return,
+        Err(MapError::TooSmall(n)) => panic!("a {n}-byte map"),
+    };
+    if holds_int64_min_minus_one(rust) {
+        return;
+    }
+    assert_eq!(
+        map,
+        c_cbor_map(p).as_deref(),
+        "{p:?} services_cbor_as_map diverged after {after}"
+    );
+    // SAFETY: builds, hashes and frees one map.
+    let c_crc = unsafe { bm_wire_sys::services_cbor_encoded_as_crc32(c_partition(p)) };
+    assert_eq!(
+        rust.cbor_map_crc32(),
+        c_crc,
+        "{p:?} services_cbor_encoded_as_crc32 diverged after {after}"
+    );
+}
+
 /// [`Op::FixCrc`]'s edit, applied to a flash image.
 fn fix_crc(image: &mut [u8]) {
     image[8] %= MAX_NUM_KV as u8 + 1;
@@ -426,6 +487,7 @@ impl Pair {
                 self.flash.bytes(p)[..IMAGE_LEN] == c_flash(p)[..],
                 "{p:?} flash diverged after {after}"
             );
+            compare_map(rust, p, after);
         }
     }
 
@@ -707,6 +769,103 @@ mod tests {
             Op::GetString(sys(b"silly"), 43),
             Op::GetBuffer(sys(b"bytes"), 9),
         ]);
+    }
+
+    /// Run `ops`, then return what [`ConfigPartition::cbor_map`] made of the
+    /// system partition, which `compare_state` has compared with the C.
+    fn system_map(ops: Vec<Op>) -> std::result::Result<Vec<u8>, MapError> {
+        let _guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut pair = Pair::reset();
+        for op in &ops {
+            pair.step(op);
+        }
+        let mut buf = [0u8; 4352];
+        let part = pair.store.partition(Partition::System);
+        assert!(!holds_int64_min_minus_one(part));
+        part.cbor_map(&mut buf).map(|n| buf[..n].to_vec())
+    }
+
+    /// `cbor_service_helper_test.cpp`'s map, set as the gtest sets it.
+    #[test]
+    fn the_cbor_service_helper_gold_map() {
+        let slot = |head: &[u8], body: &[u8]| {
+            let mut v = vec![0u8; 50];
+            v[..head.len()].copy_from_slice(head);
+            v[head.len()..head.len() + body.len()].copy_from_slice(body);
+            v
+        };
+        let map = system_map(vec![
+            Op::SetCbor(sys(b"foo"), slot(&[0x18, 0x2a], &[])),
+            Op::SetCbor(sys(b"bar"), slot(&[0x39, 0x03, 0xe7], &[])),
+            Op::SetCbor(sys(b"baz"), slot(&[0xfa, 0x40, 0x49, 0x0f, 0xd0], &[])),
+            Op::SetCbor(sys(b"silly"), slot(&[0x78, 0x2b], SILLY)),
+            Op::SetCbor(sys(b"bytes"), slot(&[0x4a], BYTES)),
+        ])
+        .unwrap();
+        assert_eq!(map.len(), 91);
+        assert_eq!(map[..7], [0xa5, 0x63, b'f', b'o', b'o', 0x18, 0x2a]);
+    }
+
+    /// Divergence #42: any `ARRAY` value, and the C returns `NULL`.
+    #[test]
+    fn an_array_value_means_no_map() {
+        let got = system_map(vec![
+            Op::SetUint(sys(b"a"), 1),
+            Op::SetCbor(sys(b"b"), vec![0x82, 0x01, 0x02]),
+        ]);
+        assert_eq!(got, Err(MapError::NoMap));
+    }
+
+    /// Divergence #88: a refused typed set leaves a key's type over a string
+    /// head, and the map reads the slot by the key's type.
+    #[test]
+    fn values_are_read_by_their_key_type() {
+        let got = system_map(vec![
+            Op::SetUint(sys(b"u"), 7),
+            Op::SetInt(sys(b"i"), -7),
+            Op::SetFloat(sys(b"f"), 0x3f80_0000),
+            Op::SetString(sys(b"u"), vec![b'x'; 60]),
+            Op::SetBuffer(sys(b"i"), vec![1; 300]),
+        ]);
+        let mut expected = vec![0xa3, 0x61, b'u', 0x18, 60, 0x61, b'i', 0x19, 1, 44];
+        expected.extend([0x61, b'f', 0xfa, 0x3f, 0x80, 0, 0]);
+        assert_eq!(got, Ok(expected));
+
+        // A `STR` key over a byte string head copies it as text.
+        assert_eq!(
+            system_map(vec![
+                Op::SetString(sys(b"s"), b"ab".to_vec()),
+                Op::SetBuffer(sys(b"s"), vec![3; 60]),
+                Op::SetCbor(sys(b"s"), vec![0x42, 1, 2]),
+            ]),
+            Ok(vec![0xa1, 0x61, b's', 0x42, 1, 2])
+        );
+    }
+
+    /// Divergence #42: a slot that does not parse is read through the
+    /// previous key's iterator over a zeroed buffer, so a 4-byte argument
+    /// reads as zero.
+    #[test]
+    fn an_unparseable_slot_reads_the_previous_iterator() {
+        let value = |i: usize| LAYOUT.value_offset(i) as u16;
+        let map = system_map(vec![
+            Op::SetUint(sys(b"a"), 0x1_0000),
+            Op::SetUint(sys(b"b"), 5),
+            Op::SetUint(sys(b"c"), 300),
+            Op::SetFloat(sys(b"d"), 0x4049_0fd0),
+            Op::SetInt(sys(b"e"), -5),
+            Op::Save(Partition::System),
+            Op::Corrupt(Partition::System, value(1), 0x1c),
+            Op::Corrupt(Partition::System, value(4), 0x1c),
+            Op::FixCrc(Partition::System),
+            Op::Reload,
+        ]);
+        let mut expected = vec![0xa5, 0x61, b'a', 0x1a, 0, 1, 0, 0];
+        expected.extend([0x61, b'b', 0x00]);
+        expected.extend([0x61, b'c', 0x19, 1, 44]);
+        expected.extend([0x61, b'd', 0xfa, 0x40, 0x49, 0x0f, 0xd0]);
+        expected.extend([0x61, b'e', 0x00]);
+        assert_eq!(map, Ok(expected));
     }
 
     /// `cborGetSet`: a whole slot copied under another key, stale tail and

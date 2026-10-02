@@ -538,6 +538,49 @@ impl<'a> Value<'a> {
         self.ty != INVALID
     }
 
+    /// `cbor_value_get_int64` with `NDEBUG` defined: [`Self::extract`],
+    /// negated as a negative integer if the flag says so, for any type.
+    ///
+    /// The C's `-*result - 1` overflows for an argument of `1 << 63`
+    /// (divergence #41); this wraps.
+    #[must_use]
+    pub fn get_int64(&self) -> i64 {
+        let v = self.extract() as i64;
+        if self.flags & NEGATIVE_INTEGER != 0 {
+            v.wrapping_neg().wrapping_sub(1)
+        } else {
+            v
+        }
+    }
+
+    /// `cbor_value_get_float` with `NDEBUG` defined: the low 32 bits of the
+    /// head's 4- or 8-byte argument, for any type.
+    ///
+    /// # Errors
+    ///
+    /// [`CborError::Unreachable`] for a head whose argument fits in 16 bits:
+    /// `_cbor_value_decode_int64_internal`'s `cbor_assert` fails.
+    pub fn get_float(&self) -> Result<u32, CborError> {
+        if self.flags & INTEGER_TOO_LARGE == 0 {
+            return Err(CborError::Unreachable);
+        }
+        Ok(self.extract() as u32)
+    }
+
+    /// This iterator's state over `buf` instead of its own buffer: what a
+    /// `CborValue` reads after the bytes under it have been overwritten.
+    #[must_use]
+    pub fn rebind<'b>(&self, buf: &'b [u8]) -> Value<'b> {
+        Value {
+            buf,
+            pos: self.pos,
+            remaining: self.remaining,
+            flags: self.flags,
+            ty: self.ty,
+            extra: self.extra,
+        }
+    }
+
     /// `cbor_value_is_length_known`.
     #[must_use]
     pub fn is_length_known(&self) -> bool {

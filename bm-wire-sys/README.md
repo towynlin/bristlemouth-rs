@@ -90,7 +90,7 @@ failure points at a tier instead of a wall of errors.
 |---|---|---|
 | T0 | nothing | `crc16/32`, `util`, `lib_state_machine`, `device`, `l2_policy` |
 | T1 | the `bm_os` shim | `aligned_malloc`, `ll`, `q`, `pcap`, `cb_queue`, `timer_callback_handler`, `bcmp/packet` |
-| T2 | tinycbor | `configuration`, `cbor_service_helper`, and the C half of `bm_common_messages`; four of its codecs with `NDEBUG` (`T2_RELEASE`, divergence #82) |
+| T2 | tinycbor | `configuration`, `cbor_service_helper`, and the C half of `bm_common_messages`; `cbor_service_helper` and four of the codecs with `NDEBUG` (`T2_RELEASE`, divergences #82, #88) |
 | T3 | `bm_ip` + a NetworkDevice | `bm_linux`, `l2`, all of `bcmp/`, `middleware/`, `integrations/` |
 | T4 | the DFU flash shim | `dfu_core`, `dfu_client`, `dfu_host`, `bm_mavlink` |
 
