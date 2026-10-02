@@ -149,6 +149,9 @@ A cargo workspace.
 - `docs/hello-world-todo.md` — the plan for a Rust hello-world app on a dev
   kit (UDP, pub/sub, `spotter_log`, board support). **Complete and closed; no
   work there.** Kept as documentation of what was built and why.
+- `docs/services-todo.md` — **the open plan**: `bm_service*.c` and the
+  built-in services (echo, sys_info, config_map, power_info, metrics). Its
+  "Working a card" says how to pick, claim and close a card.
 - `docs/bcmp-port-todo.md` — the BCMP port. Complete and closed to new
   cards; its shared contract is the record of the porting rules.
 - `docs/embassy-port-tracking-prompt.md` — the brief that produced
