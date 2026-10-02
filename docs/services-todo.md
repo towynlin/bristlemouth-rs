@@ -125,6 +125,8 @@ From reading the source; not yet run.
 
 ### S2 — Service requests
 
+**Taken:** claude/services-s2-requests
+
 - **C:** `bm_service_request.c`.
 - **Rust:** `bm_wire::service::Requests<N>` (id counter, deadlines, the
   500 ms sweep); `Node::service_request(service, data, timeout_s)`,
