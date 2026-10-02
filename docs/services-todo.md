@@ -142,6 +142,8 @@ From reading the source; not yet run.
 
 ### M2 — Metrics body
 
+**Taken:** claude/services-m2-metrics-body
+
 - **C:** `metrics_reply_msg.c`, `bm_encode_fields_from_table`,
   `bm_decode_fields_from_table`.
 - **Rust:** `bm_wire::service::metrics`: a field enum (`BM_FIELD_*`), encode
