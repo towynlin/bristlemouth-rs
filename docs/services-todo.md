@@ -123,22 +123,8 @@ From reading the source; not yet run.
 | `power_info_reply_cb` | Callbacks are dequeued FIFO, not by id; a failed send leaves its callback queued and shifts every later pairing. | E3 |
 | `power_info_service_init` | Stores the callback when registration fails. | E3 |
 | `metrics_service_handler` | Accepts a non-empty request, which sys_info and power_info refuse; `uptime_ms` wraps after ~49.7 days. | E4 |
-| `sys_info_service_handler` | `sys_config_crc` is 0 whenever `services_cbor_as_map` fails (#42). | C1 |
 
 ## Cards
-
-### C1 — Config partition as a CBOR map
-
-**Taken:** claude/services-c1-cbor-map
-
-- **C:** `services_cbor_as_map`, `services_cbor_encoded_as_crc32`.
-- **Rust:** `bm_wire::configuration::ConfigPartition::cbor_map` and
-  `cbor_map_crc32`, reading the byte image as the C does, #42 included (an
-  `ARRAY` copied raw; an unreadable value ends the map).
-- **Comparator:** extend `bm-wire-diff/src/configuration.rs` and its
-  existing target; reuse its `config_init` reset.
-- **Blocked by:** nothing. **Blocks:** E1, E2.
-- **Done:** `configuration` fuzz target clean with map and CRC compared.
 
 ### S1 — Service table, dispatch, echo
 
@@ -170,9 +156,9 @@ From reading the source; not yet run.
 
 - **C:** `sys_info_service.c`.
 - **Rust:** the handler, `Node::sys_info_request`; `Identity::app_name`,
-  `git_sha`. The CRC is C1's over the system partition.
+  `git_sha`. The CRC is `cbor_map_crc32` over the system partition.
 - **Comparator:** extends `services`.
-- **Blocked by:** C1, S2. **Blocks:** E5.
+- **Blocked by:** S2. **Blocks:** E5.
 
 ### E2 — config_map
 
@@ -181,7 +167,7 @@ From reading the source; not yet run.
   `Node::config_map_request`.
 - **Comparator:** extends `services`; seed both stores as
   `bm-wire-diff/src/config.rs` does.
-- **Blocked by:** C1, S2. **Blocks:** E5.
+- **Blocked by:** S2. **Blocks:** E5.
 
 ### E3 — power_info
 
@@ -216,14 +202,14 @@ From reading the source; not yet run.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | C1, S1 | nothing |
+| 1 | S1 | nothing |
 | 2 | S2 | S1 |
-| 3 | E1, E2, E3, E4 | S2 and its codec cards (see **Blocked by**) |
+| 3 | E1, E2, E3, E4 | S2 |
 | 4 | E5 | E1–E4 |
 
 Cards within a wave can run in parallel.
 
-## What the landed cards left for the rest (M1, M2)
+## What the landed cards left for the rest (M1, M2, C1)
 
 - **`bm_wire::cbor::parser` is tinycbor's parser.** `Value` is `CborValue`
   and each method the C function it names, including error codes, tags not
@@ -267,3 +253,16 @@ Cards within a wave can run in parallel.
   `bm_shim_heap_watch_begin(limit)` refuses zero bytes or more than `limit`
   on the calling thread and counts what it granted, so a comparator can skip
   heap-dependent inputs and free what the C leaks.
+- **A partition as a map: `ConfigPartition::cbor_map(&mut [u8])`** returns
+  the map's length, or a `MapError`: `NoMap` where the C returns `NULL`,
+  `TooSmall(n)` where the buffer is short (the C allocates), `Unreachable`
+  where the C is undefined. `cbor_map_crc32` is 0 for any error; E1 uses it
+  for `sys_config_crc`. E2 maps into the handler's buffer: `ConfigMapReply`
+  adds a header, so `TooSmall` there is contract 8's no reply; an
+  `Unreachable` partition should get none either.
+- **The map is read as a release build reads it** (#88): each value by its
+  key's stored type, through `parser::Value`'s unchecked accessors. The same
+  decision as #82, for the same reason; `bm-wire-sys/build.rs` compiles
+  `cbor_service_helper.c` with `NDEBUG`. A debug-built C node aborts on a
+  `sys_info` or `config_map` request where a refused typed set (#46) left a
+  key's type over a string head.
