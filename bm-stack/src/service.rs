@@ -12,19 +12,23 @@
 //! | `sys_info_service_init` | [`crate::Node::register_sys_info_service`] |
 //! | `config_cbor_map_service_init` | [`crate::Node::register_config_map_service`] |
 //! | `power_info_service_init` | [`crate::Node::register_power_info_service`] |
+//! | `metrics_service_init` | [`crate::Node::with_services`], if [`Services::METRICS`] |
 //! | `_service_request_received_cb` | [`crate::Node::on_frame`], for each service callback a publication reaches |
 //! | a `BmServiceHandler` | [`Services::handle`], or a built-in [`ServiceHandler`] |
 //! | a `BmPowerInfoStatsCb` | [`Services::power_info`] |
+//! | `metrics_service_add_component`, and each `MetricComponentDataCb` | [`Services::metrics`] |
 //! | `bm_service_request` | [`crate::Node::service_request`] |
 //! | `sys_info_service_request` | [`crate::Node::sys_info_request`] |
 //! | `config_cbor_map_service_request` | [`crate::Node::config_map_request`] |
 //! | `power_info_service_request` | [`crate::Node::power_info_request`] |
+//! | `metrics_service_request` | [`crate::Node::metrics_request`] |
 //! | a `BmServiceReplyCb` | [`crate::Event::ServiceReply`], [`crate::Event::ServiceTimeout`] |
 //! | a `BmPowerInfoReplyCb` | [`crate::Event::PowerInfoReply`] |
 //! | `_service_request_timer_expiry_cb` | [`crate::Node::on_service_expiry`] |
 
 use bm_wire::pubsub::SubscriptionError;
 use bm_wire::service::Requests;
+use bm_wire::service::metrics::Component;
 use bm_wire::service::power_info::{Callbacks, PowerInfoReply};
 
 use crate::node::SubscribeError;
@@ -78,6 +82,27 @@ pub trait Services {
     fn power_info(&mut self) -> Option<PowerInfoReply> {
         None
     }
+
+    /// `bm_metrics_enabled`: whether [`crate::Node::with_services`] lists
+    /// the metrics service, `<node id>/metrics`, before anything else, as
+    /// `bristlemouth_init` does. bm_protocol's `bm_config.h` sets it, so a
+    /// C node lists it; so does the default.
+    const METRICS: bool = true;
+
+    /// The components of a metrics reply: call `encode` once with them, in
+    /// the order `metrics_service_add_component` would have added them, and
+    /// return what it returns. The default has none, which a C node with
+    /// metrics enabled and no component added sends.
+    ///
+    /// A component whose `MetricComponentDataCb` would fail is left out. A
+    /// [`bm_wire::service::metrics::Field::String`] fails the encode and the
+    /// reply is not sent (divergence #85), as is a reply over
+    /// [`bm_wire::service::REPLY_DATA_LEN`] bytes.
+    ///
+    /// Called once per request, as [`Services::handle`] is.
+    fn metrics<R>(&mut self, encode: impl FnOnce(&[Component<'_>]) -> R) -> R {
+        encode(&[])
+    }
 }
 
 /// No application services: anything registered with
@@ -99,6 +124,9 @@ pub enum ServiceHandler {
     /// `power_info_request_cb`: [`bm_wire::service::power_info::handle`] of
     /// [`Services::power_info`].
     PowerInfo,
+    /// `metrics_service_handler`: [`bm_wire::service::metrics::handle`] of
+    /// [`Services::metrics`].
+    Metrics,
     /// The application's, [`Services::handle`].
     Application,
 }

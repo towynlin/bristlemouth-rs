@@ -1,16 +1,18 @@
 //! Differential comparator for the service layer on the node:
 //! `bm_service_register`, `bm_service_unregister`, `echo_service_init`,
 //! `sys_info_service_init`, `config_cbor_map_service_init`,
-//! `power_info_service_init`, `_service_request_received_cb`,
-//! `bm_service_request`, `sys_info_service_request`,
-//! `config_cbor_map_service_request`, `power_info_service_request`,
+//! `power_info_service_init`, `metrics_service_init`,
+//! `_service_request_received_cb`, `bm_service_request`,
+//! `sys_info_service_request`, `config_cbor_map_service_request`,
+//! `power_info_service_request`, `metrics_service_request`,
 //! `_service_request_cb` and the request expiry sweep against
 //! [`Node::register_service`], [`Node::unregister_service`],
 //! [`Node::register_echo_service`], [`Node::register_sys_info_service`],
 //! [`Node::register_config_map_service`],
-//! [`Node::register_power_info_service`], [`Node::on_frame_with`],
-//! [`Node::service_request_with`], [`Node::sys_info_request_with`],
-//! [`Node::config_map_request_with`], [`Node::power_info_request_with`] and
+//! [`Node::register_power_info_service`], [`Node::with_services`],
+//! [`Node::on_frame_with`], [`Node::service_request_with`],
+//! [`Node::sys_info_request_with`], [`Node::config_map_request_with`],
+//! [`Node::power_info_request_with`], [`Node::metrics_request_with`] and
 //! [`Node::on_service_expiry`].
 //!
 //! A stack target, for the reason [`crate::stack`] gives. Driven from
@@ -32,10 +34,16 @@
 //! | Answers to requests this node made | [`c_reply_cb`]'s, with `ack` true from a reply and false from the sweep | [`Event::ServiceReply`], [`Event::ServiceTimeout`] |
 //! | Answers to power_info requests | which of [`C_POWER_REPLY`] was called, and with what | [`Event::PowerInfoReply`]'s request id, mapped to the callback that request queued |
 //! | Power stats read | [`c_power_stats`]'s calls, one per service callback called | [`StandIn`]'s, one |
+//! | Metrics components read | [`C_METRIC`]'s calls, one per added component per service callback called | [`StandIn`]'s, one |
 //! | `sys_config_crc`, before each sys_info reply | `services_cbor_encoded_as_crc32` | [`ConfigPartition::cbor_map_crc32`](bm_wire::configuration::ConfigPartition::cbor_map_crc32) |
 //!
 //! Both nodes keep a config store, emptied at the start of each input by
-//! [`crate::config`]'s reset and written by [`Step::Configure`]. A sys_info
+//! [`crate::config`]'s reset and written by [`Step::Configure`]. Both list
+//! the metrics service first: `bm_shim_stack_init` and
+//! [`Node::with_services`] register it. The oracle's components are
+//! [`COMPONENTS`], added once at bring-up; [`Step::Metrics`] sets which of
+//! them report and with what, on both sides, and each input starts with none
+//! reporting. A sys_info
 //! or config_map reply's bytes are compared whole; their decoding on a
 //! requester is [`crate::service_codecs`]'s, so [`Summary::sys_info_decoded`]
 //! and [`Summary::config_map_decoded`] only count answers the Rust decoders
@@ -70,7 +78,6 @@
 //! | Under ASan, `strict_memcmp=0` (the `services` fuzz target) | `<id>/sys_info/req` and the peer's sys_info reply topic are longer than `<id>/metrics/req`, which `SUB_LIST` lists first, so each `bm_sub_wl` compares past it (divergence #38); only bytes up to the first difference are checked |
 //! | No sys_info request while the system partition's map is [`MapError::Unreachable`] | the C reads it with undefined behaviour (divergences #42, #88) |
 //! | No config_map request naming a partition whose map is [`MapError::Unreachable`], or whose `partition_id` is tagged | the C reads either with undefined behaviour (divergences #42, #82, #88) |
-//! | No request answered by the metrics service | `bm_shim_stack_init` registers it, and its reply is card E4's; the Rust node lists [`METRICS`] with [`StandIn`] so the list walks agree |
 //! | At most [`LEAK_BUDGET`] steps per process that leave a listed service nothing can unlist, and only for `x` | see below |
 //! | Fewer than [`SERVICES`] services listed, [`CALLBACKS`] callbacks per topic | the Rust node's ceilings |
 //!
@@ -102,6 +109,7 @@ use bm_wire::cbor::parser::CborError;
 use bm_wire::configuration::{MapError, Partition};
 use bm_wire::pubsub::{self as codec, CALLBACKS, Subscriber, SubscriptionError};
 use bm_wire::service::config_map::{self, ConfigMapRequest, DecodedConfigMapReply};
+use bm_wire::service::metrics::{self, Component, Entry};
 use bm_wire::service::power_info::{self, PowerInfoReply};
 use bm_wire::service::sys_info::{self, DecodedSysInfoReply, SysInfoReply};
 use bm_wire::service::{
@@ -112,6 +120,7 @@ use bm_wire::util::BmIpAddr;
 
 use crate::config::{self as config_diff, Seed};
 use crate::l2_egress::port_transmit;
+use crate::metrics_codec::{self, FieldIn};
 use crate::pubsub::oracle_subscriptions;
 use crate::resource::oracle_local_resources;
 use crate::stack::{
@@ -142,6 +151,29 @@ pub const PEER_SYS_INFO: &[u8] = b"0b54ccce5c7978bf/sys_info";
 /// The service [`Step::AskConfigMap`] asks: `config_cbor_map_service_request`
 /// of the first of [`PEERS`].
 pub const PEER_CONFIG_MAP: &[u8] = b"0b54ccce5c7978bf/config_map";
+
+/// The service [`Step::AskMetrics`] asks: `metrics_service_request` of the
+/// first of [`PEERS`].
+pub const PEER_METRICS: &[u8] = b"0b54ccce5c7978bf/metrics";
+
+/// The metrics components the oracle adds at bring-up, in order, with
+/// `metrics_service_add_component`; each is [`C_METRIC`]'s callback of the
+/// same index. NUL-terminated: the C keeps the pointer.
+pub const COMPONENTS: [&str; 3] = ["memory\0", "network_port_stats\0", "a\0"];
+
+/// Field keys a [`Step::Metrics`] table draws from: one with an interior
+/// NUL, the empty key, and a 63-byte key, thirteen fields of which outgrow
+/// the reply buffer.
+pub const FIELD_KEYS: [&str; 5] = [
+    "free_bytes",
+    "a",
+    "a\0b",
+    "",
+    "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijk",
+];
+
+/// The most fields a [`Step::Metrics`] table keeps.
+pub const MAX_FIELDS: usize = 24;
 
 /// Service names. [`ECHO`] is registered with `echo_service_init` and
 /// [`Node::register_echo_service`], [`SYS_INFO`] with `sys_info_service_init`
@@ -174,11 +206,18 @@ pub const APP_TOPICS: [&[u8]; 5] = [
     b"0b54ccce5c7978bf/sys_info/rep",
 ];
 
-/// Services this node asks: a peer's sys_info and config_map, a pattern
-/// whose reply topic matches the peer's reply topics (divergence #74), and
-/// [`NAMES`] entries the node may itself list. [`POWER_INFO`] is asked by
-/// [`Step::AskPowerInfo`] too.
-pub const ASKED: [&[u8]; 5] = [PEER_SYS_INFO, PEER_CONFIG_MAP, b"0*", b"svc", POWER_INFO];
+/// Services this node asks: a peer's sys_info, config_map and metrics, a
+/// pattern whose reply topic matches the peer's reply topics (divergence
+/// #74), and [`NAMES`] entries the node may itself list. [`POWER_INFO`] is
+/// asked by [`Step::AskPowerInfo`] too.
+pub const ASKED: [&[u8]; 6] = [
+    PEER_SYS_INFO,
+    PEER_CONFIG_MAP,
+    b"0*",
+    b"svc",
+    POWER_INFO,
+    PEER_METRICS,
+];
 
 /// Steps per process that may leave a listed service no request can unlist.
 pub const LEAK_BUDGET: u32 = 4;
@@ -233,12 +272,14 @@ fn answer(request: &[u8], reply: &mut [u8]) -> Option<usize> {
     Some(request.len())
 }
 
-/// The Rust node's [`Services`]: `answer`, recording each call, and
-/// the power stats [`Step::PowerStats`] set, counting each read.
+/// The Rust node's [`Services`]: `answer`, recording each call, the power
+/// stats [`Step::PowerStats`] set and the components [`Step::Metrics`] set,
+/// counting each read.
 #[derive(Debug, Default)]
 pub struct StandIn {
     calls: Vec<Call>,
     power_calls: usize,
+    metrics_calls: usize,
 }
 
 impl Services for StandIn {
@@ -253,7 +294,150 @@ impl Services for StandIn {
         self.power_calls += 1;
         Some(*lock(&POWER_STATS))
     }
+
+    fn metrics<R>(&mut self, encode: impl FnOnce(&[Component<'_>]) -> R) -> R {
+        self.metrics_calls += 1;
+        with_components(&lock(&METRIC_TABLES), encode)
+    }
 }
+
+/// A component's table: `(index into FIELD_KEYS, field)`s.
+pub type Table = Vec<(u8, FieldIn)>;
+
+/// The table of each of [`COMPONENTS`], or `None` where its callback fails. Set by
+/// [`Step::Metrics`]; each input starts with every one `None`.
+pub type Tables = [Option<Table>; COMPONENTS.len()];
+
+/// The tables both sides' components report.
+static METRIC_TABLES: Mutex<Tables> = Mutex::new([None, None, None]);
+
+/// The C's view of [`METRIC_TABLES`]: the entries each callback hands out,
+/// and the values they point at.
+struct CTables {
+    luts: Vec<Vec<bm_wire_sys::BmEncoderTableEntry>>,
+    /// Each value in an 8-byte slot the C reads at its own width; boxed so
+    /// the pointers outlive moves.
+    _values: Vec<Box<[u64]>>,
+}
+
+// The pointers are into `_values` and `FIELD_KEYS`, which live as long as
+// the `CTables`, and are only read under `C_TABLES`'s lock and the oracle's.
+unsafe impl Send for CTables {}
+
+static C_TABLES: Mutex<Option<CTables>> = Mutex::new(None);
+static C_METRIC_CALLS: Mutex<usize> = Mutex::new(0);
+
+/// `tables` as the Rust node reports them: the components whose table is
+/// set, in [`COMPONENTS`] order.
+fn with_components<R>(tables: &Tables, encode: impl FnOnce(&[Component<'_>]) -> R) -> R {
+    let entries: Vec<(usize, Vec<Entry<'_>>)> = tables
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let t = t.as_ref()?;
+            let fields = t
+                .iter()
+                .map(|(k, f)| Entry {
+                    key: field_key(*k),
+                    field: f.field(),
+                })
+                .collect();
+            Some((i, fields))
+        })
+        .collect();
+    let components: Vec<Component<'_>> = entries
+        .iter()
+        .map(|(i, fields)| Component {
+            key: COMPONENTS[*i].trim_end_matches('\0'),
+            fields,
+        })
+        .collect();
+    encode(&components)
+}
+
+fn field_key(k: u8) -> &'static str {
+    FIELD_KEYS[usize::from(k) % FIELD_KEYS.len()]
+}
+
+/// Set both sides' tables, and rebuild the C's.
+fn set_tables(tables: &Tables) {
+    let keys: &'static [std::ffi::CString] = {
+        static KEYS: OnceLock<Vec<std::ffi::CString>> = OnceLock::new();
+        KEYS.get_or_init(|| {
+            FIELD_KEYS
+                .iter()
+                // A key is passed with a NUL appended, so the C sees it up
+                // to its first NUL, as the port does.
+                .map(|k| {
+                    let to_nul = k.split('\0').next().expect("one piece at least");
+                    std::ffi::CString::new(to_nul).expect("no NUL")
+                })
+                .collect()
+        })
+    };
+    let values: Vec<Box<[u64]>> = tables
+        .iter()
+        .map(|t| {
+            t.iter()
+                .flatten()
+                .map(|(_, f)| metrics_codec::slot(*f))
+                .collect()
+        })
+        .collect();
+    let luts = tables
+        .iter()
+        .zip(&values)
+        .map(|(t, v)| {
+            t.iter()
+                .flatten()
+                .zip(v.iter())
+                .map(|((k, f), slot)| bm_wire_sys::BmEncoderTableEntry {
+                    key: keys[usize::from(*k) % FIELD_KEYS.len()].as_ptr(),
+                    type_: metrics_codec::c_type(*f),
+                    value_source: (&raw const *slot).cast(),
+                })
+                .collect()
+        })
+        .collect();
+    *lock(&C_TABLES) = Some(CTables {
+        luts,
+        _values: values,
+    });
+    *lock(&METRIC_TABLES) = tables.clone();
+}
+
+/// The oracle's `MetricComponentDataCb` for [`COMPONENTS`]`[K]`: its table
+/// from [`METRIC_TABLES`], or `BmENODEV` where that is `None`, which
+/// `metrics_collect_component` skips. Counts each call.
+unsafe extern "C" fn c_metric<const K: usize>(
+    metric_key: *const core::ffi::c_char,
+    lut: *mut *const bm_wire_sys::BmEncoderTableEntry,
+    num_fields: *mut usize,
+) -> bm_wire_sys::BmErr {
+    *lock(&C_METRIC_CALLS) += 1;
+    // `metrics_collect_component` passes the key it was added with.
+    let key = unsafe { core::ffi::CStr::from_ptr(metric_key) };
+    assert_eq!(key.to_bytes_with_nul(), COMPONENTS[K].as_bytes());
+    if lock(&METRIC_TABLES)[K].is_none() {
+        return bm_wire_sys::BmErr_BmENODEV;
+    }
+    let tables = lock(&C_TABLES);
+    let table = &tables.as_ref().expect("set at bring-up").luts[K];
+    // The table lives in `C_TABLES` until the next `set_tables`, after the
+    // handler has encoded it.
+    unsafe {
+        *lut = table.as_ptr();
+        *num_fields = table.len();
+    }
+    bm_wire_sys::BmErr_BmOK
+}
+
+/// The oracle's `MetricComponentDataCb`s, one per [`COMPONENTS`] entry.
+pub const C_METRIC: [unsafe extern "C" fn(
+    *const core::ffi::c_char,
+    *mut *const bm_wire_sys::BmEncoderTableEntry,
+    *mut usize,
+) -> bm_wire_sys::BmErr; COMPONENTS.len()] = [c_metric::<0>, c_metric::<1>, c_metric::<2>];
 
 /// The power stats both sides' callbacks return; [`Step::PowerStats`] sets
 /// them, and each input starts from the default.
@@ -416,7 +600,6 @@ fn c_name(name: &[u8]) -> *const core::ffi::c_char {
     let names = NAMES_C.get_or_init(|| {
         NAMES
             .iter()
-            .chain([&METRICS])
             .map(|n| CString::new(*n).expect("no NUL"))
             .collect()
     });
@@ -446,6 +629,8 @@ pub enum RequestTopic {
     Bare(u8),
     /// Any bytes (cut to 32).
     Raw(Vec<u8>),
+    /// `<node id>/metrics/req`, [`METRICS`]' request topic.
+    Metrics,
 }
 
 impl RequestTopic {
@@ -458,6 +643,7 @@ impl RequestTopic {
             }
             Self::Bare(i) => name(i).to_vec(),
             Self::Raw(bytes) => bytes[..bytes.len().min(32)].to_vec(),
+            Self::Metrics => request_topic(METRICS),
         }
     }
 }
@@ -711,6 +897,12 @@ pub enum Step {
         /// `total_on_s`, `remaining_on_s` and `upcoming_off_s`.
         stats: (u32, u32, u32),
     },
+    /// Set which of [`COMPONENTS`] report to both sides' metrics services,
+    /// and with what; tables are cut to [`MAX_FIELDS`].
+    Metrics(Tables),
+    /// This node asks [`PEER_METRICS`] with `metrics_service_request` and
+    /// [`Node::metrics_request_with`].
+    AskMetrics(Timeout),
 }
 
 /// A config_map request's `partition_id`.
@@ -770,6 +962,17 @@ pub struct Summary {
     /// Of those, the ones called for a request other than the one answered
     /// (divergence #96).
     pub power_info_crossed: usize,
+    /// Replies the metrics service sent.
+    pub metrics_replies: usize,
+    /// Of those, the ones to a request carrying data (divergence #97).
+    pub metrics_replies_with_data: usize,
+    /// Of those, the ones with at least one component.
+    pub metrics_with_components: usize,
+    /// Requests the metrics service sent no reply to: a reply over its
+    /// buffer, or a string field (divergence #85).
+    pub metrics_refused: usize,
+    /// Answers to [`PEER_METRICS`].
+    pub metrics_answered: usize,
 }
 
 /// What the oracle and the Rust node hold between inputs.
@@ -805,8 +1008,15 @@ fn state() -> (MutexGuard<'static, ()>, MutexGuard<'static, Option<State>>) {
         assert!(pubs.is_empty(), "PUB_LIST: {pubs:?}");
         assert_eq!(subs, vec![metrics_request.clone()], "SUB_LIST");
         assert_eq!(oracle_subscriptions(), subs, "the subscription list");
+        set_tables(&Tables::default());
+        for (key, cb) in COMPONENTS.iter().zip(C_METRIC) {
+            let err = unsafe {
+                bm_wire_sys::metrics_service_add_component(key.as_ptr().cast(), Some(cb), 0)
+            };
+            assert_eq!(err, bm_wire_sys::BmErr_BmOK, "{key:?}");
+        }
 
-        let mut node = Node::with_services(
+        let node = Node::with_services(
             OracleIdentity,
             SoftRtc::new(),
             config_diff::reset(&[]),
@@ -814,8 +1024,12 @@ fn state() -> (MutexGuard<'static, ()>, MutexGuard<'static, Option<State>>) {
             StandIn::default(),
             NUM_PORTS,
         );
-        node.register_service(METRICS)
-            .expect("the metrics service's stand-in");
+        assert!(
+            node.service_table()
+                .iter()
+                .eq([(METRICS, ServiceHandler::Metrics)]),
+            "the metrics service, listed at construction"
+        );
         let mut state_ = State {
             node,
             budget: LEAK_BUDGET,
@@ -1055,6 +1269,24 @@ pub fn check(input: &ServicesInput) -> Summary {
                 let source = PEERS[usize::from(reply.peer)];
                 receive(state, ingress, source, &topic, &body, &mut summary)
             }
+            Step::Metrics(tables) => {
+                let mut tables = tables.clone();
+                for table in tables.iter_mut().flatten() {
+                    table.truncate(MAX_FIELDS);
+                }
+                set_tables(&tables);
+                true
+            }
+            Step::AskMetrics(timeout) => self::ask(
+                state,
+                &Ask {
+                    service: asked_index(PEER_METRICS),
+                    data: Vec::new(),
+                    timeout: *timeout,
+                },
+                Builtin::Metrics,
+                &mut summary,
+            ),
             Step::Configure(seed) => {
                 seed.apply_c();
                 seed.apply_rust(&mut state.node.config_mut().store);
@@ -1114,8 +1346,11 @@ fn reset(state: &mut State) {
     assert!(lock(&C_POWER).is_empty(), "a power answer was not compared");
     *lock(&C_POWER_CALLS) = 0;
     *lock(&POWER_STATS) = PowerInfoReply::default();
+    *lock(&C_METRIC_CALLS) = 0;
+    set_tables(&Tables::default());
     state.node.services_mut().calls.clear();
     state.node.services_mut().power_calls = 0;
+    state.node.services_mut().metrics_calls = 0;
     *state.node.config_mut() = config_diff::reset(&[]);
 
     // Every timeout `Timeout` allows has passed within 3 s of its request.
@@ -1303,6 +1538,17 @@ fn receive(
     };
     summary.sys_info_replies += usize::from(handler == Some(ServiceHandler::SysInfo));
     summary.power_info_replies += usize::from(handler == Some(ServiceHandler::PowerInfo));
+    if let Some(with_components) = received.metrics {
+        if received.replied {
+            summary.metrics_replies += 1;
+            summary.metrics_with_components += usize::from(with_components);
+            summary.metrics_replies_with_data += usize::from(
+                matches!(state.node.service_table().lookup(topic, body), Lookup::Call { data, .. } if !data.is_empty()),
+            );
+        } else {
+            summary.metrics_refused += 1;
+        }
+    }
     if let Some(success) = received.config_map_success {
         summary.config_map_replies += 1;
         summary.config_map_successes += usize::from(success);
@@ -1327,6 +1573,9 @@ struct Received {
     power_reported: usize,
     /// Of those, the ones called for a request other than the one answered.
     power_crossed: usize,
+    /// For a request the metrics service was called for, whether any
+    /// component reported.
+    metrics: Option<bool>,
 }
 
 /// [`receive`]'s comparison, or `None` if the publication is outside the
@@ -1367,10 +1616,13 @@ fn receive_publication(
     let mut config_map_success = None;
     // Power stats reads per service callback called.
     let mut power_reads = 0;
+    // Metrics reads per service callback called, and whether any component
+    // reported.
+    let mut metrics_reads = 0;
+    let mut metrics_seen = None;
     if calls > 0 {
         match node.service_table().lookup(&topic, &body) {
             Lookup::OverRead { .. } | Lookup::ShortRequest { .. } => return None,
-            Lookup::Call { name, .. } if name == METRICS => return None,
             Lookup::Call {
                 handler: ServiceHandler::Echo,
                 data,
@@ -1404,6 +1656,14 @@ fn receive_publication(
                         power_reads = usize::from(data.is_empty());
                         let stats = *lock(&POWER_STATS);
                         power_info::handle(data, || Some(stats), &mut out)
+                    }
+                    ServiceHandler::Metrics => {
+                        metrics_reads = 1;
+                        let tables = lock(&METRIC_TABLES).clone();
+                        metrics_seen = Some(tables.iter().any(Option::is_some));
+                        with_components(&tables, |components| {
+                            metrics::handle(stack::NODE_ID, tick_count(), components, &mut out)
+                        })
                     }
                     ServiceHandler::Application => {
                         call = Some((name.to_vec(), data.to_vec()));
@@ -1450,6 +1710,7 @@ fn receive_publication(
     let c_answers = take_c_answers();
     let c_power = take_c_power();
     let c_power_reads = std::mem::take(&mut *lock(&C_POWER_CALLS));
+    let c_metric_reads = std::mem::take(&mut *lock(&C_METRIC_CALLS));
 
     let mut rs_frame = frame.clone();
     let mut rs_delivered = Vec::new();
@@ -1465,6 +1726,7 @@ fn receive_publication(
     let rs_reply = owed.reply.map(capture);
     let rs_calls = std::mem::take(&mut state.node.services_mut().calls);
     let rs_power_reads = std::mem::take(&mut state.node.services_mut().power_calls);
+    let rs_metrics_reads = std::mem::take(&mut state.node.services_mut().metrics_calls);
 
     let what = format!("{what}: {calls} service callbacks");
     assert_eq!(rs_answers, c_answers, "answers, {what}");
@@ -1477,6 +1739,15 @@ fn receive_publication(
         c_power_reads,
         power_reads * calls,
         "C power stats reads, {what}"
+    );
+    assert_eq!(
+        rs_metrics_reads, metrics_reads,
+        "Rust metrics reads, {what}"
+    );
+    assert_eq!(
+        c_metric_reads,
+        metrics_reads * calls * COMPONENTS.len(),
+        "C component callbacks, {what}"
     );
     let expected_reply = reply.as_ref().map(|p| rust_sends(p));
     assert_eq!(rs_reply, expected_reply, "Rust reply, {what}");
@@ -1534,6 +1805,7 @@ fn receive_publication(
             .iter()
             .filter(|(id, _)| Some(*id) != answered)
             .count(),
+        metrics: metrics_seen,
     })
 }
 
@@ -1636,6 +1908,9 @@ enum Builtin {
     /// `power_info_service_request` and [`Node::power_info_request_with`],
     /// to [`POWER_INFO`] with no data.
     PowerInfo,
+    /// `metrics_service_request` and [`Node::metrics_request_with`], to
+    /// [`PEER_METRICS`] with no data.
+    Metrics,
 }
 
 fn name_index(name: &[u8]) -> u8 {
@@ -1668,6 +1943,7 @@ fn ask(state: &mut State, ask: &Ask, builtin: Builtin, summary: &mut Summary) ->
             assert!(service == PEER_CONFIG_MAP && ask.data == config_map_request(id));
         }
         Builtin::PowerInfo => assert!(service == POWER_INFO && ask.data.is_empty()),
+        Builtin::Metrics => assert!(service == PEER_METRICS && ask.data.is_empty()),
     }
     let data = &ask.data[..ask.data.len().min(MAX_DATA_SIZE + 8)];
     let timeout_s = ask.timeout.seconds();
@@ -1744,6 +2020,9 @@ fn ask(state: &mut State, ask: &Ask, builtin: Builtin, summary: &mut Summary) ->
                 bm_wire_sys::power_info_service_request(Some(C_POWER_REPLY[*k]), timeout_s)
                     == bm_wire_sys::BmErr_BmOK
             }
+            Builtin::Metrics => {
+                bm_wire_sys::metrics_service_request(PEERS[0], Some(c_reply_cb), timeout_s)
+            }
         }
     };
     stack::pump_until_quiet();
@@ -1767,6 +2046,7 @@ fn ask(state: &mut State, ask: &Ask, builtin: Builtin, summary: &mut Summary) ->
             node.config_map_request_with(now, PEERS[0], id, timeout_s, on_event)
         }
         Builtin::PowerInfo => node.power_info_request_with(now, timeout_s, on_event),
+        Builtin::Metrics => node.metrics_request_with(now, PEERS[0], timeout_s, on_event),
     }
     .map(|(id, outbound)| (id, capture(outbound)));
     let what = format!("{ask:?}");
@@ -1817,6 +2097,7 @@ fn count(summary: &mut Summary, answers: &[Answer]) {
                 service == PEER_CONFIG_MAP
                     && DecodedConfigMapReply::default().decode_into(data).is_ok(),
             );
+            summary.metrics_answered += usize::from(service == PEER_METRICS);
         } else {
             summary.timeouts += 1;
         }

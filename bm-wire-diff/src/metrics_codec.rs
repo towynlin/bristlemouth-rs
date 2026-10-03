@@ -79,7 +79,7 @@ pub enum FieldIn {
 }
 
 impl FieldIn {
-    fn field(self) -> Field {
+    pub(crate) fn field(self) -> Field {
         match self {
             Self::U8(v) => Field::U8(v),
             Self::U16(v) => Field::U16(v),
@@ -140,7 +140,7 @@ fn c_key(key: &str) -> Vec<u8> {
     v
 }
 
-fn c_type(f: FieldIn) -> sys::BmField {
+pub(crate) fn c_type(f: FieldIn) -> sys::BmField {
     match f {
         FieldIn::U8(_) => sys::BmField_BM_FIELD_UINT8,
         FieldIn::U16(_) => sys::BmField_BM_FIELD_UINT16,
@@ -154,7 +154,7 @@ fn c_type(f: FieldIn) -> sys::BmField {
 
 /// A value's bytes, little-endian, in an 8-byte slot the C reads or writes
 /// at its own width.
-fn slot(f: FieldIn) -> u64 {
+pub(crate) fn slot(f: FieldIn) -> u64 {
     match f {
         FieldIn::U8(v) => v.into(),
         FieldIn::U16(v) => v.into(),

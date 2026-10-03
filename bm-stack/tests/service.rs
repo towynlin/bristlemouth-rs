@@ -17,6 +17,7 @@ use bm_wire::configuration::{Key, Layout, MapError, Partition};
 use bm_wire::crc::crc32_ieee;
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError};
 use bm_wire::service::config_map::{self, ConfigMapReply, ConfigMapRequest, DecodedConfigMapReply};
+use bm_wire::service::metrics::{self, Component, ComponentMut, Entry, Field};
 use bm_wire::service::power_info::PowerInfoReply;
 use bm_wire::service::sys_info::{DecodedSysInfoReply, SysInfoReply};
 use bm_wire::service::{REPLY_DATA_LEN, ReplyHeader, RequestHeader};
@@ -25,6 +26,7 @@ use bm_wire::udp;
 const NODE_ID: u64 = 0xC0FF_EE00_1234_5678;
 const PEER_ID: u64 = 0x0000_0000_55AA_0011;
 const ECHO: &[u8] = b"c0ffee0012345678/echo";
+const METRICS: &[u8] = b"c0ffee0012345678/metrics";
 
 struct TestIdentity;
 
@@ -47,7 +49,8 @@ impl Identity for TestIdentity {
 }
 
 /// Answers with the request reversed, and refuses a request starting `!`.
-/// Its power stats are `power`, counted in `power_calls`.
+/// Its power stats are `power`, counted in `power_calls`. Metrics off, so
+/// the service list holds only what a test registers.
 #[derive(Default)]
 struct Reverser {
     calls: Vec<(Vec<u8>, Vec<u8>)>,
@@ -71,6 +74,8 @@ impl Services for Reverser {
         self.power_calls += 1;
         self.power
     }
+
+    const METRICS: bool = false;
 }
 
 type TestNode =
@@ -679,9 +684,11 @@ fn sys_info_answers_with_the_identity_and_the_system_partitions_crc() {
         Node::with_services(NamedIdentity, SoftRtc::new(), config, NoDfu, NoServices, 2);
     node.register_sys_info_service().unwrap();
     assert!(
-        node.service_table()
-            .iter()
-            .eq([(SYS_INFO, ServiceHandler::SysInfo)])
+        node.service_table().iter().eq([
+            (METRICS, ServiceHandler::Metrics),
+            (SYS_INFO, ServiceHandler::SysInfo)
+        ]),
+        "metrics first, as `bristlemouth_init` lists it"
     );
     assert_eq!(
         node.subscriptions()
@@ -808,9 +815,11 @@ fn config_map_answers_with_the_partition_named() {
         Node::with_services(NamedIdentity, SoftRtc::new(), config, NoDfu, NoServices, 2);
     node.register_config_map_service().unwrap();
     assert!(
-        node.service_table()
-            .iter()
-            .eq([(CONFIG_MAP, ServiceHandler::ConfigMap)])
+        node.service_table().iter().eq([
+            (METRICS, ServiceHandler::Metrics),
+            (CONFIG_MAP, ServiceHandler::ConfigMap)
+        ]),
+        "metrics first, as `bristlemouth_init` lists it"
     );
 
     let mut answer = |id: u32, request: &[u8]| {
@@ -1082,4 +1091,179 @@ fn power_info_expiry_and_bad_replies_report_nothing() {
 
     let (power, _) = power_reply(&mut node, second, &power_info_body(STATS));
     assert_eq!(power, vec![(third, STATS)]);
+}
+
+/// Reports one component, `memory`, of `free` bytes, or a `String` field
+/// when `string`. Counts its calls.
+#[derive(Default)]
+struct Meter {
+    free: u32,
+    string: bool,
+    calls: usize,
+}
+
+impl Services for Meter {
+    fn metrics<R>(&mut self, encode: impl FnOnce(&[Component<'_>]) -> R) -> R {
+        self.calls += 1;
+        let fields = [
+            Entry {
+                key: "free_bytes",
+                field: Field::U32(self.free),
+            },
+            Entry {
+                key: "name",
+                field: Field::String,
+            },
+        ];
+        let fields = if self.string {
+            &fields[..]
+        } else {
+            &fields[..1]
+        };
+        encode(&[Component {
+            key: "memory",
+            fields,
+        }])
+    }
+}
+
+type MeterNode = Node<TestIdentity, SoftRtc, 4, 4, 64, 8, 64, 16, 64, 4, 8, NoConfig, NoDfu, Meter>;
+
+fn meter_node() -> MeterNode {
+    let mut node = Node::with_services(
+        TestIdentity,
+        SoftRtc::new(),
+        NoConfig,
+        NoDfu,
+        Meter {
+            free: 4096,
+            ..Meter::default()
+        },
+        2,
+    );
+    node.set_link_up(1, true);
+    node.set_link_up(2, true);
+    node
+}
+
+/// A metrics reply's `(id, reply, free_bytes)`.
+fn metrics_reply(body: &[u8]) -> (u32, metrics::Reply, u32) {
+    let header = ReplyHeader::decode(body).unwrap();
+    assert_eq!(header.target_node_id, PEER_ID);
+    let data = &body[ReplyHeader::LEN..];
+    assert_eq!(header.data_size as usize, data.len());
+    let mut reply = metrics::Reply::default();
+    let mut fields = [Entry {
+        key: "free_bytes",
+        field: Field::U32(0),
+    }];
+    metrics::decode(
+        data,
+        &mut reply,
+        &mut [ComponentMut {
+            key: "memory",
+            fields: &mut fields,
+        }],
+    )
+    .unwrap();
+    let Field::U32(free) = fields[0].field else {
+        unreachable!()
+    };
+    (header.id, reply, free)
+}
+
+#[test]
+fn metrics_is_listed_at_construction() {
+    let node = meter_node();
+    assert!(
+        node.service_table()
+            .iter()
+            .eq([(METRICS, ServiceHandler::Metrics)])
+    );
+    let topic = b"c0ffee0012345678/metrics/req";
+    assert_eq!(
+        node.subscriptions().callbacks(topic),
+        Some(&[Subscriber::Service][..])
+    );
+    assert!(
+        node.resources()
+            .iter(ResourceType::Subscriber)
+            .eq([&topic[..]])
+    );
+}
+
+#[test]
+fn metrics_answers_with_the_components_and_the_uptime() {
+    let mut node = meter_node();
+    let mut frame = frames::service_request(PEER_ID, METRICS, 7, b"");
+    let owed = node.on_frame(123_456, 1, &mut frame);
+    let reply = owed.reply.unwrap();
+    let datagram = udp::accept(reply.frame()).unwrap();
+    let publication = pubsub::decode(datagram.payload).unwrap();
+    assert_eq!(publication.topic, b"c0ffee0012345678/metrics/rep");
+    assert_eq!(
+        metrics_reply(publication.data),
+        (
+            7,
+            metrics::Reply {
+                version: metrics::VERSION,
+                node_id: NODE_ID,
+                uptime_ms: 123_456
+            },
+            4096
+        )
+    );
+    assert_eq!(node.services_mut().calls, 1);
+}
+
+/// Divergence #97: unlike sys_info and power_info, a request carrying data
+/// is answered.
+#[test]
+fn metrics_answers_a_request_carrying_data() {
+    let mut node = meter_node();
+    let mut frame = frames::service_request(PEER_ID, METRICS, 8, b"anything");
+    let owed = node.on_frame(5, 1, &mut frame);
+    let reply = owed.reply.unwrap();
+    let datagram = udp::accept(reply.frame()).unwrap();
+    let publication = pubsub::decode(datagram.payload).unwrap();
+    assert_eq!(metrics_reply(publication.data).0, 8);
+}
+
+/// Divergence #85: a `String` field fails the encode, and the handler sends
+/// nothing.
+#[test]
+fn metrics_sends_nothing_for_a_string_field() {
+    let mut node = meter_node();
+    node.services_mut().string = true;
+    let mut frame = frames::service_request(PEER_ID, METRICS, 9, b"");
+    assert!(node.on_frame(5, 1, &mut frame).reply.is_none());
+    assert_eq!(node.services_mut().calls, 1);
+}
+
+#[test]
+fn no_services_answers_metrics_with_no_components() {
+    let mut node: Node<TestIdentity, SoftRtc, 4> = Node::new(TestIdentity, SoftRtc::new(), 2);
+    node.set_link_up(1, true);
+    let mut frame = frames::service_request(PEER_ID, METRICS, 1, b"");
+    let owed = node.on_frame(0, 1, &mut frame);
+    let reply = owed.reply.unwrap();
+    let datagram = udp::accept(reply.frame()).unwrap();
+    let publication = pubsub::decode(datagram.payload).unwrap();
+    let data = &publication.data[ReplyHeader::LEN..];
+    assert_eq!(&data[data.len() - 5..], b"data\xa0", "an empty map");
+}
+
+#[test]
+fn metrics_request_asks_the_target() {
+    let mut node = meter_node();
+    let (id, outbound) = node.metrics_request(100, PEER_ID, 5).unwrap();
+    let datagram = udp::accept(outbound.frame()).unwrap();
+    let publication = pubsub::decode(datagram.payload).unwrap();
+    assert_eq!(publication.topic, b"0000000055aa0011/metrics/req");
+    assert_eq!(
+        RequestHeader::decode(publication.data),
+        Ok(RequestHeader { id, data_size: 0 })
+    );
+    let request = node.service_requests().iter().next().unwrap();
+    assert_eq!(request.service(), b"0000000055aa0011/metrics");
 }

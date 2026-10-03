@@ -14,7 +14,7 @@
 //! | What | C | Rust |
 //! |---|---|---|
 //! | The call's result | the `BmErr` | the `Result` |
-//! | Subscriptions, in order | `bm_get_subs`, less the metrics service's | [`Node::subscriptions`], and [`State`]'s own list |
+//! | Subscriptions, in order | `bm_get_subs` | [`Node::subscriptions`]; less the metrics service's, [`State`]'s own list |
 //! | `PUB_LIST` and `SUB_LIST` | [`crate::resource::oracle_local_resources`] | [`Node::resources`] |
 //! | Deliveries | the callback every oracle subscription shares | [`Event::Publication`], whose `subscription` is each matching entry of [`State`]'s list in order |
 //! | Frames a publish sends | [`as_bm_linux_sends_it`] of [`bm_wire::pubsub::encode`] | [`udp::build`] of it from [`udp::source_address`] |
@@ -94,8 +94,9 @@ pub const TOPICS: [&[u8; TOPIC_LEN]; 7] = [
 /// no pool.
 pub const DUPLICATE_PATTERN: &[u8; PATTERN_LEN] = b"dup/callba";
 
-/// Subscriptions the Rust node holds: every pattern.
-pub const SUBSCRIPTIONS: usize = PATTERNS.len();
+/// Subscriptions the Rust node holds: the metrics service's and every
+/// pattern.
+pub const SUBSCRIPTIONS: usize = 1 + PATTERNS.len();
 
 /// Resources the Rust node holds: the metrics service's, every pattern and
 /// topic, and [`DUPLICATE_PATTERN`].
@@ -239,9 +240,11 @@ fn state() -> (MutexGuard<'static, ()>, MutexGuard<'static, Option<State>>) {
         assert!(pubs.is_empty(), "PUB_LIST: {pubs:?}");
         assert_eq!(subs, vec![metrics_request_topic()], "SUB_LIST");
         assert_eq!(oracle_subscriptions(), subs, "the subscription list");
-        let mut node = Node::new(OracleIdentity, SoftRtc::new(), NUM_PORTS);
-        node.add_resource(&subs[0], ResourceType::Subscriber)
-            .expect("room for the metrics service's");
+        let node: PubSubNode = Node::new(OracleIdentity, SoftRtc::new(), NUM_PORTS);
+        assert!(
+            node.subscriptions().iter().eq([&subs[0][..]]),
+            "the metrics service's, subscribed at construction"
+        );
         *state = Some(State {
             node,
             subscriptions: Vec::new(),
@@ -579,15 +582,15 @@ fn receive(state: &mut State, arrival: &Arrival) {
 pub const PEER: u64 = 0x0b54_ccce_5c79_78bf;
 
 fn assert_lists(state: &State, step: &Step) {
-    let mut c_subs = oracle_subscriptions();
+    let c_subs = oracle_subscriptions();
     assert_eq!(
         c_subs.first(),
         Some(&metrics_request_topic()),
         "the metrics service's subscription, after {step:?}"
     );
-    c_subs.remove(0);
     assert_eq!(
-        c_subs, state.subscriptions,
+        c_subs[1..],
+        state.subscriptions,
         "C subscriptions, after {step:?}"
     );
     assert!(
@@ -595,7 +598,7 @@ fn assert_lists(state: &State, step: &Step) {
             .node
             .subscriptions()
             .iter()
-            .eq(state.subscriptions.iter().map(Vec::as_slice)),
+            .eq(c_subs.iter().map(Vec::as_slice)),
         "Rust subscriptions, after {step:?}"
     );
 
