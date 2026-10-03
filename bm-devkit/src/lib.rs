@@ -19,8 +19,7 @@ pub mod w25;
 
 use bm_phy_adin2111::{Adin2111Phy, Runner, State, Tc6};
 use bm_stack::node::{
-    INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, RESOURCE_REQUESTS_DEFAULT, RESOURCES_DEFAULT,
-    SUBSCRIPTIONS_DEFAULT,
+    INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, RESOURCE_REQUESTS_DEFAULT, SUBSCRIPTIONS_DEFAULT,
 };
 use bm_stack::{Config, Identity, Node};
 use bm_wire::bcmp::DeviceInfo;
@@ -83,6 +82,14 @@ pub type Flash = W25<FlashSpi, Delay>;
 /// The config partitions on [`Flash`].
 pub type DevkitConfigStorage = FlashConfigStorage<FlashSpi, Delay>;
 
+/// How many topics a [`Devkit`] advertises, publishers and subscribers
+/// together. `hello_world` uses 11: six subscriptions (`spotter/*`,
+/// `spotter/utc-time`, and `<id>/<service>/req` for metrics, echo, sys_info
+/// and config_map), `spotter/printf`, and `<id>/<service>/rep` for each
+/// service that answers. Past the ceiling a reply is still sent but its topic
+/// is not advertised, where a C node's `PUB_LIST` would list it.
+pub const RESOURCES: usize = 16;
+
 /// A node on this board: [`DevkitIdentity`], the RTC, and the config
 /// partitions in NOR flash.
 pub type Devkit = Node<
@@ -93,7 +100,7 @@ pub type Devkit = Node<
     PING_PAYLOAD_BYTES,
     INFO_REQUESTS_DEFAULT,
     CACHED_STRING_BYTES,
-    RESOURCES_DEFAULT,
+    RESOURCES,
     RESOURCE_NAME_BYTES,
     RESOURCE_REQUESTS_DEFAULT,
     SUBSCRIPTIONS_DEFAULT,
