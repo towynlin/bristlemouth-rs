@@ -133,6 +133,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 93 | `bm_service_request` calls `memcpy` with a NULL source for an empty request | benign | UBSan, via `cargo fuzz run services` (card E1) |
 | 94 | `config_map_service_handler` sends no reply for a map over its buffer, and the same failure reply for an unknown partition and a map that fails | replicated | reading, confirmed differentially (card E2) |
 | 95 | `config_map_service_handler`'s failure reply encodes `cbor_data` from a NULL pointer | benign | UBSan, via `cargo fuzz run services` (card E2) |
+| 96 | `power_info_reply_cb` calls the oldest queued callback, not the request's own | replicated | reading, confirmed differentially (card E3) |
 
 ---
 
@@ -3227,9 +3228,12 @@ The callback is called once per listing on each matching subscription
 `ReplyOutcome::Answered`'s data is `data_size` bytes or what arrived if
 fewer. `bm-wire-diff/src/services.rs` (`services` fuzz target) skips
 publications under 16 bytes reaching a reply subscription and compares
-reply data up to what arrived. `a_reply_is_matched_by_id_not_topic`,
-`a_reply_claiming_more_data_than_it_carries` and `a_short_reply_is_skipped`
-(`bm-wire-diff/tests/services.rs`) cover the three.
+reply data up to what arrived, and skips a reply claiming more data than
+it carries to a power_info request, whose `power_info_reply_cb` decodes
+`data_size` bytes. `a_reply_is_matched_by_id_not_topic`,
+`a_reply_claiming_more_data_than_it_carries`,
+`a_power_info_reply_claiming_more_data_than_it_carries_is_skipped` and
+`a_short_reply_is_skipped` (`bm-wire-diff/tests/services.rs`) cover them.
 
 Fix upstream by checking `data_len >= sizeof(BmServiceReplyDataHeader) +
 header->data_size`, and comparing the topic with the request's
@@ -3305,3 +3309,50 @@ passed as argument 2, which is declared to never be null
 empty byte string, `40`, on both sides. The fix is to pass a non-NULL
 pointer, or to skip the copy for a zero length in tinycbor.
 
+## 96. `power_info_reply_cb` calls the oldest queued callback, not the request's own
+
+`middleware/power_info_service.c`. `power_info_service_request` queues the
+caller's `BmPowerInfoReplyCb` on the file-scope `service_queue`
+(`common/cb_queue.c`), then calls `bm_service_request` with
+`power_info_reply_cb` as every request's `reply_cb`. That callback ignores
+`msg_id` and dequeues the head:
+
+```c
+static bool power_info_reply_cb(bool ack, uint32_t msg_id, /* ... */) {
+  /* ... decode into d; ret = ack && decode succeeded */
+  ret = queue_cb_dequeue(&service_queue, &d, ret) == BmOK;
+```
+
+| Requests end | Callback called |
+|---|---|
+| in the order they were made | each request's own |
+| a later reply overtakes an earlier request's | the earlier request's callback gets the later reply; the earlier request's reply then goes to the later callback |
+| a later request expires first, or its reply does not decode | the earlier request's callback is dequeued uncalled; the earlier request's reply goes to the later callback |
+
+A request whose `bm_service_request` fails after its node is listed still
+times out and dequeues one callback (#91), so the queue stays the length of
+the power_info requests waiting. It stays shifted for good only if
+`_create_node`'s `bm_malloc` fails after the enqueue succeeded. An expired
+request's callback is never told: the caller cannot tell a timeout from a
+reply still to come.
+
+The service name, `bus_power_controller/timing`, carries no node id, so
+every node listing it answers each request and the requester takes the
+first reply per id. `power_info_service_init` stores the stats callback
+whether or not `bm_service_register` succeeds; a failed registration still
+lists the service, so that callback is what answers a request the list walk
+reaches (#89).
+
+**replicated.** `bm_wire::service::power_info::Callbacks` keeps the queue,
+named by the id of the request that queued each callback, and the power_info
+requests waiting; `Callbacks::on_end` dequeues the head. `bm_stack::Node`
+reports `Event::PowerInfoReply` with the head's id, and no
+`Event::ServiceReply` or `Event::ServiceTimeout` for those requests.
+`ServiceRequestError::Full` queues nothing: the C's equivalent is
+`queue_cb_enqueue`'s `bm_malloc` failing. `power_info_replies_out_of_order_cross`
+and `power_info_expiry_and_a_bad_reply_use_up_the_oldest_callback`
+(`bm-wire-diff/tests/services.rs`) compare the pairing.
+
+Fix upstream by keeping each request's callback with it (the request node's
+context, or a queue keyed by `msg_id`), and calling it with `ack` false on
+expiry. Not wire-visible.
