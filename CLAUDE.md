@@ -105,7 +105,8 @@ A cargo workspace.
   - `src/channel.rs` — behind the `channel` feature: `Channels`, an
     `embassy-sync` `NodeHandle` for an application in a task of its own:
     owned `Command`s in, owned `Notification`s out, run by `ChannelApp`, an
-    `App`. Off by default, so a single-task firmware carries neither
+    `App`. A service request command reports `Notification::ServiceRequested`
+    with its id, then the reply, timeout or power_info notification. Off by default, so a single-task firmware carries neither
     `embassy-sync` nor `heapless`.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
     `src/mock/frames.rs` builds the peer frames a script feeds it; use it
