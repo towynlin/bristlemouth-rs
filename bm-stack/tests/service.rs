@@ -2,15 +2,21 @@
 //! service requests. `bm-wire-diff/tests/services.rs` compares the same
 //! against the oracle.
 
+use bm_stack::config::Config;
 use bm_stack::mock::frames;
 use bm_stack::node::SubscribeError;
 use bm_stack::service::{
     RegisterError, SERVICE_REQUESTS, ServiceHandler, ServiceRequestError, UnregisterError,
 };
-use bm_stack::{Event, Identity, NoConfig, NoDfu, Node, Services, SoftRtc};
+use bm_stack::{
+    Event, Identity, NoConfig, NoDfu, NoServices, Node, RamConfigStorage, Services, SoftRtc,
+};
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::bcmp::resource::ResourceType;
+use bm_wire::configuration::{Key, Layout, Partition};
+use bm_wire::crc::crc32_ieee;
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError};
+use bm_wire::service::sys_info::{DecodedSysInfoReply, SysInfoReply};
 use bm_wire::service::{REPLY_DATA_LEN, ReplyHeader, RequestHeader};
 use bm_wire::udp;
 
@@ -588,4 +594,162 @@ fn the_run_loop_times_a_request_out() {
     let error = embassy_futures::block_on(node.run_with(&mut phy, |e| answers.extend(answer(e))));
     assert_eq!(error, MockError::ScriptFinished);
     assert_eq!(answers, [(false, 0, PEER_ECHO.to_vec(), vec![])]);
+}
+
+// ---------------------------------------------------------------------------
+// sys_info -- card E1.
+// ---------------------------------------------------------------------------
+
+const SYS_INFO: &[u8] = b"c0ffee0012345678/sys_info";
+
+struct NamedIdentity;
+
+impl Identity for NamedIdentity {
+    fn node_id(&self) -> u64 {
+        NODE_ID
+    }
+
+    fn device_info(&self) -> DeviceInfo {
+        DeviceInfo {
+            git_sha: 0x0bad_cafe,
+            ..DeviceInfo::default()
+        }
+    }
+
+    fn app_name(&self) -> &[u8] {
+        b"bm_rs_test"
+    }
+}
+
+type ConfigNode = Node<
+    NamedIdentity,
+    SoftRtc,
+    4,
+    4,
+    64,
+    8,
+    64,
+    16,
+    64,
+    4,
+    8,
+    Config<RamConfigStorage>,
+    NoDfu,
+    NoServices,
+>;
+
+fn decoded(body: &[u8]) -> (u64, u32, u32, u32, Vec<u8>) {
+    let header = ReplyHeader::decode(body).unwrap();
+    let data = &body[ReplyHeader::LEN..];
+    assert_eq!(header.data_size as usize, data.len());
+    let mut d = DecodedSysInfoReply::default();
+    d.decode_into(data).unwrap();
+    let name = d.app_name.unwrap();
+    let mut buf = [0u8; 64];
+    let len = name.copy_to(&mut buf).unwrap();
+    (
+        d.node_id,
+        d.git_sha,
+        d.sys_config_crc,
+        d.app_name_strlen,
+        buf[..len].to_vec(),
+    )
+}
+
+#[test]
+fn sys_info_answers_with_the_identity_and_the_system_partitions_crc() {
+    let mut config = Config::load(Layout::LP64, RamConfigStorage::new());
+    config
+        .store
+        .partition_mut(Partition::System)
+        .set_uint(Key::new(b"sampleIntervalMs"), 60_000);
+    let crc = config.store.partition(Partition::System).cbor_map_crc32();
+    assert_ne!(crc, crc32_ieee(&[0xa0]), "not the empty partition's");
+    let mut node: ConfigNode =
+        Node::with_services(NamedIdentity, SoftRtc::new(), config, NoDfu, NoServices, 2);
+    node.register_sys_info_service().unwrap();
+    assert!(
+        node.service_table()
+            .iter()
+            .eq([(SYS_INFO, ServiceHandler::SysInfo)])
+    );
+    assert_eq!(
+        node.subscriptions()
+            .callbacks(b"c0ffee0012345678/sys_info/req"),
+        Some(&[Subscriber::Service][..])
+    );
+
+    let mut frame = frames::service_request(PEER_ID, SYS_INFO, 3, b"");
+    let owed = node.on_frame(0, 1, &mut frame);
+    let reply = owed.reply.unwrap();
+    let datagram = udp::accept(reply.frame()).unwrap();
+    let publication = pubsub::decode(datagram.payload).unwrap();
+    assert_eq!(publication.topic, b"c0ffee0012345678/sys_info/rep");
+    assert_eq!(&publication.data[8..12], &3u32.to_le_bytes(), "the id");
+    assert_eq!(
+        decoded(publication.data),
+        (NODE_ID, 0x0bad_cafe, crc, 10, b"bm_rs_test".to_vec())
+    );
+
+    // Any data: no reply.
+    let mut frame = frames::service_request(PEER_ID, SYS_INFO, 4, b"x");
+    assert!(node.on_frame(0, 1, &mut frame).reply.is_none());
+}
+
+#[test]
+fn sys_info_without_a_store_sends_the_empty_partitions_crc() {
+    let mut node = node();
+    node.register_sys_info_service().unwrap();
+    let (reply, _) = receive(
+        &mut node,
+        frames::service_request(PEER_ID, SYS_INFO, 1, b""),
+    );
+    let (topic, body) = reply.unwrap();
+    assert_eq!(topic, b"c0ffee0012345678/sys_info/rep");
+    assert_eq!(
+        decoded(&body),
+        (NODE_ID, 0, crc32_ieee(&[0xa0]), 0, Vec::new())
+    );
+}
+
+#[test]
+fn sys_info_request_asks_the_target_with_no_data() {
+    let mut node = node();
+    let (id, outbound) = node.sys_info_request(0, PEER_ID, 5).unwrap();
+    let datagram = udp::accept(outbound.frame()).unwrap();
+    let publication = pubsub::decode(datagram.payload).unwrap();
+    assert_eq!(publication.topic, b"0000000055aa0011/sys_info/req");
+    assert_eq!(
+        RequestHeader::decode(publication.data),
+        Ok(RequestHeader { id, data_size: 0 })
+    );
+    assert_eq!(publication.data.len(), RequestHeader::LEN);
+
+    let mut body = [0u8; 128];
+    let len = SysInfoReply::new(PEER_ID, 1, 2, b"peer")
+        .encode(&mut body)
+        .unwrap();
+    let reply = frames::service_reply(
+        PEER_ID,
+        b"0000000055aa0011/sys_info",
+        NODE_ID,
+        id,
+        &body[..len],
+    );
+    let answers = reply_to(&mut node, 10, reply);
+    assert_eq!(answers.len(), 1);
+    let (ack, answered, service, data) = &answers[0];
+    assert!(*ack);
+    assert_eq!(*answered, id);
+    assert_eq!(service, b"0000000055aa0011/sys_info");
+    let mut d = DecodedSysInfoReply::default();
+    d.decode_into(data).unwrap();
+    assert_eq!((d.node_id, d.git_sha, d.sys_config_crc), (PEER_ID, 1, 2));
+}
+
+/// `git_sha` reaches a device-info reply, as `git_sha()` does in the C.
+#[test]
+fn identity_git_sha_defaults_to_the_device_infos() {
+    assert_eq!(NamedIdentity.git_sha(), 0x0bad_cafe);
+    assert_eq!(TestIdentity.app_name(), b"");
 }

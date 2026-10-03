@@ -9,9 +9,11 @@
 //! | `bm_service_register` | [`crate::Node::register_service`] |
 //! | `bm_service_unregister` | [`crate::Node::unregister_service`] |
 //! | `echo_service_init` | [`crate::Node::register_echo_service`] |
+//! | `sys_info_service_init` | [`crate::Node::register_sys_info_service`] |
 //! | `_service_request_received_cb` | [`crate::Node::on_frame`], for each service callback a publication reaches |
-//! | a `BmServiceHandler` | [`Services::handle`], or [`ServiceHandler::Echo`] |
+//! | a `BmServiceHandler` | [`Services::handle`], or a built-in [`ServiceHandler`] |
 //! | `bm_service_request` | [`crate::Node::service_request`] |
+//! | `sys_info_service_request` | [`crate::Node::sys_info_request`] |
 //! | a `BmServiceReplyCb` | [`crate::Event::ServiceReply`], [`crate::Event::ServiceTimeout`] |
 //! | `_service_request_timer_expiry_cb` | [`crate::Node::on_service_expiry`] |
 
@@ -69,6 +71,8 @@ impl Services for NoServices {}
 pub enum ServiceHandler {
     /// `echo_service_handler`: [`bm_wire::service::echo`].
     Echo,
+    /// `sys_info_service_handler`: [`bm_wire::service::sys_info::handle`].
+    SysInfo,
     /// The application's, [`Services::handle`].
     Application,
 }

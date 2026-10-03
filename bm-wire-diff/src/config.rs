@@ -149,7 +149,7 @@ impl<'a> Arbitrary<'a> for Seed {
 }
 
 impl Seed {
-    fn apply_rust(&self, store: &mut ConfigStore) {
+    pub(crate) fn apply_rust(&self, store: &mut ConfigStore) {
         let part = store.partition_mut(self.partition);
         let key = Key::new(&self.key);
         match &self.value {
@@ -159,7 +159,7 @@ impl Seed {
         };
     }
 
-    fn apply_c(&self) {
+    pub(crate) fn apply_c(&self) {
         let p = c_partition(self.partition);
         // The C setters take a NUL-terminated key; a bare slice over-reads.
         let mut key_z = self.key.clone();
@@ -480,7 +480,7 @@ pub fn build_frame(input: &ConfigInput) -> Vec<u8> {
 /// partition is saved (the only route to `needs_commit == false`), the shim's
 /// flash is zeroed, and `config_init` reloads it. Then `seeds` are applied to
 /// both, and both are saved so their flash matches.
-fn reset(seeds: &[Seed]) -> Config<RamConfigStorage> {
+pub(crate) fn reset(seeds: &[Seed]) -> Config<RamConfigStorage> {
     for p in Partition::ALL {
         // SAFETY: a plain read of the flag, then a save if set.
         if unsafe { bm_wire_sys::needs_commit(c_partition(p)) } {
