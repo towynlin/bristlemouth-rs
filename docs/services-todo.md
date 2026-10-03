@@ -102,7 +102,7 @@ two plans are.
 9. **Gold vectors (recipe step 4).** None on the wire. Available: the
    91-byte map in `the_cbor_service_helper_gold_map`; round-trip values in
    `test/src/metrics_reply_msg_test.cpp` and
-   `bm_common_messages/test/power_info_ut.cpp`. E5 records a capture of a C
+   `bm_common_messages/test/power_info_ut.cpp`. E6 records a capture of a C
    dev kit answering a Bridge; that becomes the gold set.
 10. **Compare notifications**: handler calls and `BmServiceReplyCb`
     arguments (`ack`, `msg_id`, data), not only frames.
@@ -115,13 +115,21 @@ None open.
 
 ### E5 — On a bus
 
+**Taken:** claude/services-e5-on-a-bus
+
 - **Rust:** `bm_stack::channel` `Command`/`Notification` variants for
   service requests and replies; `bm-devkit/src/bin/hello_world.rs` registers
   in `app_main.cpp`'s order; `hello_node` makes one request.
+- **Blocked by:** nothing.
+- **Blocks:** E6.
+- **Done:** the verify commands pass.
+
+### E6 — Bench capture
+
 - **Capture:** a C dev kit answering a Bridge's samplers, as
   `bm-wire-diff/testdata/services-*.pcap`, asserted by
   `tests/capture_services.rs` (pattern: `capture_h0.rs`).
-- **Blocked by:** nothing.
+- **Blocked by:** E5.
 - **Done:** on a bench, a Bridge's topology and metrics samplers list the
   Rust node with its correct `sys_config_crc`.
 
@@ -130,6 +138,7 @@ None open.
 | Wave | Cards | Each needs |
 |---|---|---|
 | 1 | E5 | nothing |
+| 2 | E6 | E5 |
 
 Cards within a wave can run in parallel.
 
