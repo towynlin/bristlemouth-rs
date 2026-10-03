@@ -11,8 +11,12 @@
 //! | `echo_service_init` | [`crate::Node::register_echo_service`] |
 //! | `_service_request_received_cb` | [`crate::Node::on_frame`], for each service callback a publication reaches |
 //! | a `BmServiceHandler` | [`Services::handle`], or [`ServiceHandler::Echo`] |
+//! | `bm_service_request` | [`crate::Node::service_request`] |
+//! | a `BmServiceReplyCb` | [`crate::Event::ServiceReply`], [`crate::Event::ServiceTimeout`] |
+//! | `_service_request_timer_expiry_cb` | [`crate::Node::on_service_expiry`] |
 
 use bm_wire::pubsub::SubscriptionError;
+use bm_wire::service::Requests;
 
 use crate::node::SubscribeError;
 
@@ -24,6 +28,14 @@ pub const SERVICES: usize = 16;
 /// The longest service name a node lists, a ceiling bm_core does not have.
 /// bm_core's own names are 16 hex digits and a suffix of at most 11 bytes.
 pub const SERVICE_NAME_BYTES: usize = 48;
+
+/// How many service requests a node waits on at once:
+/// `CTX.service_request_list`, which in bm_core is unbounded.
+pub const SERVICE_REQUESTS: usize = 8;
+
+/// The requests a node waits on, each naming a service of up to
+/// [`SERVICE_NAME_BYTES`].
+pub type ServiceRequests = Requests<SERVICE_REQUESTS, SERVICE_NAME_BYTES>;
 
 /// The application's service handlers.
 ///
@@ -85,4 +97,34 @@ pub enum UnregisterError {
     /// `<name>/req` was unsubscribed, and no listed service starts with
     /// `name` (divergence #89).
     NotListed,
+}
+
+/// Why [`crate::Node::service_request`] returned what `bm_service_request`
+/// returns false for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRequestError {
+    /// The data is longer than [`bm_wire::service::MAX_DATA_SIZE`]. Nothing
+    /// changed.
+    TooLarge,
+    /// [`SERVICE_REQUESTS`] requests are waiting, or the name is longer than
+    /// [`SERVICE_NAME_BYTES`]. Nothing changed and no id was taken: the C's
+    /// equivalent is a `bm_malloc` failure in `_create_node`.
+    Full,
+    /// Listed as `id`, but `<service>/rep` was not subscribed, or was not
+    /// advertised. Nothing was sent. The request stays listed and times out
+    /// (divergence #91).
+    NotSubscribed {
+        /// The id the request took.
+        id: u32,
+        /// Why.
+        error: SubscribeError,
+    },
+    /// Listed as `id` and subscribed, but the publication did not fit the
+    /// transmit buffer, which with the ceilings above it always does. The
+    /// C's failed `bm_pub_wl`: the request stays listed and times out
+    /// (divergence #91).
+    NotSent {
+        /// The id the request took.
+        id: u32,
+    },
 }

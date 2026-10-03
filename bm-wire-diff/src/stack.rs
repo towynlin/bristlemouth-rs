@@ -297,6 +297,27 @@ pub fn clear_neighbor_table() {
     }
 }
 
+/// Start `common/timer_callback_handler.c`'s task, once per process.
+///
+/// `bm_service_request.c`'s expiry timer and `dfu_host.c`'s heartbeat timer
+/// hand their work to this task. `bristlemouth_init` does not start it;
+/// bm_protocol's `app_main.cpp` does (`bm_devkit/bmdk_common/app_main.cpp`),
+/// and `bm_shim_stack_init` does not, so comparators that need it call this
+/// after [`oracle`].
+///
+/// # Panics
+///
+/// If `timer_callback_handler_init` fails.
+pub fn start_timer_callback_handler() {
+    static STARTED: OnceLock<()> = OnceLock::new();
+    STARTED.get_or_init(|| {
+        assert_eq!(
+            unsafe { bm_wire_sys::timer_callback_handler_init() },
+            bm_wire_sys::BmErr_BmOK
+        );
+    });
+}
+
 /// The tick the shim's virtual clock is on.
 #[must_use]
 pub fn tick_count() -> u32 {

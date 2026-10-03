@@ -3236,15 +3236,17 @@ fn an_app_pings_on_its_own_timer_and_sees_the_reply() {
     // Serialised against the other loop tests: the mock clock is global.
     let _clock = clock_lock();
     let mut node = node();
-    let mut script = vec![Script::Idle { ms: 50 }; 12];
+    let mut script = vec![Script::Idle { ms: 50 }; 10];
     script.push(Script::Receive {
         port: 1,
         frame: echo_reply_frame(PEER_ID, OUR_PING_ID, 0, b"hello"),
     });
-    script.extend(vec![Script::Idle { ms: 50 }; 10]);
+    script.extend(vec![Script::Idle { ms: 50 }; 8]);
     let mut phy = MockPhy::new(PORTS, script);
+    // Not 500 ms: the service request sweep is due then, and its arm is
+    // polled before the application's.
     let mut app = Pinger {
-        ticker: embassy_time::Ticker::every(embassy_time::Duration::from_millis(500)),
+        ticker: embassy_time::Ticker::every(embassy_time::Duration::from_millis(400)),
         pinged_at_ms: Vec::new(),
         replies: Vec::new(),
     };
@@ -3252,7 +3254,7 @@ fn an_app_pings_on_its_own_timer_and_sees_the_reply() {
     let error = block_on(node.run_app(&mut phy, &mut app));
     assert_eq!(error, bm_stack::mock::MockError::ScriptFinished);
 
-    assert_eq!(app.pinged_at_ms, [500, 1000], "one ping per app tick");
+    assert_eq!(app.pinged_at_ms, [400, 800], "one ping per app tick");
     let requests: Vec<(u16, Vec<u8>)> = phy
         .sent
         .iter()
@@ -3271,7 +3273,7 @@ fn an_app_pings_on_its_own_timer_and_sees_the_reply() {
         "each ping is link-local, so goes out once per port"
     );
 
-    // The reply arrived after the 12th 50 ms step, 100 ms after the first ping.
+    // The reply arrived after the 10th 50 ms step, 100 ms after the first ping.
     assert_eq!(
         app.replies,
         vec![Seen::EchoReply {
@@ -3297,7 +3299,7 @@ fn an_app_task_pings_through_a_channel_and_sees_the_reply() {
     // Serialised against the other loop tests: the mock clock is global.
     let _clock = clock_lock();
     let mut node = node();
-    let mut script = vec![Script::Idle { ms: 50 }; 14];
+    let mut script = vec![Script::Idle { ms: 50 }; 11];
     script.push(Script::Receive {
         port: 1,
         frame: echo_reply_frame(PEER_ID, OUR_PING_ID, 0, b"hello"),
@@ -3309,7 +3311,9 @@ fn an_app_task_pings_through_a_channel_and_sees_the_reply() {
     let handle = channels.handle();
     let mut app = channels.app();
 
-    let mut ticker = Ticker::every(Duration::from_millis(500));
+    // Off the 150 ms and 500 ms sweeps' grids, for the reason the test above
+    // gives.
+    let mut ticker = Ticker::every(Duration::from_millis(350));
     let task = async {
         ticker.next().await;
         assert!(handle.ping(0, b"hello").await);
@@ -3321,9 +3325,9 @@ fn an_app_task_pings_through_a_channel_and_sees_the_reply() {
         Either::Second(notification) => notification,
     };
 
-    // The task queues the ping at 500 ms. The node's `select` polls `receive`
+    // The task queues the ping at 350 ms. The node's `select` polls `receive`
     // before the application arm, so the PHY advances the clock one step
-    // before the node takes it: sent at 550 ms, answered at 700 ms. A separate
+    // before the node takes it: sent at 400 ms, answered at 550 ms. A separate
     // task costs a pass of latency that `App` does not.
     assert_eq!(
         notification,

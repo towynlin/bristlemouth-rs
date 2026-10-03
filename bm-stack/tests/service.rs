@@ -1,14 +1,17 @@
-//! Services on a node: registration, dispatch from `on_frame`, echo.
-//! `bm-wire-diff/tests/services.rs` compares the same against the oracle.
+//! Services on a node: registration, dispatch from `on_frame`, echo, and
+//! service requests. `bm-wire-diff/tests/services.rs` compares the same
+//! against the oracle.
 
 use bm_stack::mock::frames;
 use bm_stack::node::SubscribeError;
-use bm_stack::service::{RegisterError, ServiceHandler, UnregisterError};
+use bm_stack::service::{
+    RegisterError, SERVICE_REQUESTS, ServiceHandler, ServiceRequestError, UnregisterError,
+};
 use bm_stack::{Event, Identity, NoConfig, NoDfu, Node, Services, SoftRtc};
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::bcmp::resource::ResourceType;
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError};
-use bm_wire::service::{REPLY_DATA_LEN, ReplyHeader};
+use bm_wire::service::{REPLY_DATA_LEN, ReplyHeader, RequestHeader};
 use bm_wire::udp;
 
 const NODE_ID: u64 = 0xC0FF_EE00_1234_5678;
@@ -335,4 +338,254 @@ fn registration_refuses_past_its_ceilings() {
         Err(RegisterError::Subscribe(SubscribeError::NotAdvertised))
     );
     assert_eq!(node.service_table().len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Service requests -- card S2.
+// ---------------------------------------------------------------------------
+
+const PEER_ECHO: &[u8] = b"0000000055aa0011/echo";
+
+/// What a service request's events carried: `(ack, id, service, data)`.
+type Answer = (bool, u32, Vec<u8>, Vec<u8>);
+
+fn answer(event: Event<'_>) -> Option<Answer> {
+    match event {
+        Event::ServiceReply { id, service, data } => {
+            Some((true, id, service.to_vec(), data.to_vec()))
+        }
+        Event::ServiceTimeout { id, service } => Some((false, id, service.to_vec(), Vec::new())),
+        _ => None,
+    }
+}
+
+fn reply_to(node: &mut TestNode, now_ms: u32, mut frame: Vec<u8>) -> Vec<Answer> {
+    let mut answers = Vec::new();
+    let owed = node.on_frame_with(now_ms, 1, &mut frame, |e| answers.extend(answer(e)));
+    assert!(owed.reply.is_none());
+    answers
+}
+
+fn expire(node: &mut TestNode, now_ms: u32) -> Vec<Answer> {
+    let mut answers = Vec::new();
+    node.on_service_expiry(now_ms, |e| answers.extend(answer(e)));
+    answers
+}
+
+#[test]
+fn a_request_is_published_and_its_reply_reported() {
+    let mut node = node();
+    let (id, outbound) = node.service_request(100, PEER_ECHO, b"hi", 5).unwrap();
+    assert_eq!(id, 0);
+    assert_eq!(outbound.mask(), 0b11);
+    let datagram = udp::accept(outbound.frame()).expect("a datagram");
+    let publication = pubsub::decode(datagram.payload).expect("a publication");
+    assert_eq!(publication.topic, b"0000000055aa0011/echo/req");
+    assert_eq!(
+        (publication.kind, publication.version),
+        (0, pubsub::COMMON_VERSION)
+    );
+    assert_eq!(publication.data, b"\0\0\0\0\x02\0\0\0hi");
+    assert_eq!(
+        RequestHeader::decode(publication.data),
+        Ok(RequestHeader {
+            id: 0,
+            data_size: 2
+        })
+    );
+
+    let reply_topic = b"0000000055aa0011/echo/rep";
+    assert_eq!(
+        node.subscriptions().callbacks(reply_topic),
+        Some(&[Subscriber::Reply][..])
+    );
+    assert!(
+        node.resources()
+            .iter(ResourceType::Subscriber)
+            .eq([&reply_topic[..]])
+    );
+    assert!(
+        node.resources()
+            .iter(ResourceType::Publisher)
+            .eq([&b"0000000055aa0011/echo/req"[..]])
+    );
+    let request = node.service_requests().iter().next().unwrap();
+    assert_eq!(
+        (
+            request.id(),
+            request.service(),
+            request.start_ms(),
+            request.timeout_ms()
+        ),
+        (0, PEER_ECHO, 100, 5000)
+    );
+
+    let reply = frames::service_reply(PEER_ID, PEER_ECHO, NODE_ID, 0, b"ok");
+    assert_eq!(
+        reply_to(&mut node, 200, reply.clone()),
+        [(true, 0, PEER_ECHO.to_vec(), b"ok".to_vec())]
+    );
+    assert!(node.service_requests().is_empty());
+    assert_eq!(reply_to(&mut node, 300, reply), [], "answered once");
+    assert_eq!(
+        node.subscriptions().callbacks(reply_topic),
+        Some(&[Subscriber::Reply][..]),
+        "the subscription stays"
+    );
+    assert_eq!(node.service_request(0, PEER_ECHO, b"", 5).unwrap().0, 1);
+}
+
+#[test]
+fn a_reply_must_name_this_node_and_a_waiting_id() {
+    let mut node = node();
+    node.service_request(0, PEER_ECHO, b"", 5).unwrap();
+    for frame in [
+        frames::service_reply(PEER_ID, PEER_ECHO, PEER_ID, 0, b""),
+        frames::service_reply(PEER_ID, PEER_ECHO, NODE_ID, 1, b""),
+    ] {
+        assert_eq!(reply_to(&mut node, 0, frame), []);
+    }
+    // Fifteen bytes of reply header.
+    let mut short = frames::service_reply(PEER_ID, PEER_ECHO, NODE_ID, 0, b"");
+    short.truncate(short.len() - 1);
+    assert_eq!(reply_to(&mut node, 0, short), [], "divergence #92");
+    assert_eq!(node.service_requests().len(), 1);
+}
+
+/// Divergence #92: matched on id and target, not topic; `data_size` is
+/// not checked against what arrived.
+#[test]
+fn a_reply_is_matched_by_id_alone() {
+    let mut node = node();
+    node.service_request(0, b"a", b"", 5).unwrap();
+    node.service_request(0, b"b", b"", 5).unwrap();
+    let reply = frames::service_reply(PEER_ID, b"b", NODE_ID, 0, b"xyz");
+    assert_eq!(
+        reply_to(&mut node, 0, reply),
+        [(true, 0, b"a".to_vec(), b"xyz".to_vec())]
+    );
+
+    let mut reply = frames::service_reply(PEER_ID, b"b", NODE_ID, 1, b"xyz");
+    let size = reply.len() - 3 - 4;
+    reply[size..size + 4].copy_from_slice(&1000u32.to_le_bytes());
+    // The UDP checksum is not verified on receive (divergence #70).
+    assert_eq!(
+        reply_to(&mut node, 0, reply),
+        [(true, 1, b"b".to_vec(), b"xyz".to_vec())]
+    );
+}
+
+#[test]
+fn an_unanswered_request_times_out_on_the_sweeps_grid() {
+    let mut node = node();
+    node.service_request(300, PEER_ECHO, b"", 1).unwrap();
+    node.service_request(300, PEER_ECHO, b"", 0).unwrap();
+    assert_eq!(expire(&mut node, 499), []);
+    assert_eq!(
+        expire(&mut node, 500),
+        [(false, 1, PEER_ECHO.to_vec(), vec![])]
+    );
+    assert_eq!(expire(&mut node, 1000), [], "300 + 1000 is still ahead");
+    assert_eq!(expire(&mut node, 1499), []);
+    assert_eq!(
+        expire(&mut node, 1500),
+        [(false, 0, PEER_ECHO.to_vec(), vec![])]
+    );
+    assert!(node.service_requests().is_empty());
+    let reply = frames::service_reply(PEER_ID, PEER_ECHO, NODE_ID, 0, b"late");
+    assert_eq!(reply_to(&mut node, 1600, reply), []);
+}
+
+#[test]
+fn on_tick_runs_the_service_sweep() {
+    let mut node = node();
+    node.service_request(0, PEER_ECHO, b"", 0).unwrap();
+    let mut answers = Vec::new();
+    node.on_tick_with(500, |e| answers.extend(answer(e)));
+    assert_eq!(answers, [(false, 0, PEER_ECHO.to_vec(), vec![])]);
+}
+
+#[test]
+fn a_request_is_delivered_to_the_application_not_to_a_service() {
+    let mut node = node();
+    node.register_service(b"svc").unwrap();
+    node.subscribe(b"*").unwrap();
+    let mut delivered = Vec::new();
+    let (_, outbound) = node
+        .service_request_with(0, b"svc", b"q", 5, |event| {
+            if let Event::Publication { source, topic, .. } = event {
+                delivered.push((source, topic.to_vec()));
+            }
+        })
+        .unwrap();
+    assert!(udp::accept(outbound.frame()).is_ok());
+    assert_eq!(delivered, [(NODE_ID, b"svc/req".to_vec())]);
+    assert!(node.services().calls.is_empty(), "not answered locally");
+}
+
+/// A reply this node publishes reaches its own reply subscription; it
+/// answers a request only when it targets this node.
+#[test]
+fn a_local_reply_answers_a_request_naming_this_node() {
+    let mut node = node();
+    node.register_service(b"svc").unwrap();
+    node.service_request(0, b"svc", b"", 5).unwrap();
+    let mut answers = Vec::new();
+    let mut frame = frames::service_request(NODE_ID, b"svc", 0, b"ab");
+    let owed = node.on_frame_with(0, 1, &mut frame, |e| answers.extend(answer(e)));
+    assert!(owed.reply.is_some());
+    assert_eq!(answers, [(true, 0, b"svc".to_vec(), b"ba".to_vec())]);
+}
+
+#[test]
+fn requests_refuse_past_their_ceilings() {
+    let mut node = node();
+    assert_eq!(
+        node.service_request(0, PEER_ECHO, &[0; 1025], 5).err(),
+        Some(ServiceRequestError::TooLarge)
+    );
+    assert_eq!(
+        node.service_request(0, &[b'n'; 49], b"", 5).err(),
+        Some(ServiceRequestError::Full)
+    );
+    for id in 0..SERVICE_REQUESTS as u32 {
+        assert_eq!(node.service_request(0, b"n", &[0; 1024], 5).unwrap().0, id);
+    }
+    assert_eq!(
+        node.service_request(0, b"n", b"", 5).err(),
+        Some(ServiceRequestError::Full)
+    );
+    assert_eq!(node.service_requests().next_id(), SERVICE_REQUESTS as u32);
+}
+
+/// Divergence #91: a request whose reply topic is not advertised stays
+/// listed, and times out.
+#[test]
+fn a_request_not_subscribed_stays_listed() {
+    let mut node = node();
+    for i in 0..16u8 {
+        node.add_resource(&[b'r', i], ResourceType::Publisher)
+            .unwrap();
+    }
+    assert_eq!(
+        node.service_request(0, b"t", b"", 0).err(),
+        Some(ServiceRequestError::NotSubscribed {
+            id: 0,
+            error: SubscribeError::NotAdvertised
+        })
+    );
+    assert_eq!(expire(&mut node, 500), [(false, 0, b"t".to_vec(), vec![])]);
+}
+
+/// The run loop sweeps on its own arm.
+#[test]
+fn the_run_loop_times_a_request_out() {
+    use bm_stack::mock::{MockError, MockPhy, Script};
+    let mut node = node();
+    node.service_request(0, PEER_ECHO, b"", 1).unwrap();
+    let mut phy = MockPhy::new(2, vec![Script::Idle { ms: 50 }; 24]);
+    let mut answers = Vec::new();
+    let error = embassy_futures::block_on(node.run_with(&mut phy, |e| answers.extend(answer(e))));
+    assert_eq!(error, MockError::ScriptFinished);
+    assert_eq!(answers, [(false, 0, PEER_ECHO.to_vec(), vec![])]);
 }

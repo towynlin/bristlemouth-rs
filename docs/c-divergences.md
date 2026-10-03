@@ -128,6 +128,8 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 88 | `services_cbor_as_map` reads each value by its key's stored type | replicated (release build); domain-limited (failed `cbor_assert`) | reading, confirmed differentially (card C1) |
 | 89 | `bm_service.c` matches services by `strncmp` prefix, and reads a request's header unchecked | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially (card S1) |
 | 90 | `echo_service_handler` copies a request of any length into its 1008-byte reply buffer | domain-limited | reading (card S1) |
+| 91 | A failed `bm_service_request` leaves its request listed, to time out; long timeouts wrap | replicated | reading, confirmed on the oracle (card S2) |
+| 92 | `_service_request_cb` reads a reply's header and `data_size` unchecked, and matches on id, not topic | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially (card S2) |
 
 ---
 
@@ -3120,3 +3122,99 @@ domain check, and `echo_refuses_what_does_not_fit_the_reply`
 (`bm-stack/tests/service.rs`) the port's behaviour.
 
 Fix upstream by testing `req_data_len <= *buffer_len`.
+
+## 91. A failed `bm_service_request` leaves its request listed, to time out; long timeouts wrap
+
+`middleware/bm_service_request.c`, `bm_service_request`:
+
+```c
+BmServiceRequestNode *node = NULL;
+do {
+  /* ... */
+  BmServiceRequestNode *node =
+      _create_node(service_strlen, service, reply_cb, (timeout_s * 1000));
+  /* ... add, subscribe, send; break on failure */
+} while (0);
+if (!rval) {
+  if (node) { /* free */ }
+}
+```
+
+The inner `node` shadows the outer, so the cleanup never runs. A request is
+listed, with an id taken, before its reply topic is subscribed and before it
+is sent:
+
+| Failure | Returns | Then |
+|---|---|---|
+| `data_len` > 1024 | false | nothing listed, no id taken |
+| `_create_node`'s `bm_malloc` | false | nothing listed, no id taken |
+| `bm_sub_wl` of `<service>/rep` (a name of 251 bytes or more, or `bm_malloc`) | false | listed; nothing sent; `reply_cb(false, id, ...)` at the first sweep past its timeout |
+| `bm_pub_wl` of `<service>/req` (`bm_malloc`, or `bm_middleware_net_tx`) | false | listed and subscribed; local subscribers have the request; `reply_cb(false, ...)` as above |
+
+A caller that treats false as "nothing happened" gets a callback later.
+
+`timeout_s * 1000` is computed in `uint32_t` and wraps for `timeout_s` above
+4 294 967. The sweep's `time_remaining_ms` is signed, so a request whose
+`timeout - elapsed` exceeds 2^31 ms reads as overdue: `timeout_s` from
+2 147 486 to 4 294 967 expires at the next sweep.
+
+The sweep's timer hands its work to `timer_callback_handler.c`'s task.
+`bristlemouth_init` does not start that task; bm_protocol's `app_main.cpp`
+does. An integrator that does not gets requests that never time out.
+
+**replicated.** `bm_wire::service::Requests::add` takes the id and wraps the
+timeout; `bm_stack::Node::service_request` returns
+`ServiceRequestError::NotSubscribed` or `NotSent` with the request listed.
+The Rust node's ceilings (names of at most 48 bytes, data of at most 1024)
+refuse what makes the C's subscribe or send fail before an id is taken, so
+`bm-wire-diff/tests/service_request_failures.rs` measures the C's two paths
+on the oracle alone; `a_request_not_subscribed_stays_listed`
+(`bm-stack/tests/service.rs`) shows the port's. `long_timeouts_wrap`
+(`bm-wire-diff/tests/services.rs`) compares the timeouts.
+
+Fix upstream by removing the inner declaration, and removing the node from
+the list on failure; computing the timeout in 64 bits or capping
+`timeout_s`; and starting the timer callback task in `bm_service_init`.
+Wire-visible only in what the caller is told.
+
+## 92. `_service_request_cb` reads a reply's header and `data_size` unchecked, and matches on id, not topic
+
+`middleware/bm_service_request.c`:
+
+```c
+BmServiceReplyDataHeader *header = (BmServiceReplyDataHeader *)data;
+if (header->target_node_id == node_id()) {
+  /* ... */
+  BmServiceRequestNode *node = _service_request_list_get_node_by_id(header->id);
+  if (node) {
+    node->reply_cb(true, header->id, node->service_strlen, node->service,
+                   header->data_size, header->data);
+```
+
+| Step | Effect |
+|---|---|
+| `header->target_node_id` with `data_len` < 16 | reads up to 16 bytes past the publication |
+| `header->data_size` passed as `reply_len` | the callback reads up to 4 GiB past the publication; a sys_info or config_map decoder reads what follows |
+| lookup by `header->id` alone | a reply on any topic reaching a reply subscription answers whichever request has that id, reported with that request's service |
+
+Reply subscriptions are `<service>/rep` and match by prefix and pattern
+(#74), so a reply on `<a>/rep` reaches the callback for a request to a
+service named `<a>*` or a prefix of it. Ids are a node-wide counter, so any
+node that can guess the next ids can answer another node's requests.
+
+The callback is called once per listing on each matching subscription
+(#79); the first call removes the request, and the rest find nothing.
+
+**replicated**, except where it reads past the datagram.
+`bm_wire::service::Requests::on_reply` matches id and target only;
+`ReplyOutcome::Short` is a body under 16 bytes, which the Rust node drops;
+`ReplyOutcome::Answered`'s data is `data_size` bytes or what arrived if
+fewer. `bm-wire-diff/src/services.rs` (`services` fuzz target) skips
+publications under 16 bytes reaching a reply subscription and compares
+reply data up to what arrived. `a_reply_is_matched_by_id_not_topic`,
+`a_reply_claiming_more_data_than_it_carries` and `a_short_reply_is_skipped`
+(`bm-wire-diff/tests/services.rs`) cover the three.
+
+Fix upstream by checking `data_len >= sizeof(BmServiceReplyDataHeader) +
+header->data_size`, and comparing the topic with the request's
+`<service>/rep`. Wire-visible: a reply on another topic stops answering.

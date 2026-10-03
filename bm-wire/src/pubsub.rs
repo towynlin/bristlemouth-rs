@@ -21,8 +21,9 @@
 //! | `bm_handle_msg` computes the data length unchecked; a `topic_len` past the payload wraps it and the callback reads out of bounds | [`decode`] refuses | #75 |
 //! | `bm_pub_wl` sizes its buffer in a `uint16_t` that wraps, then copies past it | [`encode`] takes `usize` lengths and a caller buffer | #76 |
 //!
-//! [`Subscriptions`] is `CTX.subscription_list`, with two possible callbacks
-//! per topic: the application and the service layer.
+//! [`Subscriptions`] is `CTX.subscription_list`, with three possible
+//! callbacks per topic: the application, the service layer and the service
+//! request layer.
 
 use crate::BmWireError;
 
@@ -136,14 +137,19 @@ pub enum SubscriptionError {
 
 /// A callback on a topic: what `BmPubSubNode::callback_fn` points at.
 ///
-/// A node has two: its application, and `bm_service.c`'s
-/// `_service_request_received_cb`, which every service shares.
+/// A node has three: its application, `bm_service.c`'s
+/// `_service_request_received_cb`, which every service shares, and
+/// `bm_service_request.c`'s `_service_request_cb`, which every request
+/// shares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Subscriber {
     /// The application, through `Event::Publication` in `bm-stack`.
     Application,
     /// The service layer, through `bm_wire::service::ServiceTable`.
     Service,
+    /// The service request layer, on a reply topic, through
+    /// `bm_wire::service::Requests`.
+    Reply,
 }
 
 /// How many callbacks one topic holds, a ceiling bm_core does not have.

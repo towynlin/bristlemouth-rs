@@ -171,6 +171,36 @@ pub fn service_request(src: u64, service: &[u8], id: u32, data: &[u8]) -> Vec<u8
     publication(src, &topic, 0, pubsub::COMMON_VERSION, &body)
 }
 
+/// A service reply from node `src`, as `_service_request_received_cb` sends
+/// it: a [`publication`] to `<service>/rep` of a
+/// [`bm_wire::service::ReplyHeader`] and `data`, type 0 and
+/// [`pubsub::COMMON_VERSION`]. `data_size` is `data`'s length.
+///
+/// # Panics
+///
+/// If the topic is [`pubsub::TOPIC_MAX_LEN`] bytes or longer.
+#[must_use]
+pub fn service_reply(
+    src: u64,
+    service: &[u8],
+    target_node_id: u64,
+    id: u32,
+    data: &[u8],
+) -> Vec<u8> {
+    use bm_wire::service::{REPLY_SUFFIX, ReplyHeader};
+    let topic = [service, REPLY_SUFFIX].concat();
+    let mut body = vec![0u8; ReplyHeader::LEN];
+    ReplyHeader {
+        target_node_id,
+        id,
+        data_size: data.len() as u32,
+    }
+    .encode(&mut body)
+    .expect("sixteen bytes");
+    body.extend_from_slice(data);
+    publication(src, &topic, 0, pubsub::COMMON_VERSION, &body)
+}
+
 /// A `spotter_log` publication from node `src`: [`spotter::encode_log`] in
 /// [`publication`] to [`spotter::log_topic`].
 ///

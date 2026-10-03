@@ -2,7 +2,8 @@
 //! services' bodies.
 //!
 //! The service list, request dispatch and echo are [`ServiceTable`] and
-//! [`echo`]; `bm_stack::Node` runs them.
+//! [`echo`]; the requests a node waits on are [`Requests`]. `bm_stack::Node`
+//! runs them.
 //!
 //! A body is a CBOR map with fixed keys in a fixed order, built and read by
 //! `bm_common_messages/*_msg.c` through tinycbor. Encoding uses [`cbor2`];
@@ -15,9 +16,11 @@
 pub mod config_map;
 pub mod metrics;
 pub mod power_info;
+mod request;
 pub mod sys_info;
 mod table;
 
+pub use request::{EXPIRY_PERIOD_MS, ReplyOutcome, Request, Requests, RequestsFull};
 pub use table::{
     Lookup, MAX_DATA_SIZE, MAX_SERVICE_LEN, REPLY_DATA_LEN, REPLY_SUFFIX, REQUEST_SUFFIX,
     ReplyHeader, RequestHeader, ServiceTable, TableFull, echo, service_name, topic,

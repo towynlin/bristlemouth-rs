@@ -5,8 +5,8 @@
 
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
 use bm_wire_diff::services::{
-    APP_TOPICS, ECHO, NAMES, Request, RequestTopic, ServicesInput, Size, Step, Summary, budget,
-    check,
+    APP_TOPICS, ASKED, Ask, ECHO, NAMES, Reply, ReplyId, ReplyTopic, Request, RequestTopic,
+    ServicesInput, Size, Step, Summary, Target, Timeout, budget, check,
 };
 
 fn index(name: &[u8]) -> u8 {
@@ -265,4 +265,240 @@ fn every_committed_seed_still_agrees_with_the_c() {
         "no services seeds replayed; STACK_TARGETS is {STACK_TARGETS:?}"
     );
     eprintln!("replayed {replayed} services seeds");
+}
+
+// ---------------------------------------------------------------------------
+// Service requests -- card S2.
+// ---------------------------------------------------------------------------
+
+fn asked(name: &[u8]) -> u8 {
+    ASKED
+        .iter()
+        .position(|n| *n == name)
+        .expect("an asked name") as u8
+}
+
+const PEER_ECHO: &[u8] = b"0b54ccce5c7978bf/echo";
+const PEER_PATTERN: &[u8] = b"0b54ccce5c7978bf/*";
+
+fn ask(name: &[u8], data: &[u8], timeout: Timeout) -> Step {
+    Step::Ask(Ask {
+        service: asked(name),
+        data: data.to_vec(),
+        timeout,
+    })
+}
+
+/// A peer's reply to the oldest request waiting, on `name`'s reply topic.
+fn reply(name: &[u8], data: &[u8]) -> Reply {
+    Reply {
+        ingress: 0,
+        peer: false,
+        topic: ReplyTopic::Asked(asked(name)),
+        target: Target::Us,
+        id: ReplyId::Waiting(0),
+        size: Size::Exact,
+        data: data.to_vec(),
+        cut: None,
+    }
+}
+
+#[test]
+fn every_asked_name_is_answered_and_times_out() {
+    let mut steps = Vec::new();
+    for name in ASKED {
+        steps.push(ask(name, b"ping", Timeout::Seconds(1)));
+        steps.push(Step::Reply(reply(name, b"pong")));
+        steps.push(ask(name, b"", Timeout::Seconds(1)));
+        steps.push(Step::Wait(1500));
+    }
+    let summary = run(steps);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (summary.asked, summary.answered, summary.timeouts),
+        (6, 3, 3),
+        "{summary:?}"
+    );
+}
+
+#[test]
+fn requests_left_waiting_expire_at_the_next_input() {
+    run(vec![
+        ask(PEER_ECHO, b"a", Timeout::Seconds(3)),
+        ask(PEER_ECHO, b"b", Timeout::Wrapped(2)),
+    ]);
+    let summary = run(vec![ask(PEER_ECHO, b"c", Timeout::Seconds(0))]);
+    assert_eq!(summary.asked, 1);
+}
+
+/// Divergence #91: a timeout that wraps, and one past `i32::MAX` ms.
+#[test]
+fn long_timeouts_wrap() {
+    let summary = run(vec![
+        ask(PEER_ECHO, b"", Timeout::Wrapped(0)),
+        ask(PEER_ECHO, b"", Timeout::Overdue(0)),
+        ask(PEER_ECHO, b"", Timeout::Overdue(u32::MAX)),
+        Step::Wait(600),
+        Step::Wait(700),
+    ]);
+    assert_eq!(summary.timeouts, 3, "{summary:?}");
+}
+
+/// Divergence #92: matched by id and target, not by topic; a reply to
+/// the pattern's request arrives on echo's reply topic, which both reply
+/// subscriptions match (divergence #74).
+#[test]
+fn a_reply_is_matched_by_id_not_topic() {
+    let summary = run(vec![
+        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        ask(PEER_PATTERN, b"", Timeout::Seconds(3)),
+        Step::Reply(Reply {
+            id: ReplyId::Waiting(1),
+            ..reply(PEER_ECHO, b"for the pattern")
+        }),
+        Step::Reply(Reply {
+            id: ReplyId::Waiting(0),
+            ..reply(PEER_PATTERN, b"for echo")
+        }),
+    ]);
+    assert_eq!((summary.skipped, summary.answered), (0, 2), "{summary:?}");
+}
+
+/// Divergence #92: `data_size` is passed unchecked; data is compared up to
+/// what arrived.
+#[test]
+fn a_reply_claiming_more_data_than_it_carries() {
+    let summary = run(vec![
+        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        Step::Reply(Reply {
+            size: Size::Off(100),
+            ..reply(PEER_ECHO, b"short")
+        }),
+        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        Step::Reply(Reply {
+            size: Size::Off(-3),
+            ..reply(PEER_ECHO, b"longer")
+        }),
+    ]);
+    assert_eq!((summary.skipped, summary.answered), (0, 2), "{summary:?}");
+}
+
+#[test]
+fn replies_that_answer_nothing() {
+    let summary = run(vec![
+        ask(PEER_ECHO, b"", Timeout::Seconds(1)),
+        Step::Reply(Reply {
+            target: Target::Peer(false),
+            ..reply(PEER_ECHO, b"")
+        }),
+        Step::Reply(Reply {
+            target: Target::Raw(0),
+            ..reply(PEER_ECHO, b"")
+        }),
+        Step::Reply(Reply {
+            id: ReplyId::Raw(u32::MAX),
+            ..reply(PEER_ECHO, b"")
+        }),
+        Step::Reply(Reply {
+            topic: ReplyTopic::Raw(b"0b54ccce5c7978bf/echo/rep/more".to_vec()),
+            ..reply(PEER_ECHO, b"prefixed")
+        }),
+        Step::Wait(1500),
+    ]);
+    assert_eq!(
+        (summary.skipped, summary.answered, summary.timeouts),
+        (0, 1, 0),
+        "the prefixed topic answers (divergence #74): {summary:?}"
+    );
+}
+
+/// Divergence #92: a body shorter than the reply header is read past.
+#[test]
+fn a_short_reply_is_skipped() {
+    let summary = run(vec![
+        ask(PEER_ECHO, b"", Timeout::Seconds(0)),
+        Step::Reply(Reply {
+            cut: Some(15),
+            ..reply(PEER_ECHO, b"")
+        }),
+        Step::Reply(Reply {
+            cut: Some(16),
+            ..reply(PEER_ECHO, b"x")
+        }),
+    ]);
+    assert_eq!((summary.skipped, summary.answered), (1, 1), "{summary:?}");
+}
+
+/// Divergence #79 on a reply topic: if the application subscribed it before
+/// any request did, each request lists the reply callback again, until the
+/// Rust node's `CALLBACKS`. Subscriptions outlive each input, so which
+/// happens depends on the tests run before this one. Each reply answers once
+/// either way.
+#[test]
+fn an_application_subscribed_reply_topic() {
+    let summary = run(vec![
+        Step::Subscribe(app(b"0b54ccce5c7978bf/echo/rep")),
+        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        Step::Reply(reply(PEER_ECHO, b"one")),
+        Step::Reply(reply(PEER_ECHO, b"two")),
+        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+    ]);
+    assert_eq!(summary.answered, 2, "{summary:?}");
+    assert_eq!(summary.asked + summary.skipped, 4, "{summary:?}");
+}
+
+/// A request a peer's request topic also reaches: the application hears it
+/// from this node, and a peer's reply to the node's own echo request is
+/// matched by id.
+#[test]
+fn requests_are_delivered_locally() {
+    let summary = run(vec![
+        Step::Subscribe(app(b"*")),
+        Step::Subscribe(app(b"s")),
+        ask(b"svc", b"q", Timeout::Seconds(1)),
+        Step::Reply(reply(b"svc", b"a")),
+    ]);
+    assert_eq!((summary.skipped, summary.answered), (0, 1), "{summary:?}");
+}
+
+/// The C answers a request to its own service from its middleware task; the
+/// Rust node does not, so such a request is outside the domain.
+#[test]
+fn asking_this_nodes_own_service_is_skipped() {
+    let summary = run(vec![
+        Step::Register(index(b"svc")),
+        ask(b"svc", b"q", Timeout::Seconds(1)),
+        Step::Unregister(index(b"svc")),
+        ask(b"svc", b"q", Timeout::Seconds(1)),
+    ]);
+    assert_eq!((summary.skipped, summary.asked), (1, 1), "{summary:?}");
+}
+
+#[test]
+fn too_large_a_request_is_refused_by_both() {
+    let summary = run(vec![
+        ask(PEER_ECHO, &[7; 1025], Timeout::Seconds(1)),
+        ask(PEER_ECHO, &[7; 1024], Timeout::Seconds(1)),
+    ]);
+    assert_eq!((summary.skipped, summary.asked), (0, 1), "{summary:?}");
+}
+
+#[test]
+fn the_request_table_keeps_a_slot_free() {
+    let summary = run(vec![ask(PEER_ECHO, b"", Timeout::Seconds(3)); 9]);
+    assert_eq!((summary.asked, summary.skipped), (7, 2), "{summary:?}");
+}
+
+/// Every topic a step can subscribe, at once, fits `bm_get_subs`'s buffer
+/// (divergence #78): the fuzzer's first S2 crash was the harness reading
+/// the oracle's list past it.
+#[test]
+fn every_subscription_at_once_fits_bm_get_subs() {
+    let mut steps: Vec<Step> = NAMES.iter().map(|n| Step::Register(index(n))).collect();
+    steps.extend(APP_TOPICS.iter().map(|t| Step::Subscribe(app(t))));
+    steps.extend(ASKED.iter().map(|n| ask(n, b"", Timeout::Seconds(0))));
+    steps.push(Step::Wait(500));
+    run(steps);
 }
