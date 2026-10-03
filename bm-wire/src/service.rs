@@ -2,8 +2,8 @@
 //! services' bodies.
 //!
 //! The service list, request dispatch and echo are [`ServiceTable`] and
-//! [`echo`]; the requests a node waits on are [`Requests`]. `bm_stack::Node`
-//! runs them.
+//! [`echo`]; the requests a node waits on are [`Requests`]; power_info's
+//! reply callbacks are [`power_info::Callbacks`]. `bm_stack::Node` runs them.
 //!
 //! A body is a CBOR map with fixed keys in a fixed order, built and read by
 //! `bm_common_messages/*_msg.c` through tinycbor. Encoding uses [`cbor2`];

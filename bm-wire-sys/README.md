@@ -55,6 +55,9 @@ and its behaviour differs from an RTOS deliberately:
   bytes or more than `limit`, as a small embedded heap would, and counts what
   it granted and refused. For decoders that allocate a size the sender
   chooses.
+- **An allocation floor.** While `bm_shim_alloc_floor(n)` is set, `bm_malloc`
+  on the calling thread returns at least `n` zeroed bytes. For reading
+  `bm_get_subs`, which appends past its 256 bytes (divergence #78).
 
 `csrc/bm_stack_shim.c` brings the stack up on the capture device in the order
 `middleware/bristlemouth.c` uses.

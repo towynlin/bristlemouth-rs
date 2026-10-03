@@ -5,14 +5,15 @@
 
 use bm_wire::configuration::Partition;
 use bm_wire::service::config_map::{self, ConfigMapReply, ConfigMapRequest};
+use bm_wire::service::power_info::PowerInfoReply;
 use bm_wire::service::sys_info::SysInfoReply;
 use bm_wire_diff::config::Seed;
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
 use bm_wire_diff::services::PEERS;
 use bm_wire_diff::services::{
-    APP_TOPICS, ASKED, Ask, CONFIG_MAP, ECHO, NAMES, PEER_CONFIG_MAP, PEER_SYS_INFO, PartitionId,
-    Reply, ReplyId, ReplyTopic, Request, RequestTopic, SYS_INFO, ServicesInput, Size, Step,
-    Summary, Target, Timeout, budget, check,
+    APP_TOPICS, ASKED, Ask, CONFIG_MAP, ECHO, NAMES, PEER_CONFIG_MAP, PEER_SYS_INFO, POWER_INFO,
+    PartitionId, Reply, ReplyId, ReplyTopic, Request, RequestTopic, SYS_INFO, ServicesInput, Size,
+    Step, Summary, Target, Timeout, budget, check,
 };
 
 fn index(name: &[u8]) -> u8 {
@@ -336,7 +337,7 @@ fn every_asked_name_is_answered_and_times_out() {
     assert_eq!(summary.skipped, 0, "{summary:?}");
     assert_eq!(
         (summary.asked, summary.answered, summary.timeouts),
-        (8, 4, 4),
+        (10, 5, 5),
         "{summary:?}"
     );
 }
@@ -510,11 +511,11 @@ fn the_request_table_keeps_a_slot_free() {
     assert_eq!((summary.asked, summary.skipped), (7, 2), "{summary:?}");
 }
 
-/// Every topic a step can subscribe, at once, fits `bm_get_subs`'s buffer
-/// (divergence #78): the fuzzer's first S2 crash was the harness reading
-/// the oracle's list past it.
+/// Every topic a step can subscribe, at once: more than `bm_get_subs`'s 256
+/// bytes (divergence #78), which `oracle_subscriptions` reads under an
+/// allocation floor.
 #[test]
-fn every_subscription_at_once_fits_bm_get_subs() {
+fn every_subscription_at_once() {
     let mut steps: Vec<Step> = NAMES.iter().map(|n| Step::Register(index(n))).collect();
     steps.extend(APP_TOPICS.iter().map(|t| Step::Subscribe(app(t))));
     steps.extend(ASKED.iter().map(|n| ask(n, b"", Timeout::Seconds(0))));
@@ -715,4 +716,163 @@ fn config_map_request_answered_and_timed_out() {
         (2, 1, 1, 1),
         "{summary:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// power_info -- card E3.
+// ---------------------------------------------------------------------------
+
+/// An empty request is answered with the stats both sides' callbacks return;
+/// a request with data is not, and reads no stats.
+#[test]
+fn power_info_answers_with_the_stats() {
+    let summary = run(vec![
+        Step::Register(index(POWER_INFO)),
+        request(POWER_INFO, b""),
+        Step::PowerStats(310, 121, 1500),
+        request(POWER_INFO, b""),
+        request(POWER_INFO, b"x"),
+        with(request(POWER_INFO, b""), |r| r.peer = true),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(summary.power_info_replies, 3, "{summary:?}");
+}
+
+fn reply_power_info(id: u8, total_on_s: u32) -> Step {
+    Step::ReplyPowerInfo {
+        ingress: 0,
+        peer: false,
+        id: ReplyId::Waiting(id),
+        stats: (total_on_s, 2, 3),
+    }
+}
+
+/// `power_info_service_request` against `Node::power_info_request_with`: a
+/// reply reported to its own request's callback, and a timeout reporting
+/// nothing.
+#[test]
+fn power_info_request_answered_and_timed_out() {
+    let summary = run(vec![
+        Step::AskPowerInfo(Timeout::Seconds(1)),
+        reply_power_info(0, 1),
+        Step::AskPowerInfo(Timeout::Seconds(1)),
+        Step::Wait(1500),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (
+            summary.asked,
+            summary.power_info_reported,
+            summary.power_info_crossed,
+            summary.answered,
+            summary.timeouts
+        ),
+        (2, 1, 0, 0, 0),
+        "{summary:?}"
+    );
+}
+
+/// Divergence #96: replies out of order are reported to the callbacks in
+/// the order the requests were made.
+#[test]
+fn power_info_replies_out_of_order_cross() {
+    let summary = run(vec![
+        Step::AskPowerInfo(Timeout::Seconds(3)),
+        Step::AskPowerInfo(Timeout::Seconds(3)),
+        reply_power_info(1, 22),
+        reply_power_info(0, 11),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (summary.power_info_reported, summary.power_info_crossed),
+        (2, 2),
+        "{summary:?}"
+    );
+}
+
+/// Divergence #96: a later request expiring first uses up the earlier
+/// request's callback, and so does a reply that does not decode. The first
+/// request's reply then goes to the third's callback.
+#[test]
+fn power_info_expiry_and_a_bad_reply_use_up_the_oldest_callback() {
+    let summary = run(vec![
+        Step::AskPowerInfo(Timeout::Seconds(3)),
+        Step::AskPowerInfo(Timeout::Seconds(1)),
+        Step::AskPowerInfo(Timeout::Seconds(3)),
+        Step::Wait(1500),
+        Step::Reply(Reply {
+            id: ReplyId::Waiting(1),
+            ..reply(POWER_INFO, b"\xa0")
+        }),
+        reply_power_info(0, 5),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (summary.power_info_reported, summary.power_info_crossed),
+        (1, 1),
+        "{summary:?}"
+    );
+}
+
+/// A generic request to the power_info service is answered through its own
+/// `reply_cb`, beside a power_info request on the same reply topic.
+#[test]
+fn a_generic_request_to_power_info_is_not_a_power_info_request() {
+    let summary = run(vec![
+        Step::AskPowerInfo(Timeout::Seconds(3)),
+        ask(POWER_INFO, b"", Timeout::Seconds(3)),
+        reply_power_info(1, 7),
+        reply_power_info(0, 8),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (
+            summary.answered,
+            summary.power_info_reported,
+            summary.power_info_crossed
+        ),
+        (1, 1, 0),
+        "{summary:?}"
+    );
+}
+
+/// The C decodes `data_size` bytes past the publication (divergence #92);
+/// outside the domain for a power_info request, inside for another.
+#[test]
+fn a_power_info_reply_claiming_more_data_than_it_carries_is_skipped() {
+    let mut body = [0u8; 64];
+    let len = PowerInfoReply::default().encode(&mut body).unwrap();
+    let short = |id| {
+        let mut r = reply(POWER_INFO, &body[..len]);
+        r.id = ReplyId::Waiting(id);
+        r.size = Size::Off(1);
+        Step::Reply(r)
+    };
+    let summary = run(vec![
+        Step::AskPowerInfo(Timeout::Seconds(1)),
+        ask(POWER_INFO, b"", Timeout::Seconds(1)),
+        short(0),
+        short(1),
+    ]);
+    assert_eq!(
+        (
+            summary.skipped,
+            summary.answered,
+            summary.power_info_reported
+        ),
+        (1, 1, 0),
+        "{summary:?}"
+    );
+}
+
+/// A node listing power_info answers its own request in the C.
+#[test]
+fn asking_power_info_while_serving_it_is_skipped() {
+    let summary = run(vec![
+        Step::Register(index(POWER_INFO)),
+        Step::AskPowerInfo(Timeout::Seconds(1)),
+        Step::Unregister(index(POWER_INFO)),
+        Step::AskPowerInfo(Timeout::Seconds(1)),
+    ]);
+    assert_eq!((summary.skipped, summary.asked), (1, 1), "{summary:?}");
 }

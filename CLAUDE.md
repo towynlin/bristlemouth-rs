@@ -58,7 +58,9 @@ A cargo workspace.
     `CborValue`. For decoders whose outcomes are tinycbor's error codes and
     item counting rather than CBOR's.
   - `src/service/` — the services' bodies: `sys_info`, `config_map`,
-    `power_info`, `metrics`, each encode and decode; `table.rs` is
+    `power_info`, `metrics`, each encode and decode, and each built-in's
+    handler; `power_info.rs` also holds `power_info_service.c`'s callback
+    queue (`Callbacks`); `table.rs` is
     `bm_service.c`'s list and request walk (`ServiceTable`), the request and
     reply headers, and echo's handler; `request.rs` is
     `bm_service_request.c`'s list, id counter and 500 ms sweep (`Requests`).
@@ -91,7 +93,8 @@ A cargo workspace.
     `Node`'s `S`. `Node::register_service`, `register_echo_service` and
     `unregister_service` list them; `on_frame` answers a request in
     `Owed::reply`. `Node::service_request` asks another node's service;
-    the answer is `Event::ServiceReply` or `Event::ServiceTimeout`.
+    the answer is `Event::ServiceReply` or `Event::ServiceTimeout`, or for
+    `Node::power_info_request`, `Event::PowerInfoReply` (divergence #96).
   - `src/utc_time.rs` — the Spotter's `spotter/utc-time`, which C nodes set
     their RTC from (bm_protocol app code, not bm_core): `decode` and
     `UtcTimeSetter`, for an `App`.
@@ -155,10 +158,10 @@ A cargo workspace.
     node mirroring the oracle's subscription and resource lists for the life
     of the process.
   - `src/services.rs`, `tests/services.rs` — `bm_service.c`, echo,
-    sys_info, config_map and `bm_service_request.c` against `Node`'s
-    services and requests, with one Rust node mirroring the oracle's service
-    list, request list, subscriptions and resources for the life of the
-    process, and a config store both sides empty at each input.
+    sys_info, config_map, power_info and `bm_service_request.c` against
+    `Node`'s services and requests, with one Rust node mirroring the
+    oracle's service list, request list, subscriptions and resources for the
+    life of the process, and a config store both sides empty at each input.
   - `tests/service_request_failures.rs` — `bm_service_request`'s failure
     paths on the oracle alone (divergence #91), which the Rust node's
     ceilings refuse earlier.

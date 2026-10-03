@@ -83,6 +83,10 @@ typedef struct {
 void bm_shim_heap_watch_begin(size_t limit);
 // Stop watching and report what happened since bm_shim_heap_watch_begin.
 BmShimHeapWatch bm_shim_heap_watch_end(void);
+// While `floor` is non-zero, bm_malloc on the calling thread returns at
+// least `floor` zeroed bytes, outside a heap watch. For reading bm_get_subs,
+// which writes past its 256 bytes (divergence #78); 0 restores plain malloc.
+void bm_shim_alloc_floor(size_t floor);
 
 // --- bringing the stack up ---
 

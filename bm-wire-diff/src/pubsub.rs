@@ -250,18 +250,29 @@ fn state() -> (MutexGuard<'static, ()>, MutexGuard<'static, Option<State>>) {
     (guard, state)
 }
 
+/// The most bytes [`oracle_subscriptions`] reads: `bm_get_subs`'s joined
+/// list, with its NUL.
+pub const SUBS_BYTES: usize = 4096;
+
 /// `bm_get_subs`, split. Its buffer is 256 bytes and unchecked (divergence
-/// #78); [`SUBSCRIPTIONS`] patterns and the metrics topic fit it.
+/// #78), so it is called under [`bm_wire_sys::bm_shim_alloc_floor`] of
+/// [`SUBS_BYTES`].
 ///
-/// The caller holds [`oracle`]'s lock, and keeps the subscriptions few
-/// enough to fit.
+/// The caller holds [`oracle`]'s lock.
+///
+/// # Panics
+///
+/// If the list joined does not fit [`SUBS_BYTES`].
 #[must_use]
 pub fn oracle_subscriptions() -> Vec<Vec<u8>> {
     unsafe {
+        bm_wire_sys::bm_shim_alloc_floor(SUBS_BYTES);
         let subs = bm_wire_sys::bm_get_subs();
+        bm_wire_sys::bm_shim_alloc_floor(0);
         assert!(!subs.is_null(), "bm_get_subs");
         let joined = std::ffi::CStr::from_ptr(subs).to_bytes().to_vec();
         bm_wire_sys::bm_free(subs.cast());
+        assert!(joined.len() < SUBS_BYTES, "bm_get_subs past its floor");
         if joined.is_empty() {
             return Vec::new();
         }

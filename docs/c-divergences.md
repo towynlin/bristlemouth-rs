@@ -2767,7 +2767,9 @@ and appends every subscription's topic and a `" | "` separator with
 subscriptions can overflow it.
 
 **c-only.** No port. `bm-wire-diff/src/node_udp.rs` reads the oracle's
-subscriptions through it and keeps them few.
+subscriptions through it and keeps them few;
+`bm_wire_diff::pubsub::oracle_subscriptions` reads it under
+`bm_shim_alloc_floor`, which makes `bm_malloc` return 4096 zeroed bytes.
 
 Fix upstream by bounding each append by the space left.
 
