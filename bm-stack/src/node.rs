@@ -144,7 +144,9 @@
 //! the request in [`Node::service_requests`], subscribes `<service>/rep` and
 //! publishes `<service>/req`. A reply reaching that subscription arrives as
 //! [`Event::ServiceReply`], and silence as [`Event::ServiceTimeout`] from
-//! [`Node::on_service_expiry`].
+//! [`Node::on_service_expiry`]. A request [`Node::power_info_request`] made
+//! ends as `power_info_service.c`'s callback queue says instead:
+//! [`Event::PowerInfoReply`] or nothing.
 //!
 //! # Three timers, not one
 //!
@@ -193,6 +195,7 @@ use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError, Subscriptions};
 use bm_wire::service::config_map::{self, ConfigMapRequest};
+use bm_wire::service::power_info::{self, Ended, PowerInfoReply};
 use bm_wire::service::sys_info::{self, SysInfoReply};
 use bm_wire::service::{
     self as service_wire, Lookup, ReplyHeader, ReplyOutcome, RequestHeader, ServiceTable,
@@ -206,8 +209,8 @@ use crate::config::{Configuration, NoConfig};
 use crate::dfu::{DfuFinished, HostRequest, NodeDfu};
 use crate::port::{DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy, Rtc, RtcTimeAndDate};
 use crate::service::{
-    NoServices, RegisterError, SERVICE_NAME_BYTES, SERVICES, ServiceHandler, ServiceRequestError,
-    ServiceRequests, Services, UnregisterError,
+    NoServices, PowerInfoCallbacks, RegisterError, SERVICE_NAME_BYTES, SERVICES, ServiceHandler,
+    ServiceRequestError, ServiceRequests, Services, UnregisterError,
 };
 
 /// Largest frame the node will build or accept.
@@ -534,6 +537,22 @@ pub enum Event<'a> {
         id: u32,
         /// The service the request named.
         service: &'a [u8],
+    },
+    /// A power_info reply decoded: the `BmPowerInfoReplyCb` a
+    /// [`Node::power_info_request`] queued. Requests that function makes
+    /// report this in place of [`Event::ServiceReply`] and
+    /// [`Event::ServiceTimeout`], as their C `reply_cb` is
+    /// `power_info_reply_cb`.
+    ///
+    /// Each of those requests that ends, answered or expired, uses up the
+    /// oldest callback still queued, so `id` is the oldest such request's,
+    /// which need not be the one answered (divergence #96). An expiry or a
+    /// reply that does not decode reports nothing, and uses one up too.
+    PowerInfoReply {
+        /// The id of the request whose callback this is.
+        id: u32,
+        /// The reply.
+        reply: PowerInfoReply,
     },
 }
 
@@ -971,6 +990,8 @@ pub struct Node<
     services: S,
     /// `CTX.service_request_list` and its expiry timer.
     service_requests: ServiceRequests,
+    /// `power_info_service.c`'s `service_queue`.
+    power_info: PowerInfoCallbacks,
     port_count: u8,
     /// Link state per port, bit 0 for port 1. Cached rather than read from the
     /// PHY on demand, so the synchronous half stays free of I/O — the same
@@ -1218,6 +1239,7 @@ impl<
             service_table: ServiceTable::new(),
             services,
             service_requests: ServiceRequests::new(),
+            power_info: PowerInfoCallbacks::new(),
             port_count,
             link_mask: 0,
             udp_ports: [None; UDP_PORTS],
@@ -2737,6 +2759,7 @@ impl<
         Self::deliver_locally(
             &self.subscriptions,
             &mut self.service_requests,
+            &mut self.power_info,
             node_id,
             topic,
             kind,
@@ -2909,6 +2932,7 @@ impl<
                         replied = true;
                         Self::answer_request(
                             &mut self.service_requests,
+                            &mut self.power_info,
                             node_id,
                             publication.data,
                             events,
@@ -2926,6 +2950,7 @@ impl<
         Self::deliver_locally(
             &self.subscriptions,
             &mut self.service_requests,
+            &mut self.power_info,
             node_id,
             reply.topic,
             reply.kind,
@@ -2993,6 +3018,9 @@ impl<
                     |partition, out| partition_map(config, partition, out),
                     reply,
                 ),
+                ServiceHandler::PowerInfo => {
+                    power_info::handle(data, || services.power_info(), reply)
+                }
                 ServiceHandler::Application => services.handle(name, data, reply),
             }
             .filter(|len| *len <= reply.len())
@@ -3028,6 +3056,7 @@ impl<
     fn deliver_locally(
         subscriptions: &Subscriptions<SUBSCRIPTIONS, RESOURCE_NAME>,
         requests: &mut ServiceRequests,
+        power_info: &mut PowerInfoCallbacks,
         node_id: u64,
         topic: &[u8],
         kind: u8,
@@ -3049,7 +3078,7 @@ impl<
                     }),
                     Subscriber::Reply if !replied => {
                         replied = true;
-                        Self::answer_request(requests, node_id, data, events);
+                        Self::answer_request(requests, power_info, node_id, data, events);
                     }
                     Subscriber::Reply | Subscriber::Service => {}
                 }
@@ -3060,16 +3089,20 @@ impl<
     /// `_service_request_cb`: report the request `body` answers, if any.
     fn answer_request(
         requests: &mut ServiceRequests,
+        power_info: &mut PowerInfoCallbacks,
         node_id: u64,
         body: &[u8],
         events: &mut impl FnMut(Event<'_>),
     ) {
         if let ReplyOutcome::Answered { request, data } = requests.on_reply(node_id, body) {
-            events(Event::ServiceReply {
-                id: request.id(),
-                service: request.service(),
-                data,
-            });
+            match power_info.on_end(request.id(), Some(data)) {
+                Ended::Other => events(Event::ServiceReply {
+                    id: request.id(),
+                    service: request.service(),
+                    data,
+                }),
+                ended => report_power_info(ended, events),
+            }
         }
     }
 
@@ -3227,6 +3260,58 @@ impl<
         self.service_request_with(now_ms, &name[..len], &data[..data_len], timeout_s, events)
     }
 
+    /// List the power_info service, `bus_power_controller/timing` —
+    /// `power_info_service_init`. An empty request is answered with
+    /// [`Services::power_info`]; see [`bm_wire::service::power_info::handle`].
+    ///
+    /// The name carries no node id, so every node listing it answers a
+    /// request. The C refuses a NULL callback; here a node whose
+    /// [`Services::power_info`] returns `None` lists the service and sends no
+    /// reply.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::register_service`].
+    pub fn register_power_info_service(&mut self) -> Result<(), RegisterError> {
+        self.list_service(power_info::SERVICE, ServiceHandler::PowerInfo)
+    }
+
+    /// [`Node::power_info_request_with`], discarding local deliveries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::service_request_with`].
+    pub fn power_info_request(
+        &mut self,
+        now_ms: u32,
+        timeout_s: u32,
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        self.power_info_request_with(now_ms, timeout_s, |_| {})
+    }
+
+    /// Ask the bus for its power timing — `power_info_service_request`:
+    /// queue a callback for the request, then [`Node::service_request_with`]
+    /// to `bus_power_controller/timing` with no data. Every node listing the
+    /// service answers; the first reply ends the request.
+    ///
+    /// The answer is [`Event::PowerInfoReply`], not
+    /// [`Event::ServiceReply`]; an expiry reports nothing. Answers pair with
+    /// requests in the order the requests were made, not by id (divergence
+    /// #96).
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::service_request_with`]. [`ServiceRequestError::Full`]
+    /// queues no callback: the C's equivalent is `queue_cb_enqueue` failing.
+    pub fn power_info_request_with(
+        &mut self,
+        now_ms: u32,
+        timeout_s: u32,
+        events: impl FnMut(Event<'_>),
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        self.request_with(now_ms, power_info::SERVICE, &[], timeout_s, true, events)
+    }
+
     fn list_service(&mut self, name: &[u8], handler: ServiceHandler) -> Result<(), RegisterError> {
         self.service_table
             .add(name, handler)
@@ -3322,6 +3407,20 @@ impl<
         service: &[u8],
         data: &[u8],
         timeout_s: u32,
+        events: impl FnMut(Event<'_>),
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        self.request_with(now_ms, service, data, timeout_s, false, events)
+    }
+
+    /// [`Node::service_request_with`], queueing a power_info callback for the
+    /// request first if `power_info`.
+    fn request_with(
+        &mut self,
+        now_ms: u32,
+        service: &[u8],
+        data: &[u8],
+        timeout_s: u32,
+        power_info: bool,
         mut events: impl FnMut(Event<'_>),
     ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
         if data.len() > service_wire::MAX_DATA_SIZE {
@@ -3331,6 +3430,11 @@ impl<
             .service_requests
             .add(service, timeout_s, now_ms)
             .map_err(|_| ServiceRequestError::Full)?;
+        if power_info {
+            // Cannot fail: one callback per waiting request, and `add` found
+            // a request's room.
+            let _ = self.power_info.push(id);
+        }
         let mut topic = [0u8; SERVICE_NAME_BYTES + service_wire::REPLY_SUFFIX.len()];
         // Cannot fail: `add` holds no longer name.
         let len = service_wire::topic(&mut topic, service, service_wire::REPLY_SUFFIX)
@@ -3373,6 +3477,7 @@ impl<
         Self::deliver_locally(
             &self.subscriptions,
             &mut self.service_requests,
+            &mut self.power_info,
             node_id,
             request.topic,
             request.kind,
@@ -3396,17 +3501,27 @@ impl<
     /// least its timeout after it was made. Calling early, late or twice
     /// changes nothing.
     pub fn on_service_expiry(&mut self, now_ms: u32, mut events: impl FnMut(Event<'_>)) {
+        let power_info = &mut self.power_info;
         self.service_requests.on_tick(now_ms, |request| {
-            events(Event::ServiceTimeout {
-                id: request.id(),
-                service: request.service(),
-            });
+            match power_info.on_end(request.id(), None) {
+                Ended::Other => events(Event::ServiceTimeout {
+                    id: request.id(),
+                    service: request.service(),
+                }),
+                ended => report_power_info(ended, &mut events),
+            }
         });
     }
 
     /// `CTX.service_request_list`: the requests waiting on a reply.
     pub fn service_requests(&self) -> &ServiceRequests {
         &self.service_requests
+    }
+
+    /// `power_info_service.c`'s callback queue, and which waiting requests
+    /// [`Node::power_info_request`] made.
+    pub fn power_info_callbacks(&self) -> &PowerInfoCallbacks {
+        &self.power_info
     }
 
     /// `BM_SERVICE_CONTEXT.service_list`: the services listed, in the order a
@@ -4333,6 +4448,16 @@ fn sys_config_crc(config: &impl Configuration) -> u32 {
         || bm_wire::crc::crc32_ieee(&[0xa0]),
         |store| store.partition(Partition::System).cbor_map_crc32(),
     )
+}
+
+/// The `BmPowerInfoReplyCb` call `power_info_reply_cb` makes, if any.
+fn report_power_info(ended: Ended, events: &mut impl FnMut(Event<'_>)) {
+    if let Ended::Called { callback, reply } = ended {
+        events(Event::PowerInfoReply {
+            id: callback,
+            reply,
+        });
+    }
 }
 
 /// `services_cbor_as_map(partition)`, for a config_map reply. With no store,

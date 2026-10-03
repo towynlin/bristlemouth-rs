@@ -113,20 +113,10 @@ From reading the source; not yet run.
 
 | Where | Suspicion | Card |
 |---|---|---|
-| `power_info_reply_cb` | Callbacks are dequeued FIFO, not by id; a failed send leaves its callback queued and shifts every later pairing. | E3 |
-| `power_info_service_init` | Stores the callback when registration fails. | E3 |
 | `metrics_service_handler` | Accepts a non-empty request, which sys_info and power_info refuse; `uptime_ms` wraps after ~49.7 days. | E4 |
 
 ## Cards
 
-
-### E3 — power_info
-
-- **C:** `power_info_service.c`, `common/cb_queue.c`.
-- **Rust:** the server through `Services::power_info`; the requester, with
-  the FIFO pairing reproduced in what `Event::PowerInfoReply` reports.
-- **Comparator:** extends `services`.
-- **Blocked by:** nothing. **Blocks:** E5.
 
 ### E4 — metrics
 
@@ -145,7 +135,7 @@ From reading the source; not yet run.
 - **Capture:** a C dev kit answering a Bridge's samplers, as
   `bm-wire-diff/testdata/services-*.pcap`, asserted by
   `tests/capture_services.rs` (pattern: `capture_h0.rs`).
-- **Blocked by:** E3, E4.
+- **Blocked by:** E4.
 - **Done:** on a bench, a Bridge's topology and metrics samplers list the
   Rust node with its correct `sys_config_crc`.
 
@@ -153,12 +143,12 @@ From reading the source; not yet run.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | E3, E4 | nothing |
-| 2 | E5 | E3, E4 |
+| 1 | E4 | nothing |
+| 2 | E5 | E4 |
 
 Cards within a wave can run in parallel.
 
-## What the landed cards left for the rest (M1, M2, C1, S1, S2, E1, E2)
+## What the landed cards left for the rest (M1, M2, C1, S1, S2, E1, E2, E3)
 
 - **The service list is `bm_wire::service::ServiceTable<H, N, NAME>`**, the
   C's walk included (#89): `lookup` returns the first service whose name
@@ -167,14 +157,15 @@ Cards within a wave can run in parallel.
   bm_stack::service::ServiceHandler`, `SERVICES` (16) names of up to 48 bytes.
 - **Built-ins are `ServiceHandler` variants; the application's are
   `Services::handle`.** Echo is `ServiceHandler::Echo`, sys_info
-  `ServiceHandler::SysInfo`, config_map `ServiceHandler::ConfigMap`, all
-  answered in `Node::serve`, which takes `&I` and `&C`. E3 and E4 add a
-  variant each and its arm there; E4's uptime is not passed yet. A
-  built-in's handler body is a sans-io function beside its codec
-  (`bm_wire::service::sys_info::handle`, `config_map::handle`), and its
-  registration a `Node::register_<name>_service` building `<id><SUFFIX>`.
-  `Services` has one method; E3 and E4 add theirs with defaults
-  (contract 3).
+  `ServiceHandler::SysInfo`, config_map `ServiceHandler::ConfigMap`,
+  power_info `ServiceHandler::PowerInfo`, all answered in `Node::serve`,
+  which takes `&I` and `&C`. E4 adds a variant and its arm there; its
+  uptime is not passed yet. A built-in's handler body is a sans-io function
+  beside its codec (`bm_wire::service::sys_info::handle`,
+  `config_map::handle`, `power_info::handle`), and its registration a
+  `Node::register_<name>_service` building `<id><SUFFIX>`. `Services` has
+  `handle` and `power_info` (the stats callback, default `None`, which
+  sends no reply); E4 adds `metrics` with a default (contract 3).
 - **`Identity::git_sha` and `Identity::app_name`** (contract 7). `git_sha`
   defaults to `device_info().git_sha` and is what the device-info reply
   and DFU now read. `app_name` defaults to empty. `bm-devkit`'s
@@ -228,13 +219,24 @@ Cards within a wave can run in parallel.
   target, timeout_s)` builds `<target>/sys_info` and calls
   `service_request_with` with no data;
   `Node::config_map_request(_with)(now_ms, target, partition_id,
-  timeout_s)` does the same with a `ConfigMapRequest`. E3 and E4's
-  requesters follow. The application tells replies apart by `service` or
+  timeout_s)` does the same with a `ConfigMapRequest`. E4's requester
+  follows. The application tells replies apart by `service` or
   by the id it kept, and decodes the data itself
   (`DecodedSysInfoReply::decode_into`, `DecodedConfigMapReply::decode_into`).
   `service` is the request's, not the reply's topic (#92). `data` is
   `data_size` bytes or what arrived if fewer (#92), so a decoder sees a
   short body where the C reads past the publication.
+- **power_info's requester is the exception.** `power_info_service_request`
+  queues the caller's callback and makes every request's `reply_cb` its
+  own, which dequeues the oldest callback (#96).
+  `Node::power_info_request(_with)(now_ms, timeout_s)` queues one in
+  `bm_wire::service::power_info::Callbacks`, named by the request's id; its
+  requests report `Event::PowerInfoReply { id, reply }` with the dequeued
+  callback's id, only for a reply that decodes, and never `ServiceReply` or
+  `ServiceTimeout`. Decided so the events are the C's callbacks one for
+  one. The comparator tells the oracle's callbacks apart as
+  `C_POWER_REPLY`, eight functions, since a `BmPowerInfoReplyCb` takes no
+  context.
 - **Ceilings:** `bm_stack::service::SERVICE_REQUESTS` (8) requests, names of
   `SERVICE_NAME_BYTES`. `bm_wire::service::Requests<N, NAME>` is the list,
   id counter and sweep phase; `resuming(next_id, next_sweep_ms)` lines one up
@@ -252,27 +254,25 @@ Cards within a wave can run in parallel.
   at a time, and at each input's start, which waits out every request (the
   C's list has no reset). `Timeout` keeps every timeout within seconds.
   `Step::Ask` asks an `ASKED` service; `Step::Reply` injects a peer's reply.
-  E3 and E4 add their requests as `Step` variants, as `Step::AskSysInfo`
-  and `Step::AskConfigMap` do; `Answer` carries reply bytes, which
+  E4 adds its request as a `Step` variant, as `Step::AskSysInfo`,
+  `Step::AskConfigMap` and `Step::AskPowerInfo` do; `Answer` carries reply bytes, which
   `service_codecs` already compares decoded, so it was not extended. A
   service whose request carries CBOR needs a step that sends a well-formed
   one, as `Step::RequestConfigMap` does: in 14 minutes of fuzzing,
-  `Step::Request`'s arbitrary data reached no config_map reply.
+  `Step::Request`'s arbitrary data reached no config_map reply;
+  `Step::ReplyPowerInfo` is the same for a power_info reply.
+  `Step::PowerStats` sets the stats both sides' callbacks return.
   `Summary::sys_info_replies`, `config_map_replies` and
   `config_map_successes` count the node's replies; `sys_info_decoded` and
   `config_map_decoded` the answers to `PEER_SYS_INFO` and `PEER_CONFIG_MAP`
   that decode.
-- **The comparator's subscriptions are near `bm_get_subs`'s 256 bytes**
-  (#78): at most 250 joined, and reply subscriptions are never removed.
-  `assert_lists` fails before the C overflows, and
-  `every_subscription_at_once_fits_bm_get_subs` subscribes the worst case.
-  E1 replaced `<id>/echo/x` with `<id>/sys_info`; E2 dropped `<id>/e`, `sv`
-  and `s?c` from `NAMES` and shortened `ASKED`'s peer pattern to `0*`
-  (`0*/rep` still matches every peer reply topic, #74). 5 bytes are left.
-  E3 needs about 34 to serve `bus_power_controller/timing` and E4 about 32
-  to ask a peer's metrics (serving it is already counted). Candidates left:
-  `svc` in `ASKED` (10), `s*` (9), the application's `s` (4); `x` is the
-  leak budget's name and should stay.
+- **The comparator reads `bm_get_subs` under an allocation floor** (#78):
+  `bm_shim_alloc_floor` makes `bm_malloc` return at least n zeroed bytes,
+  and `pubsub::oracle_subscriptions` sets 4096, so the pools no longer
+  budget bytes. E3 found the 256-byte budget could not hold
+  `bus_power_controller/timing`'s two topics. A card adding topics raises
+  `services::SUBSCRIPTIONS` (28) and `RESOURCES` (48), the Rust node's
+  ceilings.
 - **The comparator's node keeps a `Config<RamConfigStorage>`**, replaced at
   each input by `config::reset(&[])`, which also empties the oracle's
   `CONFIGS`. `Step::Configure(Seed)` writes one key to both, in any
@@ -307,12 +307,9 @@ Cards within a wave can run in parallel.
   aborts on a `config_map` request such as `{"p": "ab"}`; the Rust server
   does what a release node does.
 - **Decoders write into `&mut self`** (`decode_into`) rather than returning a
-  value, because the C writes fields as it reads them and
-  `power_info_reply_cb` passes the partly decoded struct to the requester's
-  callback whether or not decoding succeeded. E3 reports that struct.
+  value, because the C writes fields as it reads them.
 - **Encoders return `Err(CborError::OutOfMemory)` where the C's handler
-  returns false**: no reply (contract 8). E3 encodes into the handler's
-  1008 bytes. `config_map::handle` writes the reply's fields and then the
+  returns false**: no reply (contract 8). `config_map::handle` writes the reply's fields and then the
   map into that buffer, measuring the map first; a reply that does not fit
   is no reply (#94).
 - **Decoded strings are `CborString`s**, borrowed from the body, chunked or

@@ -17,6 +17,7 @@ use bm_wire::configuration::{Key, Layout, MapError, Partition};
 use bm_wire::crc::crc32_ieee;
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError};
 use bm_wire::service::config_map::{self, ConfigMapReply, ConfigMapRequest, DecodedConfigMapReply};
+use bm_wire::service::power_info::PowerInfoReply;
 use bm_wire::service::sys_info::{DecodedSysInfoReply, SysInfoReply};
 use bm_wire::service::{REPLY_DATA_LEN, ReplyHeader, RequestHeader};
 use bm_wire::udp;
@@ -46,9 +47,12 @@ impl Identity for TestIdentity {
 }
 
 /// Answers with the request reversed, and refuses a request starting `!`.
+/// Its power stats are `power`, counted in `power_calls`.
 #[derive(Default)]
 struct Reverser {
     calls: Vec<(Vec<u8>, Vec<u8>)>,
+    power: Option<PowerInfoReply>,
+    power_calls: usize,
 }
 
 impl Services for Reverser {
@@ -61,6 +65,11 @@ impl Services for Reverser {
             *out = *byte;
         }
         Some(request.len())
+    }
+
+    fn power_info(&mut self) -> Option<PowerInfoReply> {
+        self.power_calls += 1;
+        self.power
     }
 }
 
@@ -924,4 +933,153 @@ fn config_map_request_asks_the_target_for_a_partition() {
     let mut d = DecodedConfigMapReply::default();
     d.decode_into(data).unwrap();
     assert_eq!((d.node_id, d.partition_id, d.success), (PEER_ID, 3, true));
+}
+
+// ---------------------------------------------------------------------------
+// power_info -- card E3.
+// ---------------------------------------------------------------------------
+
+const POWER_INFO: &[u8] = b"bus_power_controller/timing";
+
+const STATS: PowerInfoReply = PowerInfoReply {
+    total_on_s: 310,
+    remaining_on_s: 121,
+    upcoming_off_s: 1500,
+};
+
+fn power_info_body(reply: PowerInfoReply) -> Vec<u8> {
+    let mut body = [0u8; 64];
+    let len = reply.encode(&mut body).unwrap();
+    body[..len].to_vec()
+}
+
+#[test]
+fn power_info_answers_an_empty_request_with_the_stats() {
+    let mut node = node();
+    node.register_power_info_service().unwrap();
+    assert!(
+        node.service_table()
+            .iter()
+            .eq([(POWER_INFO, ServiceHandler::PowerInfo)])
+    );
+
+    // No stats: no reply, as the C's handler with no callback.
+    let (reply, _) = receive(
+        &mut node,
+        frames::service_request(PEER_ID, POWER_INFO, 1, b""),
+    );
+    assert_eq!(reply, None);
+    assert_eq!(node.services().power_calls, 1);
+
+    node.services_mut().power = Some(STATS);
+    let (reply, _) = receive(
+        &mut node,
+        frames::service_request(PEER_ID, POWER_INFO, 2, b""),
+    );
+    let (topic, body) = reply.unwrap();
+    assert_eq!(topic, b"bus_power_controller/timing/rep");
+    let header = ReplyHeader::decode(&body).unwrap();
+    assert_eq!((header.target_node_id, header.id), (PEER_ID, 2));
+    let mut d = PowerInfoReply::default();
+    d.decode_into(&body[ReplyHeader::LEN..]).unwrap();
+    assert_eq!(d, STATS);
+    assert_eq!(node.services().power_calls, 2);
+
+    // A request with data is refused before the stats are read.
+    let (reply, _) = receive(
+        &mut node,
+        frames::service_request(PEER_ID, POWER_INFO, 3, b"x"),
+    );
+    assert_eq!(reply, None);
+    assert_eq!(node.services().power_calls, 2);
+}
+
+/// What a power_info request's events carried: `(id, reply)`, and every other
+/// answer.
+fn power_answers(events: &mut Vec<(u32, PowerInfoReply)>, other: &mut Vec<Answer>, e: Event<'_>) {
+    match e {
+        Event::PowerInfoReply { id, reply } => events.push((id, reply)),
+        e => other.extend(answer(e)),
+    }
+}
+
+fn power_reply(
+    node: &mut TestNode,
+    id: u32,
+    body: &[u8],
+) -> (Vec<(u32, PowerInfoReply)>, Vec<Answer>) {
+    let mut frame = frames::service_reply(PEER_ID, POWER_INFO, NODE_ID, id, body);
+    let (mut power, mut other) = (Vec::new(), Vec::new());
+    node.on_frame_with(10, 1, &mut frame, |e| {
+        power_answers(&mut power, &mut other, e)
+    });
+    (power, other)
+}
+
+#[test]
+fn power_info_request_asks_the_bus() {
+    let mut node = node();
+    let (id, outbound) = node.power_info_request(0, 5).unwrap();
+    let datagram = udp::accept(outbound.frame()).unwrap();
+    let publication = pubsub::decode(datagram.payload).unwrap();
+    assert_eq!(publication.topic, b"bus_power_controller/timing/req");
+    assert_eq!(
+        RequestHeader::decode(publication.data),
+        Ok(RequestHeader { id, data_size: 0 })
+    );
+    assert_eq!(publication.data.len(), RequestHeader::LEN);
+    assert!(node.power_info_callbacks().queued().eq([id]));
+
+    let (power, other) = power_reply(&mut node, id, &power_info_body(STATS));
+    assert_eq!(power, vec![(id, STATS)]);
+    assert!(other.is_empty(), "no ServiceReply: {other:?}");
+    assert_eq!(node.power_info_callbacks().queued().count(), 0);
+    assert!(node.service_requests().is_empty());
+}
+
+/// Divergence #96: a reply to the second request is reported to the first's
+/// callback; the first's reply then goes to the second's.
+#[test]
+fn power_info_replies_pair_with_requests_in_order() {
+    let mut node = node();
+    let (first, _) = node.power_info_request(0, 5).unwrap();
+    let (second, _) = node.power_info_request(0, 5).unwrap();
+    let late = PowerInfoReply {
+        total_on_s: 2,
+        ..STATS
+    };
+    let (power, _) = power_reply(&mut node, second, &power_info_body(late));
+    assert_eq!(power, vec![(first, late)]);
+    let (power, _) = power_reply(&mut node, first, &power_info_body(STATS));
+    assert_eq!(power, vec![(second, STATS)]);
+}
+
+/// An expiry reports nothing and uses up the oldest callback; so does a
+/// reply that does not decode. Other requests still report as before.
+#[test]
+fn power_info_expiry_and_bad_replies_report_nothing() {
+    let mut node = node();
+    let (first, _) = node.power_info_request(0, 1).unwrap();
+    let (echo, _) = node.service_request(0, PEER_ECHO, b"", 1).unwrap();
+    let (second, _) = node.power_info_request(0, 5).unwrap();
+    let (third, _) = node.power_info_request(0, 5).unwrap();
+    assert!(
+        node.power_info_callbacks()
+            .queued()
+            .eq([first, second, third])
+    );
+
+    let (mut power, mut other) = (Vec::new(), Vec::new());
+    node.on_service_expiry(1000, |e| power_answers(&mut power, &mut other, e));
+    assert!(power.is_empty());
+    assert_eq!(other, vec![(false, echo, PEER_ECHO.to_vec(), Vec::new())]);
+    assert!(node.power_info_callbacks().queued().eq([second, third]));
+
+    let (power, other) = power_reply(&mut node, third, b"\xa0");
+    assert!(power.is_empty() && other.is_empty());
+    assert!(node.power_info_callbacks().queued().eq([third]));
+    assert!(node.power_info_callbacks().is_waiting(second));
+
+    let (power, _) = power_reply(&mut node, second, &power_info_body(STATS));
+    assert_eq!(power, vec![(third, STATS)]);
 }

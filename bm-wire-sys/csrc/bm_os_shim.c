@@ -132,7 +132,14 @@ BmShimHeapWatch bm_shim_heap_watch_end(void) {
   return HEAP_WATCH.seen;
 }
 
+static _Thread_local size_t ALLOC_FLOOR;
+
+void bm_shim_alloc_floor(size_t floor) { ALLOC_FLOOR = floor; }
+
 void *bm_malloc(size_t size) {
+  if (ALLOC_FLOOR && !HEAP_WATCH.on) {
+    return calloc(1, size < ALLOC_FLOOR ? ALLOC_FLOOR : size);
+  }
   if (!HEAP_WATCH.on) {
     return malloc(size);
   }

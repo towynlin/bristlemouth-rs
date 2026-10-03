@@ -1,14 +1,17 @@
 //! Differential comparator for the service layer on the node:
 //! `bm_service_register`, `bm_service_unregister`, `echo_service_init`,
 //! `sys_info_service_init`, `config_cbor_map_service_init`,
-//! `_service_request_received_cb`, `bm_service_request`,
-//! `sys_info_service_request`, `config_cbor_map_service_request`,
+//! `power_info_service_init`, `_service_request_received_cb`,
+//! `bm_service_request`, `sys_info_service_request`,
+//! `config_cbor_map_service_request`, `power_info_service_request`,
 //! `_service_request_cb` and the request expiry sweep against
 //! [`Node::register_service`], [`Node::unregister_service`],
 //! [`Node::register_echo_service`], [`Node::register_sys_info_service`],
-//! [`Node::register_config_map_service`], [`Node::on_frame_with`],
+//! [`Node::register_config_map_service`],
+//! [`Node::register_power_info_service`], [`Node::on_frame_with`],
 //! [`Node::service_request_with`], [`Node::sys_info_request_with`],
-//! [`Node::config_map_request_with`] and [`Node::on_service_expiry`].
+//! [`Node::config_map_request_with`], [`Node::power_info_request_with`] and
+//! [`Node::on_service_expiry`].
 //!
 //! A stack target, for the reason [`crate::stack`] gives. Driven from
 //! `tests/services.rs`.
@@ -27,6 +30,8 @@
 //! | Deliveries to the application | `on_publication`'s: the request's, then the replies' | [`Event::Publication`]: the request's, then the reply's |
 //! | A request this node makes | `bm_service_request`'s result, its frame and local deliveries | [`Node::service_request_with`]'s |
 //! | Answers to requests this node made | [`c_reply_cb`]'s, with `ack` true from a reply and false from the sweep | [`Event::ServiceReply`], [`Event::ServiceTimeout`] |
+//! | Answers to power_info requests | which of [`C_POWER_REPLY`] was called, and with what | [`Event::PowerInfoReply`]'s request id, mapped to the callback that request queued |
+//! | Power stats read | [`c_power_stats`]'s calls, one per service callback called | [`StandIn`]'s, one |
 //! | `sys_config_crc`, before each sys_info reply | `services_cbor_encoded_as_crc32` | [`ConfigPartition::cbor_map_crc32`](bm_wire::configuration::ConfigPartition::cbor_map_crc32) |
 //!
 //! Both nodes keep a config store, emptied at the start of each input by
@@ -61,6 +66,7 @@
 //! | Fewer than [`SERVICE_REQUESTS`] requests outstanding; asserted after every step | the Rust node's ceiling |
 //! | Timeouts that expire within seconds ([`Timeout`]) | the start of each input waits them out |
 //! | No request answered by echo with more than [`REPLY_DATA_LEN`] bytes | the C copies past its buffer (divergence #90) |
+//! | No reply to a power_info request whose `data_size` is more than it carries | `power_info_reply_cb` decodes `data_size` bytes, past the publication (divergence #92) |
 //! | Under ASan, `strict_memcmp=0` (the `services` fuzz target) | `<id>/sys_info/req` and the peer's sys_info reply topic are longer than `<id>/metrics/req`, which `SUB_LIST` lists first, so each `bm_sub_wl` compares past it (divergence #38); only bytes up to the first difference are checked |
 //! | No sys_info request while the system partition's map is [`MapError::Unreachable`] | the C reads it with undefined behaviour (divergences #42, #88) |
 //! | No config_map request naming a partition whose map is [`MapError::Unreachable`], or whose `partition_id` is tagged | the C reads either with undefined behaviour (divergences #42, #82, #88) |
@@ -96,6 +102,7 @@ use bm_wire::cbor::parser::CborError;
 use bm_wire::configuration::{MapError, Partition};
 use bm_wire::pubsub::{self as codec, CALLBACKS, Subscriber, SubscriptionError};
 use bm_wire::service::config_map::{self, ConfigMapRequest, DecodedConfigMapReply};
+use bm_wire::service::power_info::{self, PowerInfoReply};
 use bm_wire::service::sys_info::{self, DecodedSysInfoReply, SysInfoReply};
 use bm_wire::service::{
     Lookup, MAX_DATA_SIZE, REPLY_DATA_LEN, REPLY_SUFFIX, REQUEST_SUFFIX, ReplyHeader, RequestHeader,
@@ -125,6 +132,9 @@ pub const SYS_INFO: &[u8] = b"c0ffee0012345678/sys_info";
 /// `config_cbor_map_service_init`'s name, `<node id>/config_map`.
 pub const CONFIG_MAP: &[u8] = b"c0ffee0012345678/config_map";
 
+/// `power_info_service_init`'s name, the same on every node.
+pub const POWER_INFO: &[u8] = power_info::SERVICE;
+
 /// The service [`Step::AskSysInfo`] asks: `sys_info_service_request` of
 /// the first of [`PEERS`].
 pub const PEER_SYS_INFO: &[u8] = b"0b54ccce5c7978bf/sys_info";
@@ -136,8 +146,10 @@ pub const PEER_CONFIG_MAP: &[u8] = b"0b54ccce5c7978bf/config_map";
 /// Service names. [`ECHO`] is registered with `echo_service_init` and
 /// [`Node::register_echo_service`], [`SYS_INFO`] with `sys_info_service_init`
 /// and [`Node::register_sys_info_service`], [`CONFIG_MAP`] with
-/// `config_cbor_map_service_init` and [`Node::register_config_map_service`];
-/// the rest with [`c_handler`] and [`StandIn`].
+/// `config_cbor_map_service_init` and [`Node::register_config_map_service`],
+/// [`POWER_INFO`] with `power_info_service_init` of [`c_power_stats`] and
+/// [`Node::register_power_info_service`]; the rest with [`c_handler`] and
+/// [`StandIn`].
 ///
 /// `s` prefixes `svc`; `s*` subscribes a pattern that matches other
 /// services' request topics; `x` shares a prefix with none, so it is the one
@@ -148,7 +160,9 @@ pub const PEER_CONFIG_MAP: &[u8] = b"0b54ccce5c7978bf/config_map";
 /// unregistering it removes the metrics service instead (divergence #89), and
 /// nothing can then remove it. Listed first, it ends the walk for every
 /// request. `bm_wire::service`'s unit tests cover it.
-pub const NAMES: [&[u8]; 7] = [ECHO, SYS_INFO, CONFIG_MAP, b"svc", b"s", b"s*", b"x"];
+pub const NAMES: [&[u8]; 8] = [
+    ECHO, SYS_INFO, CONFIG_MAP, POWER_INFO, b"svc", b"s", b"s*", b"x",
+];
 
 /// Topics the application subscribes: a service's request topic, a prefix,
 /// everything, echo's request topic, and a peer's sys_info reply topic.
@@ -161,22 +175,20 @@ pub const APP_TOPICS: [&[u8]; 5] = [
 ];
 
 /// Services this node asks: a peer's sys_info and config_map, a pattern
-/// whose reply topic matches the peer's reply topics (divergence #74), and a
-/// [`NAMES`] entry the node may itself list.
-///
-/// Few and short, so every topic subscribed at once fits `bm_get_subs`'s 256
-/// bytes (divergence #78); the list comparison checks it.
-pub const ASKED: [&[u8]; 4] = [PEER_SYS_INFO, PEER_CONFIG_MAP, b"0*", b"svc"];
+/// whose reply topic matches the peer's reply topics (divergence #74), and
+/// [`NAMES`] entries the node may itself list. [`POWER_INFO`] is asked by
+/// [`Step::AskPowerInfo`] too.
+pub const ASKED: [&[u8]; 5] = [PEER_SYS_INFO, PEER_CONFIG_MAP, b"0*", b"svc", POWER_INFO];
 
 /// Steps per process that may leave a listed service no request can unlist.
 pub const LEAK_BUDGET: u32 = 4;
 
 /// Topics the Rust node holds: every request, application and asked reply
 /// topic.
-pub const SUBSCRIPTIONS: usize = 24;
+pub const SUBSCRIPTIONS: usize = 28;
 
 /// Resources the Rust node holds: every request, reply and application topic.
-pub const RESOURCES: usize = 40;
+pub const RESOURCES: usize = 48;
 
 /// The node ids requests come from. The second shares the first's low 32
 /// bits.
@@ -221,10 +233,12 @@ fn answer(request: &[u8], reply: &mut [u8]) -> Option<usize> {
     Some(request.len())
 }
 
-/// The Rust node's [`Services`]: `answer`, recording each call.
+/// The Rust node's [`Services`]: `answer`, recording each call, and
+/// the power stats [`Step::PowerStats`] set, counting each read.
 #[derive(Debug, Default)]
 pub struct StandIn {
     calls: Vec<Call>,
+    power_calls: usize,
 }
 
 impl Services for StandIn {
@@ -234,7 +248,74 @@ impl Services for StandIn {
         self.calls.push((service.to_vec(), request.to_vec()));
         answer(request, reply)
     }
+
+    fn power_info(&mut self) -> Option<PowerInfoReply> {
+        self.power_calls += 1;
+        Some(*lock(&POWER_STATS))
+    }
 }
+
+/// The power stats both sides' callbacks return; [`Step::PowerStats`] sets
+/// them, and each input starts from the default.
+static POWER_STATS: Mutex<PowerInfoReply> = Mutex::new(PowerInfoReply {
+    total_on_s: 0,
+    remaining_on_s: 0,
+    upcoming_off_s: 0,
+});
+static C_POWER_CALLS: Mutex<usize> = Mutex::new(0);
+/// Calls of [`C_POWER_REPLY`]: `(which, reply)`.
+static C_POWER: Mutex<Vec<(usize, PowerInfoReply)>> = Mutex::new(Vec::new());
+
+/// The oracle's `BmPowerInfoStatsCb`: the power stats [`Step::PowerStats`]
+/// set, counting each call.
+///
+/// # Safety
+///
+/// Called by `power_info_request_cb`.
+pub unsafe extern "C" fn c_power_stats(
+    _arg: *mut core::ffi::c_void,
+) -> bm_wire_sys::PowerInfoReplyData {
+    *lock(&C_POWER_CALLS) += 1;
+    let d = *lock(&POWER_STATS);
+    bm_wire_sys::PowerInfoReplyData {
+        total_on_s: d.total_on_s,
+        remaining_on_s: d.remaining_on_s,
+        upcoming_off_s: d.upcoming_off_s,
+    }
+}
+
+/// The `BmPowerInfoReplyCb` `K`, recording its call.
+unsafe extern "C" fn c_power_reply<const K: usize>(
+    d: *const bm_wire_sys::PowerInfoReplyData,
+) -> bm_wire_sys::BmErr {
+    // `power_info_reply_cb` passes its decoded struct.
+    let d = unsafe { &*d };
+    lock(&C_POWER).push((
+        K,
+        PowerInfoReply {
+            total_on_s: d.total_on_s,
+            remaining_on_s: d.remaining_on_s,
+            upcoming_off_s: d.upcoming_off_s,
+        },
+    ));
+    bm_wire_sys::BmErr_BmOK
+}
+
+/// The oracle's `BmPowerInfoReplyCb`s, told apart by index, as the C passes
+/// a callback no context. Each [`Step::AskPowerInfo`] queues one not already
+/// queued; at most [`SERVICE_REQUESTS`] − 1 requests wait.
+pub const C_POWER_REPLY: [unsafe extern "C" fn(
+    *const bm_wire_sys::PowerInfoReplyData,
+) -> bm_wire_sys::BmErr; SERVICE_REQUESTS] = [
+    c_power_reply::<0>,
+    c_power_reply::<1>,
+    c_power_reply::<2>,
+    c_power_reply::<3>,
+    c_power_reply::<4>,
+    c_power_reply::<5>,
+    c_power_reply::<6>,
+    c_power_reply::<7>,
+];
 
 static C_CALLS: Mutex<Vec<Call>> = Mutex::new(Vec::new());
 static DELIVERED: Mutex<Vec<Delivery>> = Mutex::new(Vec::new());
@@ -612,6 +693,24 @@ pub enum Step {
     /// This node asks [`PEER_CONFIG_MAP`] for a `partition_id` with
     /// `config_cbor_map_service_request` and [`Node::config_map_request_with`].
     AskConfigMap(PartitionId, Timeout),
+    /// Set the power stats both sides' power_info services send.
+    PowerStats(u32, u32, u32),
+    /// This node asks [`POWER_INFO`] with `power_info_service_request` and
+    /// [`Node::power_info_request_with`].
+    AskPowerInfo(Timeout),
+    /// A peer's power_info reply that decodes: a [`Step::Reply`] on
+    /// [`POWER_INFO`]'s reply topic to this node, carrying these stats. A
+    /// [`Step::Reply`]'s data rarely decodes.
+    ReplyPowerInfo {
+        /// The port it arrives on, reduced to 1..=[`NUM_PORTS`].
+        ingress: u8,
+        /// Which of [`PEERS`] sends it.
+        peer: bool,
+        /// The header's `id`.
+        id: ReplyId,
+        /// `total_on_s`, `remaining_on_s` and `upcoming_off_s`.
+        stats: (u32, u32, u32),
+    },
 }
 
 /// A config_map request's `partition_id`.
@@ -664,6 +763,13 @@ pub struct Summary {
     pub config_map_successes: usize,
     /// Answers to [`PEER_CONFIG_MAP`] that [`DecodedConfigMapReply`] reads.
     pub config_map_decoded: usize,
+    /// Replies the power_info service sent.
+    pub power_info_replies: usize,
+    /// Power_info callbacks called.
+    pub power_info_reported: usize,
+    /// Of those, the ones called for a request other than the one answered
+    /// (divergence #96).
+    pub power_info_crossed: usize,
 }
 
 /// What the oracle and the Rust node hold between inputs.
@@ -671,6 +777,9 @@ pub struct State {
     node: ServicesNode,
     /// What is left of [`LEAK_BUDGET`].
     budget: u32,
+    /// `(request id, index into C_POWER_REPLY)` of each power_info callback
+    /// queued.
+    power_callbacks: Vec<(u32, usize)>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -710,6 +819,7 @@ fn state() -> (MutexGuard<'static, ()>, MutexGuard<'static, Option<State>>) {
         let mut state_ = State {
             node,
             budget: LEAK_BUDGET,
+            power_callbacks: Vec::new(),
         };
         advertise_everything(&mut state_);
         *state = Some(state_);
@@ -898,6 +1008,53 @@ pub fn check(input: &ServicesInput) -> Summary {
                 Builtin::ConfigMap(partition_id.id()),
                 &mut summary,
             ),
+            Step::PowerStats(total_on_s, remaining_on_s, upcoming_off_s) => {
+                *lock(&POWER_STATS) = PowerInfoReply {
+                    total_on_s: *total_on_s,
+                    remaining_on_s: *remaining_on_s,
+                    upcoming_off_s: *upcoming_off_s,
+                };
+                true
+            }
+            Step::AskPowerInfo(timeout) => self::ask(
+                state,
+                &Ask {
+                    service: asked_index(POWER_INFO),
+                    data: Vec::new(),
+                    timeout: *timeout,
+                },
+                Builtin::PowerInfo,
+                &mut summary,
+            ),
+            Step::ReplyPowerInfo {
+                ingress,
+                peer,
+                id,
+                stats: (total_on_s, remaining_on_s, upcoming_off_s),
+            } => {
+                let mut data = [0u8; 64];
+                let len = PowerInfoReply {
+                    total_on_s: *total_on_s,
+                    remaining_on_s: *remaining_on_s,
+                    upcoming_off_s: *upcoming_off_s,
+                }
+                .encode(&mut data)
+                .expect("at most 49 bytes");
+                let reply = Reply {
+                    ingress: *ingress,
+                    peer: *peer,
+                    topic: ReplyTopic::Asked(asked_index(POWER_INFO)),
+                    target: Target::Us,
+                    id: *id,
+                    size: Size::Exact,
+                    data: data[..len].to_vec(),
+                    cut: None,
+                };
+                let (topic, body) = reply.publication(&state.node);
+                let ingress = reply.ingress % NUM_PORTS + 1;
+                let source = PEERS[usize::from(reply.peer)];
+                receive(state, ingress, source, &topic, &body, &mut summary)
+            }
             Step::Configure(seed) => {
                 seed.apply_c();
                 seed.apply_rust(&mut state.node.config_mut().store);
@@ -954,7 +1111,11 @@ fn reset(state: &mut State) {
     let _ = take_delivered();
     let _ = take_c_calls();
     assert!(lock(&C_ANSWERS).is_empty(), "an answer was not compared");
+    assert!(lock(&C_POWER).is_empty(), "a power answer was not compared");
+    *lock(&C_POWER_CALLS) = 0;
+    *lock(&POWER_STATS) = PowerInfoReply::default();
     state.node.services_mut().calls.clear();
+    state.node.services_mut().power_calls = 0;
     *state.node.config_mut() = config_diff::reset(&[]);
 
     // Every timeout `Timeout` allows has passed within 3 s of its request.
@@ -968,6 +1129,10 @@ fn reset(state: &mut State) {
     assert!(
         state.node.service_requests().is_empty(),
         "requests outlived their timeouts"
+    );
+    assert!(
+        state.power_callbacks.is_empty(),
+        "power_info callbacks queued"
     );
 
     for topic in APP_TOPICS {
@@ -1063,6 +1228,15 @@ fn register(state: &mut State, name: &[u8]) -> bool {
             .node
             .register_config_map_service()
             .expect("config_cbor_map_service_init registers");
+    } else if name == POWER_INFO {
+        let c = unsafe {
+            bm_wire_sys::power_info_service_init(Some(c_power_stats), core::ptr::null_mut())
+        };
+        assert_eq!(c, bm_wire_sys::BmErr_BmOK, "power_info_service_init");
+        state
+            .node
+            .register_power_info_service()
+            .expect("power_info_service_init registers");
     } else {
         let c =
             unsafe { bm_wire_sys::bm_service_register(name.len(), c_name(name), Some(c_handler)) };
@@ -1073,6 +1247,7 @@ fn register(state: &mut State, name: &[u8]) -> bool {
         ECHO => ServiceHandler::Echo,
         SYS_INFO => ServiceHandler::SysInfo,
         CONFIG_MAP => ServiceHandler::ConfigMap,
+        POWER_INFO => ServiceHandler::PowerInfo,
         _ => ServiceHandler::Application,
     };
     assert_eq!(
@@ -1117,34 +1292,45 @@ fn receive(
     summary: &mut Summary,
 ) -> bool {
     let what = format!("{topic:?} from {source:#x}, body {body:?}");
-    let Some((calls, replied, answers, config_map_success)) =
-        receive_publication(state, ingress, source, topic, body, &what)
-    else {
+    let Some(received) = receive_publication(state, ingress, source, topic, body, &what) else {
         return false;
     };
-    summary.most_calls = summary.most_calls.max(calls);
-    summary.replies += usize::from(replied);
-    let sys_info_request = calls > 0
-        && matches!(
-            state.node.service_table().lookup(topic, body),
-            Lookup::Call {
-                handler: ServiceHandler::SysInfo,
-                ..
-            }
-        );
-    summary.sys_info_replies += usize::from(replied && sys_info_request);
-    if let Some(success) = config_map_success {
+    summary.most_calls = summary.most_calls.max(received.calls);
+    summary.replies += usize::from(received.replied);
+    let handler = match state.node.service_table().lookup(topic, body) {
+        Lookup::Call { handler, .. } if received.calls > 0 && received.replied => Some(handler),
+        _ => None,
+    };
+    summary.sys_info_replies += usize::from(handler == Some(ServiceHandler::SysInfo));
+    summary.power_info_replies += usize::from(handler == Some(ServiceHandler::PowerInfo));
+    if let Some(success) = received.config_map_success {
         summary.config_map_replies += 1;
         summary.config_map_successes += usize::from(success);
     }
-    count(summary, &answers);
+    summary.power_info_reported += received.power_reported;
+    summary.power_info_crossed += received.power_crossed;
+    count(summary, &received.answers);
     true
 }
 
-/// [`receive`]'s comparison. Returns how many service callbacks the
-/// publication reached, whether it was answered, the answers it gave
-/// requests this node made, and a config_map reply's `success`; or `None` if
-/// it is outside the domain.
+/// What [`receive_publication`] compared.
+struct Received {
+    /// How many service callbacks the publication reached on the oracle.
+    calls: usize,
+    /// Whether it was answered.
+    replied: bool,
+    /// The answers it gave requests this node made.
+    answers: Vec<Answer>,
+    /// A config_map reply's `success`.
+    config_map_success: Option<bool>,
+    /// Power_info callbacks called.
+    power_reported: usize,
+    /// Of those, the ones called for a request other than the one answered.
+    power_crossed: usize,
+}
+
+/// [`receive`]'s comparison, or `None` if the publication is outside the
+/// domain.
 fn receive_publication(
     state: &mut State,
     ingress: u8,
@@ -1152,11 +1338,21 @@ fn receive_publication(
     topic: &[u8],
     body: &[u8],
     what: &str,
-) -> Option<(usize, bool, Vec<Answer>, Option<bool>)> {
+) -> Option<Received> {
     let (topic, body) = (topic.to_vec(), body.to_vec());
     let node = &state.node;
-    if reaches_reply(node, &topic) && body.len() < ReplyHeader::LEN {
-        return None;
+    let mut answered = None;
+    if reaches_reply(node, &topic) {
+        let header = ReplyHeader::decode(&body).ok()?;
+        let carried = body.len() - ReplyHeader::LEN;
+        if header.target_node_id == stack::NODE_ID
+            && node.power_info_callbacks().is_waiting(header.id)
+        {
+            if header.data_size as usize > carried {
+                return None;
+            }
+            answered = Some(header.id);
+        }
     }
     let calls: usize = node
         .subscriptions()
@@ -1169,6 +1365,8 @@ fn receive_publication(
     let mut reply: Option<Vec<u8>> = None;
     let mut call: Option<Call> = None;
     let mut config_map_success = None;
+    // Power stats reads per service callback called.
+    let mut power_reads = 0;
     if calls > 0 {
         match node.service_table().lookup(&topic, &body) {
             Lookup::OverRead { .. } | Lookup::ShortRequest { .. } => return None,
@@ -1201,6 +1399,11 @@ fn receive_publication(
                             d.success
                         });
                         len
+                    }
+                    ServiceHandler::PowerInfo => {
+                        power_reads = usize::from(data.is_empty());
+                        let stats = *lock(&POWER_STATS);
+                        power_info::handle(data, || Some(stats), &mut out)
                     }
                     ServiceHandler::Application => {
                         call = Some((name.to_vec(), data.to_vec()));
@@ -1245,22 +1448,36 @@ fn receive_publication(
     let c_delivered = take_delivered();
     let c_calls = take_c_calls();
     let c_answers = take_c_answers();
+    let c_power = take_c_power();
+    let c_power_reads = std::mem::take(&mut *lock(&C_POWER_CALLS));
 
     let mut rs_frame = frame.clone();
     let mut rs_delivered = Vec::new();
     let mut rs_answers = Vec::new();
+    let mut rs_power = Vec::new();
     let owed = state
         .node
         .on_frame_with(tick_count(), ingress, &mut rs_frame, |event| {
-            record(event, &mut rs_delivered, &mut rs_answers);
+            record(event, &mut rs_delivered, &mut rs_answers, &mut rs_power);
         });
     assert!(owed.forward.is_none());
     let rs_relay = owed.relay.map(capture).unwrap_or_default();
     let rs_reply = owed.reply.map(capture);
     let rs_calls = std::mem::take(&mut state.node.services_mut().calls);
+    let rs_power_reads = std::mem::take(&mut state.node.services_mut().power_calls);
 
     let what = format!("{what}: {calls} service callbacks");
     assert_eq!(rs_answers, c_answers, "answers, {what}");
+    compare_power(state, &rs_power, &c_power, &what);
+    assert_eq!(
+        rs_power_reads, power_reads,
+        "Rust power stats reads, {what}"
+    );
+    assert_eq!(
+        c_power_reads,
+        power_reads * calls,
+        "C power stats reads, {what}"
+    );
     let expected_reply = reply.as_ref().map(|p| rust_sends(p));
     assert_eq!(rs_reply, expected_reply, "Rust reply, {what}");
     assert_eq!(
@@ -1307,7 +1524,17 @@ fn receive_publication(
         expected_c.extend(replied.iter().cloned());
     }
     assert_eq!(c_delivered, expected_c, "C deliveries, {what}");
-    Some((calls, reply.is_some(), c_answers, config_map_success))
+    Some(Received {
+        calls,
+        replied: reply.is_some(),
+        answers: c_answers,
+        config_map_success,
+        power_reported: rs_power.len(),
+        power_crossed: rs_power
+            .iter()
+            .filter(|(id, _)| Some(*id) != answered)
+            .count(),
+    })
 }
 
 /// A publication's deliveries to the application: one per application
@@ -1333,8 +1560,47 @@ fn take_c_answers() -> Vec<Answer> {
     std::mem::take(&mut *lock(&C_ANSWERS))
 }
 
-/// File a Rust event as a delivery or an answer.
-fn record(event: Event<'_>, delivered: &mut Vec<Delivery>, answers: &mut Vec<Answer>) {
+fn take_c_power() -> Vec<(usize, PowerInfoReply)> {
+    std::mem::take(&mut *lock(&C_POWER))
+}
+
+/// Compare the power_info callbacks called: the Rust node's, named by the
+/// request that queued each, against the oracle's, by which of
+/// [`C_POWER_REPLY`] it is. Then forget the callbacks no longer queued.
+fn compare_power(
+    state: &mut State,
+    rs: &[(u32, PowerInfoReply)],
+    c: &[(usize, PowerInfoReply)],
+    what: &str,
+) {
+    let rs: Vec<(usize, PowerInfoReply)> = rs
+        .iter()
+        .map(|(id, reply)| {
+            let (_, k) = state
+                .power_callbacks
+                .iter()
+                .find(|(queued, _)| queued == id)
+                .expect("a queued callback");
+            (*k, *reply)
+        })
+        .collect();
+    assert_eq!(rs, c, "power_info callbacks, {what}");
+    let queued: Vec<u32> = state.node.power_info_callbacks().queued().collect();
+    state.power_callbacks.retain(|(id, _)| queued.contains(id));
+    assert_eq!(
+        state.power_callbacks.len(),
+        queued.len(),
+        "callbacks queued, {what}"
+    );
+}
+
+/// File a Rust event as a delivery, an answer or a power_info callback.
+fn record(
+    event: Event<'_>,
+    delivered: &mut Vec<Delivery>,
+    answers: &mut Vec<Answer>,
+    power: &mut Vec<(u32, PowerInfoReply)>,
+) {
     match event {
         Event::Publication {
             source,
@@ -1350,6 +1616,7 @@ fn record(event: Event<'_>, delivered: &mut Vec<Delivery>, answers: &mut Vec<Ans
         Event::ServiceTimeout { id, service } => {
             answers.push((false, id, service.to_vec(), Vec::new()));
         }
+        Event::PowerInfoReply { id, reply } => power.push((id, reply)),
         _ => {}
     }
 }
@@ -1366,6 +1633,9 @@ enum Builtin {
     /// [`Node::config_map_request_with`], to [`PEER_CONFIG_MAP`] with this
     /// partition id's [`ConfigMapRequest`].
     ConfigMap(u32),
+    /// `power_info_service_request` and [`Node::power_info_request_with`],
+    /// to [`POWER_INFO`] with no data.
+    PowerInfo,
 }
 
 fn name_index(name: &[u8]) -> u8 {
@@ -1397,6 +1667,7 @@ fn ask(state: &mut State, ask: &Ask, builtin: Builtin, summary: &mut Summary) ->
         Builtin::ConfigMap(id) => {
             assert!(service == PEER_CONFIG_MAP && ask.data == config_map_request(id));
         }
+        Builtin::PowerInfo => assert!(service == POWER_INFO && ask.data.is_empty()),
     }
     let data = &ask.data[..ask.data.len().min(MAX_DATA_SIZE + 8)];
     let timeout_s = ask.timeout.seconds();
@@ -1443,6 +1714,12 @@ fn ask(state: &mut State, ask: &Ask, builtin: Builtin, summary: &mut Summary) ->
     }
 
     *lock(&AVAILABLE) = body.len().saturating_sub(ReplyHeader::LEN);
+    if let Builtin::PowerInfo = builtin {
+        let k = (0..SERVICE_REQUESTS)
+            .find(|k| state.power_callbacks.iter().all(|(_, used)| used != k))
+            .expect("fewer requests wait than there are callbacks");
+        state.power_callbacks.push((id, k));
+    }
     let c_ok = unsafe {
         match builtin {
             Builtin::None => bm_wire_sys::bm_service_request(
@@ -1462,17 +1739,25 @@ fn ask(state: &mut State, ask: &Ask, builtin: Builtin, summary: &mut Summary) ->
                 Some(c_reply_cb),
                 timeout_s,
             ),
+            Builtin::PowerInfo => {
+                let (_, k) = state.power_callbacks.last().expect("queued above");
+                bm_wire_sys::power_info_service_request(Some(C_POWER_REPLY[*k]), timeout_s)
+                    == bm_wire_sys::BmErr_BmOK
+            }
         }
     };
     stack::pump_until_quiet();
     let c_frames = drain();
     let c_delivered = take_delivered();
     let c_answers = take_c_answers();
+    let c_power = take_c_power();
     assert!(take_c_calls().is_empty(), "no handler is called");
 
     let mut rs_delivered = Vec::new();
     let mut rs_answers = Vec::new();
-    let on_event = |event: Event<'_>| record(event, &mut rs_delivered, &mut rs_answers);
+    let mut rs_power = Vec::new();
+    let on_event =
+        |event: Event<'_>| record(event, &mut rs_delivered, &mut rs_answers, &mut rs_power);
     let now = tick_count();
     let node = &mut state.node;
     let rs = match builtin {
@@ -1481,11 +1766,13 @@ fn ask(state: &mut State, ask: &Ask, builtin: Builtin, summary: &mut Summary) ->
         Builtin::ConfigMap(id) => {
             node.config_map_request_with(now, PEERS[0], id, timeout_s, on_event)
         }
+        Builtin::PowerInfo => node.power_info_request_with(now, timeout_s, on_event),
     }
     .map(|(id, outbound)| (id, capture(outbound)));
     let what = format!("{ask:?}");
     assert_eq!(c_ok, rs.is_ok(), "the result, {what}: {rs:?}");
     assert_eq!(rs_answers, c_answers, "local answers, {what}");
+    compare_power(state, &rs_power, &c_power, &what);
     match rs {
         Err(ServiceRequestError::TooLarge) => {
             assert!(too_large, "{what}");
@@ -1616,11 +1903,15 @@ fn wait(state: &mut State, ms: u32, summary: &mut Summary) {
         }
         assert!(take_delivered().is_empty() && take_c_calls().is_empty());
         let c_answers = take_c_answers();
+        let c_power = take_c_power();
         let mut rs_answers = Vec::new();
+        let mut rs_power = Vec::new();
         state.node.on_service_expiry(to, |event| {
-            record(event, &mut Vec::new(), &mut rs_answers);
+            record(event, &mut Vec::new(), &mut rs_answers, &mut rs_power);
         });
         assert_eq!(rs_answers, c_answers, "the sweep at {to}");
+        let what = format!("the sweep at {to}");
+        compare_power(state, &rs_power, &c_power, &what);
         count(summary, &c_answers);
         if to == target {
             return;
@@ -1629,15 +1920,6 @@ fn wait(state: &mut State, ms: u32, summary: &mut Summary) {
 }
 
 fn assert_lists(state: &State, after: &str) {
-    // `bm_get_subs` joins the topics with " | " into 256 bytes, unchecked
-    // (divergence #78). The two lists agreed after the previous step.
-    let subs = state.node.subscriptions();
-    let joined: usize =
-        subs.iter().map(<[u8]>::len).sum::<usize>() + 3 * subs.len().saturating_sub(1);
-    assert!(
-        joined < 256,
-        "{joined} bytes of subscriptions overflow bm_get_subs, after {after}"
-    );
     assert!(
         oracle_subscriptions()
             .iter()

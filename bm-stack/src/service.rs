@@ -11,16 +11,21 @@
 //! | `echo_service_init` | [`crate::Node::register_echo_service`] |
 //! | `sys_info_service_init` | [`crate::Node::register_sys_info_service`] |
 //! | `config_cbor_map_service_init` | [`crate::Node::register_config_map_service`] |
+//! | `power_info_service_init` | [`crate::Node::register_power_info_service`] |
 //! | `_service_request_received_cb` | [`crate::Node::on_frame`], for each service callback a publication reaches |
 //! | a `BmServiceHandler` | [`Services::handle`], or a built-in [`ServiceHandler`] |
+//! | a `BmPowerInfoStatsCb` | [`Services::power_info`] |
 //! | `bm_service_request` | [`crate::Node::service_request`] |
 //! | `sys_info_service_request` | [`crate::Node::sys_info_request`] |
 //! | `config_cbor_map_service_request` | [`crate::Node::config_map_request`] |
+//! | `power_info_service_request` | [`crate::Node::power_info_request`] |
 //! | a `BmServiceReplyCb` | [`crate::Event::ServiceReply`], [`crate::Event::ServiceTimeout`] |
+//! | a `BmPowerInfoReplyCb` | [`crate::Event::PowerInfoReply`] |
 //! | `_service_request_timer_expiry_cb` | [`crate::Node::on_service_expiry`] |
 
 use bm_wire::pubsub::SubscriptionError;
 use bm_wire::service::Requests;
+use bm_wire::service::power_info::{Callbacks, PowerInfoReply};
 
 use crate::node::SubscribeError;
 
@@ -41,10 +46,14 @@ pub const SERVICE_REQUESTS: usize = 8;
 /// [`SERVICE_NAME_BYTES`].
 pub type ServiceRequests = Requests<SERVICE_REQUESTS, SERVICE_NAME_BYTES>;
 
+/// `power_info_service.c`'s callback queue: one per power_info request
+/// waiting.
+pub type PowerInfoCallbacks = Callbacks<SERVICE_REQUESTS>;
+
 /// The application's service handlers.
 ///
-/// One method serves every service [`crate::Node::register_service`] lists;
-/// `service` says which.
+/// [`Services::handle`] serves every service [`crate::Node::register_service`]
+/// lists; `service` says which. The rest feed built-in services.
 pub trait Services {
     /// `BmServiceHandler`: answer `request` to `service` by writing up to
     /// `reply.len()` bytes into `reply`, and return how many. `None` sends no
@@ -57,6 +66,16 @@ pub trait Services {
     /// it reaches (see [`crate::Node::on_frame_with`]).
     fn handle(&mut self, service: &[u8], request: &[u8], reply: &mut [u8]) -> Option<usize> {
         let _ = (service, request, reply);
+        None
+    }
+
+    /// `BmPowerInfoStatsCb`, the callback `power_info_service_init` stores:
+    /// the bus's power timing, for the reply of the power_info service
+    /// [`crate::Node::register_power_info_service`] lists. `None`, the
+    /// default, sends no reply, as the C's handler with no callback does.
+    ///
+    /// Called once per empty request, as [`Services::handle`] is.
+    fn power_info(&mut self) -> Option<PowerInfoReply> {
         None
     }
 }
@@ -77,6 +96,9 @@ pub enum ServiceHandler {
     SysInfo,
     /// `config_map_service_handler`: [`bm_wire::service::config_map::handle`].
     ConfigMap,
+    /// `power_info_request_cb`: [`bm_wire::service::power_info::handle`] of
+    /// [`Services::power_info`].
+    PowerInfo,
     /// The application's, [`Services::handle`].
     Application,
 }
