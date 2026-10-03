@@ -123,6 +123,8 @@ From reading the source; not yet run.
 
 ### E2 — config_map
 
+**Taken:** claude/services-e2-config-map
+
 - **C:** `config_cbor_map_service.c`.
 - **Rust:** the handler, reading `C: Configuration`;
   `Node::config_map_request`.
