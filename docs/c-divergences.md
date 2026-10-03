@@ -131,6 +131,8 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 91 | A failed `bm_service_request` leaves its request listed, to time out; long timeouts wrap | replicated | reading, confirmed on the oracle (card S2) |
 | 92 | `_service_request_cb` reads a reply's header and `data_size` unchecked, and matches on id, not topic | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially (card S2) |
 | 93 | `bm_service_request` calls `memcpy` with a NULL source for an empty request | benign | UBSan, via `cargo fuzz run services` (card E1) |
+| 94 | `config_map_service_handler` sends no reply for a map over its buffer, and the same failure reply for an unknown partition and a map that fails | replicated | reading, confirmed differentially (card E2) |
+| 95 | `config_map_service_handler`'s failure reply encodes `cbor_data` from a NULL pointer | benign | UBSan, via `cargo fuzz run services` (card E2) |
 
 ---
 
@@ -3254,3 +3256,50 @@ Reached by every sys_info, metrics and power_info request a C node makes.
 **benign.** Every libc copies nothing for a zero length, and the request's
 frame matches the Rust node's. C2y makes the call defined (N3322). The fix is
 to skip the copy when `data_len` is 0.
+
+## 94. `config_map_service_handler` sends no reply for a map over its buffer, and the same failure reply for an unknown partition and a map that fails
+
+`middleware/config_cbor_map_service.c`, `config_map_service_handler`:
+
+| Request | Reply |
+|---|---|
+| does not decode | none |
+| `partition_id` not 1, 2 or 3 | `success` 0, `cbor_encoded_map_len` 0, the id echoed |
+| a partition `services_cbor_as_map` returns `NULL` for (every `ARRAY` key, #42) | the same |
+| a map that, with the other fields, exceeds the handler's 1008 bytes | none: `config_cbor_map_reply_encode` returns `CborErrorOutOfMemory` and the handler returns false |
+| otherwise | `success` 1 and the map |
+
+The fields before the map take up to 78 bytes, so a map over about 930
+bytes gets no reply. A partition holds up to 50 keys of up to 32-byte names
+and 50-byte values, about 4 kB of map. The requester (a Bridge's
+`sensorController.cpp`) sees a timeout, the same as for an absent node, and
+cannot tell an unknown partition from one whose map failed.
+
+**replicated.** `bm_wire::service::config_map::handle` returns `None` for a
+reply that does not fit and the failure reply for the two `success` 0 cases.
+`config_map_past_its_buffer_is_no_reply` and
+`config_map_answers_each_partition` (`bm-wire-diff/tests/services.rs`)
+confirm both against the oracle; `the_handler_sends_nothing_past_its_buffer`
+(`bm-wire/src/service/config_map.rs`) shows the boundary.
+
+Fix upstream by replying `success` 0 when the map does not fit, or by
+splitting the map across replies. Wire-visible: a reply where there was none.
+
+## 95. `config_map_service_handler`'s failure reply encodes `cbor_data` from a NULL pointer
+
+`middleware/config_cbor_map_service.c` sets `reply.cbor_data` to
+`services_cbor_as_map`'s result, `NULL` for an unknown partition or a map that
+fails (#94), and `cbor_encoded_map_len` to 0.
+`config_cbor_map_reply_encode` passes both to `cbor_encode_byte_string`, and
+tinycbor's `append_to_buffer` calls `memcpy(ptr, NULL, 0)`, which is undefined
+as #93's is. Reported by UBSan during `cargo fuzz run services`:
+
+```
+third_party/tinycbor/src/cborencoder.c:298:5: runtime error: null pointer
+passed as argument 2, which is declared to never be null
+```
+
+**benign.** Every libc copies nothing for a zero length; the reply ends in an
+empty byte string, `40`, on both sides. The fix is to pass a non-NULL
+pointer, or to skip the copy for a zero length in tinycbor.
+
