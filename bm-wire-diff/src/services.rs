@@ -57,6 +57,7 @@
 //! | Fewer than [`SERVICE_REQUESTS`] requests outstanding; asserted after every step | the Rust node's ceiling |
 //! | Timeouts that expire within seconds ([`Timeout`]) | the start of each input waits them out |
 //! | No request answered by echo with more than [`REPLY_DATA_LEN`] bytes | the C copies past its buffer (divergence #90) |
+//! | Under ASan, `strict_memcmp=0` (the `services` fuzz target) | `<id>/sys_info/req` and the peer's sys_info reply topic are longer than `<id>/metrics/req`, which `SUB_LIST` lists first, so each `bm_sub_wl` compares past it (divergence #38); only bytes up to the first difference are checked |
 //! | No sys_info request while the system partition's map is [`MapError::Unreachable`] | the C reads it with undefined behaviour (divergences #42, #88) |
 //! | No request answered by the metrics service | `bm_shim_stack_init` registers it, and its reply is card E4's; the Rust node lists [`METRICS`] with [`StandIn`] so the list walks agree |
 //! | At most [`LEAK_BUDGET`] steps per process that leave a listed service nothing can unlist, and only for `x` | see below |

@@ -1559,6 +1559,17 @@ that is ever stored. The lists have no remove, so that rule has to look ahead â€
 one short entry would make every longer needle undefined for the rest of the
 process.
 
+bm_core's own start-up reaches the second half. `bristlemouth_init`
+registers metrics first, so `SUB_LIST` starts with `<id>/metrics/req`, 28
+bytes; a dev kit's `app_main.cpp` then registers sys_info, whose
+`<id>/sys_info/req` is 29, and every `bm_sub` of a longer topic follows. Each
+compares one or more bytes past the metrics entry. The bytes differ at offset
+17 (`m`, `s`), so the outcome is defined in practice, but ASan's default
+`strict_memcmp=1` reports it. The `services` fuzz target sets
+`strict_memcmp=0` (`__asan_default_options` in
+`bm-wire/fuzz/fuzz_targets/services.rs`), which checks only the bytes up to
+the first difference: a needle an entry prefixes is still reported.
+
 Fix by comparing the lengths first:
 
 ```c
