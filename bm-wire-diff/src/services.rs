@@ -607,11 +607,29 @@ pub enum Step {
         /// The header's `id`.
         id: u32,
         /// The partition.
-        partition_id: u32,
+        partition_id: PartitionId,
     },
     /// This node asks [`PEER_CONFIG_MAP`] for a `partition_id` with
     /// `config_cbor_map_service_request` and [`Node::config_map_request_with`].
-    AskConfigMap(u32, Timeout),
+    AskConfigMap(PartitionId, Timeout),
+}
+
+/// A config_map request's `partition_id`.
+#[derive(Debug, Clone, Copy, Arbitrary)]
+pub enum PartitionId {
+    /// 0 to 3: an unknown id or one of `config_map::PARTITION_ID_*`.
+    Small(u8),
+    /// Any id.
+    Raw(u32),
+}
+
+impl PartitionId {
+    fn id(self) -> u32 {
+        match self {
+            Self::Small(id) => u32::from(id % 4),
+            Self::Raw(id) => id,
+        }
+    }
 }
 
 /// Steps run in order, after `reset`.
@@ -839,7 +857,7 @@ pub fn check(input: &ServicesInput) -> Summary {
                     topic: RequestTopic::Service(name_index(CONFIG_MAP)),
                     id: *id,
                     size: Size::Exact,
-                    data: config_map_request(*partition_id),
+                    data: config_map_request(partition_id.id()),
                     cut: None,
                 };
                 let (topic, body) = request.publication();
@@ -874,10 +892,10 @@ pub fn check(input: &ServicesInput) -> Summary {
                 state,
                 &Ask {
                     service: asked_index(PEER_CONFIG_MAP),
-                    data: config_map_request(*partition_id),
+                    data: config_map_request(partition_id.id()),
                     timeout: *timeout,
                 },
-                Builtin::ConfigMap(*partition_id),
+                Builtin::ConfigMap(partition_id.id()),
                 &mut summary,
             ),
             Step::Configure(seed) => {

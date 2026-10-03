@@ -10,9 +10,9 @@ use bm_wire_diff::config::Seed;
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
 use bm_wire_diff::services::PEERS;
 use bm_wire_diff::services::{
-    APP_TOPICS, ASKED, Ask, CONFIG_MAP, ECHO, NAMES, PEER_CONFIG_MAP, PEER_SYS_INFO, Reply,
-    ReplyId, ReplyTopic, Request, RequestTopic, SYS_INFO, ServicesInput, Size, Step, Summary,
-    Target, Timeout, budget, check,
+    APP_TOPICS, ASKED, Ask, CONFIG_MAP, ECHO, NAMES, PEER_CONFIG_MAP, PEER_SYS_INFO, PartitionId,
+    Reply, ReplyId, ReplyTopic, Request, RequestTopic, SYS_INFO, ServicesInput, Size, Step,
+    Summary, Target, Timeout, budget, check,
 };
 
 fn index(name: &[u8]) -> u8 {
@@ -627,7 +627,7 @@ fn config_map_answers_each_partition() {
         ingress: 1,
         peer: true,
         id: 9,
-        partition_id: 3,
+        partition_id: PartitionId::Small(3),
     });
     let summary = run(steps);
     assert_eq!(summary.skipped, 0, "{summary:?}");
@@ -699,9 +699,9 @@ fn config_map_request_answered_and_timed_out() {
     .encode(&mut body)
     .unwrap();
     let summary = run(vec![
-        Step::AskConfigMap(3, Timeout::Seconds(1)),
+        Step::AskConfigMap(PartitionId::Small(3), Timeout::Seconds(1)),
         Step::Reply(reply(PEER_CONFIG_MAP, &body[..len])),
-        Step::AskConfigMap(u32::MAX, Timeout::Seconds(1)),
+        Step::AskConfigMap(PartitionId::Raw(u32::MAX), Timeout::Seconds(1)),
         Step::Wait(1500),
     ]);
     assert_eq!(summary.skipped, 0, "{summary:?}");
