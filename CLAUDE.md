@@ -105,14 +105,16 @@ A cargo workspace.
   - `src/channel.rs` — behind the `channel` feature: `Channels`, an
     `embassy-sync` `NodeHandle` for an application in a task of its own:
     owned `Command`s in, owned `Notification`s out, run by `ChannelApp`, an
-    `App`. A service request command reports `Notification::ServiceRequested`
-    with its id, then the reply, timeout or power_info notification. Off by default, so a single-task firmware carries neither
-    `embassy-sync` nor `heapless`.
+    `App`. A service request command reports
+    `Notification::ServiceRequested` with its id, then the reply, timeout or
+    power_info notification. Off by default, so a single-task firmware
+    carries neither `embassy-sync` nor `heapless`.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
     `src/mock/frames.rs` builds the peer frames a script feeds it; use it
     rather than a local builder.
   - `examples/hello_node.rs` — a node on the mock PHY through the public API
-    only: a scripted neighbour, an `App` that pings it. Panics on a wrong
+    only: a scripted neighbour, an `App` that pings it, publishes, logs to
+    the Spotter and asks for its sys_info. Panics on a wrong
     outcome, so CI runs it.
 - `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
   SPI, on the per-port frame I/O of
