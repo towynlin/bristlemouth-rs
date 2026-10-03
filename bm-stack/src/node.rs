@@ -192,6 +192,7 @@ use bm_wire::l2::{self, TxKind};
 use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError, Subscriptions};
+use bm_wire::service::sys_info::{self, SysInfoReply};
 use bm_wire::service::{
     self as service_wire, Lookup, ReplyHeader, ReplyOutcome, RequestHeader, ServiceTable,
 };
@@ -2512,7 +2513,7 @@ impl<
         timeout_ms: u32,
         internal: bool,
     ) -> bool {
-        let git_sha = self.identity.device_info().git_sha;
+        let git_sha = self.identity.git_sha();
         let request = HostRequest {
             info,
             dst_node_id,
@@ -2546,7 +2547,7 @@ impl<
     /// Also `None`, leaving the rest queued, if the body's type has been
     /// unregistered.
     pub fn next_dfu_transmission(&mut self, now_ms: u32) -> Option<Outbound<'_>> {
-        let git_sha = self.identity.device_info().git_sha;
+        let git_sha = self.identity.git_sha();
         let (message_type, len, body) = self.dfu.next_body(now_ms, &mut self.config, git_sha)?;
         self.send(
             now_ms,
@@ -2894,6 +2895,8 @@ impl<
                         reply_end = Self::serve(
                             &self.service_table,
                             &mut self.services,
+                            &self.identity,
+                            &self.config,
                             &mut self.tx,
                             node_id,
                             source,
@@ -2941,9 +2944,12 @@ impl<
     /// `_service_request_received_cb`, up to the `bm_pub_wl` of its reply:
     /// find the service, call its handler, and build the reply frame into
     /// `tx`. Returns the frame's length, or `None` for no reply.
+    #[allow(clippy::too_many_arguments)]
     fn serve(
         table: &ServiceTable<ServiceHandler, SERVICES, SERVICE_NAME_BYTES>,
         services: &mut S,
+        identity: &I,
+        config: &C,
         tx: &mut [u8; MTU],
         node_id: u64,
         source: u64,
@@ -2971,6 +2977,15 @@ impl<
             let (reply_header, reply) = body.split_at_mut(ReplyHeader::LEN);
             let len = match handler {
                 ServiceHandler::Echo => service_wire::echo(data, reply),
+                ServiceHandler::SysInfo => {
+                    let info = SysInfoReply::new(
+                        node_id,
+                        identity.git_sha(),
+                        sys_config_crc(config),
+                        identity.app_name(),
+                    );
+                    sys_info::handle(data, &info, reply)
+                }
                 ServiceHandler::Application => services.handle(name, data, reply),
             }
             .filter(|len| *len <= reply.len())
@@ -3080,6 +3095,63 @@ impl<
         let len = service_wire::service_name(&mut name, self.identity.node_id(), b"/echo")
             .map_err(|_| RegisterError::Full)?;
         self.list_service(&name[..len], ServiceHandler::Echo)
+    }
+
+    /// List the sys_info service, `<node id>/sys_info` —
+    /// `sys_info_service_init`. An empty request is answered with a
+    /// [`SysInfoReply`] of this node's id, [`Identity::git_sha`],
+    /// [`Identity::app_name`] and `sys_config_crc`: the CRC-32 of the system
+    /// partition as a CBOR map,
+    /// [`bm_wire::configuration::ConfigPartition::cbor_map_crc32`]. A node
+    /// with [`NoConfig`] sends an empty partition's.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::register_service`].
+    pub fn register_sys_info_service(&mut self) -> Result<(), RegisterError> {
+        let mut name = [0u8; SERVICE_NAME_BYTES];
+        // Cannot fail: 25 bytes.
+        let len = service_wire::service_name(&mut name, self.identity.node_id(), sys_info::SUFFIX)
+            .map_err(|_| RegisterError::Full)?;
+        self.list_service(&name[..len], ServiceHandler::SysInfo)
+    }
+
+    /// [`Node::sys_info_request_with`], discarding local deliveries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::service_request_with`].
+    pub fn sys_info_request(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        timeout_s: u32,
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        self.sys_info_request_with(now_ms, target_node_id, timeout_s, |_| {})
+    }
+
+    /// Ask `target_node_id` for its sys_info — `sys_info_service_request`:
+    /// [`Node::service_request_with`] to `<target>/sys_info` with no data.
+    ///
+    /// The answer is [`Event::ServiceReply`] with that service;
+    /// [`bm_wire::service::sys_info::DecodedSysInfoReply::decode_into`] reads
+    /// its data.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::service_request_with`].
+    pub fn sys_info_request_with(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        timeout_s: u32,
+        events: impl FnMut(Event<'_>),
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        let mut name = [0u8; SERVICE_NAME_BYTES];
+        // Cannot fail: 25 bytes.
+        let len = service_wire::service_name(&mut name, target_node_id, sys_info::SUFFIX)
+            .map_err(|_| ServiceRequestError::Full)?;
+        self.service_request_with(now_ms, &name[..len], &[], timeout_s, events)
     }
 
     fn list_service(&mut self, name: &[u8], handler: ServiceHandler) -> Result<(), RegisterError> {
@@ -3623,6 +3695,7 @@ impl<
         let node_id = identity.node_id();
         let mut info = identity.device_info();
         info.node_id = node_id;
+        info.git_sha = identity.git_sha();
         // Each length field is a single byte. bm_core assigns `strlen()` to a
         // `uint8_t`, which wraps -- a 300-byte name becomes 44 bytes of it.
         // Truncating is the same size ceiling without the surprise.
@@ -4178,4 +4251,13 @@ impl<
             }
         }
     }
+}
+
+/// `services_cbor_encoded_as_crc32(BM_CFG_PARTITION_SYSTEM)`, for a sys_info
+/// reply. With no store, an empty partition's: the CRC of `a0`.
+fn sys_config_crc(config: &impl Configuration) -> u32 {
+    config.store().map_or_else(
+        || bm_wire::crc::crc32_ieee(&[0xa0]),
+        |store| store.partition(Partition::System).cbor_map_crc32(),
+    )
 }

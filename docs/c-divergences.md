@@ -130,6 +130,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 90 | `echo_service_handler` copies a request of any length into its 1008-byte reply buffer | domain-limited | reading (card S1) |
 | 91 | A failed `bm_service_request` leaves its request listed, to time out; long timeouts wrap | replicated | reading, confirmed on the oracle (card S2) |
 | 92 | `_service_request_cb` reads a reply's header and `data_size` unchecked, and matches on id, not topic | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially (card S2) |
+| 93 | `bm_service_request` calls `memcpy` with a NULL source for an empty request | benign | UBSan, via `cargo fuzz run services` (card E1) |
 
 ---
 
@@ -1558,6 +1559,17 @@ the defined half: every needle is at most twelve bytes and nothing shorter than
 that is ever stored. The lists have no remove, so that rule has to look ahead —
 one short entry would make every longer needle undefined for the rest of the
 process.
+
+bm_core's own start-up reaches the second half. `bristlemouth_init`
+registers metrics first, so `SUB_LIST` starts with `<id>/metrics/req`, 28
+bytes; a dev kit's `app_main.cpp` then registers sys_info, whose
+`<id>/sys_info/req` is 29, and every `bm_sub` of a longer topic follows. Each
+compares one or more bytes past the metrics entry. The bytes differ at offset
+17 (`m`, `s`), so the outcome is defined in practice, but ASan's default
+`strict_memcmp=1` reports it. The `services` fuzz target sets
+`strict_memcmp=0` (`__asan_default_options` in
+`bm-wire/fuzz/fuzz_targets/services.rs`), which checks only the bytes up to
+the first difference: a needle an entry prefixes is still reported.
 
 Fix by comparing the lengths first:
 
@@ -3218,3 +3230,27 @@ reply data up to what arrived. `a_reply_is_matched_by_id_not_topic`,
 Fix upstream by checking `data_len >= sizeof(BmServiceReplyDataHeader) +
 header->data_size`, and comparing the topic with the request's
 `<service>/rep`. Wire-visible: a reply on another topic stops answering.
+
+## 93. `bm_service_request` calls `memcpy` with a NULL source for an empty request
+
+`middleware/bm_service_request.c`:
+
+```c
+memcpy(header->data, data, data_len);
+```
+
+`sys_info_service_request`, `metrics_service_request` and
+`power_info_service_request` pass `data_len` 0 and `data` NULL. C17 requires
+`memcpy`'s pointers to be valid even when the length is 0, so this is
+undefined. Reported by UBSan during `cargo fuzz run services`:
+
+```
+bm_service_request.c:258:3: runtime error: null pointer passed as argument 2,
+which is declared to never be null
+```
+
+Reached by every sys_info, metrics and power_info request a C node makes.
+
+**benign.** Every libc copies nothing for a zero length, and the request's
+frame matches the Rust node's. C2y makes the call defined (N3322). The fix is
+to skip the copy when `data_len` is 0.

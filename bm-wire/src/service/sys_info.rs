@@ -22,6 +22,23 @@ use crate::cbor::parser::{CborError, CborString};
 /// `SYS_INFO_REPLY_NUM_FIELDS`.
 pub const NUM_FIELDS: usize = 5;
 
+/// `sys_info_service_suffix`: the service is `<node id>/sys_info`.
+pub const SUFFIX: &[u8] = b"/sys_info";
+
+/// `sys_info_service_handler`: write `reply` into `out` and return its
+/// length, or `None` for no reply.
+///
+/// A request carrying any data gets no reply; nor does a reply that does not
+/// fit `out`, which for the handler's [`super::REPLY_DATA_LEN`] bytes needs
+/// an `app_name` of about 950 bytes.
+#[must_use]
+pub fn handle(request: &[u8], reply: &SysInfoReply<'_>, out: &mut [u8]) -> Option<usize> {
+    if !request.is_empty() {
+        return None;
+    }
+    reply.encode(out).ok()
+}
+
 /// `SysInfoReplyData`, to encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SysInfoReply<'a> {
@@ -39,7 +56,20 @@ pub struct SysInfoReply<'a> {
     pub app_name: &'a [u8],
 }
 
-impl SysInfoReply<'_> {
+impl<'a> SysInfoReply<'a> {
+    /// The reply `sys_info_service_handler` builds: `app_name_strlen` is
+    /// `app_name`'s length.
+    #[must_use]
+    pub fn new(node_id: u64, git_sha: u32, sys_config_crc: u32, app_name: &'a [u8]) -> Self {
+        Self {
+            node_id,
+            git_sha,
+            sys_config_crc,
+            app_name_strlen: app_name.len() as u32,
+            app_name,
+        }
+    }
+
     /// `sys_info_reply_encode` into `out`, returning the encoded length.
     ///
     /// # Errors
@@ -152,6 +182,19 @@ mod tests {
         assert_eq!(d.sys_config_crc, reply.sys_config_crc);
         assert_eq!(d.app_name_strlen, 11);
         assert!(d.app_name.unwrap().eq_bytes(b"bm_wire_sys"));
+    }
+
+    #[test]
+    fn the_handler_refuses_data_and_what_does_not_fit() {
+        let reply = SysInfoReply::new(1, 2, 3, b"bm_wire_sys");
+        assert_eq!(reply.app_name_strlen, 11);
+        let mut out = [0u8; super::super::REPLY_DATA_LEN];
+        let len = handle(b"", &reply, &mut out).unwrap();
+        let mut d = DecodedSysInfoReply::default();
+        d.decode_into(&out[..len]).unwrap();
+        assert!(d.app_name.unwrap().eq_bytes(b"bm_wire_sys"));
+        assert_eq!(handle(b"\0", &reply, &mut out), None);
+        assert_eq!(handle(b"", &reply, &mut out[..len - 1]), None);
     }
 
     #[test]

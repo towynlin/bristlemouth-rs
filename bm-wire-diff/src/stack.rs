@@ -56,6 +56,8 @@ pub const SERIAL_NUMBER: [u8; 16] = *b"bm-wire-diff\0\0\0\0";
 pub const DEVICE_NAME: &[u8] = b"stack-oracle";
 /// Version string the stack is brought up with.
 pub const VERSION_STRING: &[u8] = b"0.0.0-diff";
+/// `bm_app_name`, from `bm-wire-sys/csrc/bm_config.h`.
+pub const APP_NAME: &[u8] = b"bm_wire_sys";
 
 static ORACLE: OnceLock<Mutex<()>> = OnceLock::new();
 
@@ -362,6 +364,10 @@ impl Identity for OracleIdentity {
 
     fn device_name(&self) -> &[u8] {
         DEVICE_NAME
+    }
+
+    fn app_name(&self) -> &[u8] {
+        APP_NAME
     }
 }
 

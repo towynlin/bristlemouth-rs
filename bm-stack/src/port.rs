@@ -62,8 +62,8 @@ pub trait Identity {
     /// This node's 64-bit id. Its addresses and its MAC are derived from it.
     fn node_id(&self) -> u64;
 
-    /// The fixed half of a device-info reply. `node_id` is overwritten with
-    /// [`Self::node_id`], so an implementation may leave it zero.
+    /// The fixed half of a device-info reply. `node_id` and `git_sha` are
+    /// overwritten with [`Self::node_id`] and [`Self::git_sha`].
     fn device_info(&self) -> DeviceInfo;
 
     /// Firmware version string. At most 255 bytes reach the wire.
@@ -73,6 +73,20 @@ pub trait Identity {
 
     /// Device name. At most 255 bytes reach the wire.
     fn device_name(&self) -> &[u8] {
+        b""
+    }
+
+    /// `git_sha()`: the build's version-control hash. A device-info reply,
+    /// a sys_info reply and DFU's image checks read it. Defaults to
+    /// [`Self::device_info`]'s, which the device-info reply overwrites with
+    /// this, as it does `node_id`.
+    fn git_sha(&self) -> u32 {
+        self.device_info().git_sha
+    }
+
+    /// `bm_app_name`: the application's name, sent in a sys_info reply. The C
+    /// reads it to its first NUL, so it should hold none.
+    fn app_name(&self) -> &[u8] {
         b""
     }
 }

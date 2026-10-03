@@ -121,14 +121,6 @@ From reading the source; not yet run.
 ## Cards
 
 
-### E1 — sys_info
-
-- **C:** `sys_info_service.c`.
-- **Rust:** the handler, `Node::sys_info_request`; `Identity::app_name`,
-  `git_sha`. The CRC is `cbor_map_crc32` over the system partition.
-- **Comparator:** extends `services`.
-- **Blocked by:** nothing. **Blocks:** E5.
-
 ### E2 — config_map
 
 - **C:** `config_cbor_map_service.c`.
@@ -163,7 +155,7 @@ From reading the source; not yet run.
 - **Capture:** a C dev kit answering a Bridge's samplers, as
   `bm-wire-diff/testdata/services-*.pcap`, asserted by
   `tests/capture_services.rs` (pattern: `capture_h0.rs`).
-- **Blocked by:** E1, E2, E3, E4.
+- **Blocked by:** E2, E3, E4.
 - **Done:** on a bench, a Bridge's topology and metrics samplers list the
   Rust node with its correct `sys_config_crc`.
 
@@ -171,12 +163,12 @@ From reading the source; not yet run.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | E1, E2, E3, E4 | nothing |
-| 2 | E5 | E1–E4 |
+| 1 | E2, E3, E4 | nothing |
+| 2 | E5 | E2–E4 |
 
 Cards within a wave can run in parallel.
 
-## What the landed cards left for the rest (M1, M2, C1, S1, S2)
+## What the landed cards left for the rest (M1, M2, C1, S1, S2, E1)
 
 - **The service list is `bm_wire::service::ServiceTable<H, N, NAME>`**, the
   C's walk included (#89): `lookup` returns the first service whose name
@@ -184,11 +176,21 @@ Cards within a wave can run in parallel.
   `remove` is the prefix removal. `bm_stack::Node` holds one with `H =
   bm_stack::service::ServiceHandler`, `SERVICES` (16) names of up to 48 bytes.
 - **Built-ins are `ServiceHandler` variants; the application's are
-  `Services::handle`.** Echo is `ServiceHandler::Echo`, answered in
-  `Node::serve`. E1–E4 add a variant each and its arm there, rather than
-  going through `S`, because their handlers read the node's own state
-  (`Identity`, `C: Configuration`, the uptime). `Services` has one method;
-  E3 and E4 add theirs with defaults (contract 3).
+  `Services::handle`.** Echo is `ServiceHandler::Echo`, sys_info
+  `ServiceHandler::SysInfo`, both answered in `Node::serve`, which takes
+  `&I` and `&C`. E2–E4 add a variant each and its arm there; E4's uptime
+  is not passed yet. A built-in's handler body is a sans-io function beside
+  its codec (`bm_wire::service::sys_info::handle`), and its registration a
+  `Node::register_<name>_service` building `<id><SUFFIX>`. `Services` has
+  one method; E3 and E4 add theirs with defaults (contract 3).
+- **`Identity::git_sha` and `Identity::app_name`** (contract 7). `git_sha`
+  defaults to `device_info().git_sha` and is what the device-info reply
+  and DFU now read. `app_name` defaults to empty. `bm-devkit`'s
+  `DevkitIdentity` does not set it: bm_protocol's `bm_app_name` is the
+  CMake `APP_NAME` of the app built, which E5 should look up there.
+- **`sys_config_crc` with `NoConfig`** is the empty map's CRC
+  (`crc32_ieee(&[0xa0])`), what a C node with an empty system partition
+  sends, rather than 0, which the C sends only when the map fails.
 - **Metrics is not registered at construction yet.** E4 registers it in
   `Node::with_services`, first, as `bristlemouth_init` does. Until then
   `bm-wire-diff/src/services.rs` lists a stand-in named
@@ -230,9 +232,11 @@ Cards within a wave can run in parallel.
   returns `(id, Outbound)`; the answer is `Event::ServiceReply { id,
   service, data }` from `on_frame_with` or `Event::ServiceTimeout { id,
   service }` from `Node::on_service_expiry`. The C's per-request
-  `reply_cb` is not carried: E1–E4's requesters (`Node::sys_info_request`
-  and the rest) build their service name, call `service_request`, and the
-  application tells their replies apart by `service` or by the id it kept.
+  `reply_cb` is not carried: `Node::sys_info_request(_with)(now_ms,
+  target, timeout_s)` builds `<target>/sys_info` and calls
+  `service_request_with` with no data, and E2–E4's requesters do the same;
+  the application tells replies apart by `service` or by the id it kept,
+  and decodes the data itself (`DecodedSysInfoReply::decode_into`).
   `service` is the request's, not the reply's topic (#92). `data` is
   `data_size` bytes or what arrived if fewer (#92), so a decoder sees a
   short body where the C reads past the publication.
@@ -253,13 +257,25 @@ Cards within a wave can run in parallel.
   at a time, and at each input's start, which waits out every request (the
   C's list has no reset). `Timeout` keeps every timeout within seconds.
   `Step::Ask` asks an `ASKED` service; `Step::Reply` injects a peer's reply.
-  E1–E4 add their requests as `Step` variants and their decoded replies to
-  `Answer`.
+  E2–E4 add their requests as `Step` variants, as `Step::AskSysInfo`
+  does; `Answer` carries reply bytes, which `service_codecs` already
+  compares decoded, so it was not extended. `Summary::sys_info_replies` and
+  `sys_info_decoded` count the node's sys_info replies and the answers to
+  `PEER_SYS_INFO` that decode.
 - **The comparator's subscriptions are near `bm_get_subs`'s 256 bytes**
-  (#78): at most 237 joined, and reply subscriptions are never removed.
-  `assert_lists` fails before the C overflows. A card adding a subscribed
-  topic, or a service E1–E4 asks, has about 18 bytes left; past that,
-  shorten names or drop pool entries.
+  (#78): at most 242 joined, and reply subscriptions are never removed.
+  `assert_lists` fails before the C overflows. E1 made room by replacing
+  `<id>/echo/x` in `NAMES` with `<id>/sys_info`, and the peer's echo in
+  `ASKED` and `APP_TOPICS` with `PEER_SYS_INFO`. 13 bytes are left: E2–E4
+  each need about 32 to serve and as many to ask, so each replaces pool
+  entries the same way (candidates: `<id>/e`, `s?c`, an `ASKED` entry).
+- **The comparator's node keeps a `Config<RamConfigStorage>`**, replaced at
+  each input by `config::reset(&[])`, which also empties the oracle's
+  `CONFIGS`. `Step::Configure(Seed)` writes one key to both, in any
+  partition; E2 reads the same stores. Before each sys_info reply the
+  comparator asserts `services_cbor_encoded_as_crc32` against
+  `cbor_map_crc32`, and skips a request where the system partition's map
+  is `MapError::Unreachable`.
 
 - **`bm_wire::cbor::parser` is tinycbor's parser.** `Value` is `CborValue`
   and each method the C function it names, including error codes, tags not
@@ -290,7 +306,7 @@ Cards within a wave can run in parallel.
   `power_info_reply_cb` passes the partly decoded struct to the requester's
   callback whether or not decoding succeeded. E3 reports that struct.
 - **Encoders return `Err(CborError::OutOfMemory)` where the C's handler
-  returns false**: no reply (contract 8). E1–E3 encode into the handler's
+  returns false**: no reply (contract 8). E2 and E3 encode into the handler's
   1008 bytes. `ConfigMapReply::encode` takes the map as a slice and writes
   its length as `cbor_encoded_map_len`; `config_map_service_handler` sends
   an empty one with `success` false. `config_map::PARTITION_ID_*` are the
@@ -306,8 +322,8 @@ Cards within a wave can run in parallel.
 - **A partition as a map: `ConfigPartition::cbor_map(&mut [u8])`** returns
   the map's length, or a `MapError`: `NoMap` where the C returns `NULL`,
   `TooSmall(n)` where the buffer is short (the C allocates), `Unreachable`
-  where the C is undefined. `cbor_map_crc32` is 0 for any error; E1 uses it
-  for `sys_config_crc`. E2 maps into the handler's buffer: `ConfigMapReply`
+  where the C is undefined. `cbor_map_crc32` is 0 for any error; it is
+  `sys_config_crc`. E2 maps into the handler's buffer: `ConfigMapReply`
   adds a header, so `TooSmall` there is contract 8's no reply; an
   `Unreachable` partition should get none either.
 - **The map is read as a release build reads it** (#88): each value by its

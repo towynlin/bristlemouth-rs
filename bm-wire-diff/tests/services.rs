@@ -3,10 +3,14 @@
 //!
 //! Its own binary for the reason `bm_wire_diff::stack` gives.
 
+use bm_wire::configuration::Partition;
+use bm_wire::service::sys_info::SysInfoReply;
+use bm_wire_diff::config::Seed;
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
+use bm_wire_diff::services::PEERS;
 use bm_wire_diff::services::{
-    APP_TOPICS, ASKED, Ask, ECHO, NAMES, Reply, ReplyId, ReplyTopic, Request, RequestTopic,
-    ServicesInput, Size, Step, Summary, Target, Timeout, budget, check,
+    APP_TOPICS, ASKED, Ask, ECHO, NAMES, PEER_SYS_INFO, Reply, ReplyId, ReplyTopic, Request,
+    RequestTopic, SYS_INFO, ServicesInput, Size, Step, Summary, Target, Timeout, budget, check,
 };
 
 fn index(name: &[u8]) -> u8 {
@@ -49,6 +53,14 @@ fn the_node_id_is_the_pools() {
     assert_eq!(
         ECHO,
         format!("{:016x}/echo", bm_wire_diff::stack::NODE_ID).as_bytes()
+    );
+    assert_eq!(
+        SYS_INFO,
+        format!("{:016x}/sys_info", bm_wire_diff::stack::NODE_ID).as_bytes()
+    );
+    assert_eq!(
+        PEER_SYS_INFO,
+        format!("{:016x}/sys_info", bm_wire_diff::services::PEERS[0]).as_bytes()
     );
 }
 
@@ -278,7 +290,6 @@ fn asked(name: &[u8]) -> u8 {
         .expect("an asked name") as u8
 }
 
-const PEER_ECHO: &[u8] = b"0b54ccce5c7978bf/echo";
 const PEER_PATTERN: &[u8] = b"0b54ccce5c7978bf/*";
 
 fn ask(name: &[u8], data: &[u8], timeout: Timeout) -> Step {
@@ -324,10 +335,10 @@ fn every_asked_name_is_answered_and_times_out() {
 #[test]
 fn requests_left_waiting_expire_at_the_next_input() {
     run(vec![
-        ask(PEER_ECHO, b"a", Timeout::Seconds(3)),
-        ask(PEER_ECHO, b"b", Timeout::Wrapped(2)),
+        ask(PEER_SYS_INFO, b"a", Timeout::Seconds(3)),
+        ask(PEER_SYS_INFO, b"b", Timeout::Wrapped(2)),
     ]);
-    let summary = run(vec![ask(PEER_ECHO, b"c", Timeout::Seconds(0))]);
+    let summary = run(vec![ask(PEER_SYS_INFO, b"c", Timeout::Seconds(0))]);
     assert_eq!(summary.asked, 1);
 }
 
@@ -335,9 +346,9 @@ fn requests_left_waiting_expire_at_the_next_input() {
 #[test]
 fn long_timeouts_wrap() {
     let summary = run(vec![
-        ask(PEER_ECHO, b"", Timeout::Wrapped(0)),
-        ask(PEER_ECHO, b"", Timeout::Overdue(0)),
-        ask(PEER_ECHO, b"", Timeout::Overdue(u32::MAX)),
+        ask(PEER_SYS_INFO, b"", Timeout::Wrapped(0)),
+        ask(PEER_SYS_INFO, b"", Timeout::Overdue(0)),
+        ask(PEER_SYS_INFO, b"", Timeout::Overdue(u32::MAX)),
         Step::Wait(600),
         Step::Wait(700),
     ]);
@@ -345,20 +356,20 @@ fn long_timeouts_wrap() {
 }
 
 /// Divergence #92: matched by id and target, not by topic; a reply to
-/// the pattern's request arrives on echo's reply topic, which both reply
+/// the pattern's request arrives on sys_info's reply topic, which both reply
 /// subscriptions match (divergence #74).
 #[test]
 fn a_reply_is_matched_by_id_not_topic() {
     let summary = run(vec![
-        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        ask(PEER_SYS_INFO, b"", Timeout::Seconds(3)),
         ask(PEER_PATTERN, b"", Timeout::Seconds(3)),
         Step::Reply(Reply {
             id: ReplyId::Waiting(1),
-            ..reply(PEER_ECHO, b"for the pattern")
+            ..reply(PEER_SYS_INFO, b"for the pattern")
         }),
         Step::Reply(Reply {
             id: ReplyId::Waiting(0),
-            ..reply(PEER_PATTERN, b"for echo")
+            ..reply(PEER_PATTERN, b"for sys_info")
         }),
     ]);
     assert_eq!((summary.skipped, summary.answered), (0, 2), "{summary:?}");
@@ -369,15 +380,15 @@ fn a_reply_is_matched_by_id_not_topic() {
 #[test]
 fn a_reply_claiming_more_data_than_it_carries() {
     let summary = run(vec![
-        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        ask(PEER_SYS_INFO, b"", Timeout::Seconds(3)),
         Step::Reply(Reply {
             size: Size::Off(100),
-            ..reply(PEER_ECHO, b"short")
+            ..reply(PEER_SYS_INFO, b"short")
         }),
-        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        ask(PEER_SYS_INFO, b"", Timeout::Seconds(3)),
         Step::Reply(Reply {
             size: Size::Off(-3),
-            ..reply(PEER_ECHO, b"longer")
+            ..reply(PEER_SYS_INFO, b"longer")
         }),
     ]);
     assert_eq!((summary.skipped, summary.answered), (0, 2), "{summary:?}");
@@ -386,22 +397,22 @@ fn a_reply_claiming_more_data_than_it_carries() {
 #[test]
 fn replies_that_answer_nothing() {
     let summary = run(vec![
-        ask(PEER_ECHO, b"", Timeout::Seconds(1)),
+        ask(PEER_SYS_INFO, b"", Timeout::Seconds(1)),
         Step::Reply(Reply {
             target: Target::Peer(false),
-            ..reply(PEER_ECHO, b"")
+            ..reply(PEER_SYS_INFO, b"")
         }),
         Step::Reply(Reply {
             target: Target::Raw(0),
-            ..reply(PEER_ECHO, b"")
+            ..reply(PEER_SYS_INFO, b"")
         }),
         Step::Reply(Reply {
             id: ReplyId::Raw(u32::MAX),
-            ..reply(PEER_ECHO, b"")
+            ..reply(PEER_SYS_INFO, b"")
         }),
         Step::Reply(Reply {
-            topic: ReplyTopic::Raw(b"0b54ccce5c7978bf/echo/rep/more".to_vec()),
-            ..reply(PEER_ECHO, b"prefixed")
+            topic: ReplyTopic::Raw(b"0b54ccce5c7978bf/sys_info/rep/more".to_vec()),
+            ..reply(PEER_SYS_INFO, b"prefixed")
         }),
         Step::Wait(1500),
     ]);
@@ -416,14 +427,14 @@ fn replies_that_answer_nothing() {
 #[test]
 fn a_short_reply_is_skipped() {
     let summary = run(vec![
-        ask(PEER_ECHO, b"", Timeout::Seconds(0)),
+        ask(PEER_SYS_INFO, b"", Timeout::Seconds(0)),
         Step::Reply(Reply {
             cut: Some(15),
-            ..reply(PEER_ECHO, b"")
+            ..reply(PEER_SYS_INFO, b"")
         }),
         Step::Reply(Reply {
             cut: Some(16),
-            ..reply(PEER_ECHO, b"x")
+            ..reply(PEER_SYS_INFO, b"x")
         }),
     ]);
     assert_eq!((summary.skipped, summary.answered), (1, 1), "{summary:?}");
@@ -437,21 +448,20 @@ fn a_short_reply_is_skipped() {
 #[test]
 fn an_application_subscribed_reply_topic() {
     let summary = run(vec![
-        Step::Subscribe(app(b"0b54ccce5c7978bf/echo/rep")),
-        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
-        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
-        Step::Reply(reply(PEER_ECHO, b"one")),
-        Step::Reply(reply(PEER_ECHO, b"two")),
-        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
-        ask(PEER_ECHO, b"", Timeout::Seconds(3)),
+        Step::Subscribe(app(b"0b54ccce5c7978bf/sys_info/rep")),
+        ask(PEER_SYS_INFO, b"", Timeout::Seconds(3)),
+        ask(PEER_SYS_INFO, b"", Timeout::Seconds(3)),
+        Step::Reply(reply(PEER_SYS_INFO, b"one")),
+        Step::Reply(reply(PEER_SYS_INFO, b"two")),
+        ask(PEER_SYS_INFO, b"", Timeout::Seconds(3)),
+        ask(PEER_SYS_INFO, b"", Timeout::Seconds(3)),
     ]);
     assert_eq!(summary.answered, 2, "{summary:?}");
     assert_eq!(summary.asked + summary.skipped, 4, "{summary:?}");
 }
 
 /// A request a peer's request topic also reaches: the application hears it
-/// from this node, and a peer's reply to the node's own echo request is
-/// matched by id.
+/// from this node, and a peer's reply is matched by id.
 #[test]
 fn requests_are_delivered_locally() {
     let summary = run(vec![
@@ -479,15 +489,15 @@ fn asking_this_nodes_own_service_is_skipped() {
 #[test]
 fn too_large_a_request_is_refused_by_both() {
     let summary = run(vec![
-        ask(PEER_ECHO, &[7; 1025], Timeout::Seconds(1)),
-        ask(PEER_ECHO, &[7; 1024], Timeout::Seconds(1)),
+        ask(PEER_SYS_INFO, &[7; 1025], Timeout::Seconds(1)),
+        ask(PEER_SYS_INFO, &[7; 1024], Timeout::Seconds(1)),
     ]);
     assert_eq!((summary.skipped, summary.asked), (0, 1), "{summary:?}");
 }
 
 #[test]
 fn the_request_table_keeps_a_slot_free() {
-    let summary = run(vec![ask(PEER_ECHO, b"", Timeout::Seconds(3)); 9]);
+    let summary = run(vec![ask(PEER_SYS_INFO, b"", Timeout::Seconds(3)); 9]);
     assert_eq!((summary.asked, summary.skipped), (7, 2), "{summary:?}");
 }
 
@@ -501,4 +511,78 @@ fn every_subscription_at_once_fits_bm_get_subs() {
     steps.extend(ASKED.iter().map(|n| ask(n, b"", Timeout::Seconds(0))));
     steps.push(Step::Wait(500));
     run(steps);
+}
+
+// ---------------------------------------------------------------------------
+// sys_info -- card E1.
+// ---------------------------------------------------------------------------
+
+/// The reply carries the system partition's CRC as the C computes it, before
+/// and after keys are stored; a user key leaves it alone. A request with
+/// data is not answered.
+#[test]
+fn sys_info_answers_with_the_system_partitions_crc() {
+    let summary = run(vec![
+        Step::Register(index(SYS_INFO)),
+        request(SYS_INFO, b""),
+        Step::Configure(Seed::uint(Partition::System, b"foo", 7)),
+        Step::Configure(Seed::str(Partition::System, b"bar", b"text")),
+        request(SYS_INFO, b""),
+        Step::Configure(Seed::int(Partition::System, b"foo", -7)),
+        Step::Configure(Seed::uint(Partition::User, b"baz", 1)),
+        request(SYS_INFO, b""),
+        request(SYS_INFO, b"x"),
+        Step::Unregister(index(SYS_INFO)),
+        request(SYS_INFO, b""),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (summary.replies, summary.sys_info_replies),
+        (3, 3),
+        "{summary:?}"
+    );
+}
+
+/// Each input starts from an empty store on both sides.
+#[test]
+fn the_store_is_emptied_between_inputs() {
+    run(vec![Step::Configure(Seed::uint(
+        Partition::System,
+        b"quux",
+        1,
+    ))]);
+    let summary = run(vec![
+        Step::Register(index(SYS_INFO)),
+        request(SYS_INFO, b""),
+        Step::Register(index(ECHO)),
+        request(ECHO, b"after"),
+    ]);
+    assert_eq!(summary.sys_info_replies, 1, "{summary:?}");
+}
+
+/// `sys_info_service_request` against `Node::sys_info_request_with`: a reply
+/// the requester decodes, and a timeout.
+#[test]
+fn sys_info_request_answered_and_timed_out() {
+    let mut body = [0u8; 128];
+    let len = SysInfoReply::new(PEERS[0], 0xfeed, 0x1234_5678, b"peer_app")
+        .encode(&mut body)
+        .unwrap();
+    let summary = run(vec![
+        Step::AskSysInfo(Timeout::Seconds(1)),
+        Step::Reply(reply(PEER_SYS_INFO, &body[..len])),
+        Step::AskSysInfo(Timeout::Seconds(1)),
+        Step::Wait(1500),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (
+            summary.asked,
+            summary.answered,
+            summary.sys_info_decoded,
+            summary.timeouts
+        ),
+        (2, 1, 1, 1),
+        "{summary:?}"
+    );
 }

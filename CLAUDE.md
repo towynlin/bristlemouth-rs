@@ -154,10 +154,11 @@ A cargo workspace.
     `bm_pub_wl` and `bm_handle_msg` against `Node`'s pub/sub, with one Rust
     node mirroring the oracle's subscription and resource lists for the life
     of the process.
-  - `src/services.rs`, `tests/services.rs` — `bm_service.c`, echo and
-    `bm_service_request.c` against `Node`'s services and requests, with one
-    Rust node mirroring the oracle's service list, request list,
-    subscriptions and resources for the life of the process.
+  - `src/services.rs`, `tests/services.rs` — `bm_service.c`, echo,
+    sys_info and `bm_service_request.c` against `Node`'s services and
+    requests, with one Rust node mirroring the oracle's service list, request
+    list, subscriptions and resources for the life of the process, and a
+    config store both sides empty at each input.
   - `tests/service_request_failures.rs` — `bm_service_request`'s failure
     paths on the oracle alone (divergence #91), which the Rust node's
     ceilings refuse earlier.
@@ -288,8 +289,10 @@ libFuzzer resolves corpus paths against the shell's directory.
 `CARGO_CFG_FUZZING`, so the fuzzers check the C for undefined behaviour as well
 as the port for divergence. That found divergence #6. One check is off —
 `-fno-sanitize=alignment`, because `clear_ports_legacy` trips it on every
-received frame (divergence #11). Do not widen that exemption without a
-divergence entry saying why.
+received frame (divergence #11). The `services` target also sets ASan's
+`strict_memcmp=0`, because bm_core's own registration order compares
+`SUB_LIST` entries past their end (divergence #38). Do not widen either
+exemption without a divergence entry saying why.
 
 On a crash: `cargo fuzz tmin <target> <artifact>`, then drop the minimized file
 into `bm-wire/fuzz/seeds/<target>/`, where `cargo test` will replay it.
