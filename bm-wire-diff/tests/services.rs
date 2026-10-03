@@ -4,13 +4,15 @@
 //! Its own binary for the reason `bm_wire_diff::stack` gives.
 
 use bm_wire::configuration::Partition;
+use bm_wire::service::config_map::{self, ConfigMapReply, ConfigMapRequest};
 use bm_wire::service::sys_info::SysInfoReply;
 use bm_wire_diff::config::Seed;
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
 use bm_wire_diff::services::PEERS;
 use bm_wire_diff::services::{
-    APP_TOPICS, ASKED, Ask, ECHO, NAMES, PEER_SYS_INFO, Reply, ReplyId, ReplyTopic, Request,
-    RequestTopic, SYS_INFO, ServicesInput, Size, Step, Summary, Target, Timeout, budget, check,
+    APP_TOPICS, ASKED, Ask, CONFIG_MAP, ECHO, NAMES, PEER_CONFIG_MAP, PEER_SYS_INFO, Reply,
+    ReplyId, ReplyTopic, Request, RequestTopic, SYS_INFO, ServicesInput, Size, Step, Summary,
+    Target, Timeout, budget, check,
 };
 
 fn index(name: &[u8]) -> u8 {
@@ -62,6 +64,14 @@ fn the_node_id_is_the_pools() {
         PEER_SYS_INFO,
         format!("{:016x}/sys_info", bm_wire_diff::services::PEERS[0]).as_bytes()
     );
+    assert_eq!(
+        CONFIG_MAP,
+        format!("{:016x}/config_map", bm_wire_diff::stack::NODE_ID).as_bytes()
+    );
+    assert_eq!(
+        PEER_CONFIG_MAP,
+        format!("{:016x}/config_map", bm_wire_diff::services::PEERS[0]).as_bytes()
+    );
 }
 
 /// Every name registered, asked, and unregistered, from both peers and on
@@ -80,8 +90,8 @@ fn every_name() {
         steps.push(request(name, b"gone"));
     }
     let summary = run(steps);
-    assert_eq!(summary.skipped, 0);
-    assert!(summary.replies >= 2 * 6, "{summary:?}");
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert!(summary.replies >= 2 * 5, "{summary:?}");
 }
 
 #[test]
@@ -177,25 +187,24 @@ fn unregistering_a_prefix_removes_an_earlier_service() {
     assert_eq!(summary.replies, 1);
 }
 
-/// Divergence #89: `<id>/e` prefixes `<id>/echo/req`, so listed first it
-/// shadows echo; listed after, it does not.
+/// Divergence #89: `s` prefixes `svc/req`, so listed first it shadows
+/// `svc`; listed after, it does not.
 #[test]
 fn a_prefixing_name_shadows_a_later_service() {
-    let e = b"c0ffee0012345678/e";
     let summary = run(vec![
-        Step::Register(index(e)),
-        Step::Register(index(ECHO)),
-        request(ECHO, b"shadowed"),
-        request(e, b"answered"),
+        Step::Register(index(b"s")),
+        Step::Register(index(b"svc")),
+        request(b"svc", b"shadowed"),
+        request(b"s", b"answered"),
     ]);
-    assert_eq!(summary.replies, 1);
+    assert_eq!((summary.skipped, summary.replies), (0, 1));
     let summary = run(vec![
-        Step::Register(index(ECHO)),
-        Step::Register(index(e)),
-        request(ECHO, b"answered"),
-        request(e, b"answered"),
+        Step::Register(index(b"svc")),
+        Step::Register(index(b"s")),
+        request(b"svc", b"answered"),
+        request(b"s", b"answered"),
     ]);
-    assert_eq!(summary.replies, 2);
+    assert_eq!((summary.skipped, summary.replies), (0, 2));
 }
 
 /// `s*/req` matches `svc/req`, so a request to `svc` reaches the service
@@ -290,7 +299,7 @@ fn asked(name: &[u8]) -> u8 {
         .expect("an asked name") as u8
 }
 
-const PEER_PATTERN: &[u8] = b"0b54ccce5c7978bf/*";
+const PEER_PATTERN: &[u8] = b"0*";
 
 fn ask(name: &[u8], data: &[u8], timeout: Timeout) -> Step {
     Step::Ask(Ask {
@@ -327,7 +336,7 @@ fn every_asked_name_is_answered_and_times_out() {
     assert_eq!(summary.skipped, 0, "{summary:?}");
     assert_eq!(
         (summary.asked, summary.answered, summary.timeouts),
-        (6, 3, 3),
+        (8, 4, 4),
         "{summary:?}"
     );
 }
@@ -580,6 +589,127 @@ fn sys_info_request_answered_and_timed_out() {
             summary.asked,
             summary.answered,
             summary.sys_info_decoded,
+            summary.timeouts
+        ),
+        (2, 1, 1, 1),
+        "{summary:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// config_map -- card E2.
+// ---------------------------------------------------------------------------
+
+fn config_map_request(partition_id: u32) -> Vec<u8> {
+    let mut data = [0u8; 32];
+    let len = ConfigMapRequest { partition_id }.encode(&mut data).unwrap();
+    data[..len].to_vec()
+}
+
+/// Each partition id, before and after keys are stored; an unknown id is
+/// answered with `success` 0 (the suspected defect, confirmed).
+#[test]
+fn config_map_answers_each_partition() {
+    let mut steps = vec![Step::Register(index(CONFIG_MAP))];
+    for id in [0, 1, 2, 3, 4, u32::MAX] {
+        steps.push(request(CONFIG_MAP, &config_map_request(id)));
+    }
+    steps.extend([
+        Step::Configure(Seed::uint(Partition::System, b"foo", 7)),
+        Step::Configure(Seed::int(Partition::Hardware, b"bar", -7)),
+        Step::Configure(Seed::str(Partition::User, b"baz", b"text")),
+        Step::Configure(Seed::uint(Partition::User, b"quux", 70_000)),
+    ]);
+    for id in 1..=3 {
+        steps.push(request(CONFIG_MAP, &config_map_request(id)));
+    }
+    steps.push(Step::RequestConfigMap {
+        ingress: 1,
+        peer: true,
+        id: 9,
+        partition_id: 3,
+    });
+    let summary = run(steps);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (summary.config_map_replies, summary.config_map_successes),
+        (10, 7),
+        "{summary:?}"
+    );
+}
+
+/// A request that does not decode gets no reply. Bytes after the map are not
+/// read; a `partition_id` of another type is read for its head's argument,
+/// as a release build does (divergence #82); a tagged one is outside the
+/// domain.
+#[test]
+fn config_map_requests_that_do_not_decode() {
+    let summary = run(vec![
+        Step::Register(index(CONFIG_MAP)),
+        request(CONFIG_MAP, b""),
+        request(CONFIG_MAP, b"\xa0"),
+        request(CONFIG_MAP, b"\xa1\x61p\x01\x00"),
+        request(CONFIG_MAP, b"\xa1\x01\x01"),
+        request(CONFIG_MAP, b"\xa1\x61p\x62ab"),
+        request(CONFIG_MAP, b"\xa1\x61p\xc6\x01"),
+    ]);
+    assert_eq!(summary.skipped, 1, "{summary:?}");
+    assert_eq!(
+        (summary.config_map_replies, summary.config_map_successes),
+        (2, 2),
+        "{summary:?}"
+    );
+}
+
+/// A partition whose map does not fit the handler's 1008 bytes with the
+/// reply's other fields gets no reply on either side (contract 8).
+#[test]
+fn config_map_past_its_buffer_is_no_reply() {
+    let mut steps = vec![Step::Register(index(CONFIG_MAP))];
+    let keys: Vec<Vec<u8>> = (0..20).map(|i| format!("key{i:02}").into_bytes()).collect();
+    for key in &keys {
+        steps.push(Step::Configure(Seed::str(
+            Partition::Hardware,
+            key,
+            &[b'v'; 40],
+        )));
+        steps.push(request(
+            CONFIG_MAP,
+            &config_map_request(config_map::PARTITION_ID_HW),
+        ));
+    }
+    let summary = run(steps);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    // The fields before the map take 78 bytes, leaving 930. Each key adds
+    // 6 + 42 bytes to the map: 19 keys' 913 fit, 20 keys' 961 do not.
+    assert_eq!(summary.config_map_replies, 19, "{summary:?}");
+}
+
+/// `config_cbor_map_service_request` against `Node::config_map_request_with`:
+/// a reply the requester decodes, and a timeout.
+#[test]
+fn config_map_request_answered_and_timed_out() {
+    let mut body = [0u8; 128];
+    let len = ConfigMapReply {
+        node_id: PEERS[0],
+        partition_id: 3,
+        success: true,
+        cbor_data: b"\xa1\x61k\x01",
+    }
+    .encode(&mut body)
+    .unwrap();
+    let summary = run(vec![
+        Step::AskConfigMap(3, Timeout::Seconds(1)),
+        Step::Reply(reply(PEER_CONFIG_MAP, &body[..len])),
+        Step::AskConfigMap(u32::MAX, Timeout::Seconds(1)),
+        Step::Wait(1500),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (
+            summary.asked,
+            summary.answered,
+            summary.config_map_decoded,
             summary.timeouts
         ),
         (2, 1, 1, 1),

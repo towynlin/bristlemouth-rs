@@ -183,7 +183,7 @@ use bm_wire::bcmp::resource::{
 };
 use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, Heartbeat, MessageType, forward, rx, tx};
-use bm_wire::configuration::{Key, Partition};
+use bm_wire::configuration::{Key, MapError, Partition};
 use bm_wire::frame::{
     self, IP_PROTO_BCMP, IPV6_INGRESS_EGRESS_PORTS_OFFSET, IPV6_SOURCE_ADDRESS_OFFSET,
     MIN_FRAME_WITH_ADDRESSES,
@@ -192,6 +192,7 @@ use bm_wire::l2::{self, TxKind};
 use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError, Subscriptions};
+use bm_wire::service::config_map::{self, ConfigMapRequest};
 use bm_wire::service::sys_info::{self, SysInfoReply};
 use bm_wire::service::{
     self as service_wire, Lookup, ReplyHeader, ReplyOutcome, RequestHeader, ServiceTable,
@@ -2986,6 +2987,12 @@ impl<
                     );
                     sys_info::handle(data, &info, reply)
                 }
+                ServiceHandler::ConfigMap => config_map::handle(
+                    data,
+                    node_id,
+                    |partition, out| partition_map(config, partition, out),
+                    reply,
+                ),
                 ServiceHandler::Application => services.handle(name, data, reply),
             }
             .filter(|len| *len <= reply.len())
@@ -3152,6 +3159,72 @@ impl<
         let len = service_wire::service_name(&mut name, target_node_id, sys_info::SUFFIX)
             .map_err(|_| ServiceRequestError::Full)?;
         self.service_request_with(now_ms, &name[..len], &[], timeout_s, events)
+    }
+
+    /// List the config_map service, `<node id>/config_map` —
+    /// `config_cbor_map_service_init`. A request names a partition; the
+    /// reply carries it as a CBOR map,
+    /// [`bm_wire::configuration::ConfigPartition::cbor_map`].
+    /// [`bm_wire::service::config_map::handle`] lists the outcomes. A node
+    /// with [`NoConfig`] sends an empty map for each partition.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::register_service`].
+    pub fn register_config_map_service(&mut self) -> Result<(), RegisterError> {
+        let mut name = [0u8; SERVICE_NAME_BYTES];
+        // Cannot fail: 27 bytes.
+        let len =
+            service_wire::service_name(&mut name, self.identity.node_id(), config_map::SUFFIX)
+                .map_err(|_| RegisterError::Full)?;
+        self.list_service(&name[..len], ServiceHandler::ConfigMap)
+    }
+
+    /// [`Node::config_map_request_with`], discarding local deliveries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::service_request_with`].
+    pub fn config_map_request(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        partition_id: u32,
+        timeout_s: u32,
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        self.config_map_request_with(now_ms, target_node_id, partition_id, timeout_s, |_| {})
+    }
+
+    /// Ask `target_node_id` for a configuration partition as a CBOR map —
+    /// `config_cbor_map_service_request`: [`Node::service_request_with`] to
+    /// `<target>/config_map` with a [`ConfigMapRequest`].
+    /// `config_map::PARTITION_ID_*` are the ids a node answers.
+    ///
+    /// The answer is [`Event::ServiceReply`] with that service;
+    /// [`bm_wire::service::config_map::DecodedConfigMapReply::decode_into`]
+    /// reads its data.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::service_request_with`].
+    pub fn config_map_request_with(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        partition_id: u32,
+        timeout_s: u32,
+        events: impl FnMut(Event<'_>),
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        let mut name = [0u8; SERVICE_NAME_BYTES];
+        // Cannot fail: 27 bytes.
+        let len = service_wire::service_name(&mut name, target_node_id, config_map::SUFFIX)
+            .map_err(|_| ServiceRequestError::Full)?;
+        // Cannot fail: at most 19 bytes.
+        let mut data = [0u8; 32];
+        let data_len = ConfigMapRequest { partition_id }
+            .encode(&mut data)
+            .map_err(|_| ServiceRequestError::TooLarge)?;
+        self.service_request_with(now_ms, &name[..len], &data[..data_len], timeout_s, events)
     }
 
     fn list_service(&mut self, name: &[u8], handler: ServiceHandler) -> Result<(), RegisterError> {
@@ -4260,4 +4333,23 @@ fn sys_config_crc(config: &impl Configuration) -> u32 {
         || bm_wire::crc::crc32_ieee(&[0xa0]),
         |store| store.partition(Partition::System).cbor_map_crc32(),
     )
+}
+
+/// `services_cbor_as_map(partition)`, for a config_map reply. With no store,
+/// an empty partition's: `a0`.
+fn partition_map(
+    config: &impl Configuration,
+    partition: Partition,
+    out: &mut [u8],
+) -> Result<usize, MapError> {
+    match config.store() {
+        Some(store) => store.partition(partition).cbor_map(out),
+        None => match out.first_mut() {
+            Some(byte) => {
+                *byte = 0xa0;
+                Ok(1)
+            }
+            None => Err(MapError::TooSmall(1)),
+        },
+    }
 }

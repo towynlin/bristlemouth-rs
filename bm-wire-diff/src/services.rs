@@ -1,12 +1,14 @@
 //! Differential comparator for the service layer on the node:
 //! `bm_service_register`, `bm_service_unregister`, `echo_service_init`,
-//! `sys_info_service_init`, `_service_request_received_cb`,
-//! `bm_service_request`, `sys_info_service_request`, `_service_request_cb`
-//! and the request expiry sweep against [`Node::register_service`],
-//! [`Node::unregister_service`], [`Node::register_echo_service`],
-//! [`Node::register_sys_info_service`], [`Node::on_frame_with`],
-//! [`Node::service_request_with`], [`Node::sys_info_request_with`] and
-//! [`Node::on_service_expiry`].
+//! `sys_info_service_init`, `config_cbor_map_service_init`,
+//! `_service_request_received_cb`, `bm_service_request`,
+//! `sys_info_service_request`, `config_cbor_map_service_request`,
+//! `_service_request_cb` and the request expiry sweep against
+//! [`Node::register_service`], [`Node::unregister_service`],
+//! [`Node::register_echo_service`], [`Node::register_sys_info_service`],
+//! [`Node::register_config_map_service`], [`Node::on_frame_with`],
+//! [`Node::service_request_with`], [`Node::sys_info_request_with`],
+//! [`Node::config_map_request_with`] and [`Node::on_service_expiry`].
 //!
 //! A stack target, for the reason [`crate::stack`] gives. Driven from
 //! `tests/services.rs`.
@@ -29,15 +31,17 @@
 //!
 //! Both nodes keep a config store, emptied at the start of each input by
 //! [`crate::config`]'s reset and written by [`Step::Configure`]. A sys_info
-//! reply's bytes are compared whole; its decoding on a requester is
-//! [`crate::service_codecs`]'s, so [`Summary::sys_info_decoded`] only
-//! counts answers the Rust decoder reads.
+//! or config_map reply's bytes are compared whole; their decoding on a
+//! requester is [`crate::service_codecs`]'s, so [`Summary::sys_info_decoded`]
+//! and [`Summary::config_map_decoded`] only count answers the Rust decoders
+//! read.
 //!
 //! Time moves only in [`Step::Wait`], one 500 ms sweep at a time, and at the
 //! start of each input, which waits until no request is outstanding
 //! (`CTX.service_request_list` has no reset either). The oracle's sweep runs
 //! on `timer_callback_handler.c`'s task, which
-//! [`stack::start_timer_callback_handler`] starts.//!
+//! [`stack::start_timer_callback_handler`] starts.
+//!
 //! Where the C calls the service callback `k` times for one publication
 //! (divergence #79, or two service subscriptions matching one topic), it
 //! sends `k` identical replies, calls the handler `k` times and delivers the
@@ -59,6 +63,7 @@
 //! | No request answered by echo with more than [`REPLY_DATA_LEN`] bytes | the C copies past its buffer (divergence #90) |
 //! | Under ASan, `strict_memcmp=0` (the `services` fuzz target) | `<id>/sys_info/req` and the peer's sys_info reply topic are longer than `<id>/metrics/req`, which `SUB_LIST` lists first, so each `bm_sub_wl` compares past it (divergence #38); only bytes up to the first difference are checked |
 //! | No sys_info request while the system partition's map is [`MapError::Unreachable`] | the C reads it with undefined behaviour (divergences #42, #88) |
+//! | No config_map request naming a partition whose map is [`MapError::Unreachable`], or whose `partition_id` is tagged | the C reads either with undefined behaviour (divergences #42, #82, #88) |
 //! | No request answered by the metrics service | `bm_shim_stack_init` registers it, and its reply is card E4's; the Rust node lists [`METRICS`] with [`StandIn`] so the list walks agree |
 //! | At most [`LEAK_BUDGET`] steps per process that leave a listed service nothing can unlist, and only for `x` | see below |
 //! | Fewer than [`SERVICES`] services listed, [`CALLBACKS`] callbacks per topic | the Rust node's ceilings |
@@ -87,8 +92,10 @@ use bm_stack::service::{SERVICE_REQUESTS, SERVICES, ServiceHandler, ServiceReque
 use bm_stack::{Event, NoDfu, Node, RamConfigStorage, Services, SoftRtc};
 use bm_wire::bcmp::info::CACHED_STRING_BYTES;
 use bm_wire::bcmp::resource::{RESOURCE_NAME_BYTES, ResourceType};
+use bm_wire::cbor::parser::CborError;
 use bm_wire::configuration::{MapError, Partition};
 use bm_wire::pubsub::{self as codec, CALLBACKS, Subscriber, SubscriptionError};
+use bm_wire::service::config_map::{self, ConfigMapRequest, DecodedConfigMapReply};
 use bm_wire::service::sys_info::{self, DecodedSysInfoReply, SysInfoReply};
 use bm_wire::service::{
     Lookup, MAX_DATA_SIZE, REPLY_DATA_LEN, REPLY_SUFFIX, REQUEST_SUFFIX, ReplyHeader, RequestHeader,
@@ -115,35 +122,33 @@ pub const ECHO: &[u8] = b"c0ffee0012345678/echo";
 /// `sys_info_service_init`'s name, `<node id>/sys_info`.
 pub const SYS_INFO: &[u8] = b"c0ffee0012345678/sys_info";
 
+/// `config_cbor_map_service_init`'s name, `<node id>/config_map`.
+pub const CONFIG_MAP: &[u8] = b"c0ffee0012345678/config_map";
+
 /// The service [`Step::AskSysInfo`] asks: `sys_info_service_request` of
 /// the first of [`PEERS`].
 pub const PEER_SYS_INFO: &[u8] = b"0b54ccce5c7978bf/sys_info";
 
+/// The service [`Step::AskConfigMap`] asks: `config_cbor_map_service_request`
+/// of the first of [`PEERS`].
+pub const PEER_CONFIG_MAP: &[u8] = b"0b54ccce5c7978bf/config_map";
+
 /// Service names. [`ECHO`] is registered with `echo_service_init` and
 /// [`Node::register_echo_service`], [`SYS_INFO`] with `sys_info_service_init`
-/// and [`Node::register_sys_info_service`]; the rest with [`c_handler`] and
-/// [`StandIn`].
+/// and [`Node::register_sys_info_service`], [`CONFIG_MAP`] with
+/// `config_cbor_map_service_init` and [`Node::register_config_map_service`];
+/// the rest with [`c_handler`] and [`StandIn`].
 ///
-/// `<id>/e` prefixes echo's name; `s`,
-/// `sv` and `svc` prefix each other; `s*` and `s?c` subscribe patterns that
-/// match other services' request topics; `x` shares a prefix with none, so
-/// it is the one name [`LEAK_BUDGET`] may leave listed.
+/// `s` prefixes `svc`; `s*` subscribes a pattern that matches other
+/// services' request topics; `x` shares a prefix with none, so it is the one
+/// name [`LEAK_BUDGET`] may leave listed. `bm_wire::service`'s unit tests
+/// cover a name prefixing a built-in's.
 ///
 /// Not the empty name: it prefixes [`METRICS`], which is listed first, so
 /// unregistering it removes the metrics service instead (divergence #89), and
 /// nothing can then remove it. Listed first, it ends the walk for every
 /// request. `bm_wire::service`'s unit tests cover it.
-pub const NAMES: [&[u8]; 9] = [
-    ECHO,
-    b"c0ffee0012345678/e",
-    SYS_INFO,
-    b"svc",
-    b"sv",
-    b"s",
-    b"s*",
-    b"s?c",
-    b"x",
-];
+pub const NAMES: [&[u8]; 7] = [ECHO, SYS_INFO, CONFIG_MAP, b"svc", b"s", b"s*", b"x"];
 
 /// Topics the application subscribes: a service's request topic, a prefix,
 /// everything, echo's request topic, and a peer's sys_info reply topic.
@@ -155,13 +160,13 @@ pub const APP_TOPICS: [&[u8]; 5] = [
     b"0b54ccce5c7978bf/sys_info/rep",
 ];
 
-/// Services this node asks: a peer's sys_info, a pattern whose reply topic
-/// matches the peer's other reply topics (divergence #74), and a [`NAMES`]
-/// entry the node may itself list.
+/// Services this node asks: a peer's sys_info and config_map, a pattern
+/// whose reply topic matches the peer's reply topics (divergence #74), and a
+/// [`NAMES`] entry the node may itself list.
 ///
-/// Three, so every topic subscribed at once fits `bm_get_subs`'s 256 bytes
-/// (divergence #78); the list comparison checks it.
-pub const ASKED: [&[u8]; 3] = [PEER_SYS_INFO, b"0b54ccce5c7978bf/*", b"svc"];
+/// Few and short, so every topic subscribed at once fits `bm_get_subs`'s 256
+/// bytes (divergence #78); the list comparison checks it.
+pub const ASKED: [&[u8]; 4] = [PEER_SYS_INFO, PEER_CONFIG_MAP, b"0*", b"svc"];
 
 /// Steps per process that may leave a listed service no request can unlist.
 pub const LEAK_BUDGET: u32 = 4;
@@ -591,6 +596,22 @@ pub enum Step {
     /// This node asks [`PEER_SYS_INFO`] with `sys_info_service_request` and
     /// [`Node::sys_info_request_with`].
     AskSysInfo(Timeout),
+    /// A peer's request to [`CONFIG_MAP`] for a `partition_id`, as
+    /// `config_cbor_map_service_request` encodes it. A [`Step::Request`]'s
+    /// data is rarely a CBOR map.
+    RequestConfigMap {
+        /// The port it arrives on, reduced to 1..=[`NUM_PORTS`].
+        ingress: u8,
+        /// Which of [`PEERS`] sends it.
+        peer: bool,
+        /// The header's `id`.
+        id: u32,
+        /// The partition.
+        partition_id: u32,
+    },
+    /// This node asks [`PEER_CONFIG_MAP`] for a `partition_id` with
+    /// `config_cbor_map_service_request` and [`Node::config_map_request_with`].
+    AskConfigMap(u32, Timeout),
 }
 
 /// Steps run in order, after `reset`.
@@ -619,6 +640,12 @@ pub struct Summary {
     pub sys_info_replies: usize,
     /// Answers to [`PEER_SYS_INFO`] that [`DecodedSysInfoReply`] reads.
     pub sys_info_decoded: usize,
+    /// Replies the config_map service sent.
+    pub config_map_replies: usize,
+    /// Of those, the ones with `success` set.
+    pub config_map_successes: usize,
+    /// Answers to [`PEER_CONFIG_MAP`] that [`DecodedConfigMapReply`] reads.
+    pub config_map_decoded: usize,
 }
 
 /// What the oracle and the Rust node hold between inputs.
@@ -800,21 +827,57 @@ pub fn check(input: &ServicesInput) -> Summary {
                     &mut summary,
                 )
             }
+            Step::RequestConfigMap {
+                ingress,
+                peer,
+                id,
+                partition_id,
+            } => {
+                let request = Request {
+                    ingress: *ingress,
+                    peer: *peer,
+                    topic: RequestTopic::Service(name_index(CONFIG_MAP)),
+                    id: *id,
+                    size: Size::Exact,
+                    data: config_map_request(*partition_id),
+                    cut: None,
+                };
+                let (topic, body) = request.publication();
+                let ingress = request.ingress % NUM_PORTS + 1;
+                receive(
+                    state,
+                    ingress,
+                    request.source(),
+                    &topic,
+                    &body,
+                    &mut summary,
+                )
+            }
             Step::Reply(reply) => {
                 let (topic, body) = reply.publication(&state.node);
                 let ingress = reply.ingress % NUM_PORTS + 1;
                 let source = PEERS[usize::from(reply.peer)];
                 receive(state, ingress, source, &topic, &body, &mut summary)
             }
-            Step::Ask(ask) => self::ask(state, ask, false, &mut summary),
+            Step::Ask(ask) => self::ask(state, ask, Builtin::None, &mut summary),
             Step::AskSysInfo(timeout) => self::ask(
                 state,
                 &Ask {
-                    service: 0,
+                    service: asked_index(PEER_SYS_INFO),
                     data: Vec::new(),
                     timeout: *timeout,
                 },
-                true,
+                Builtin::SysInfo,
+                &mut summary,
+            ),
+            Step::AskConfigMap(partition_id, timeout) => self::ask(
+                state,
+                &Ask {
+                    service: asked_index(PEER_CONFIG_MAP),
+                    data: config_map_request(*partition_id),
+                    timeout: *timeout,
+                },
+                Builtin::ConfigMap(*partition_id),
                 &mut summary,
             ),
             Step::Configure(seed) => {
@@ -976,6 +1039,12 @@ fn register(state: &mut State, name: &[u8]) -> bool {
             .node
             .register_sys_info_service()
             .expect("sys_info_service_init registers");
+    } else if name == CONFIG_MAP {
+        unsafe { bm_wire_sys::config_cbor_map_service_init() };
+        state
+            .node
+            .register_config_map_service()
+            .expect("config_cbor_map_service_init registers");
     } else {
         let c =
             unsafe { bm_wire_sys::bm_service_register(name.len(), c_name(name), Some(c_handler)) };
@@ -985,6 +1054,7 @@ fn register(state: &mut State, name: &[u8]) -> bool {
     let handler = match name {
         ECHO => ServiceHandler::Echo,
         SYS_INFO => ServiceHandler::SysInfo,
+        CONFIG_MAP => ServiceHandler::ConfigMap,
         _ => ServiceHandler::Application,
     };
     assert_eq!(
@@ -1029,7 +1099,7 @@ fn receive(
     summary: &mut Summary,
 ) -> bool {
     let what = format!("{topic:?} from {source:#x}, body {body:?}");
-    let Some((calls, replied, answers)) =
+    let Some((calls, replied, answers, config_map_success)) =
         receive_publication(state, ingress, source, topic, body, &what)
     else {
         return false;
@@ -1045,13 +1115,18 @@ fn receive(
             }
         );
     summary.sys_info_replies += usize::from(replied && sys_info_request);
+    if let Some(success) = config_map_success {
+        summary.config_map_replies += 1;
+        summary.config_map_successes += usize::from(success);
+    }
     count(summary, &answers);
     true
 }
 
 /// [`receive`]'s comparison. Returns how many service callbacks the
-/// publication reached, whether it was answered and the answers it gave
-/// requests this node made, or `None` if it is outside the domain.
+/// publication reached, whether it was answered, the answers it gave
+/// requests this node made, and a config_map reply's `success`; or `None` if
+/// it is outside the domain.
 fn receive_publication(
     state: &mut State,
     ingress: u8,
@@ -1059,7 +1134,7 @@ fn receive_publication(
     topic: &[u8],
     body: &[u8],
     what: &str,
-) -> Option<(usize, bool, Vec<Answer>)> {
+) -> Option<(usize, bool, Vec<Answer>, Option<bool>)> {
     let (topic, body) = (topic.to_vec(), body.to_vec());
     let node = &state.node;
     if reaches_reply(node, &topic) && body.len() < ReplyHeader::LEN {
@@ -1075,6 +1150,7 @@ fn receive_publication(
     // often.
     let mut reply: Option<Vec<u8>> = None;
     let mut call: Option<Call> = None;
+    let mut config_map_success = None;
     if calls > 0 {
         match node.service_table().lookup(&topic, &body) {
             Lookup::OverRead { .. } | Lookup::ShortRequest { .. } => return None,
@@ -1098,6 +1174,15 @@ fn receive_publication(
                         let crc = sys_config_crc(node)?;
                         let info = SysInfoReply::new(stack::NODE_ID, GIT_SHA, crc, APP_NAME);
                         sys_info::handle(data, &info, &mut out)
+                    }
+                    ServiceHandler::ConfigMap => {
+                        let len = config_map_reply(node, data, &mut out)?;
+                        config_map_success = len.map(|len| {
+                            let mut d = DecodedConfigMapReply::default();
+                            d.decode_into(&out[..len]).expect("the reply decodes");
+                            d.success
+                        });
+                        len
                     }
                     ServiceHandler::Application => {
                         call = Some((name.to_vec(), data.to_vec()));
@@ -1204,7 +1289,7 @@ fn receive_publication(
         expected_c.extend(replied.iter().cloned());
     }
     assert_eq!(c_delivered, expected_c, "C deliveries, {what}");
-    Some((calls, reply.is_some(), c_answers))
+    Some((calls, reply.is_some(), c_answers, config_map_success))
 }
 
 /// A publication's deliveries to the application: one per application
@@ -1251,12 +1336,50 @@ fn record(event: Event<'_>, delivered: &mut Vec<Delivery>, answers: &mut Vec<Ans
     }
 }
 
-/// `bm_service_request` and [`Node::service_request_with`], or with
-/// `sys_info` `sys_info_service_request` and [`Node::sys_info_request_with`]
-/// for [`ASKED`]'s first entry, [`PEER_SYS_INFO`]. Returns whether it ran.
-fn ask(state: &mut State, ask: &Ask, sys_info: bool, summary: &mut Summary) -> bool {
+/// Which requester [`ask`] calls.
+#[derive(Debug, Clone, Copy)]
+enum Builtin {
+    /// `bm_service_request` and [`Node::service_request_with`].
+    None,
+    /// `sys_info_service_request` and [`Node::sys_info_request_with`], to
+    /// [`PEER_SYS_INFO`] with no data.
+    SysInfo,
+    /// `config_cbor_map_service_request` and
+    /// [`Node::config_map_request_with`], to [`PEER_CONFIG_MAP`] with this
+    /// partition id's [`ConfigMapRequest`].
+    ConfigMap(u32),
+}
+
+fn name_index(name: &[u8]) -> u8 {
+    NAMES.iter().position(|n| *n == name).expect("a pool name") as u8
+}
+
+fn asked_index(service: &[u8]) -> u8 {
+    ASKED
+        .iter()
+        .position(|n| *n == service)
+        .expect("an asked name") as u8
+}
+
+fn config_map_request(partition_id: u32) -> Vec<u8> {
+    let mut data = [0u8; 32];
+    let len = ConfigMapRequest { partition_id }
+        .encode(&mut data)
+        .expect("at most 19 bytes");
+    data[..len].to_vec()
+}
+
+/// One of `builtin`'s requests, compared: `ask.data` is the request data
+/// `builtin` sends. Returns whether it ran.
+fn ask(state: &mut State, ask: &Ask, builtin: Builtin, summary: &mut Summary) -> bool {
     let service = ASKED[usize::from(ask.service) % ASKED.len()];
-    assert!(!sys_info || (service == PEER_SYS_INFO && ask.data.is_empty()));
+    match builtin {
+        Builtin::None => {}
+        Builtin::SysInfo => assert!(service == PEER_SYS_INFO && ask.data.is_empty()),
+        Builtin::ConfigMap(id) => {
+            assert!(service == PEER_CONFIG_MAP && ask.data == config_map_request(id));
+        }
+    }
     let data = &ask.data[..ask.data.len().min(MAX_DATA_SIZE + 8)];
     let timeout_s = ask.timeout.seconds();
     let node = &state.node;
@@ -1303,17 +1426,24 @@ fn ask(state: &mut State, ask: &Ask, sys_info: bool, summary: &mut Summary) -> b
 
     *lock(&AVAILABLE) = body.len().saturating_sub(ReplyHeader::LEN);
     let c_ok = unsafe {
-        if sys_info {
-            bm_wire_sys::sys_info_service_request(PEERS[0], Some(c_reply_cb), timeout_s)
-        } else {
-            bm_wire_sys::bm_service_request(
+        match builtin {
+            Builtin::None => bm_wire_sys::bm_service_request(
                 service.len(),
                 service.as_ptr().cast(),
                 data.len(),
                 data.as_ptr(),
                 Some(c_reply_cb),
                 timeout_s,
-            )
+            ),
+            Builtin::SysInfo => {
+                bm_wire_sys::sys_info_service_request(PEERS[0], Some(c_reply_cb), timeout_s)
+            }
+            Builtin::ConfigMap(id) => bm_wire_sys::config_cbor_map_service_request(
+                PEERS[0],
+                id,
+                Some(c_reply_cb),
+                timeout_s,
+            ),
         }
     };
     stack::pump_until_quiet();
@@ -1325,14 +1455,14 @@ fn ask(state: &mut State, ask: &Ask, sys_info: bool, summary: &mut Summary) -> b
     let mut rs_delivered = Vec::new();
     let mut rs_answers = Vec::new();
     let on_event = |event: Event<'_>| record(event, &mut rs_delivered, &mut rs_answers);
-    let rs = if sys_info {
-        state
-            .node
-            .sys_info_request_with(tick_count(), PEERS[0], timeout_s, on_event)
-    } else {
-        state
-            .node
-            .service_request_with(tick_count(), service, data, timeout_s, on_event)
+    let now = tick_count();
+    let node = &mut state.node;
+    let rs = match builtin {
+        Builtin::None => node.service_request_with(now, service, data, timeout_s, on_event),
+        Builtin::SysInfo => node.sys_info_request_with(now, PEERS[0], timeout_s, on_event),
+        Builtin::ConfigMap(id) => {
+            node.config_map_request_with(now, PEERS[0], id, timeout_s, on_event)
+        }
     }
     .map(|(id, outbound)| (id, capture(outbound)));
     let what = format!("{ask:?}");
@@ -1378,6 +1508,10 @@ fn count(summary: &mut Summary, answers: &[Answer]) {
                 service == PEER_SYS_INFO
                     && DecodedSysInfoReply::default().decode_into(data).is_ok(),
             );
+            summary.config_map_decoded += usize::from(
+                service == PEER_CONFIG_MAP
+                    && DecodedConfigMapReply::default().decode_into(data).is_ok(),
+            );
         } else {
             summary.timeouts += 1;
         }
@@ -1396,6 +1530,49 @@ fn sys_config_crc(node: &ServicesNode) -> Option<u32> {
     let c = unsafe { bm_wire_sys::services_cbor_encoded_as_crc32(Partition::System as _) };
     assert_eq!(c, crc, "services_cbor_encoded_as_crc32");
     Some(crc)
+}
+
+/// The config_map reply both nodes send for `request`, as
+/// [`config_map::handle`] writes it into `out`: `Some(None)` for none, or
+/// `None` where the C is undefined: a tagged `partition_id`, or a partition
+/// whose map is [`MapError::Unreachable`] (divergences #42, #82, #88).
+/// Asserts the C's `services_cbor_as_map` writes the same map first.
+fn config_map_reply(node: &ServicesNode, request: &[u8], out: &mut [u8]) -> Option<Option<usize>> {
+    let mut req = ConfigMapRequest::default();
+    if req.decode_into(request) == Err(CborError::Unreachable) {
+        return None;
+    }
+    let store = &node.config().store;
+    if let Some(p) = config_map::partition(req.partition_id) {
+        let partition = store.partition(p);
+        let mut map = Vec::new();
+        let mut rs = partition.cbor_map(&mut map);
+        if let Err(MapError::TooSmall(len)) = rs {
+            map.resize(len, 0);
+            rs = partition.cbor_map(&mut map);
+        }
+        if rs == Err(MapError::Unreachable) {
+            return None;
+        }
+        let mut c_len = 0usize;
+        let c = unsafe { bm_wire_sys::services_cbor_as_map(&mut c_len, p as _) };
+        let c_map = (!c.is_null()).then(|| {
+            let bytes = unsafe { std::slice::from_raw_parts(c, c_len) }.to_vec();
+            unsafe { bm_wire_sys::bm_free(c.cast()) };
+            bytes
+        });
+        assert_eq!(
+            c_map.as_deref(),
+            rs.ok().map(|len| &map[..len]),
+            "services_cbor_as_map({p:?})"
+        );
+    }
+    Some(config_map::handle(
+        request,
+        stack::NODE_ID,
+        |p, out| store.partition(p).cbor_map(out),
+        out,
+    ))
 }
 
 /// Let `ms` pass on both, one request sweep at a time, comparing what each
