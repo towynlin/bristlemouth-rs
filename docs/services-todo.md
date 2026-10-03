@@ -123,6 +123,8 @@ From reading the source; not yet run.
 
 ### E1 — sys_info
 
+**Taken:** claude/services-e1-sys-info
+
 - **C:** `sys_info_service.c`.
 - **Rust:** the handler, `Node::sys_info_request`; `Identity::app_name`,
   `git_sha`. The CRC is `cbor_map_crc32` over the system partition.
