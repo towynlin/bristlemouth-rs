@@ -129,11 +129,12 @@ A cargo workspace.
 - `bm-devkit/` — board support for the dev kit's mote (STM32U575CI,
   ADIN2111 on SPI3, W25Q64JV NOR flash on SPI2): `start` powers and brings up
   the ADIN2111, sets up the flash and starts the RTC, `node` builds a
-  `Devkit` node with the chip's node id, the RTC and its config partitions
-  in flash; `src/bin/bringup.rs`
+  `Devkit` node with the chip's node id, the binary's name as `app_name`, the
+  RTC and its config partitions in flash; `src/bin/bringup.rs`
   runs one and logs the config keys it loaded; `src/bin/hello_world.rs` is
   the hello-world app: subscribes to `spotter/*`, sends `hello world` with
-  `spotter_log` every 10 s, and sets the RTC from `spotter/utc-time`.
+  `spotter_log` every 10 s, sets the RTC from `spotter/utc-time`, and
+  lists echo, sys_info and config_map after metrics, as a C dev kit does.
   **Its own workspace**, for
   bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
   `.cargo/config.toml` sets the thumb target and a `probe-rs run` runner.

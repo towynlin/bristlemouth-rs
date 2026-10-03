@@ -6,6 +6,11 @@
 //! dev kits do, and logs BCMP time messages, each set, and every 10 s the
 //! node's RTC reading.
 //!
+//! It lists the services a C dev kit lists, in `app_main.cpp`'s order:
+//! metrics at construction, then echo, sys_info and config_map, so a
+//! Bridge's topology, sensor and metrics samplers can ask it. Its sys_info
+//! app name is `hello_world`, as bm_protocol's `bm_devkit/hello_world`'s is.
+//!
 //! ```text
 //! cd bm-devkit && cargo run --release --bin hello_world
 //! ```
@@ -18,6 +23,7 @@ use bm_stack::utc_time::{self, UtcTimeSetter};
 use bm_stack::{App, Event, Outbound, Rtc};
 use bm_wire::bcmp::MessageType;
 use bm_wire::bcmp::time::{SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
+use bm_wire::configuration::Partition;
 use bm_wire::spotter::USE_TIMESTAMP;
 use defmt::{info, warn};
 use embassy_executor::Spawner;
@@ -162,7 +168,15 @@ async fn main(spawner: Spawner) {
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));
 
     static NODE: StaticCell<Devkit> = StaticCell::new();
-    let node = NODE.init_with(|| bm_devkit::node(board.node_id, board.flash, board.rtc));
+    let node = NODE.init_with(|| {
+        bm_devkit::node(
+            env!("CARGO_BIN_NAME"),
+            board.node_id,
+            board.flash,
+            board.rtc,
+        )
+    });
+    // `app_main.cpp:412-415`: the utc-time subscription, then the services.
     for topic in [SUBSCRIPTION, utc_time::TOPIC] {
         if let Err(error) = node.subscribe(topic) {
             warn!(
@@ -172,6 +186,25 @@ async fn main(spawner: Spawner) {
             );
         }
     }
+    for (name, result) in [
+        ("echo", node.register_echo_service()),
+        ("sys_info", node.register_sys_info_service()),
+        ("config_map", node.register_config_map_service()),
+    ] {
+        if let Err(error) = result {
+            warn!("register {=str}: {}", name, defmt::Debug2Format(&error));
+        }
+    }
+    for (name, _) in node.service_table().iter() {
+        info!("service {=[u8]:a}", name);
+    }
+    info!(
+        "sys_config_crc {=u32:08x}",
+        node.config()
+            .store
+            .partition(Partition::System)
+            .cbor_map_crc32()
+    );
     let mut app = Hello {
         ticker: Ticker::every(Duration::from_secs(10)),
         utc_time: UtcTimeSetter::new(),

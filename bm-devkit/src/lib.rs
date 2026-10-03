@@ -204,13 +204,18 @@ pub async fn start() -> Board {
     }
 }
 
-/// A [`Devkit`] node with id `node_id` and this chip's UID as its name, its
-/// config partitions loaded from `flash` in the layout `arm-none-eabi-gcc`
-/// gives bm_protocol's.
+/// A [`Devkit`] node with id `node_id`, this chip's UID as its name and
+/// `app_name` as its `bm_app_name`, its config partitions loaded from `flash`
+/// in the layout `arm-none-eabi-gcc` gives bm_protocol's.
+///
+/// bm_protocol's `bm_app_name` is the app directory's name
+/// (`src/CMakeLists.txt`, `get_filename_component(APP_NAME ${APP} NAME)`);
+/// a binary here passes `env!("CARGO_BIN_NAME")`, which is the same for
+/// `hello_world`.
 #[must_use]
-pub fn node(node_id: u64, flash: Flash, rtc: DevkitRtc) -> Devkit {
+pub fn node(app_name: &'static str, node_id: u64, flash: Flash, rtc: DevkitRtc) -> Devkit {
     Node::with_config(
-        DevkitIdentity::new(node_id, embassy_stm32::uid::uid()),
+        DevkitIdentity::new(node_id, embassy_stm32::uid::uid(), app_name),
         rtc,
         Config::load(Layout::ARM_EABI_GCC, FlashConfigStorage::new(flash)),
         PORTS,
@@ -276,20 +281,24 @@ const fn version_part(part: &str) -> u8 {
 
 /// What a dev kit says about itself, as `bcl_init` fills `DeviceCfg`: vendor,
 /// product and hardware version 0, the placeholder serial number, and the UID
-/// string as device name. Firmware version and git SHA are this crate's.
+/// string as device name. Firmware version and git SHA are this crate's; the
+/// app name, sent in a sys_info reply, is the binary's.
 #[derive(Debug, Clone, Copy)]
 pub struct DevkitIdentity {
     node_id: u64,
     name: [u8; 24],
+    app_name: &'static str,
 }
 
 impl DevkitIdentity {
-    /// The identity of the chip with this node id and UID.
+    /// The identity of the chip with this node id and UID, running
+    /// `app_name`.
     #[must_use]
-    pub fn new(node_id: u64, uid: &[u8; 12]) -> Self {
+    pub fn new(node_id: u64, uid: &[u8; 12], app_name: &'static str) -> Self {
         Self {
             node_id,
             name: uid_string(uid),
+            app_name,
         }
     }
 }
@@ -322,5 +331,9 @@ impl Identity for DevkitIdentity {
 
     fn device_name(&self) -> &[u8] {
         &self.name
+    }
+
+    fn app_name(&self) -> &[u8] {
+        self.app_name.as_bytes()
     }
 }
