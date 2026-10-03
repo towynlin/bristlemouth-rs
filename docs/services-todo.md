@@ -122,6 +122,8 @@ From reading the source; not yet run.
 
 ### E3 — power_info
 
+**Taken:** claude/services-e3-power-info
+
 - **C:** `power_info_service.c`, `common/cb_queue.c`.
 - **Rust:** the server through `Services::power_info`; the requester, with
   the FIFO pairing reproduced in what `Event::PowerInfoReply` reports.
