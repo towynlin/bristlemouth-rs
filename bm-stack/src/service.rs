@@ -10,10 +10,12 @@
 //! | `bm_service_unregister` | [`crate::Node::unregister_service`] |
 //! | `echo_service_init` | [`crate::Node::register_echo_service`] |
 //! | `sys_info_service_init` | [`crate::Node::register_sys_info_service`] |
+//! | `config_cbor_map_service_init` | [`crate::Node::register_config_map_service`] |
 //! | `_service_request_received_cb` | [`crate::Node::on_frame`], for each service callback a publication reaches |
 //! | a `BmServiceHandler` | [`Services::handle`], or a built-in [`ServiceHandler`] |
 //! | `bm_service_request` | [`crate::Node::service_request`] |
 //! | `sys_info_service_request` | [`crate::Node::sys_info_request`] |
+//! | `config_cbor_map_service_request` | [`crate::Node::config_map_request`] |
 //! | a `BmServiceReplyCb` | [`crate::Event::ServiceReply`], [`crate::Event::ServiceTimeout`] |
 //! | `_service_request_timer_expiry_cb` | [`crate::Node::on_service_expiry`] |
 
@@ -73,6 +75,8 @@ pub enum ServiceHandler {
     Echo,
     /// `sys_info_service_handler`: [`bm_wire::service::sys_info::handle`].
     SysInfo,
+    /// `config_map_service_handler`: [`bm_wire::service::config_map::handle`].
+    ConfigMap,
     /// The application's, [`Services::handle`].
     Application,
 }

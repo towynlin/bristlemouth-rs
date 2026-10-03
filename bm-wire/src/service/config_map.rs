@@ -11,6 +11,7 @@
 
 use super::{encode_map, enter_map, leave_map, skip_key};
 use crate::cbor::parser::{CborError, CborString};
+use crate::configuration::{MapError, Partition};
 
 /// `CONFIG_CBOR_MAP_REQUEST_NUM_FIELDS`.
 pub const REQUEST_NUM_FIELDS: usize = 1;
@@ -23,6 +24,83 @@ pub const PARTITION_ID_SYS: u32 = 1;
 pub const PARTITION_ID_HW: u32 = 2;
 /// `CONFIG_CBOR_MAP_PARTITION_ID_USER`.
 pub const PARTITION_ID_USER: u32 = 3;
+
+/// `config_map_suffix`: the service is `<node id>/config_map`.
+pub const SUFFIX: &[u8] = b"/config_map";
+
+/// The partition a request's `partition_id` names, as
+/// `config_map_service_handler` maps it; `None` for any other id.
+#[must_use]
+pub fn partition(partition_id: u32) -> Option<Partition> {
+    match partition_id {
+        PARTITION_ID_SYS => Some(Partition::System),
+        PARTITION_ID_HW => Some(Partition::Hardware),
+        PARTITION_ID_USER => Some(Partition::User),
+        _ => None,
+    }
+}
+
+/// `config_map_service_handler`: write the reply into `out` and return its
+/// length, or `None` for no reply.
+///
+/// `map` is `services_cbor_as_map` for a partition, as
+/// [`crate::configuration::ConfigPartition::cbor_map`] writes it. It is
+/// called twice, to measure and then to write the map into `out` after the
+/// reply's other fields, so the map needs no buffer of its own.
+///
+/// | Request | Reply |
+/// |---|---|
+/// | does not decode | none |
+/// | `partition_id` not 1, 2 or 3 | `success` 0, no data, the id echoed |
+/// | a partition [`MapError::NoMap`] | `success` 0, no data |
+/// | a partition [`MapError::Unreachable`] | none: the C is undefined |
+/// | a reply over `out` | none (contract 8) |
+/// | otherwise | `success` 1 and the map |
+#[must_use]
+pub fn handle(
+    request: &[u8],
+    node_id: u64,
+    mut map: impl FnMut(Partition, &mut [u8]) -> Result<usize, MapError>,
+    out: &mut [u8],
+) -> Option<usize> {
+    let mut req = ConfigMapRequest::default();
+    req.decode_into(request).ok()?;
+    let found = match partition(req.partition_id) {
+        None => None,
+        Some(p) => match map(p, &mut []) {
+            Ok(len) | Err(MapError::TooSmall(len)) => Some((p, len)),
+            Err(MapError::NoMap) => None,
+            Err(MapError::Unreachable) => return None,
+        },
+    };
+    let len = found.map_or(0, |(_, len)| len);
+    let head = encode_head(node_id, req.partition_id, found.is_some(), len, out).ok()?;
+    let end = head.checked_add(len).filter(|end| *end <= out.len())?;
+    if let Some((p, _)) = found {
+        map(p, &mut out[head..end]).ok()?;
+    }
+    Some(end)
+}
+
+/// `config_cbor_map_reply_encode` up to `cbor_data`'s bytes: the map, every
+/// field, and the byte string's head for `len` bytes.
+fn encode_head(
+    node_id: u64,
+    partition_id: u32,
+    success: bool,
+    len: usize,
+    out: &mut [u8],
+) -> Result<usize, CborError> {
+    let len32 = u32::try_from(len).map_err(|_| CborError::OutOfMemory)?;
+    encode_map(out, REPLY_NUM_FIELDS, |w| {
+        w.uint("node_id", node_id);
+        w.uint("partition_id", partition_id.into());
+        w.uint("success", success.into());
+        w.uint("cbor_encoded_map_len", len32.into());
+        w.text(b"cbor_data");
+        w.bytes_head(len);
+    })
+}
 
 /// `ConfigCborMapRequestData`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -82,15 +160,19 @@ impl ConfigMapReply<'_> {
     ///
     /// [`CborError::OutOfMemory`] if it does not fit.
     pub fn encode(&self, out: &mut [u8]) -> Result<usize, CborError> {
-        let len = u32::try_from(self.cbor_data.len()).map_err(|_| CborError::OutOfMemory)?;
-        encode_map(out, REPLY_NUM_FIELDS, |w| {
-            w.uint("node_id", self.node_id);
-            w.uint("partition_id", self.partition_id.into());
-            w.uint("success", self.success.into());
-            w.uint("cbor_encoded_map_len", len.into());
-            w.text(b"cbor_data");
-            w.bytes(self.cbor_data);
-        })
+        let data = self.cbor_data;
+        let head = encode_head(
+            self.node_id,
+            self.partition_id,
+            self.success,
+            data.len(),
+            out,
+        )?;
+        let end = head + data.len();
+        out.get_mut(head..end)
+            .ok_or(CborError::OutOfMemory)?
+            .copy_from_slice(data);
+        Ok(end)
     }
 }
 
@@ -203,6 +285,115 @@ mod tests {
             d.decode_into(b"\xa1\x61p\xc6\x00"),
             Err(CborError::Unreachable)
         );
+    }
+
+    /// A partition whose map is `len` bytes of filler.
+    fn map_of(len: usize) -> impl FnMut(Partition, &mut [u8]) -> Result<usize, MapError> {
+        move |_, out| {
+            let Some(out) = out.get_mut(..len) else {
+                return Err(MapError::TooSmall(len));
+            };
+            out.fill(0x5a);
+            Ok(len)
+        }
+    }
+
+    fn request(partition_id: u32) -> ([u8; 32], usize) {
+        let mut buf = [0u8; 32];
+        let len = ConfigMapRequest { partition_id }.encode(&mut buf).unwrap();
+        (buf, len)
+    }
+
+    /// The decoded fields, and whether the data is `data`.
+    fn reply(out: &[u8], data: &[u8]) -> (u64, u32, bool, u32, bool) {
+        let mut d = DecodedConfigMapReply::default();
+        d.decode_into(out).unwrap();
+        let same = d.cbor_data.map_or(data.is_empty(), |s| s.eq_bytes(data));
+        (
+            d.node_id,
+            d.partition_id,
+            d.success,
+            d.cbor_encoded_map_len,
+            same,
+        )
+    }
+
+    const NODE: u64 = 0xc0ff_ee00_1234_5678;
+
+    #[test]
+    fn the_handler_maps_each_partition_id() {
+        for (id, expected) in [
+            (PARTITION_ID_SYS, Partition::System),
+            (PARTITION_ID_HW, Partition::Hardware),
+            (PARTITION_ID_USER, Partition::User),
+        ] {
+            let (req, len) = request(id);
+            let mut out = [0u8; super::super::REPLY_DATA_LEN];
+            let n = handle(
+                &req[..len],
+                NODE,
+                |p, out| {
+                    assert_eq!(p, expected);
+                    map_of(1)(p, out)
+                },
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(reply(&out[..n], &[0x5a]), (NODE, id, true, 1, true));
+        }
+    }
+
+    /// An unknown partition, and one with no map, are still answered.
+    #[test]
+    fn the_handler_answers_an_unknown_partition_unsuccessfully() {
+        let mut out = [0u8; super::super::REPLY_DATA_LEN];
+        let (req, len) = request(7);
+        let n = handle(
+            &req[..len],
+            NODE,
+            |_, _| unreachable!("no partition"),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(reply(&out[..n], b""), (NODE, 7, false, 0, true));
+        assert_eq!(
+            &out[n - 11..n],
+            b"\x69cbor_data\x40",
+            "an empty byte string"
+        );
+
+        let (req, len) = request(PARTITION_ID_HW);
+        let n = handle(&req[..len], NODE, |_, _| Err(MapError::NoMap), &mut out).unwrap();
+        assert_eq!(reply(&out[..n], b""), (NODE, 2, false, 0, true));
+    }
+
+    #[test]
+    fn the_handler_sends_nothing_for_a_bad_request_or_an_undefined_map() {
+        let mut out = [0u8; super::super::REPLY_DATA_LEN];
+        assert_eq!(handle(b"", NODE, map_of(1), &mut out), None);
+        assert_eq!(handle(b"\xa0", NODE, map_of(1), &mut out), None);
+        let (req, len) = request(PARTITION_ID_SYS);
+        assert_eq!(
+            handle(
+                &req[..len],
+                NODE,
+                |_, _| Err(MapError::Unreachable),
+                &mut out
+            ),
+            None
+        );
+    }
+
+    /// Contract 8: a reply over the handler's 1008 bytes is no reply. The
+    /// fields before the map take 78 bytes here.
+    #[test]
+    fn the_handler_sends_nothing_past_its_buffer() {
+        let mut out = [0u8; super::super::REPLY_DATA_LEN];
+        let (req, len) = request(PARTITION_ID_USER);
+        let n = handle(&req[..len], NODE, map_of(930), &mut out).unwrap();
+        assert_eq!(n, out.len());
+        assert_eq!(reply(&out, &[0x5a; 930]), (NODE, 3, true, 930, true));
+        assert_eq!(handle(&req[..len], NODE, map_of(931), &mut out), None);
     }
 
     #[test]

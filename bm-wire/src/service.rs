@@ -94,10 +94,10 @@ impl<'o, 'b> MapWriter<'o, 'b> {
         self.write(&value.to_bits().to_be_bytes());
     }
 
-    /// `cbor_encode_byte_string`.
-    fn bytes(&mut self, bytes: &[u8]) {
-        self.push(Header::Bytes(Some(bytes.len())));
-        self.write(bytes);
+    /// `cbor_encode_byte_string`'s head, for a caller writing the bytes
+    /// itself.
+    fn bytes_head(&mut self, len: usize) {
+        self.push(Header::Bytes(Some(len)));
     }
 }
 

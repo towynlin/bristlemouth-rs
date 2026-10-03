@@ -13,9 +13,10 @@ use bm_stack::{
 };
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::bcmp::resource::ResourceType;
-use bm_wire::configuration::{Key, Layout, Partition};
+use bm_wire::configuration::{Key, Layout, MapError, Partition};
 use bm_wire::crc::crc32_ieee;
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError};
+use bm_wire::service::config_map::{self, ConfigMapReply, ConfigMapRequest, DecodedConfigMapReply};
 use bm_wire::service::sys_info::{DecodedSysInfoReply, SysInfoReply};
 use bm_wire::service::{REPLY_DATA_LEN, ReplyHeader, RequestHeader};
 use bm_wire::udp;
@@ -752,4 +753,175 @@ fn sys_info_request_asks_the_target_with_no_data() {
 fn identity_git_sha_defaults_to_the_device_infos() {
     assert_eq!(NamedIdentity.git_sha(), 0x0bad_cafe);
     assert_eq!(TestIdentity.app_name(), b"");
+}
+
+// ---------------------------------------------------------------------------
+// config_map -- card E2.
+// ---------------------------------------------------------------------------
+
+const CONFIG_MAP: &[u8] = b"c0ffee0012345678/config_map";
+
+fn config_map_request(partition_id: u32) -> Vec<u8> {
+    let mut data = [0u8; 32];
+    let len = ConfigMapRequest { partition_id }.encode(&mut data).unwrap();
+    data[..len].to_vec()
+}
+
+/// `(node id, partition id, success, data)` of a reply body.
+fn config_map_reply(body: &[u8]) -> (u64, u32, bool, Vec<u8>) {
+    let header = ReplyHeader::decode(body).unwrap();
+    let data = &body[ReplyHeader::LEN..];
+    assert_eq!(header.data_size as usize, data.len());
+    let mut d = DecodedConfigMapReply::default();
+    d.decode_into(data).unwrap();
+    let mut map = vec![0u8; d.cbor_encoded_map_len as usize];
+    if let Some(s) = d.cbor_data {
+        s.copy_to(&mut map).unwrap();
+    }
+    (d.node_id, d.partition_id, d.success, map)
+}
+
+#[test]
+fn config_map_answers_with_the_partition_named() {
+    let mut config = Config::load(Layout::LP64, RamConfigStorage::new());
+    config
+        .store
+        .partition_mut(Partition::User)
+        .set_uint(Key::new(b"sampleIntervalMs"), 60_000);
+    let mut user = [0u8; 64];
+    let len = config
+        .store
+        .partition(Partition::User)
+        .cbor_map(&mut user)
+        .unwrap();
+    let user = user[..len].to_vec();
+    let mut node: ConfigNode =
+        Node::with_services(NamedIdentity, SoftRtc::new(), config, NoDfu, NoServices, 2);
+    node.register_config_map_service().unwrap();
+    assert!(
+        node.service_table()
+            .iter()
+            .eq([(CONFIG_MAP, ServiceHandler::ConfigMap)])
+    );
+
+    let mut answer = |id: u32, request: &[u8]| {
+        let mut frame = frames::service_request(PEER_ID, CONFIG_MAP, id, request);
+        let owed = node.on_frame(0, 1, &mut frame);
+        owed.reply.map(|reply| {
+            let datagram = udp::accept(reply.frame()).unwrap();
+            let publication = pubsub::decode(datagram.payload).unwrap();
+            assert_eq!(publication.topic, b"c0ffee0012345678/config_map/rep");
+            assert_eq!(&publication.data[8..12], &id.to_le_bytes(), "the id");
+            config_map_reply(publication.data)
+        })
+    };
+    assert_eq!(
+        answer(1, &config_map_request(config_map::PARTITION_ID_USER)),
+        Some((NODE_ID, 3, true, user))
+    );
+    assert_eq!(
+        answer(2, &config_map_request(config_map::PARTITION_ID_SYS)),
+        Some((NODE_ID, 1, true, vec![0xa0]))
+    );
+    // An unknown partition is answered, unsuccessfully.
+    assert_eq!(
+        answer(3, &config_map_request(0)),
+        Some((NODE_ID, 0, false, vec![]))
+    );
+    // A request that does not decode is not.
+    assert_eq!(answer(4, b""), None);
+    assert_eq!(answer(5, b"\xa0"), None);
+}
+
+/// A map over the handler's buffer gets no reply (contract 8).
+#[test]
+fn config_map_sends_nothing_for_a_map_past_its_buffer() {
+    let mut config = Config::load(Layout::LP64, RamConfigStorage::new());
+    let hw = config.store.partition_mut(Partition::Hardware);
+    for i in 0..30u8 {
+        let key = [b'k', b'0' + i / 10, b'0' + i % 10];
+        assert!(hw.set_string(Key::new(&key), &[b'v'; 40]));
+    }
+    let map = config
+        .store
+        .partition(Partition::Hardware)
+        .cbor_map(&mut []);
+    assert!(
+        matches!(map, Err(MapError::TooSmall(n)) if n > REPLY_DATA_LEN),
+        "{map:?}"
+    );
+    let mut node: ConfigNode =
+        Node::with_services(NamedIdentity, SoftRtc::new(), config, NoDfu, NoServices, 2);
+    node.register_config_map_service().unwrap();
+    let mut frame = frames::service_request(
+        PEER_ID,
+        CONFIG_MAP,
+        1,
+        &config_map_request(config_map::PARTITION_ID_HW),
+    );
+    assert!(node.on_frame(0, 1, &mut frame).reply.is_none());
+}
+
+#[test]
+fn config_map_without_a_store_sends_an_empty_map() {
+    let mut node = node();
+    node.register_config_map_service().unwrap();
+    let (reply, _) = receive(
+        &mut node,
+        frames::service_request(
+            PEER_ID,
+            CONFIG_MAP,
+            1,
+            &config_map_request(config_map::PARTITION_ID_HW),
+        ),
+    );
+    let (topic, body) = reply.unwrap();
+    assert_eq!(topic, b"c0ffee0012345678/config_map/rep");
+    assert_eq!(config_map_reply(&body), (NODE_ID, 2, true, vec![0xa0]));
+}
+
+#[test]
+fn config_map_request_asks_the_target_for_a_partition() {
+    let mut node = node();
+    let (id, outbound) = node
+        .config_map_request(0, PEER_ID, config_map::PARTITION_ID_USER, 5)
+        .unwrap();
+    let datagram = udp::accept(outbound.frame()).unwrap();
+    let publication = pubsub::decode(datagram.payload).unwrap();
+    assert_eq!(publication.topic, b"0000000055aa0011/config_map/req");
+    let data = config_map_request(3);
+    assert_eq!(
+        RequestHeader::decode(publication.data),
+        Ok(RequestHeader {
+            id,
+            data_size: data.len() as u32
+        })
+    );
+    assert_eq!(&publication.data[RequestHeader::LEN..], &data[..]);
+
+    let mut body = [0u8; 128];
+    let len = ConfigMapReply {
+        node_id: PEER_ID,
+        partition_id: 3,
+        success: true,
+        cbor_data: b"\xa0",
+    }
+    .encode(&mut body)
+    .unwrap();
+    let reply = frames::service_reply(
+        PEER_ID,
+        b"0000000055aa0011/config_map",
+        NODE_ID,
+        id,
+        &body[..len],
+    );
+    let answers = reply_to(&mut node, 10, reply);
+    assert_eq!(answers.len(), 1);
+    let (ack, answered, service, data) = &answers[0];
+    assert!(*ack);
+    assert_eq!(*answered, id);
+    assert_eq!(service, b"0000000055aa0011/config_map");
+    let mut d = DecodedConfigMapReply::default();
+    d.decode_into(data).unwrap();
+    assert_eq!((d.node_id, d.partition_id, d.success), (PEER_ID, 3, true));
 }
