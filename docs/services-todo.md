@@ -120,6 +120,8 @@ From reading the source; not yet run.
 
 ### E4 — metrics
 
+**Taken:** claude/services-e4-metrics
+
 - **C:** `metrics_service.c`.
 - **Rust:** registered at construction when enabled (contract 4);
   components through `Services::metrics`; `uptime_ms` from the time the node
