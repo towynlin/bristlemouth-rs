@@ -136,6 +136,9 @@
 //! it inside the subscriber callback. One reply per received publication;
 //! see [`Node::on_frame_with`] and divergence #89.
 //!
+//! The metrics service is listed at construction, before any other, unless
+//! [`Services::METRICS`] is false.
+//!
 //! A publication this node makes is not dispatched to its own services, so
 //! a request to one of them goes unanswered and times out, where a C node
 //! answers it from its middleware task.
@@ -195,6 +198,7 @@ use bm_wire::l2_policy;
 use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
 use bm_wire::pubsub::{self, Subscriber, SubscriptionError, Subscriptions};
 use bm_wire::service::config_map::{self, ConfigMapRequest};
+use bm_wire::service::metrics;
 use bm_wire::service::power_info::{self, Ended, PowerInfoReply};
 use bm_wire::service::sys_info::{self, SysInfoReply};
 use bm_wire::service::{
@@ -719,8 +723,9 @@ pub const INFO_REQUESTS_DEFAULT: usize = 8;
 /// bm_core's `PUB_LIST` and `SUB_LIST` are `bm_malloc`'d and have no ceiling.
 /// A node advertising more topics than this raises the parameter;
 /// [`Node::add_resource`] reports [`ResourceAddError::Full`] rather than
-/// truncating a name, because a truncated name is a different name.
-pub const RESOURCES_DEFAULT: usize = 8;
+/// truncating a name, because a truncated name is a different name. One is
+/// the metrics service's subscription ([`Services::METRICS`]).
+pub const RESOURCES_DEFAULT: usize = 9;
 
 /// Default number of unanswered resource-table requests a node remembers,
 /// [`Node`]'s `RESOURCE_REQUESTS`.
@@ -733,8 +738,9 @@ pub const RESOURCE_REQUESTS_DEFAULT: usize = 4;
 /// `SUBSCRIPTIONS`.
 ///
 /// bm_core's `CTX.subscription_list` is `bm_malloc`'d and unbounded.
-/// [`Node::subscribe`] reports [`SubscriptionError::Full`] past it.
-pub const SUBSCRIPTIONS_DEFAULT: usize = 8;
+/// [`Node::subscribe`] reports [`SubscriptionError::Full`] past it. One is
+/// the metrics service's ([`Services::METRICS`]).
+pub const SUBSCRIPTIONS_DEFAULT: usize = 9;
 
 /// Default size of a node's expected-ping-payload buffer, [`Node`]'s
 /// `PING_PAYLOAD`.
@@ -1164,8 +1170,15 @@ impl<
     /// modules, with the expiry sweep phased from zero — where
     /// [`Node::on_tick`]'s uptime clock starts. The DFU machine comes up in
     /// `Init` with the reboot info [`NoInitRam::load`] returns, and moves on
-    /// from it at the first [`Node::next_dfu_transmission`]. No service is
-    /// listed, and the service request sweep is phased from zero too.
+    /// from it at the first [`Node::next_dfu_transmission`]. The service
+    /// request sweep is phased from zero too.
+    ///
+    /// If [`Services::METRICS`], the metrics service, `<node id>/metrics`, is
+    /// listed and `<node id>/metrics/req` subscribed, as `bristlemouth_init`
+    /// calls `metrics_service_init` before an application registers
+    /// anything (contract 4 of `docs/services-todo.md`). A request is
+    /// answered with [`Services::metrics`]; see
+    /// [`bm_wire::service::metrics::handle`]. Otherwise no service is listed.
     pub fn with_services(
         identity: I,
         rtc: R,
@@ -1221,7 +1234,7 @@ impl<
             let _ = registry.add(message_type, cfg);
         }
         let dfu = NodeDfu::new(identity.node_id(), dfu);
-        Self {
+        let mut node = Self {
             identity,
             rtc,
             neighbors: NeighborTable::new(),
@@ -1244,7 +1257,13 @@ impl<
             link_mask: 0,
             udp_ports: [None; UDP_PORTS],
             tx: [0u8; MTU],
+        };
+        if S::METRICS {
+            // Fails only for ceilings of zero, as `metrics_service_init`'s
+            // failure is a `bm_malloc` failure; the node runs without it.
+            let _ = node.register_metrics_service();
         }
+        node
     }
 
     /// Register a message type, as each module's init does with `packet_add`.
@@ -1453,7 +1472,8 @@ impl<
                 if datagram.src_port == pubsub::PORT
                     && let Ok(publication) = pubsub::decode(datagram.payload)
                 {
-                    let reply = self.deliver_publication(datagram.source, &publication, events);
+                    let reply =
+                        self.deliver_publication(now_ms, datagram.source, &publication, events);
                     return (reply, None);
                 }
             } else if self.udp_bound(datagram.dst_port) {
@@ -2895,6 +2915,7 @@ impl<
     /// call removes the request the reply answers, and the rest find none.
     fn deliver_publication(
         &mut self,
+        now_ms: u32,
         source: u64,
         publication: &pubsub::Publication<'_>,
         events: &mut impl FnMut(Event<'_>),
@@ -2922,6 +2943,7 @@ impl<
                             &self.identity,
                             &self.config,
                             &mut self.tx,
+                            now_ms,
                             node_id,
                             source,
                             publication,
@@ -2977,6 +2999,7 @@ impl<
         identity: &I,
         config: &C,
         tx: &mut [u8; MTU],
+        now_ms: u32,
         node_id: u64,
         source: u64,
         publication: &pubsub::Publication<'_>,
@@ -3021,6 +3044,10 @@ impl<
                 ServiceHandler::PowerInfo => {
                     power_info::handle(data, || services.power_info(), reply)
                 }
+                // `bm_ticks_to_ms(bm_get_tick_count())`: the C's uptime is
+                // its tick count, which is what `now_ms` counts from.
+                ServiceHandler::Metrics => services
+                    .metrics(|components| metrics::handle(node_id, now_ms, components, reply)),
                 ServiceHandler::Application => services.handle(name, data, reply),
             }
             .filter(|len| *len <= reply.len())
@@ -3310,6 +3337,53 @@ impl<
         events: impl FnMut(Event<'_>),
     ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
         self.request_with(now_ms, power_info::SERVICE, &[], timeout_s, true, events)
+    }
+
+    /// List the metrics service, `<node id>/metrics` — `metrics_service_init`,
+    /// which [`Node::with_services`] calls if [`Services::METRICS`].
+    fn register_metrics_service(&mut self) -> Result<(), RegisterError> {
+        let mut name = [0u8; SERVICE_NAME_BYTES];
+        // Cannot fail: 24 bytes.
+        let len = service_wire::service_name(&mut name, self.identity.node_id(), metrics::SUFFIX)
+            .map_err(|_| RegisterError::Full)?;
+        self.list_service(&name[..len], ServiceHandler::Metrics)
+    }
+
+    /// [`Node::metrics_request_with`], discarding local deliveries.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::service_request_with`].
+    pub fn metrics_request(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        timeout_s: u32,
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        self.metrics_request_with(now_ms, target_node_id, timeout_s, |_| {})
+    }
+
+    /// Ask `target_node_id` for its metrics — `metrics_service_request`:
+    /// [`Node::service_request_with`] to `<target>/metrics` with no data.
+    ///
+    /// The answer is [`Event::ServiceReply`] with that service;
+    /// [`bm_wire::service::metrics::decode`] reads its data.
+    ///
+    /// # Errors
+    ///
+    /// As [`Node::service_request_with`].
+    pub fn metrics_request_with(
+        &mut self,
+        now_ms: u32,
+        target_node_id: u64,
+        timeout_s: u32,
+        events: impl FnMut(Event<'_>),
+    ) -> Result<(u32, Outbound<'_>), ServiceRequestError> {
+        let mut name = [0u8; SERVICE_NAME_BYTES];
+        // Cannot fail: 24 bytes.
+        let len = service_wire::service_name(&mut name, target_node_id, metrics::SUFFIX)
+            .map_err(|_| ServiceRequestError::Full)?;
+        self.service_request_with(now_ms, &name[..len], &[], timeout_s, events)
     }
 
     fn list_service(&mut self, name: &[u8], handler: ServiceHandler) -> Result<(), RegisterError> {

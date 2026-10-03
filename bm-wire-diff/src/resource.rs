@@ -770,7 +770,16 @@ fn resource_node(model: &Model) -> ResourceNode {
         (ResourceType::Publisher, &model.publishers),
         (ResourceType::Subscriber, &model.subscribers),
     ] {
-        for name in names {
+        // The metrics service's subscription, which both nodes hold from
+        // construction.
+        let held = usize::from(node.resources().count(kind));
+        assert!(
+            node.resources()
+                .iter(kind)
+                .eq(names[..held].iter().map(Vec::as_slice)),
+            "the node's own resources lead the model's"
+        );
+        for name in &names[held..] {
             node.add_resource(name, kind)
                 .expect("the model only holds what the pool can produce");
         }

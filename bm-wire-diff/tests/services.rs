@@ -5,15 +5,18 @@
 
 use bm_wire::configuration::Partition;
 use bm_wire::service::config_map::{self, ConfigMapReply, ConfigMapRequest};
+use bm_wire::service::metrics;
 use bm_wire::service::power_info::PowerInfoReply;
 use bm_wire::service::sys_info::SysInfoReply;
 use bm_wire_diff::config::Seed;
+use bm_wire_diff::metrics_codec::FieldIn;
 use bm_wire_diff::replay::{STACK_TARGETS, replay_target};
 use bm_wire_diff::services::PEERS;
 use bm_wire_diff::services::{
-    APP_TOPICS, ASKED, Ask, CONFIG_MAP, ECHO, NAMES, PEER_CONFIG_MAP, PEER_SYS_INFO, POWER_INFO,
-    PartitionId, Reply, ReplyId, ReplyTopic, Request, RequestTopic, SYS_INFO, ServicesInput, Size,
-    Step, Summary, Target, Timeout, budget, check,
+    APP_TOPICS, ASKED, Ask, CONFIG_MAP, ECHO, FIELD_KEYS, MAX_FIELDS, METRICS, NAMES,
+    PEER_CONFIG_MAP, PEER_METRICS, PEER_SYS_INFO, POWER_INFO, PartitionId, Reply, ReplyId,
+    ReplyTopic, Request, RequestTopic, SYS_INFO, ServicesInput, Size, Step, Summary, Target,
+    Timeout, budget, check,
 };
 
 fn index(name: &[u8]) -> u8 {
@@ -72,6 +75,14 @@ fn the_node_id_is_the_pools() {
     assert_eq!(
         PEER_CONFIG_MAP,
         format!("{:016x}/config_map", bm_wire_diff::services::PEERS[0]).as_bytes()
+    );
+    assert_eq!(
+        METRICS,
+        format!("{:016x}/metrics", bm_wire_diff::stack::NODE_ID).as_bytes()
+    );
+    assert_eq!(
+        PEER_METRICS,
+        format!("{:016x}/metrics", bm_wire_diff::services::PEERS[0]).as_bytes()
     );
 }
 
@@ -337,7 +348,7 @@ fn every_asked_name_is_answered_and_times_out() {
     assert_eq!(summary.skipped, 0, "{summary:?}");
     assert_eq!(
         (summary.asked, summary.answered, summary.timeouts),
-        (10, 5, 5),
+        (12, 6, 6),
         "{summary:?}"
     );
 }
@@ -875,4 +886,160 @@ fn asking_power_info_while_serving_it_is_skipped() {
         Step::AskPowerInfo(Timeout::Seconds(1)),
     ]);
     assert_eq!((summary.skipped, summary.asked), (1, 1), "{summary:?}");
+}
+
+/// A peer's request to the metrics service.
+fn request_metrics(data: &[u8]) -> Step {
+    with(request(ECHO, data), |r| r.topic = RequestTopic::Metrics)
+}
+
+/// The 63-byte key: a field of it and a `U64` is 73 bytes, so twelve fit
+/// one component in the reply buffer and thirteen do not.
+fn long_key() -> u8 {
+    FIELD_KEYS
+        .iter()
+        .position(|k| k.len() == 63)
+        .expect("in the pool") as u8
+}
+
+#[test]
+fn metrics_answers_with_the_components_set() {
+    let summary = run(vec![
+        request_metrics(b""),
+        Step::Metrics([
+            Some(vec![
+                (0, FieldIn::U32(4096)),
+                (1, FieldIn::Float(0x3fc0_0000)),
+            ]),
+            None,
+            Some(vec![]),
+        ]),
+        request_metrics(b""),
+        Step::Wait(1234),
+        with(request_metrics(b""), |r| r.peer = true),
+        Step::Metrics([
+            None,
+            Some(vec![
+                (2, FieldIn::U8(1)),
+                (3, FieldIn::U16(2)),
+                (long_key(), FieldIn::Double(u64::MAX)),
+                (0, FieldIn::U64(u64::MAX)),
+            ]),
+            None,
+        ]),
+        request_metrics(b""),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (summary.metrics_replies, summary.metrics_with_components),
+        (4, 3),
+        "{summary:?}"
+    );
+}
+
+/// Divergence #97: a request carrying data is answered, where sys_info and
+/// power_info send nothing.
+#[test]
+fn metrics_answers_a_request_carrying_data() {
+    let summary = run(vec![
+        request_metrics(b"x"),
+        request_metrics(&[0xa5; 1000]),
+        with(request_metrics(b"ab"), |r| r.size = Size::Off(-1)),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (summary.metrics_replies, summary.metrics_replies_with_data),
+        (2, 2),
+        "{summary:?}"
+    );
+}
+
+/// Contract 8: a reply over the handler's 1008 bytes is no reply; and #85:
+/// a string field is no reply. Both sides read the components either way.
+#[test]
+fn metrics_past_its_buffer_or_with_a_string_is_no_reply() {
+    let long = |n: usize| Some(vec![(long_key(), FieldIn::U64(u64::MAX)); n]);
+    let summary = run(vec![
+        Step::Metrics([long(12), None, None]),
+        request_metrics(b""),
+        Step::Metrics([long(13), None, None]),
+        request_metrics(b""),
+        Step::Metrics([long(MAX_FIELDS), long(MAX_FIELDS), long(MAX_FIELDS)]),
+        request_metrics(b""),
+        Step::Metrics([
+            Some(vec![(0, FieldIn::String), (1, FieldIn::U8(1))]),
+            None,
+            None,
+        ]),
+        request_metrics(b""),
+        Step::Metrics([
+            None,
+            None,
+            Some(vec![(1, FieldIn::U8(1)), (0, FieldIn::String)]),
+        ]),
+        request_metrics(b""),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (summary.metrics_replies, summary.metrics_refused),
+        (1, 4),
+        "{summary:?}"
+    );
+}
+
+/// Each input starts with no component reporting.
+#[test]
+fn the_components_are_emptied_between_inputs() {
+    run(vec![Step::Metrics([
+        Some(vec![(0, FieldIn::U8(9))]),
+        None,
+        None,
+    ])]);
+    let summary = run(vec![request_metrics(b"")]);
+    assert_eq!(
+        (summary.metrics_replies, summary.metrics_with_components),
+        (1, 0),
+        "{summary:?}"
+    );
+}
+
+/// `metrics_service_request` against `Node::metrics_request_with`: one
+/// request answered with a metrics body, one timed out.
+#[test]
+fn metrics_request_answered_and_timed_out() {
+    let mut body = [0u8; 128];
+    let fields = [metrics::Entry {
+        key: "free_bytes",
+        field: metrics::Field::U32(1),
+    }];
+    let len = metrics::encode(
+        &metrics::Reply {
+            version: metrics::VERSION,
+            node_id: bm_wire_diff::services::PEERS[0],
+            uptime_ms: 99,
+        },
+        &[metrics::Component {
+            key: "memory",
+            fields: &fields,
+        }],
+        &mut body,
+    )
+    .expect("fits");
+    let summary = run(vec![
+        Step::AskMetrics(Timeout::Seconds(1)),
+        Step::Reply(reply(PEER_METRICS, &body[..len])),
+        Step::AskMetrics(Timeout::Seconds(1)),
+        Step::Wait(1500),
+    ]);
+    assert_eq!(summary.skipped, 0, "{summary:?}");
+    assert_eq!(
+        (
+            summary.asked,
+            summary.metrics_answered,
+            summary.answered,
+            summary.timeouts
+        ),
+        (2, 1, 1, 1),
+        "{summary:?}"
+    );
 }

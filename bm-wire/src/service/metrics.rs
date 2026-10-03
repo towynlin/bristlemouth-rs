@@ -28,6 +28,31 @@ pub const VERSION: u8 = 1;
 /// `METRICS_REPLY_NUM_FIELDS`: the top-level map's pairs.
 pub const NUM_FIELDS: usize = 4;
 
+/// `metrics_service_suffix`: the service is `<node id>/metrics`.
+pub const SUFFIX: &[u8] = b"/metrics";
+
+/// `metrics_service_handler`: encode a [`VERSION`] reply of `node_id`,
+/// `uptime_ms` and `components` into `out` and return its length, or `None`
+/// for no reply.
+///
+/// The request's data is not read: a request carrying any is answered, where
+/// sys_info and power_info send nothing (divergence #97). A reply that does
+/// not fit `out`, or that [`encode`] refuses, is no reply.
+#[must_use]
+pub fn handle(
+    node_id: u64,
+    uptime_ms: u32,
+    components: &[Component<'_>],
+    out: &mut [u8],
+) -> Option<usize> {
+    let reply = Reply {
+        version: VERSION,
+        node_id,
+        uptime_ms,
+    };
+    encode(&reply, components, out).ok()
+}
+
 /// `BmField`, with the value: the source to encode from, or the destination
 /// a decode writes to.
 #[derive(Debug, Clone, Copy, PartialEq)]

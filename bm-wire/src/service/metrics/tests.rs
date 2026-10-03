@@ -149,3 +149,35 @@ fn a_tagged_field_value_runs_past_the_component() {
     let mut it = Value::parse(&map).unwrap().enter_container().unwrap();
     assert_eq!(decode_fields(&mut it, &mut []), Err(CborError::Unreachable));
 }
+
+#[test]
+fn the_handler_sends_nothing_past_its_buffer() {
+    let mut out = [0u8; crate::service::REPLY_DATA_LEN];
+    let fields = [Entry {
+        key: "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijk",
+        field: Field::U64(u64::MAX),
+    }; 32];
+    let fits = |n: usize, out: &mut [u8]| {
+        let comp = [Component {
+            key: "c",
+            fields: &fields[..n],
+        }];
+        handle(0x0123_4567_89ab_cdef, u32::MAX, &comp, out)
+    };
+    let last = (0..=fields.len())
+        .take_while(|n| fits(*n, &mut out).is_some())
+        .last()
+        .unwrap();
+    assert!(last < fields.len(), "32 fields overflow 1008 bytes");
+    let len = fits(last, &mut out).unwrap();
+    assert!(len <= out.len() && len + 73 > out.len(), "{len}");
+    assert_eq!(fits(last + 1, &mut out), None);
+
+    let len = handle(2, 3, &[], &mut out).unwrap();
+    assert_eq!(
+        out[..len][..10],
+        [
+            0xa4, 0x67, b'v', b'e', b'r', b's', b'i', b'o', b'n', VERSION
+        ]
+    );
+}

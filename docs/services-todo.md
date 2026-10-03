@@ -109,23 +109,9 @@ two plans are.
 
 ## Suspected C defects to confirm
 
-From reading the source; not yet run.
-
-| Where | Suspicion | Card |
-|---|---|---|
-| `metrics_service_handler` | Accepts a non-empty request, which sys_info and power_info refuse; `uptime_ms` wraps after ~49.7 days. | E4 |
+None open.
 
 ## Cards
-
-
-### E4 — metrics
-
-- **C:** `metrics_service.c`.
-- **Rust:** registered at construction when enabled (contract 4);
-  components through `Services::metrics`; `uptime_ms` from the time the node
-  is given.
-- **Comparator:** extends `services`.
-- **Blocked by:** nothing. **Blocks:** E5.
 
 ### E5 — On a bus
 
@@ -135,7 +121,7 @@ From reading the source; not yet run.
 - **Capture:** a C dev kit answering a Bridge's samplers, as
   `bm-wire-diff/testdata/services-*.pcap`, asserted by
   `tests/capture_services.rs` (pattern: `capture_h0.rs`).
-- **Blocked by:** E4.
+- **Blocked by:** nothing.
 - **Done:** on a bench, a Bridge's topology and metrics samplers list the
   Rust node with its correct `sys_config_crc`.
 
@@ -143,12 +129,11 @@ From reading the source; not yet run.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | E4 | nothing |
-| 2 | E5 | E4 |
+| 1 | E5 | nothing |
 
 Cards within a wave can run in parallel.
 
-## What the landed cards left for the rest (M1, M2, C1, S1, S2, E1, E2, E3)
+## What the landed cards left for the rest (M1, M2, C1, S1, S2, E1, E2, E3, E4)
 
 - **The service list is `bm_wire::service::ServiceTable<H, N, NAME>`**, the
   C's walk included (#89): `lookup` returns the first service whose name
@@ -158,14 +143,14 @@ Cards within a wave can run in parallel.
 - **Built-ins are `ServiceHandler` variants; the application's are
   `Services::handle`.** Echo is `ServiceHandler::Echo`, sys_info
   `ServiceHandler::SysInfo`, config_map `ServiceHandler::ConfigMap`,
-  power_info `ServiceHandler::PowerInfo`, all answered in `Node::serve`,
-  which takes `&I` and `&C`. E4 adds a variant and its arm there; its
-  uptime is not passed yet. A built-in's handler body is a sans-io function
+  power_info `ServiceHandler::PowerInfo`, metrics `ServiceHandler::Metrics`,
+  all answered in `Node::serve`, which takes `&I`, `&C` and the time
+  `on_frame` was given. A built-in's handler body is a sans-io function
   beside its codec (`bm_wire::service::sys_info::handle`,
-  `config_map::handle`, `power_info::handle`), and its registration a
-  `Node::register_<name>_service` building `<id><SUFFIX>`. `Services` has
-  `handle` and `power_info` (the stats callback, default `None`, which
-  sends no reply); E4 adds `metrics` with a default (contract 3).
+  `config_map::handle`, `power_info::handle`, `metrics::handle`), and its
+  registration a `Node::register_<name>_service` building `<id><SUFFIX>`.
+  `Services` has `handle`, `power_info` (the stats callback, default
+  `None`, which sends no reply), `METRICS` and `metrics`.
 - **`Identity::git_sha` and `Identity::app_name`** (contract 7). `git_sha`
   defaults to `device_info().git_sha` and is what the device-info reply
   and DFU now read. `app_name` defaults to empty. `bm-devkit`'s
@@ -174,11 +159,20 @@ Cards within a wave can run in parallel.
 - **`sys_config_crc` with `NoConfig`** is the empty map's CRC
   (`crc32_ieee(&[0xa0])`), what a C node with an empty system partition
   sends, rather than 0, which the C sends only when the map fails.
-- **Metrics is not registered at construction yet.** E4 registers it in
-  `Node::with_services`, first, as `bristlemouth_init` does. Until then
-  `bm-wire-diff/src/services.rs` lists a stand-in named
-  `<id>/metrics` first, so the walks agree, and never sends it a request
-  it would answer.
+- **Metrics is listed at construction.** `Node::with_services` lists
+  `<id>/metrics` before anything else when `Services::METRICS` (default
+  true, as bm_protocol's `bm_metrics_enabled`), so `hello_world` gets it
+  without a call, ahead of `app_main.cpp`'s echo, sys_info and config_map.
+  There is no public `register_metrics_service`: a second listing would be
+  a second entry (#89). `Services::metrics(encode)` calls `encode` once with
+  the components, a key and `&[Entry]` each; the default has none, which a
+  C node with no component added sends. bm_protocol's dev kits also add
+  `memory_metrics.c`'s `memory` component, which reads FreeRTOS heap
+  statistics and has no counterpart here. Decided as a generic method
+  taking a closure because a component borrows its entries, which an
+  implementation cannot return from `&mut self`. A reply over 1008 bytes or
+  with a `Field::String` is no reply (#85, #97). `RESOURCES_DEFAULT` and
+  `SUBSCRIPTIONS_DEFAULT` are 9, one for the metrics subscription.
 - **A topic's subscribers are a list.** `bm_wire::pubsub::Subscriptions`
   keeps `Subscriber::Application`, `Subscriber::Service` and
   `Subscriber::Reply` (`_service_request_cb` on `<svc>/rep`) callbacks per
@@ -196,19 +190,6 @@ Cards within a wave can run in parallel.
   and no queue for it; no caller needs it. Local deliveries reach
   application and reply callbacks only (`Node::deliver_locally`). The
   comparator skips such a request.
-- **The C's service list cannot be reset.** Registering adds one entry and
-  at most one callback; unregistering removes one callback and at most one
-  entry, so an entry left without its callback (#79's re-registration, #89's
-  prefix removal) stays for the life of the process. The comparator's
-  `reset` unregisters what it can at the start of each input, and
-  `LEAK_BUDGET` lets four steps per process leave an entry, only for `x`, a
-  name sharing a prefix with no other: a stuck entry stops every request it
-  prefixes and is removed by unregistering any name that prefixes it, which
-  then strands that name too. S2 extends the same mirror to requests.
-- **Every resource is advertised once at start-up, longest first** (#38):
-  `advertise_everything` subscribes and unsubscribes each request,
-  application and asked reply topic, and publishes nothing to each reply and
-  asked request topic. A card adding a topic adds it there.
 - **`bm_stack::mock::frames::service_request`** and `service_reply` build a
   peer's request and reply frames.
 - **Requests: `Node::service_request(now_ms, service, data, timeout_s)`**
@@ -219,10 +200,12 @@ Cards within a wave can run in parallel.
   target, timeout_s)` builds `<target>/sys_info` and calls
   `service_request_with` with no data;
   `Node::config_map_request(_with)(now_ms, target, partition_id,
-  timeout_s)` does the same with a `ConfigMapRequest`. E4's requester
-  follows. The application tells replies apart by `service` or
+  timeout_s)` does the same with a `ConfigMapRequest`, and
+  `Node::metrics_request(_with)(now_ms, target, timeout_s)` with no data.
+  The application tells replies apart by `service` or
   by the id it kept, and decodes the data itself
-  (`DecodedSysInfoReply::decode_into`, `DecodedConfigMapReply::decode_into`).
+  (`DecodedSysInfoReply::decode_into`, `DecodedConfigMapReply::decode_into`,
+  `metrics::decode`).
   `service` is the request's, not the reply's topic (#92). `data` is
   `data_size` bytes or what arrived if fewer (#92), so a decoder sees a
   short body where the C reads past the publication.
@@ -245,59 +228,6 @@ Cards within a wave can run in parallel.
   its own arm in `Node::run_app` and phased from construction. `on_tick`
   runs it too. An `App` ticker on a multiple of 500 ms now loses its tie to
   that arm, as one on the 150 ms grid already did.
-- **The oracle's sweep needs `stack::start_timer_callback_handler`.**
-  `bm_service_request.c` hands expiries to `timer_callback_handler.c`'s task,
-  which `bm_shim_stack_init` does not start, because `dfu_host.c`'s
-  heartbeats go through it too and `dfu_core`'s comparator does not expect
-  them. The `services` comparator starts it at bring-up.
-- **Time in the `services` comparator** moves only in `Step::Wait`, one sweep
-  at a time, and at each input's start, which waits out every request (the
-  C's list has no reset). `Timeout` keeps every timeout within seconds.
-  `Step::Ask` asks an `ASKED` service; `Step::Reply` injects a peer's reply.
-  E4 adds its request as a `Step` variant, as `Step::AskSysInfo`,
-  `Step::AskConfigMap` and `Step::AskPowerInfo` do; `Answer` carries reply bytes, which
-  `service_codecs` already compares decoded, so it was not extended. A
-  service whose request carries CBOR needs a step that sends a well-formed
-  one, as `Step::RequestConfigMap` does: in 14 minutes of fuzzing,
-  `Step::Request`'s arbitrary data reached no config_map reply;
-  `Step::ReplyPowerInfo` is the same for a power_info reply.
-  `Step::PowerStats` sets the stats both sides' callbacks return.
-  `Summary::sys_info_replies`, `config_map_replies` and
-  `config_map_successes` count the node's replies; `sys_info_decoded` and
-  `config_map_decoded` the answers to `PEER_SYS_INFO` and `PEER_CONFIG_MAP`
-  that decode.
-- **The comparator reads `bm_get_subs` under an allocation floor** (#78):
-  `bm_shim_alloc_floor` makes `bm_malloc` return at least n zeroed bytes,
-  and `pubsub::oracle_subscriptions` sets 4096, so the pools no longer
-  budget bytes. E3 found the 256-byte budget could not hold
-  `bus_power_controller/timing`'s two topics. A card adding topics raises
-  `services::SUBSCRIPTIONS` (28) and `RESOURCES` (48), the Rust node's
-  ceilings.
-- **The comparator's node keeps a `Config<RamConfigStorage>`**, replaced at
-  each input by `config::reset(&[])`, which also empties the oracle's
-  `CONFIGS`. `Step::Configure(Seed)` writes one key to both, in any
-  partition. Before each sys_info reply the comparator asserts
-  `services_cbor_encoded_as_crc32` against `cbor_map_crc32`, and before
-  each config_map reply `services_cbor_as_map` against `cbor_map`; it skips
-  a request whose partition's map is `MapError::Unreachable`, or whose
-  `partition_id` is tagged.
-
-- **`bm_wire::cbor::parser` is tinycbor's parser.** `Value` is `CborValue`
-  and each method the C function it names, including error codes, tags not
-  counting as items, and `cbor_value_validate_basic` reading only the
-  top-level item. M2 added `string_length`, `map_find_value`, `skip_tag`,
-  `is_double` and the codes `ImproperValue`, `TooFewItems` and
-  `UnsupportedType`; floats are read as `extract()`'s bits. Where tinycbor
-  would fail a `cbor_assert`, a method returns `CborError::Unreachable`, and
-  a comparator does not call the C on that input.
-- **The metrics body: `bm_wire::service::metrics`** (E4). `encode(&Reply,
-  &[Component], buf)`; a component is a key and `&[Entry]`, an entry a key
-  and a `Field`. Contract 8's "over 1008 bytes is no reply" is
-  `Err(CborError::OutOfMemory)` from `encode` into the handler's 1008-byte
-  buffer. `Field::String` fails the encode (divergence #85), so
-  `Services::metrics` should not offer it. `metrics_reply_msg.c` and
-  `bm_messages_helper.c` are not in `T2_RELEASE`: the oracle's metrics codec
-  keeps its asserts, which #87 reaches.
 - **The oracle's codecs are a release build.** `bm-wire-sys/build.rs`
   `T2_RELEASE` compiles `sys_info_svc_reply_msg.c`,
   `config_cbor_map_srv_{request,reply}_msg.c` and `power_info_reply_msg.c`
@@ -314,21 +244,9 @@ Cards within a wave can run in parallel.
   is no reply (#94).
 - **Decoded strings are `CborString`s**, borrowed from the body, chunked or
   not; `copy_to` and `eq_bytes` read them. No allocation.
-- **Allocation is a seam.** `sys_info_reply_decode` and
-  `config_cbor_map_reply_decode` `bm_malloc` a size the sender chooses
-  (#83, #84). The port assumes the allocation succeeds.
-  `bm_shim_heap_watch_begin(limit)` refuses zero bytes or more than `limit`
-  on the calling thread and counts what it granted, so a comparator can skip
-  heap-dependent inputs and free what the C leaks.
 - **A partition as a map: `ConfigPartition::cbor_map(&mut [u8])`** returns
   the map's length, or a `MapError`: `NoMap` where the C returns `NULL`,
   `TooSmall(n)` where the buffer is short (the C allocates), `Unreachable`
   where the C is undefined. `cbor_map_crc32` is 0 for any error; it is
   `sys_config_crc`. A node with `NoConfig` maps every partition as the
   empty map, `a0`.
-- **The map is read as a release build reads it** (#88): each value by its
-  key's stored type, through `parser::Value`'s unchecked accessors. The same
-  decision as #82, for the same reason; `bm-wire-sys/build.rs` compiles
-  `cbor_service_helper.c` with `NDEBUG`. A debug-built C node aborts on a
-  `sys_info` or `config_map` request where a refused typed set (#46) left a
-  key's type over a string head.

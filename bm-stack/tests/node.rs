@@ -2630,7 +2630,11 @@ fn a_reply_shorter_than_its_declared_counts_is_dropped() {
 const PUB: ResourceType = ResourceType::Publisher;
 const SUB: ResourceType = ResourceType::Subscriber;
 
-/// A node advertising two topics it publishes and one it subscribes to.
+/// `<node id>/metrics/req`, which every node here subscribes at construction.
+const METRICS_REQ: &[u8] = b"c0ffee0012345678/metrics/req";
+
+/// A node advertising two topics it publishes and two it subscribes to: the
+/// metrics service's request topic and `button`.
 fn node_with_resources() -> Node<TestIdentity, SoftRtc, 4> {
     let mut node = node();
     node.add_resource(b"spotter/utc-time", PUB).unwrap();
@@ -2689,21 +2693,56 @@ fn a_directed_request_is_answered_with_both_lists() {
     let table = ResourceTableReply::decode(received.payload).unwrap();
     assert_eq!(table.node_id, NODE_ID);
     assert_eq!(table.publisher_count(), 2);
-    assert_eq!(table.subscriber_count(), 1);
+    assert_eq!(table.subscriber_count(), 2);
     assert!(
         table
             .publishers()
             .map(|r| r.name)
             .eq([&b"spotter/utc-time"[..], b"sensor/temp"])
     );
-    assert!(table.subscribers().map(|r| r.name).eq([&b"button"[..]]));
+    assert!(
+        table
+            .subscribers()
+            .map(|r| r.name)
+            .eq([METRICS_REQ, b"button"])
+    );
     assert_eq!(received.payload.len(), node.resources().reply_len());
+}
+
+/// Services with the metrics service off: `bm_metrics_enabled` 0.
+struct NoMetrics;
+
+impl bm_stack::Services for NoMetrics {
+    const METRICS: bool = false;
 }
 
 /// A node with nothing to advertise still answers, with the head alone.
 #[test]
 fn an_empty_table_is_still_answered() {
-    let mut node = node();
+    let mut node: Node<
+        TestIdentity,
+        SoftRtc,
+        4,
+        4,
+        { bm_stack::node::PING_PAYLOAD_BYTES },
+        { bm_stack::node::INFO_REQUESTS_DEFAULT },
+        { bm_wire::bcmp::info::CACHED_STRING_BYTES },
+        { bm_stack::node::RESOURCES_DEFAULT },
+        { bm_wire::bcmp::resource::RESOURCE_NAME_BYTES },
+        { bm_stack::node::RESOURCE_REQUESTS_DEFAULT },
+        { bm_stack::node::SUBSCRIPTIONS_DEFAULT },
+        bm_stack::NoConfig,
+        bm_stack::NoDfu,
+        NoMetrics,
+    > = Node::with_services(
+        TestIdentity,
+        SoftRtc::new(),
+        bm_stack::NoConfig,
+        bm_stack::NoDfu,
+        NoMetrics,
+        PORTS,
+    );
+    assert_eq!(node.service_table().len(), 0, "no metrics service");
     let mut frame = resource_request_frame(NODE_ID);
     let mut reply = node
         .on_frame(1000, 1, &mut frame)
@@ -2891,7 +2930,7 @@ fn adding_a_prefix_of_a_stored_resource_is_refused() {
     );
     assert_eq!(node.resources().count(PUB), 2);
     node.add_resource(b"sensor", SUB).unwrap();
-    assert_eq!(node.resources().count(SUB), 2);
+    assert_eq!(node.resources().count(SUB), 3);
 }
 
 /// An unregistered type is neither sent nor answered, the C's `BmENODEV`.
@@ -2966,7 +3005,7 @@ fn the_run_loop_answers_a_resource_request() {
     let table = ResourceTableReply::decode(received.payload).unwrap();
     assert_eq!(table.node_id, NODE_ID);
     assert_eq!(table.publisher_count(), 2);
-    assert_eq!(table.subscriber_count(), 1);
+    assert_eq!(table.subscriber_count(), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -3391,17 +3430,17 @@ fn subscribing_advertises_and_unsubscribing_does_not_withdraw() {
     assert!(
         node.subscriptions()
             .iter()
-            .eq([&b"sensor/*"[..], b"spotter"])
+            .eq([METRICS_REQ, b"sensor/*", b"spotter"])
     );
-    assert!(
-        node.resources()
-            .iter(ResourceType::Subscriber)
-            .eq([&b"sensor/*"[..], b"spotter"])
-    );
+    assert!(node.resources().iter(ResourceType::Subscriber).eq([
+        METRICS_REQ,
+        b"sensor/*",
+        b"spotter"
+    ]));
 
     node.unsubscribe(b"spotter").unwrap();
-    assert!(node.subscriptions().iter().eq([&b"sensor/*"[..]]));
-    assert_eq!(node.resources().count(ResourceType::Subscriber), 2);
+    assert!(node.subscriptions().iter().eq([METRICS_REQ, b"sensor/*"]));
+    assert_eq!(node.resources().count(ResourceType::Subscriber), 3);
 
     assert_eq!(
         node.unsubscribe(b"spotter"),
@@ -3425,14 +3464,15 @@ fn subscribing_advertises_and_unsubscribing_does_not_withdraw() {
 /// `bm_sub_wl` keeps the subscription when the resource add fails.
 #[test]
 fn a_full_resource_table_still_subscribes() {
-    let mut node: Node<TestIdentity, SoftRtc, 4, 4, 64, 8, 64, 1> =
+    // The metrics service's subscription takes one of the two.
+    let mut node: Node<TestIdentity, SoftRtc, 4, 4, 64, 8, 64, 2> =
         Node::new(TestIdentity, SoftRtc::new(), PORTS);
     node.subscribe(b"a").unwrap();
     assert_eq!(
         node.subscribe(b"b"),
         Err(bm_stack::SubscribeError::NotAdvertised)
     );
-    assert!(node.subscriptions().iter().eq([&b"a"[..], b"b"]));
+    assert!(node.subscriptions().iter().eq([METRICS_REQ, b"a", b"b"]));
 }
 
 #[test]

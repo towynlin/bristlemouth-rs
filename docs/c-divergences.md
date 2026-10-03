@@ -134,6 +134,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 94 | `config_map_service_handler` sends no reply for a map over its buffer, and the same failure reply for an unknown partition and a map that fails | replicated | reading, confirmed differentially (card E2) |
 | 95 | `config_map_service_handler`'s failure reply encodes `cbor_data` from a NULL pointer | benign | UBSan, via `cargo fuzz run services` (card E2) |
 | 96 | `power_info_reply_cb` calls the oldest queued callback, not the request's own | replicated | reading, confirmed differentially (card E3) |
+| 97 | `metrics_service_handler` answers a request carrying data, sends nothing for a reply over its buffer, and reports a 32-bit uptime | replicated | reading, confirmed differentially (card E4) |
 
 ---
 
@@ -3356,3 +3357,37 @@ and `power_info_expiry_and_a_bad_reply_use_up_the_oldest_callback`
 Fix upstream by keeping each request's callback with it (the request node's
 context, or a queue keyed by `msg_id`), and calling it with `ack` false on
 expiry. Not wire-visible.
+
+## 97. `metrics_service_handler` answers a request carrying data, sends nothing for a reply over its buffer, and reports a 32-bit uptime
+
+`middleware/metrics_service.c`, `metrics_service_handler`:
+
+| Input | The C |
+|---|---|
+| a request carrying data | `(void)req_data; (void)req_data_len;`: answered as an empty one. `sys_info_service_handler` and `power_info_request_cb` send nothing for it |
+| components whose body exceeds the handler's 1008 bytes | `metrics_reply_encode` returns `CborErrorOutOfMemory`; the handler logs and returns false: no reply |
+| a component with a `BM_FIELD_STRING` field | no reply (#85) |
+| a component whose `MetricComponentDataCb` fails, or hands back a NULL table | left out of `data`; the rest are sent |
+| `uptime_ms` | `bm_ticks_to_ms(bm_get_tick_count())`, a `uint32_t`: milliseconds since boot modulo 2^32, wrapping after 49.7 days at a 1 kHz tick |
+
+A field of a 63-byte key and a `uint64` value takes 73 bytes, so a node
+listing a dozen such fields goes silent; a Bridge's `metrics_sampler.cpp`
+sees a timeout, the same as for an absent node. The wire format carries
+`uptime_ms` as an unsigned integer of any width, so the wrap is the C's
+type, not the format's.
+
+**replicated.** `bm_wire::service::metrics::handle` takes no request;
+`bm_stack::Node` calls it with the time the node is given, a `u32` of
+milliseconds, which `Node::run` wraps as bm_core's tick counter does.
+`metrics_answers_a_request_carrying_data` and
+`metrics_past_its_buffer_or_with_a_string_is_no_reply`
+(`bm-wire-diff/tests/services.rs`) compare the first three rows against the
+oracle; `the_handler_sends_nothing_past_its_buffer`
+(`bm-wire/src/service/metrics/tests.rs`) shows the boundary.
+
+Fix upstream by refusing a request carrying data, as the other built-ins do,
+and by replying without the components that do not fit, or with an error
+field. Wire-visible: a reply where there was none. Widening `uptime_ms` to 64
+bits is wire-compatible with any decoder that reads it as `uint64`;
+`metrics_reply_decode` reads it with `decode_key_value_uint32`, which
+truncates.
