@@ -316,7 +316,7 @@ fn every_asked_name_is_answered_and_times_out() {
     assert_eq!(summary.skipped, 0, "{summary:?}");
     assert_eq!(
         (summary.asked, summary.answered, summary.timeouts),
-        (8, 4, 4),
+        (6, 3, 3),
         "{summary:?}"
     );
 }
@@ -489,4 +489,16 @@ fn too_large_a_request_is_refused_by_both() {
 fn the_request_table_keeps_a_slot_free() {
     let summary = run(vec![ask(PEER_ECHO, b"", Timeout::Seconds(3)); 9]);
     assert_eq!((summary.asked, summary.skipped), (7, 2), "{summary:?}");
+}
+
+/// Every topic a step can subscribe, at once, fits `bm_get_subs`'s buffer
+/// (divergence #78): the fuzzer's first S2 crash was the harness reading
+/// the oracle's list past it.
+#[test]
+fn every_subscription_at_once_fits_bm_get_subs() {
+    let mut steps: Vec<Step> = NAMES.iter().map(|n| Step::Register(index(n))).collect();
+    steps.extend(APP_TOPICS.iter().map(|t| Step::Subscribe(app(t))));
+    steps.extend(ASKED.iter().map(|n| ask(n, b"", Timeout::Seconds(0))));
+    steps.push(Step::Wait(500));
+    run(steps);
 }

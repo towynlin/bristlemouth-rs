@@ -132,15 +132,13 @@ pub const APP_TOPICS: [&[u8]; 5] = [
     b"0b54ccce5c7978bf/echo/rep",
 ];
 
-/// Services this node asks: each peer's echo, a pattern whose reply topic
-/// matches the first peer's other reply topics (divergence #74), and a
-/// [`NAMES`] entry the node may itself list.
-pub const ASKED: [&[u8]; 4] = [
-    b"0b54ccce5c7978bf/echo",
-    b"777777775c7978bf/echo",
-    b"0b54ccce5c7978bf/*",
-    b"svc",
-];
+/// Services this node asks: a peer's echo, a pattern whose reply topic
+/// matches the peer's other reply topics (divergence #74), and a [`NAMES`]
+/// entry the node may itself list.
+///
+/// Three, so every topic subscribed at once fits `bm_get_subs`'s 256 bytes
+/// (divergence #78); the list comparison checks it.
+pub const ASKED: [&[u8]; 3] = [b"0b54ccce5c7978bf/echo", b"0b54ccce5c7978bf/*", b"svc"];
 
 /// Steps per process that may leave a listed service no request can unlist.
 pub const LEAK_BUDGET: u32 = 4;
@@ -1338,6 +1336,15 @@ fn wait(state: &mut State, ms: u32, summary: &mut Summary) {
 }
 
 fn assert_lists(state: &State, after: &str) {
+    // `bm_get_subs` joins the topics with " | " into 256 bytes, unchecked
+    // (divergence #78). The two lists agreed after the previous step.
+    let subs = state.node.subscriptions();
+    let joined: usize =
+        subs.iter().map(<[u8]>::len).sum::<usize>() + 3 * subs.len().saturating_sub(1);
+    assert!(
+        joined < 256,
+        "{joined} bytes of subscriptions overflow bm_get_subs, after {after}"
+    );
     assert!(
         oracle_subscriptions()
             .iter()
