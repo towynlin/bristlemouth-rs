@@ -131,7 +131,8 @@ A cargo workspace.
   the ADIN2111, sets up the flash and starts the RTC, `node` builds a
   `Devkit` node with the chip's node id, the binary's name as `app_name`, the
   RTC and its config partitions in flash; `src/bin/bringup.rs`
-  runs one and logs the config keys it loaded; `src/bin/hello_world.rs` is
+  runs one and logs the config keys it loaded, each as a
+  `bm_wire::configuration::Entry`; `src/bin/hello_world.rs` is
   the hello-world app: subscribes to `spotter/*`, sends `hello world` with
   `spotter_log` every 10 s, sets the RTC from `spotter/utc-time`, and
   lists echo, sys_info and config_map after metrics, as a C dev kit does.
