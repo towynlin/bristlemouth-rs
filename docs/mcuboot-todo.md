@@ -178,6 +178,8 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ### M1 — Header, TLVs and trailer
 
+**Taken:** claude/mcuboot-m1-codecs
+
 - **Rust:** new crate `bm-mcuboot`: `no_std`, no `alloc`, no dependencies,
   `forbid(unsafe_code)`. Explicit little-endian codecs for `image_header`,
   `image_version` and the TLV area; the trailer offsets for a slot of a
