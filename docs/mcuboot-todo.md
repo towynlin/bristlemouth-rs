@@ -181,6 +181,8 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ### S1 — The slot
 
+**Taken:** claude/mcuboot-s1
+
 - **Rust, `bm-devkit`:** `src/slot.rs`: `bm_stack::DfuSlot` on slot 2 over
   `embassy_stm32::flash` (blocking), per contract 10.
 
