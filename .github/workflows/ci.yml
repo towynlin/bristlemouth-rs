@@ -48,10 +48,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          # bm-wire-sys compiles vendor/bm_core, which has submodules of its
-          # own -- tinycbor and mavlink are in the tier lists.
-          submodules: recursive
+      # Not `submodules: recursive`. bm-wire-sys compiles vendor/bm_core,
+      # whose own submodules (tinycbor, mavlink) are in the tier lists;
+      # bm-mcuboot-sys compiles vendor/mcuboot, whose own submodules (mbedtls,
+      # esp-idf, the Cypress libraries) it does not use.
+      - name: Submodules
+        run: |
+          git submodule update --init --recursive --depth 1 bm-wire-sys/vendor/bm_core
+          git submodule update --init --depth 1 bm-mcuboot-sys/vendor/mcuboot
       - name: libclang, for bindgen
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
       - run: rustup toolchain install stable --profile minimal --component clippy --no-self-update
@@ -78,8 +82,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: recursive
+      - name: Submodules
+        run: |
+          git submodule update --init --recursive --depth 1 bm-wire-sys/vendor/bm_core
+          git submodule update --init --depth 1 bm-mcuboot-sys/vendor/mcuboot
       - name: libclang, for bindgen
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
       - run: rustup toolchain install stable --profile minimal --no-self-update
@@ -111,7 +117,7 @@ jobs:
       - name: Docs
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features --locked -p bm-wire -p bm-stack -p bm-wire-diff
+        run: cargo doc --no-deps --all-features --locked -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys
 
   embedded:
     name: bare-metal builds
@@ -150,8 +156,10 @@ jobs:
     # its own MSRV check.
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: recursive
+      - name: Submodules
+        run: |
+          git submodule update --init --recursive --depth 1 bm-wire-sys/vendor/bm_core
+          git submodule update --init --depth 1 bm-mcuboot-sys/vendor/mcuboot
       - name: libclang, for bindgen
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
       - name: Install the toolchain rust-version names
@@ -197,15 +205,17 @@ jobs:
               exit 1
             fi
           done
-      # The host-only oracle must never be reachable from a crate that ships.
-      - name: The oracle stays out of the firmware crates
+      # The host-only oracles must never be reachable from a crate that ships.
+      - name: The oracles stay out of the firmware crates
         run: |
           status=0
           for pkg in bm-wire bm-stack; do
-            if cargo tree --locked -p "$pkg" --all-features | grep -q 'bm-wire-sys'; then
-              echo "::error::$pkg reaches bm-wire-sys; the oracle would end up in firmware"
-              status=1
-            fi
+            for oracle in bm-wire-sys bm-mcuboot-sys; do
+              if cargo tree --locked -p "$pkg" --all-features | grep -q "$oracle"; then
+                echo "::error::$pkg reaches $oracle; the oracle would end up in firmware"
+                status=1
+              fi
+            done
           done
           exit $status
 

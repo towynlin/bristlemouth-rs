@@ -196,6 +196,23 @@ A cargo workspace.
     should be libc. Run from the workspace root. `--check` fails on anything
     outside its libc allowlist, which deliberately omits `rand` and `time`, so
     a non-deterministic reach from `csrc/` trips it.
+- `bm-mcuboot-sys/` — MCUboot v1.9.0's `bootutil` with bm_protocol's
+  configuration, over RAM flash. The oracle for slot contents and images.
+  Host-only; `bm-wire` and `bm-stack` must never depend on it. `README.md`
+  is its contract.
+  - `vendor/mcuboot/` — the C submodule. **Never edit it.** Check it out
+    without `--recursive`: its own submodules are not used.
+  - `csrc/` — `mcuboot_config.h` and the port headers, citing the bm_protocol
+    lines they mirror; `bm_mcuboot.c`, the flash map over RAM and the entry
+    points. Deterministic, as `bm-wire-sys/csrc/`.
+  - `build.rs` — compiles everything twice: `libbm_mcuboot.a` with no
+    signature type and `libbm_mcuboot_ed25519.a` with `MCUBOOT_SIGN_ED25519`,
+    every symbol of the second prefixed `ed25519_`.
+  - `src/lib.rs` — `lock(Build)` returns an `Oracle`: `reset`, `read`,
+    `write`, `set_pending`, `set_confirmed`, `swap_type`, `boot_go`.
+  - `testdata/` — `test_ed25519_key.pem`, a test-only private key whose
+    public half the signing build trusts, and an image `imgtool` signed
+    with it.
 - `docs/c-divergences.md` — the upstream defect list.
 - `docs/hello-world-todo.md` — the plan for a Rust hello-world app on a dev
   kit (UDP, pub/sub, `spotter_log`, board support). **Complete and closed; no
@@ -264,7 +281,7 @@ cargo +1.97 check --workspace --all-targets                # the declared MSRV
 cargo tree -p bm-wire                                      # only cbor2, serde, serde_core
 ./bm-wire-sys/scripts/check_symbols.sh --check             # only libc may be unresolved
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features \
-  -p bm-wire -p bm-stack -p bm-wire-diff                   # -D warnings, as CI does
+  -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys # -D warnings, as CI does
 cd bm-wire/fuzz && mkdir -p corpus/<target>                # libFuzzer wants it to exist
 cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 ```
@@ -322,8 +339,9 @@ discussion.
 
 `.claude/hooks/session-start.sh` handles all of it and is registered as a
 `SessionStart` hook, so on Claude Code on the web it has already run. It checks
-out the `bm_core` submodule tree, updates stable, installs the MSRV toolchain
-(with rustfmt and clippy) and nightly, adds both embedded targets to both,
+out the `bm_core` submodule tree and the `mcuboot` submodule, updates stable,
+installs the MSRV toolchain (with rustfmt and clippy) and nightly, adds both
+embedded targets to both,
 installs `cargo-fuzz`, and warms the four workspaces' dependency caches. It
 reads the MSRV from `Cargo.toml`, is idempotent, and no-ops outside a remote
 container. Run it by hand with:
