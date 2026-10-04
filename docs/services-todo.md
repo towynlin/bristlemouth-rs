@@ -1,6 +1,14 @@
 # Services todo
 
-Open. The port of bm_core's service layer and built-in services, as
+> **Complete and closed. There is no work here.** Every card has landed and
+> on a bench a Bridge's samplers listed `hello_world` with its correct
+> `sys_config_crc`. Do not add cards, pick work from this file, or edit it as
+> part of a card. It is kept as documentation: the sections below record what
+> was built, the API shapes, and the reasons for decisions. "Working a card"
+> and the "Order" section describe the process the plan followed and are
+> historical.
+
+The port of bm_core's service layer and built-in services, as
 dependency-ordered cards sized for one agent each. Same card format as
 `docs/bcmp-port-todo.md`, whose "The shared contract" applies in full; the
 "Services contract" below adds to it.
@@ -19,8 +27,8 @@ Out of scope: `middleware/bm_mavlink.c` (no pub/sub; not a service);
 
 Why: a Bridge's `topology_sampler.cpp` and `sensorController.cpp` request
 `sys_info` and `config_map` from every node, and `metrics_sampler.cpp`
-requests `metrics` (bm_protocol `src/apps/bridge/`). A Rust node answers none
-of them today.
+requests `metrics` (bm_protocol `src/apps/bridge/`). A Rust node now answers
+all three.
 
 ## Working a card
 
@@ -102,8 +110,8 @@ two plans are.
 9. **Gold vectors (recipe step 4).** None on the wire. Available: the
    91-byte map in `the_cbor_service_helper_gold_map`; round-trip values in
    `test/src/metrics_reply_msg_test.cpp` and
-   `bm_common_messages/test/power_info_ut.cpp`. E6 records a capture of a C
-   dev kit answering a Bridge; that becomes the gold set.
+   `bm_common_messages/test/power_info_ut.cpp`. No capture of a C dev kit
+   answering a Bridge was recorded; E6 closed on the bench check alone.
 10. **Compare notifications**: handler calls and `BmServiceReplyCb`
     arguments (`ack`, `msg_id`, data), not only frames.
 
@@ -113,24 +121,22 @@ None open.
 
 ## Cards
 
-### E6 — Bench capture
-
-- **Capture:** a C dev kit answering a Bridge's samplers, as
-  `bm-wire-diff/testdata/services-*.pcap`, asserted by
-  `tests/capture_services.rs` (pattern: `capture_h0.rs`).
-- **Blocked by:** nothing.
-- **Done:** on a bench, a Bridge's topology and metrics samplers list the
-  Rust node with its correct `sys_config_crc`.
+None remain.
 
 ## Order
 
-| Wave | Cards | Each needs |
-|---|---|---|
-| 1 | E6 | nothing |
+No cards remain.
 
-Cards within a wave can run in parallel.
+## What the landed cards left for the rest (M1, M2, C1, S1, S2, E1, E2, E3, E4, E5, E6)
 
-## What the landed cards left for the rest (M1, M2, C1, S1, S2, E1, E2, E3, E4, E5)
+- **Bench result (E6).** With a Bridge, a C dev kit on bm_protocol's
+  `bm_devkit/hello_world` and `bm-devkit`'s `hello_world`: `bmsrv req
+  sysinfo` returned the Rust node's id, git SHA, `sys_config_crc` and app
+  name `hello_world`; the topology sampler reported the logged
+  `sys_config_crc`; a metrics request returned `{"version": 1, "node_id":
+  ..., "uptime_ms": ..., "data": {}}`. Three checklist items of PR #60 were
+  not run, among them the sysinfo control against the C dev kit and the
+  capture. No pcap was recorded, so there is no `capture_services.rs`.
 
 - **The Rust node on the bench is `bm-devkit`'s `hello_world`.** It lists
   `<id>/metrics` at construction, then echo, sys_info and config_map after
@@ -144,8 +150,7 @@ Cards within a wave can run in parallel.
   bm_protocol's `APP_NAME` for `src/apps/bm_devkit/hello_world` (the app
   directory's name, `src/CMakeLists.txt`). Decided over a constant per
   binary because it is the rule CMake applies.
-- **Known differences from a C dev kit's replies**, for the capture's
-  assertions: `git_sha` is this repo's `HEAD`, not bm_protocol's; the
+- **Known differences from a C dev kit's replies:** `git_sha` is this repo's `HEAD`, not bm_protocol's; the
   metrics reply has no components, where a C dev kit's has `memory_metrics.c`'s
   `memory`; the device-info version string is `bm-devkit@v<version>+<sha>`.
 - **`bm_devkit::RESOURCES` is 16**, not `RESOURCES_DEFAULT` (9):
@@ -166,7 +171,7 @@ Cards within a wave can run in parallel.
 - **`sys_config_crc` with `NoConfig`** is the empty map's CRC
   (`crc32_ieee(&[0xa0])`), what a C node with an empty system partition
   sends, rather than 0, which the C sends only when the map fails.
-- **Decoders** for a capture's bodies: `DecodedSysInfoReply::decode_into`,
+- **Decoders** for service bodies: `DecodedSysInfoReply::decode_into`,
   `DecodedConfigMapReply::decode_into`, `metrics::decode`,
   `PowerInfoReply::decode_into`; headers `bm_wire::service::{RequestHeader,
   ReplyHeader}`. `bm-wire-diff/src/pcap.rs` reads captures.
