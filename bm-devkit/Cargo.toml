@@ -33,7 +33,8 @@ bm-wire = { path = "../bm-wire" }
 bm-phy-adin2111 = { path = "../bm-phy-adin2111" }
 
 cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }
-cortex-m-rt = "0.7"
+# Exact: `devkit.x` is this version's `link.x`, edited.
+cortex-m-rt = "=0.7.7"
 defmt = "1.0.1"
 defmt-rtt = "1.0"
 panic-probe = { version = "1.0", features = ["print-defmt"] }

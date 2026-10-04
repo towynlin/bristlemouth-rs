@@ -8,9 +8,20 @@ is the hello-world app.
 cd bm-devkit && cargo build --target thumbv8m.main-none-eabihf
 cd bm-devkit && cargo run --release --bin bringup     # probe-rs, defmt over RTT
 cd bm-devkit && cargo run --release --bin hello_world
-# The runner passes --no-catch-reset, so logging continues across a reset.
-# probe-rs 0.21 has no such flag: cargo install probe-rs-tools --locked
+BM_IMAGE_KEY=<ed25519.pem> cargo run --release --bin hello_world   # signed
 ```
+
+The images link for MCUboot slot 1 and need bm_protocol's bootloader on the
+chip: "Installing the C bootloader", below. `cargo run` is `runner.sh`:
+
+| Step | Command |
+|---|---|
+| Image | `bm-image dfu <elf> [--key $BM_IMAGE_KEY] -o <elf>.dfu.bin`, run from the repository root |
+| Program slot 1 | `probe-rs download --binary-format bin --base-address 0x0800C000 <elf>.dfu.bin`. The bootloader's pages are not written. |
+| Start | `probe-rs reset`, so the bootloader runs first |
+| Log | `probe-rs attach --no-catch-reset <elf>`: logging continues across a reset. probe-rs 0.21 has no such flag: `cargo install probe-rs-tools --locked` |
+
+Arguments after `cargo run ... --` go to `probe-rs attach`.
 
 Its own workspace, beside `bm-phy-adin2111` and for the same reason (git
 embassy, `links = "embassy-time"`). `Cargo.lock` pins the same embassy commit
@@ -36,7 +47,7 @@ The dev kit apps build with `-DBSP=bm_mote_v1.0`
 | Part | STM32U575CITxQ, LQFP48, 2 MB flash, 768 KB SRAM1–3 + 16 KB SRAM4 | `bm_mote_v1.0.ioc` `Mcu.UserName`, `Mcu.Package`; `STM32U575CITXQ_FLASH.ld` |
 | embassy-stm32 feature | `stm32u575ci` | |
 | probe-rs chip | `STM32U575CITxQ` | |
-| Power supply | SMPS (`PWR_SMPS_SUPPLY`) | `.ioc` `PWR.PowerMode`. Not configured here; embassy's default (LDO) is what the embassy example runs on. |
+| Power supply | SMPS (`PWR_SMPS_SUPPLY`) | `.ioc` `PWR.PowerMode`. Not configured here: the bootloader selects it and it stays selected ("What the bootloader leaves"). |
 | SYSCLK | 160 MHz: MSI range 0 (48 MHz), PLL1 M=3 N=10 R=1, MBOOST /4, AHB/APB /1, flash latency 4, VOS scale 1 | `Core/Src/main.c` `SystemClock_Config` |
 | LSE | 32.768 kHz crystal on PC14/PC15, drive high | `.ioc`; `SystemClock_Config` |
 | HSE | none; PH0/PH1 are GPIOs | `.ioc` |
@@ -106,6 +117,8 @@ name `getUIDStr()` (`%08x%08x%08x` of `UID[2]`, `UID[1]`, `UID[0]`,
 `DevkitIdentity` does the same with this crate's version and the first 8 hex
 digits of `HEAD` (`build.rs`); its version string is
 `bm-devkit@v<version>+<sha>`, after the C's `<app>@<describe>+<sha>`.
+The constants are `src/version.rs`'s, which also puts them in the image's
+version note ("Version note", below).
 
 `bm_app_name`, sent in a sys_info reply, is `APP_NAME`
 (`src/lib/bm_integration/bm_config.h`), the app directory's name
@@ -181,17 +194,127 @@ that sector, in both.
 
 ## Flash layout, bootloader, no-init RAM
 
-`src/CMakeLists.txt:72-133` and `src/bsp/common/linker/bs_stm32u575.ld`:
+`src/CMakeLists.txt:72-133` and `src/bsp/common/linker/bs_stm32u575.ld`,
+built with `USE_BOOTLOADER=1`, which is what dev kits ship with:
 
-| Build | Layout |
+| Area | Address | Size |
+|---|---|---|
+| MCUboot bootloader | `0x08000000` | `0xC000` |
+| slot 1: 512-byte MCUboot header, then the image | `0x0800C000` | `0xF2000` |
+| slot 2 | `0x080FE000` | `0xF2000` |
+| scratch | `0x081F0000` | `0x10000` |
+| `NOINIT` | `0x200BFE00` | 512, the top of RAM |
+
+The C also keeps a memfault coredump region at the end of flash. This is the
+only layout linked here; there is no build for `0x08000000`.
+
+| File | What |
 |---|---|
-| default | application at `0x08000000` |
-| `USE_BOOTLOADER=1` | MCUboot 48 KB at `0x08000000`; slot 1 at `0x0800C000`, `0xF2000` bytes, 512-byte MCUboot header before the vector table; slot 2 after it; 64 KB scratch |
-| both | top 512 bytes of RAM (`0x200BFE00`) are `NOINIT`; memfault coredump region at the end of flash |
+| `memory.x` | `FLASH` from `0x0800C200`, `0xF0520` bytes: `bm-image`'s limit for a signed image's body (`docs/mcuboot-todo.md`, contract 3) |
+| `devkit.x` | cortex-m-rt 0.7.7's `link.x` with two changes, below. `build.rs` links with it; `Cargo.toml` pins `cortex-m-rt = "=0.7.7"` |
 
-`memory.x` links at `0x08000000`, so `probe-rs run` replaces whatever is
-installed, bootloader included. Restoring C firmware means flashing its
-bootloader and image again.
+| `devkit.x` change | Why |
+|---|---|
+| `.note.sofar.version` at `ORIGIN(FLASH) + 0x238`, `_stext` after it | The C's address for the version note. The link fails if the vector table runs into it or the note is absent. |
+| The vector table's alignment assertion asks for 128 bytes | cortex-m-rt asks for the next power of two above the table's size, `0x400` for `0x238` bytes, which `0x0800C200` is not. That is ARMv7-M's rule; ARMv8-M's `VTOR` holds bits 31:7, and the C image runs from the same address. |
+
+The bootloader validates slot 1 on every boot (`MCUBOOT_VALIDATE_PRIMARY_SLOT`),
+so an ELF programmed at `0x0800C200` without its header and hash TLV does not
+boot. `runner.sh` and `bm-image unified` both write a whole image from
+`0x0800C000`.
+
+### Version note
+
+`src/version.rs` `NOTE` is bm_protocol's `versionNote`
+(`src/lib/common/version.h`, filled by `cmake/git_version.cmake`,
+placed by `bs_stm32u575.ld:104-108`): an ELF note header (`namesz` 8,
+`descsz` 118, type `0x10`), `"VERSION\0"`, and a packed `versionInfo_t`.
+
+| Field | C | Here |
+|---|---|---|
+| address | `0x0800C438`, after the `0x238`-byte vector table; the magic is at file offset `0x44C` of the `.dfu.bin` | the same |
+| `gitSHA` | `git describe --match ForceNone --abbrev=8 --always` | `version::GIT_SHA`, as `DevkitIdentity` |
+| `maj`, `min`, `rev` | from a `vX.Y.Z` tag, else `0xFF` each | this crate's Cargo version |
+| `hwVersion` | 0 | 0 |
+| `flags` | bit 0 eng unless `RELEASE=1`; bit 1 dirty | bit 0 set; dirty not computed |
+| `versionStr` | `git describe --always --dirty --abbrev=8` | `DevkitIdentity`'s version string |
+| section type | `SHT_NOTE` | `SHT_PROGBITS`; tools find the magic in the binary |
+
+`bm-image dfu` fills `ih_ver` from the note, so the three versions of
+contract 8 come from `src/version.rs`.
+
+### What the bootloader leaves
+
+`src/apps/bootloader/app_main.c`: `boot_port_init` (`:24-44`), then
+`boot_port_startup` (`:56-78`) suspends the HAL tick, calls `HAL_DeInit`,
+sets `VTOR`, loads `MSP` and calls the reset vector. `HAL_DeInit` resets the
+peripherals, not RCC, PWR or the IWDG.
+
+| State at the image's reset vector | Source | Here |
+|---|---|---|
+| SYSCLK 160 MHz from PLL1: MSIS range 2 (16 MHz), M=3, N=30, R=1, MBOOST /1; flash latency 4; VOS range 1 | `src/bsp/bootloader/Core/Src/main.c:117-167` | `embassy_stm32::init` (`rcc/u5.rs`) switches SYSCLK to HSI before it changes MSIS or a PLL, then sets up `config()`'s tree: MSIS 48 MHz, N=10, MBOOST /4. `config()` is unchanged. |
+| LSI on | the same | left on; the IWDG holds it on |
+| SMPS selected (`PWR_CR3.REGSEL`) | `main.c:173-188` | not written; stays SMPS |
+| IWDG running: prescaler 32, reload 4095, about 4.1 s | `Core/Src/iwdg.c:28-51` | `src/watchdog.rs`: `start` feeds it, then spawns `watchdog::task`, which feeds it every second. The C feeds from its lowest-priority task (`src/lib/common/watchdog.c`). |
+| `SCB->CCR` `DIV_0_TRP` set | `app_main.c:40` | left set |
+| `ulBootloaderMagic` zeroed | `bootloader_helper.c:28-43` | "No-init RAM" |
+
+Read from a kit running `hello_world` under the bootloader:
+
+| Register | Value | Meaning |
+|---|---|---|
+| `SCB->VTOR` | `0x0800C200` | |
+| `IWDG_PR`, `IWDG_RLR` | 3, `0xFFF` | the bootloader's /32 and 4095 |
+| `RCC_CFGR1` | `0x0000000F` | SYSCLK is PLL1R |
+| `RCC_ICSCR1` | `0x0485AD68` | MSIS range 0, 48 MHz |
+| `RCC_PLL1CFGR` | `0x0007220D` | source MSIS, M=3, MBOOST /4 |
+| `PWR_CR3` | `0x00000002` | SMPS |
+| `PWR_VOSR` | `0x0007C000` | range 1, booster on |
+
+### Installing the C bootloader
+
+Once per kit, and again after anything writes `0x08000000`. Build
+bm_protocol's `bootloader` preset (`CMakePresets.json`), then either:
+
+```
+probe-rs download --chip STM32U575CITxQ <bm_protocol>/preset-builds/bootloader/src/bootloader-bootloader.elf
+```
+
+or build a `.unified.bin`, bootloader and Rust image together, and program
+it at `0x08000000`:
+
+```
+cargo run -p bm-image -- unified <bootloader.elf> <elf>.dfu.bin -o <elf>.unified.bin
+probe-rs download --chip STM32U575CITxQ --binary-format bin --base-address 0x08000000 <elf>.unified.bin
+dfu-util -a 0 -s 0x08000000:leave -D <elf>.unified.bin    # without a probe, from the ROM bootloader
+```
+
+That preset's bootloader takes unsigned images and ignores a signature. One
+built with `SIGN_IMAGES=1` refuses an image not signed with its key:
+`BM_IMAGE_KEY`.
+
+A kit that had Rust firmware linked at `0x08000000` keeps that image's
+remains between the bootloader's end and `0x0800C000`; nothing reads them.
+
+### Restoring C firmware
+
+Program a C `.elf.unified.bin` (bm_protocol's `hello-world` preset writes
+`preset-builds/hello-world/src/bm_mote_v1.0-hello_world-dbg.elf.unified.bin`)
+at `0x08000000` with either command above. With the bootloader already
+installed, its `.elf.dfu.bin` at `0x0800C000` is enough.
+
+### On a bench
+
+With the `bootloader` preset's ELF at bm_protocol `62d8b5d0` installed, on a
+bus with a Bridge and a C dev kit:
+
+| Step | Result |
+|---|---|
+| `cargo run --release --bin hello_world` | boots; logs node id, services, both neighbours' heartbeats and the Bridge's `spotter/utc-time`; no reset in 40 s |
+| `bm-image unified` of that bootloader and the Rust `.dfu.bin`, programmed at `0x08000000` with `probe-rs download` | the same, 25 s |
+
+Not run: `dfu-util` as the transport for the `.unified.bin`; the Bridge's
+topology listing.
 
 ### No-init RAM
 
@@ -302,5 +425,5 @@ in `docs/c-divergences.md`):
 
 ## Not used yet
 
-USB (the C console and pcap), the Bristlefin expander and LEDs, LSI, the
-watchdog (`MX_IWDG_Init`), low-power management, and the SMPS.
+USB (the C console and pcap), the Bristlefin expander and LEDs, and
+low-power management.
