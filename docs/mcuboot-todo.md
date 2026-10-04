@@ -152,7 +152,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
    | `0x200BFE4C` | `client_update_reboot_info`, 18 bytes | `bm_wire::bcmp::dfu_core::RebootInfo::encode`/`decode`. The old image writes it, the new one reads it, so C and Rust must use this address. |
 
    The order is the linker script's; the addresses hold for any app that
-   links memfault's U5 core. N1 checks a second app's map.
+   links memfault's U5 core; the Bridge's map agrees.
 10. **Flash hooks** (`bm_dfu_wrapper.cpp`, `port_flash.c`): erase is whole
     8 KB pages, page-aligned, else failure; write and erase are verified by
     reading back; out-of-range is failure. bm_core erases the whole slot
@@ -217,7 +217,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   | Version note | A `#[used]` static in the C's layout (contract 8), in a section a linker fragment places at `0x0800C438`, padding after the vector table if cortex-m-rt's ends earlier. Fields from the values `DevkitIdentity` reports. |
   | Watchdog | Fed from a task spawned in `start`, period 1 s, before anything that can wait. |
   | Clocks | `config()` reaches the same tree from the bootloader's state (contract 6) as from reset. |
-  | Runner | `.cargo/config.toml`'s runner builds the `.dfu.bin` with `bm-image`, programs it at `0x0800C000`, and attaches for defmt. `BM_IMAGE_KEY`, when set, is the `--key` path. `cargo run` keeps working and no longer touches the bootloader. |
+  | Runner | `.cargo/config.toml`'s runner builds the `.dfu.bin` with `bm-image`, programs it at `0x0800C000`, and attaches for defmt, without the reset vector catch (`--no-catch-reset`): every DFU ends in a reset. `BM_IMAGE_KEY`, when set, is the `--key` path. `cargo run` keeps working and no longer touches the bootloader. |
   | CI | builds a `.dfu.bin` for `hello_world` and runs `bm-image info` on it. |
 
 - **README:** replace "Flash layout, bootloader, no-init RAM"'s
@@ -229,23 +229,6 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   the same.
 - **Blocked by:** I1.
 - **Done:** the bench line.
-
-### N1 — No-init RAM and reset reason
-
-- **Rust, `bm-devkit`:** `src/noinit.rs`: `bm_stack::NoInitRam` at
-  `0x200BFE4C` through `RebootInfo::encode`/`decode`; a reset function that
-  writes `resetReason` and its magic, then `SCB::sys_reset`; a read of the
-  reset reason at boot, clearing the magic as `checkResetReason` does,
-  logged over defmt. Volatile access to fixed addresses; `memory.x` already
-  keeps the region out of `RAM`. Nothing writes `0x200BFE00` or the
-  memfault bytes.
-- **Check:** contract 9's addresses in a second bm_protocol app's map (for
-  example `bm_devkit/bm_soft_module`, or the Bridge's, noting any
-  difference).
-- **Bench:** a value stored, then a reset with a reason, reads back with
-  that reason.
-- **Blocked by:** nothing.
-- **Done:** builds for the thumb target; the bench line.
 
 ### S1 — The slot
 
@@ -269,7 +252,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 - **Bench:** a dev kit running Rust `hello_world` accepts a Rust
   `.dfu.bin` with a different git SHA from a Bridge, reboots into it, and
   the Bridge reports success.
-- **Blocked by:** L1, N1.
+- **Blocked by:** L1.
 - **Done:** the bench line.
 
 ### B1 — On a bus
@@ -304,17 +287,16 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | N1 | nothing |
-| 2 | I1 | nothing |
-| 3 | L1 | I1 |
-| 4 | S1 | L1, N1 |
-| 5 | B1 | S1 |
+| 1 | I1 | nothing |
+| 2 | L1 | I1 |
+| 3 | S1 | L1 |
+| 4 | B1 | S1 |
 
 Cards within a wave can run in parallel.
 
 ## What the landed cards left for the rest
 
-Landed: O1, M1.
+Landed: O1, N1, M1.
 
 ### O1 — `bm-mcuboot-sys`
 
@@ -322,7 +304,7 @@ Landed: O1, M1.
 
 | Need | Where |
 |---|---|
-| The oracle | `bm_mcuboot_sys::lock(Build) -> Oracle`. One process-global lock for both builds; flash persists between locks, so start with `reset()`. |
+| The oracle | `bm_mcuboot_sys::lock(Build) -> Oracle`. One process-global lock for both builds; flash persists between locks, so start with `reset()`. `Oracle::switch(build)` changes build without releasing it. |
 | Flash | `Oracle::read(area, off, &mut buf)`, `read_area(area) -> Vec<u8>`, `write(area, off, &data)`, over `Area::{Bootloader, Primary, Secondary, Scratch}` with `offset()` and `size()`. `write` stores bytes with no flash semantics. |
 | `bootutil` | `set_pending(permanent: bool)`, `set_confirmed()`, `swap_type()` (`swap_type::{NONE, TEST, PERM, REVERT, FAIL, PANIC}`), `boot_go() -> Result<Booted, Refusal>`. `Booted` is `image_off` (`0xC000`), `flash_dev_id` and the 32 header bytes. |
 | The two builds | `Build::Unsigned` and `Build::Ed25519`, both linked into every binary, each with its own flash. No feature or environment variable. |
@@ -441,3 +423,30 @@ What `bootutil_public.c` does, reproduced and compared with the oracle
 | `set_confirmed`, bad magic | `BOOT_EBADVECT` (4). |
 | `set_confirmed`, `image_ok` neither `0x01` nor erased | 0, nothing written; `boot_swap_type` is `NONE`, so the image stays. |
 | A failed write | The oracle's flash has already cleared the bits. `RamSlot` does the same. |
+
+### N1, for S1
+
+`bm_devkit::noinit`:
+
+| Item | Use |
+|---|---|
+| `NoInit` | A unit struct implementing `bm_stack::NoInitRam` at `0x200BFE4C`. |
+| `reset(ResetReason) -> !` | `set_pending_and_reset` passes `ResetReason::Mcuboot`, `fail_update_and_reset` `ResetReason::UpdateFailed`. |
+| `take_reset_reason()` | Called once by `start`; read `Board::reset_reason` instead. A second call returns `Invalid`. |
+
+- `Node` takes one type `D: DfuSlot + NoInitRam`, so `node` still passes
+  `NoDfu`. S1's slot type implements both traits and delegates `load` and
+  `store` to `NoInit`.
+- `FlashConfigStorage::reset` now resets with `ResetReason::Config`.
+- Contract 9's addresses are the same in the Bridge's link map, which adds
+  `_reboot_info` (8 bytes, `ncp_dfu.cpp`) at `0x200BFE60`.
+  `client_update_reboot_info` is the first object in plain `.noinit`; its
+  address depends on memfault's U5 core being linked ahead of it
+  (`bm-devkit/README.md`, "No-init RAM").
+- On a bench: `Invalid` after flashing and after the reset button;
+  `Config` after `bm cfg commit` from a C node; a `RebootInfo` stored
+  before `reset(ResetReason::Mcuboot)` read back unchanged with reason
+  `Mcuboot`. Not run: a C image reading what a Rust image wrote, or the
+  reverse.
+- After power-on `NoInit::load` returns whatever RAM holds. The DFU client
+  acts only on `DFU_REBOOT_MAGIC`.

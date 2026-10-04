@@ -8,6 +8,8 @@ is the hello-world app.
 cd bm-devkit && cargo build --target thumbv8m.main-none-eabihf
 cd bm-devkit && cargo run --release --bin bringup     # probe-rs, defmt over RTT
 cd bm-devkit && cargo run --release --bin hello_world
+# The runner passes --no-catch-reset, so logging continues across a reset.
+# probe-rs 0.21 has no such flag: cargo install probe-rs-tools --locked
 ```
 
 Its own workspace, beside `bm-phy-adin2111` and for the same reason (git
@@ -161,7 +163,7 @@ Here:
 |---|---|
 | `spiflash::W25` | `w25::W25`, over `embedded-hal` blocking `SpiDevice` and `DelayNs`; `start` builds it on SPI2 at 20 MHz with `FLASH_CS` (PA8) |
 | `NvmPartition` + `bm_config_wrapper.cpp` | `storage::FlashConfigStorage`, a `bm_stack::ConfigStorage` |
-| `bm_config_reset`: `resetSystem(RESET_REASON_CONFIG)` | `SCB::sys_reset`; no reset reason, since the no-init block is not placed |
+| `bm_config_reset`: `resetSystem(RESET_REASON_CONFIG)` | `noinit::reset(ResetReason::Config)` |
 
 Differences from the C, none visible in flash contents after a completed
 write:
@@ -189,9 +191,48 @@ that sector, in both.
 
 `memory.x` links at `0x08000000`, so `probe-rs run` replaces whatever is
 installed, bootloader included. Restoring C firmware means flashing its
-bootloader and image again. `memory.x` leaves the no-init 512 bytes out of
-`RAM` so a later DFU card can place `NoInitRam` where the C bootloader
-expects it.
+bootloader and image again.
+
+### No-init RAM
+
+`bs_stm32u575.ld:57-71` takes the top 512 bytes of RAM as `NOINIT`, and
+`:225-234` fixes the order of what goes in it. `memory.x` leaves the same
+bytes out of `RAM`; `src/noinit.rs` reads and writes them at fixed addresses.
+
+| Address | Size | Symbol | Source | `noinit` |
+|---|---|---|---|---|
+| `0x200BFE00` | 4 | `ulBootloaderMagic` | `src/lib/common/bootloader_helper.c:13`. `enterBootloaderIfNeeded` (`:28-43`, called from `src/apps/bootloader/app_main.c:83`) zeroes it on every boot and jumps to the ROM bootloader on `0xB8278F6D` | never written |
+| `0x200BFE04` | 4 | `resetReason`, a `ResetReason_t` (`reset_reason.h:13-28`; no `-fshort-enums`) | `src/lib/common/reset_reason.c:11` | `reset`, `take_reset_reason` |
+| `0x200BFE08` | 4 | `ulResetReasonMagic`, `0xB8278F7D` (`reset_reason.h:11`) | `reset_reason.c:10` | `reset`, `take_reset_reason` |
+| `0x200BFE0C` | `0x40` | `s_reboot_tracking` | `src/lib/memfault/memfault_platform_core_u5.c:40-41` | never written |
+| `0x200BFE4C` | 18 | `client_update_reboot_info`, a packed `ReboootClientUpdateInfo` | `src/lib/bm_core/bcmp/dfu_core.c:27`; `bm_noinit_ram_attribute` is `section(".noinit")` (`src/lib/bm_integration/bm_config.h:10`) | `NoInit`, through `RebootInfo::encode`/`decode` |
+
+Addresses are from two link maps, which agree:
+
+| Map | Build |
+|---|---|
+| `preset-builds/hello-world/src/bm_mote_v1.0-hello_world-dbg.elf.map` | the `hello-world` preset |
+| `bridge_v1_0-bridge-dbg.elf.map` | the `bridge` preset's cache variables (`APP=bridge`, `BSP=bridge_v1_0`), configured into a directory outside the checkout |
+
+The Bridge's map has one more object, `_reboot_info` (8 bytes,
+`src/lib/bm_ncp/ncp_dfu.cpp`, section `.noinit._reboot_info`), at
+`0x200BFE60`; the linker script places that section last. The bootloader's
+map (`preset-builds/bootloader/src/`) has only `ulBootloaderMagic`, at
+`0x200BFE00`.
+
+`client_update_reboot_info`'s address depends on the link: it is the first
+object in plain `.noinit`, after the three named sections. An app without
+memfault's U5 core, or with another `.noinit` object linked ahead of
+`libbcmp.a`, would move it.
+
+| C | Rust |
+|---|---|
+| `resetSystem(reason)` (`reset_reason.c:14-30`): magic, reason, `NVIC_SystemReset` | `noinit::reset(reason)`: the same writes, then `SCB::sys_reset` |
+| `checkResetReason()` (`reset_reason.c:32-54`): the stored reason if the magic is set, else `RESET_REASON_INVALID`; zeroes the magic and sets the stored reason to `RESET_REASON_INVALID`; later calls return a cached value | `noinit::take_reset_reason()`: the same reads and writes, no cache. `start` calls it once; the result is `Board::reset_reason`, which both binaries log |
+| reasons written on the DFU path: `RESET_REASON_MCUBOOT` (4) and `RESET_REASON_UPDATE_FAILED` (6), `src/lib/drivers/bm_dfu_wrapper.cpp:26`, `:31` | `ResetReason::Mcuboot`, `ResetReason::UpdateFailed`; not written until the node has a `DfuSlot` |
+
+`bm_devkit::node` still builds its node with `NoDfu`: `Node` takes one type
+for `DfuSlot` and `NoInitRam`, so `NoInit` goes in with the slot.
 
 ## DFU image locations
 

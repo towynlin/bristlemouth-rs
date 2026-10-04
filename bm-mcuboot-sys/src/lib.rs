@@ -142,6 +142,13 @@ fn refusal(rc: i32) -> Result<(), Refusal> {
 }
 
 impl Oracle {
+    /// The other build, without releasing the lock: its flash as it was
+    /// left.
+    #[must_use]
+    pub fn switch(self, build: Build) -> Self {
+        Self { build, ..self }
+    }
+
     pub fn build(&self) -> Build {
         self.build
     }

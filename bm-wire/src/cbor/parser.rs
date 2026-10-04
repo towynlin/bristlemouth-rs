@@ -405,6 +405,12 @@ impl<'a> Value<'a> {
         self.preparse_next_value()
     }
 
+    /// `cbor_value_get_next_byte`, as an offset into the buffer.
+    #[must_use]
+    pub fn next_byte(&self) -> usize {
+        self.pos
+    }
+
     /// `cbor_value_at_end`.
     #[must_use]
     pub fn at_end(&self) -> bool {

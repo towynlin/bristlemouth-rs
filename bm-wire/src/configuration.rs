@@ -48,6 +48,10 @@ use cbor2::core::{Encoder, Header};
 use crate::cbor::parser::{CborError, Value};
 use crate::crc::{crc32_ieee, crc32_ieee_update};
 
+mod entry;
+
+pub use entry::{Entry, EntryValue};
+
 /// Keys a partition can hold. `MAX_NUM_KV`.
 pub const MAX_NUM_KV: usize = 50;
 /// Longest key accepted, in bytes. `MAX_KEY_LEN_BYTES`. A key this long is
@@ -608,6 +612,11 @@ impl ConfigPartition {
             key_len,
             value_type,
         }
+    }
+
+    /// The first `numKeys` keys with their values, for display.
+    pub fn entries(&self) -> impl Iterator<Item = Entry<'_>> + '_ {
+        (0..usize::from(self.num_keys())).map(|i| self.entry(i))
     }
 
     /// `get_config_uint`: an unsigned integer, truncated to 32 bits.

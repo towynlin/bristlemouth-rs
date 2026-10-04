@@ -165,6 +165,7 @@ impl App<Devkit> for Hello {
 async fn main(spawner: Spawner) {
     let mut board = bm_devkit::start().await;
     info!("node id {=u64:016x}", board.node_id);
+    info!("reset reason: {}", board.reset_reason);
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));
 
     static NODE: StaticCell<Devkit> = StaticCell::new();

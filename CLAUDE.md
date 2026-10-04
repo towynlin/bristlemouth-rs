@@ -131,7 +131,8 @@ A cargo workspace.
   the ADIN2111, sets up the flash and starts the RTC, `node` builds a
   `Devkit` node with the chip's node id, the binary's name as `app_name`, the
   RTC and its config partitions in flash; `src/bin/bringup.rs`
-  runs one and logs the config keys it loaded; `src/bin/hello_world.rs` is
+  runs one and logs the config keys it loaded, each as a
+  `bm_wire::configuration::Entry`; `src/bin/hello_world.rs` is
   the hello-world app: subscribes to `spotter/*`, sends `hello world` with
   `spotter_log` every 10 s, sets the RTC from `spotter/utc-time`, and
   lists echo, sys_info and config_map after metrics, as a C dev kit does.
@@ -145,6 +146,9 @@ A cargo workspace.
     `embedded-hal` traits only.
   - `src/rtc.rs` — `DevkitRtc`, `bm_stack::Rtc` over the STM32 RTC on LSE,
     as bm_protocol's `stm32_rtc.c`.
+  - `src/noinit.rs` — the no-init RAM C images and the bootloader share, at
+    fixed addresses: `NoInit`, `bm_stack::NoInitRam`; `reset` and
+    `take_reset_reason`, bm_protocol's `reset_reason.c`.
   - `src/storage.rs` — `FlashConfigStorage`, `bm_stack::ConfigStorage` at
     bm_protocol's partition offsets.
 - `bm-wire-diff/` — the differential harness. Host-only. One comparator per

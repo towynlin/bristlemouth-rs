@@ -2,9 +2,9 @@
 //! hears over defmt. The manual check for card B1 is that a C node on the
 //! same bus lists it as a neighbour.
 //!
-//! At start it logs the keys each config partition loaded from flash, so a
-//! key set and committed over the bus shows up after the reset the commit
-//! causes.
+//! At start it logs each config partition's keys as loaded from flash, one
+//! `name type value` line each ([`bm_wire::configuration::Entry`]), so a key
+//! set and committed over the bus shows up after the reset the commit causes.
 //!
 //! ```text
 //! cd bm-devkit && cargo run --release --bin bringup
@@ -68,13 +68,8 @@ fn log_config(store: &ConfigStore) {
     ] {
         let part = store.partition(partition);
         info!("{=str} config: {=u8} keys", name, part.num_keys());
-        for key in part.stored_keys() {
-            let len = key
-                .key_buf
-                .iter()
-                .position(|&b| b == 0)
-                .unwrap_or(key.key_buf.len());
-            info!("  {=[u8]:a}", key.key_buf[..len]);
+        for entry in part.entries() {
+            info!("  {}", defmt::Display2Format(&entry));
         }
     }
 }
@@ -83,6 +78,7 @@ fn log_config(store: &ConfigStore) {
 async fn main(spawner: Spawner) {
     let mut board = bm_devkit::start().await;
     info!("node id {=u64:016x}", board.node_id);
+    info!("reset reason: {}", board.reset_reason);
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));
 
     static NODE: StaticCell<Devkit> = StaticCell::new();

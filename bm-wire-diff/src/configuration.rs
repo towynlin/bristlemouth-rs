@@ -1023,4 +1023,34 @@ mod tests {
             Op::SetUint(sys(b"foo"), 1),
         ]);
     }
+
+    /// Issue #65: a string set over the bus, then a longer one for the same
+    /// key, saved and reloaded. `set_config_cbor` writes `key_buf` only for a
+    /// new key, so it keeps the first value's bytes while the slot holds the
+    /// second.
+    #[test]
+    fn a_second_cbor_set_leaves_key_buf_as_the_first_wrote_it() {
+        let over_the_bus = |value: &[u8]| {
+            let key = KeyInput {
+                text: [b"ztest2", value].concat(),
+                len: 6,
+            };
+            Op::SetCbor(
+                Target {
+                    partition: Partition::System,
+                    key,
+                },
+                value.to_vec(),
+            )
+        };
+        run(vec![
+            over_the_bus(b"jhanashimas"),
+            Op::Save(Partition::System),
+            over_the_bus(b"lhanashimaska"),
+            Op::GetString(sys(b"ztest2"), 50),
+            Op::Save(Partition::System),
+            Op::Reload,
+            Op::GetString(sys(b"ztest2"), 50),
+        ]);
+    }
 }

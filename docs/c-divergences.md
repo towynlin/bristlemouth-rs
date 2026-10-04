@@ -1958,7 +1958,12 @@ second stops at a NUL in either string. Three consequences:
    then the value's bytes up to the first NUL or 31 bytes. The lookup still
    works, since it compares only `key_len` bytes; the extra bytes are saved to
    flash. If the value has no NUL and the message ends first, `snprintf`
-   reads past the message.
+   reads past the message. `set_config_cbor` writes `key_buf` only for a new
+   key, so the extra bytes stay those of the first set whatever the slot holds
+   later; the typed setters rewrite `key_buf` on every set. bm_protocol's
+   `cfg <partition> set` passes a pointer into the command line, so its keys
+   carry the rest of the line (`sensorsPollIntervalMs uint 3000`). A reader
+   of `key_buf` must stop at `key_len`: `bm_wire::configuration::Entry`.
 3. **Keys that differ after an embedded NUL are the same key.** `is_key_valid`
    accepts `\0`, so `"ab\0c"` and `"ab\0d"`, both with `key_len` 4, find
    each other.
@@ -1967,6 +1972,7 @@ second stops at a NUL in either string. Three consequences:
 pointer and `key_len` separately, reads past its end as NUL, and stores and
 compares as the C does. `bm-wire-diff/src/configuration.rs` confirms each
 case: `a_32_byte_key_appends_on_every_set`, `a_key_followed_by_its_value`,
+`a_second_cbor_set_leaves_key_buf_as_the_first_wrote_it`,
 `keys_that_differ_after_a_nul_are_one_key`.
 
 Fix upstream by copying exactly `key_len` bytes with `memcpy` and rejecting
