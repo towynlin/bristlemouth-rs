@@ -149,7 +149,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
    | `0x200BFE4C` | `client_update_reboot_info`, 18 bytes | `bm_wire::bcmp::dfu_core::RebootInfo::encode`/`decode`. The old image writes it, the new one reads it, so C and Rust must use this address. |
 
    The order is the linker script's; the addresses hold for any app that
-   links memfault's U5 core. N1 checks a second app's map.
+   links memfault's U5 core; the Bridge's map agrees.
 10. **Flash hooks** (`bm_dfu_wrapper.cpp`, `port_flash.c`): erase is whole
     8 KB pages, page-aligned, else failure; write and erase are verified by
     reading back; out-of-range is failure. bm_core erases the whole slot
@@ -245,27 +245,6 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 - **Blocked by:** I1.
 - **Done:** the bench line.
 
-### N1 — No-init RAM and reset reason
-
-**Taken:** claude/mcuboot-n1-noinit
-
-**Bench pending:** https://github.com/towynlin/bristlemouth-rs/pull/62
-
-- **Rust, `bm-devkit`:** `src/noinit.rs`: `bm_stack::NoInitRam` at
-  `0x200BFE4C` through `RebootInfo::encode`/`decode`; a reset function that
-  writes `resetReason` and its magic, then `SCB::sys_reset`; a read of the
-  reset reason at boot, clearing the magic as `checkResetReason` does,
-  logged over defmt. Volatile access to fixed addresses; `memory.x` already
-  keeps the region out of `RAM`. Nothing writes `0x200BFE00` or the
-  memfault bytes.
-- **Check:** contract 9's addresses in a second bm_protocol app's map (for
-  example `bm_devkit/bm_soft_module`, or the Bridge's, noting any
-  difference).
-- **Bench:** a value stored, then a reset with a reason, reads back with
-  that reason.
-- **Blocked by:** nothing.
-- **Done:** builds for the thumb target; the bench line.
-
 ### S1 — The slot
 
 - **Rust, `bm-devkit`:** `src/slot.rs`: `bm_stack::DfuSlot` on slot 2 over
@@ -288,7 +267,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 - **Bench:** a dev kit running Rust `hello_world` accepts a Rust
   `.dfu.bin` with a different git SHA from a Bridge, reboots into it, and
   the Bridge reports success.
-- **Blocked by:** M1, L1, N1.
+- **Blocked by:** M1, L1.
 - **Done:** the bench line.
 
 ### B1 — On a bus
@@ -323,17 +302,17 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | M1, N1 | nothing |
+| 1 | M1 | nothing |
 | 2 | I1 | M1 |
 | 3 | L1 | I1 |
-| 4 | S1 | M1, L1, N1 |
+| 4 | S1 | M1, L1 |
 | 5 | B1 | S1 |
 
 Cards within a wave can run in parallel.
 
 ## What the landed cards left for the rest
 
-Landed: O1. N1's code has landed; its bench line is pending.
+Landed: O1, N1.
 
 ### O1 — `bm-mcuboot-sys`
 
@@ -399,5 +378,10 @@ Left open:
   `client_update_reboot_info` is the first object in plain `.noinit`; its
   address depends on memfault's U5 core being linked ahead of it
   (`bm-devkit/README.md`, "No-init RAM").
+- On a bench: `Invalid` after flashing and after the reset button;
+  `Config` after `bm cfg commit` from a C node; a `RebootInfo` stored
+  before `reset(ResetReason::Mcuboot)` read back unchanged with reason
+  `Mcuboot`. Not run: a C image reading what a Rust image wrote, or the
+  reverse.
 - After power-on `NoInit::load` returns whatever RAM holds. The DFU client
   acts only on `DFU_REBOOT_MAGIC`.
