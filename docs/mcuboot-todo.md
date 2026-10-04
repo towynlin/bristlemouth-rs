@@ -276,6 +276,8 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 **Taken:** claude/mcuboot-n1-noinit
 
+**Bench pending:** https://github.com/towynlin/bristlemouth-rs/pull/62
+
 - **Rust, `bm-devkit`:** `src/noinit.rs`: `bm_stack::NoInitRam` at
   `0x200BFE4C` through `RebootInfo::encode`/`decode`; a reset function that
   writes `resetReason` and its magic, then `SCB::sys_reset`; a read of the
@@ -359,4 +361,26 @@ Cards within a wave can run in parallel.
 
 ## What the landed cards left for the rest
 
-Nothing has landed.
+N1's code has landed; its bench line is pending.
+
+### N1, for S1
+
+`bm_devkit::noinit`:
+
+| Item | Use |
+|---|---|
+| `NoInit` | A unit struct implementing `bm_stack::NoInitRam` at `0x200BFE4C`. |
+| `reset(ResetReason) -> !` | `set_pending_and_reset` passes `ResetReason::Mcuboot`, `fail_update_and_reset` `ResetReason::UpdateFailed`. |
+| `take_reset_reason()` | Called once by `start`; read `Board::reset_reason` instead. A second call returns `Invalid`. |
+
+- `Node` takes one type `D: DfuSlot + NoInitRam`, so `node` still passes
+  `NoDfu`. S1's slot type implements both traits and delegates `load` and
+  `store` to `NoInit`.
+- `FlashConfigStorage::reset` now resets with `ResetReason::Config`.
+- Contract 9's addresses are the same in the Bridge's link map, which adds
+  `_reboot_info` (8 bytes, `ncp_dfu.cpp`) at `0x200BFE60`.
+  `client_update_reboot_info` is the first object in plain `.noinit`; its
+  address depends on memfault's U5 core being linked ahead of it
+  (`bm-devkit/README.md`, "No-init RAM").
+- After power-on `NoInit::load` returns whatever RAM holds. The DFU client
+  acts only on `DFU_REBOOT_MAGIC`.
