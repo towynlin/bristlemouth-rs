@@ -27,7 +27,7 @@ Out of scope:
 | A bootloader in Rust | Deployed nodes have the C one; it is used unchanged. |
 | Encrypted images (`ENCRYPT_IMAGES`, x25519) | `CMakePresets.json` does not enable it. Signing is in scope: contract 13. |
 | A no-bootloader link at `0x08000000` | One layout, the deployed one. |
-| Vendoring bm_protocol | Never. The bootloader comes by path (I1). |
+| Vendoring bm_protocol | Never. The bootloader comes by path (`bm-image unified`). |
 | DFU host on a dev kit (image in the W25 `dfu` partition) | The Bridge is the host. `bm-devkit/README.md`, "DFU image locations". |
 | Memfault reboot tracking and coredumps | Rust firmware has no memfault. Its no-init bytes are left untouched. |
 | `update confirm`, `mcuboot_cli.c` | USB console. |
@@ -161,7 +161,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 11. **Proven, not assumed.** MCUboot v1.9.0's `bootutil` is compiled on the
     host as an oracle (O1), with bm_protocol's configuration and flash map
     over RAM. What Rust writes to a slot is what `boot_set_pending` and
-    `boot_set_confirmed` write; an image I1 builds is one `boot_go` boots.
+    `boot_set_confirmed` write; an image `bm-image` builds is one `boot_go` boots.
 12. **A dev kit is recoverable; a potted node is not.** Bench cards run on
     dev kits. `dfu-util` of a C `.elf.unified.bin` at `0x08000000` restores
     one.
@@ -178,34 +178,6 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
     for this repo's tests.
 
 ## Cards
-
-### I1 — Image tool
-
-- **Rust:** new host crate `bm-image` in the root workspace; the SHA-256
-  dependency lives here, not in `bm-mcuboot`. A library over bytes and a
-  CLI:
-
-  | Command | Output |
-  |---|---|
-  | `bm-image dfu <elf> [--key <ed25519.pem>] -o <out.dfu.bin>` | Contract 2's file. The binary is the ELF's loadable sections from `0x0800C200`, gaps `0xFF`. Version and git SHA come from the image's own `versionInfo_t` (contract 8), so the header cannot disagree with it; an ELF without one is an error. With `--key`, signed as contract 2 says; the key is a PEM as `imgtool keygen -t ed25519` writes, unencrypted. |
-  | `bm-image unified <bootloader> <dfu.bin> -o <out.unified.bin>` | The bootloader, an ELF or a flat binary given by path (in a bm_protocol checkout, `preset-builds/bootloader/src/bootloader-bootloader.elf`), padded with `0xFF` to `0xC000`, then the `.dfu.bin` (`src/CMakeLists.txt:683-684`). |
-  | `bm-image info <file>` | Header, TLVs (signed or not, and the key hash), version note, CRC-16 (kermit) and size: `BmDfuImgInfo`'s fields. |
-
-  Rejects a file longer than `0xF07B0` bytes (contract 3) and states the limit.
-- **Gold:** a small binary run through bm_protocol's `imgtool.py` with
-  contract 2's arguments, once without a key and once with O1's test key;
-  input and both outputs committed as test data with the commands;
-  `bm-image`'s outputs are byte-identical (ed25519 signatures are
-  deterministic). Header fields asserted
-  against the C `hello_world` `.dfu.bin`'s first 32 bytes (`3db8f396
-  00000000 0002 0000 b4da0300 00000000 000d0c00 d0b5d862 00000000`).
-- **Oracle:** O1's `boot_go` boots a `bm-image` file from slot 1, and from
-  slot 2 after `bm_mcuboot::set_pending`: unsigned on the unsigned build,
-  signed on both. On the signing build an unsigned image, one signed with
-  another key, and one with a flipped body byte are each refused; assert
-  what `boot_go` does with slot 2 and which image it boots.
-- **Blocked by:** nothing.
-- **Done:** gold and oracle tests pass in `cargo test`.
 
 ### L1 — Link for slot 1
 
@@ -227,7 +199,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   boots, logs, stays up past 10 s (the IWDG), and appears in a Bridge's
   topology. `dfu-util` of a `.unified.bin` built from the Rust image boots
   the same.
-- **Blocked by:** I1.
+- **Blocked by:** nothing.
 - **Done:** the bench line.
 
 ### S1 — The slot
@@ -287,30 +259,19 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | I1 | nothing |
-| 2 | L1 | I1 |
-| 3 | S1 | L1 |
-| 4 | B1 | S1 |
+| 1 | L1 | nothing |
+| 2 | S1 | L1 |
+| 3 | B1 | S1 |
 
 Cards within a wave can run in parallel.
 
 ## What the landed cards left for the rest
 
-Landed: O1, N1, M1.
+Landed: O1, N1, M1, I1.
 
 ### O1 — `bm-mcuboot-sys`
 
-`bm-mcuboot-sys/README.md` is the contract. For M1 and I1:
-
-| Need | Where |
-|---|---|
-| The oracle | `bm_mcuboot_sys::lock(Build) -> Oracle`. One process-global lock for both builds; flash persists between locks, so start with `reset()`. `Oracle::switch(build)` changes build without releasing it. |
-| Flash | `Oracle::read(area, off, &mut buf)`, `read_area(area) -> Vec<u8>`, `write(area, off, &data)`, over `Area::{Bootloader, Primary, Secondary, Scratch}` with `offset()` and `size()`. `write` stores bytes with no flash semantics. |
-| `bootutil` | `set_pending(permanent: bool)`, `set_confirmed()`, `swap_type()` (`swap_type::{NONE, TEST, PERM, REVERT, FAIL, PANIC}`), `boot_go() -> Result<Booted, Refusal>`. `Booted` is `image_off` (`0xC000`), `flash_dev_id` and the 32 header bytes. |
-| The two builds | `Build::Unsigned` and `Build::Ed25519`, both linked into every binary, each with its own flash. No feature or environment variable. |
-| The test key | Private: `bm-mcuboot-sys/testdata/test_ed25519_key.pem`, as `imgtool keygen -t ed25519` writes it. Public: `bm-mcuboot-sys/csrc/test_ed25519_pub_key.c`. |
-| A signed example | `bm-mcuboot-sys/testdata/body.signed.dfu.bin`, from `body.bin` with contract 2's arguments; the command is in the README. Its TLV area is 144 bytes: SHA-256, `KEYHASH`, `ED25519`. |
-| `imgtool` | `bm-mcuboot-sys/vendor/mcuboot/scripts/imgtool.py`; needs `cryptography`, `intelhex`, `click`, `cbor2`. bm_protocol's pixi environment has them. |
+`bm-mcuboot-sys/README.md` is the contract.
 
 Observed on the oracle, asserted in `bm-mcuboot-sys/tests/smoke.rs`:
 
@@ -325,11 +286,11 @@ Decisions:
 
 | Decision | Reason |
 |---|---|
-| Both builds in one binary, the signing build's symbols prefixed `ed25519_` by a generated force-included header | I1's tests need both builds in one `cargo test`; a cargo feature would give one per build of the crate. `build.rs` needs `nm`. |
+| Both builds in one binary, the signing build's symbols prefixed `ed25519_` by a generated force-included header | `bm-image`'s tests need both builds in one `cargo test`; a cargo feature would give one per build of the crate. `build.rs` needs `nm`. |
 | A bootutil `assert` returns `Refusal::Asserted` | The bootloader resets there; aborting would end the test process. |
 | `flash_area_write` clears bits and compares, as `port_flash.c`'s read-back does | A second write to bytes that are not erased fails unless it changes nothing. A flash trait M1 compares against needs the same rule. |
 | No bindgen | The API is this crate's own eight C functions. |
-| `sha256` exported | Test images need a hash TLV and the crate has no Rust dependencies. I1 has its own. |
+| `sha256` exported | Test images need a hash TLV and the crate has no Rust dependencies. |
 
 Left open:
 
@@ -345,16 +306,7 @@ Left open:
 
 ### M1 — `bm-mcuboot`, `bm-mcuboot-diff`
 
-`bm-mcuboot` has no SHA-256 and no signing. For I1:
-
-| Need | Call |
-|---|---|
-| The header | `Header::new(img_size, Version { major, minor, revision, build_num }).encode() -> [u8; 32]`, then `0xFF` to `image::BM_HDR_SIZE` |
-| The TLV area | `tlv::encode_unsigned(&sha256) -> [u8; 40]`, `tlv::encode_ed25519(&sha256, &keyhash, &signature) -> [u8; 144]`. I1 computes the three inputs. |
-| `info` | `Header::decode(bytes)`, `TlvArea::parse(bytes, &header)`, then `iter()`, `find(tlv::KEYHASH)`, `end()` (the file's length) |
-| The slot limit | `Trailer::BM.status_off(trailer::BM_MAX_IMG_SECTORS)`, `0xF0900`: where the bootloader's trailer starts. See the table below. |
-| An image in slot 2, marked by Rust | `bm_mcuboot_diff::RamSlot::of(&oracle, Area::Secondary)`, `set_pending(&mut slot, &Trailer::BM, false)`, `oracle.write(Area::Secondary, 0, &slot.bytes)` |
-| An unsigned test image | `bm_mcuboot_diff::image(body, version)`, hashed with the oracle's `sha256` |
+`bm-mcuboot` has no SHA-256 and no signing; `bm-image` has both.
 
 For S1:
 
@@ -405,7 +357,7 @@ Decisions:
 | `bm-mcuboot-diff`, not `bm-wire-diff` | Only the root `Cargo.lock` moved, and `fuzz.yml` does not need `vendor/mcuboot`. |
 | `Flash` has `erase`, which the card did not list | `boot_set_pending` erases the slot on a bad magic. |
 | `FlashError` is a unit struct, not an associated type | `bootutil` reports every flash failure as `BOOT_EFLASH`. |
-| `Trailer` is a value passed to free functions, with `Trailer::BM` | One `Flash` per slot serves both functions; I1 uses the offsets without flash. |
+| `Trailer` is a value passed to free functions, with `Trailer::BM` | One `Flash` per slot serves both functions; `bm-image` uses the offsets without flash. |
 | `Header::decode` checks nothing | The C casts the bytes. Validation is `boot_go`'s, on the oracle. |
 | `SwapState::swap_type` is a `u8` | The C keeps a `swap_info` nibble of 0, which is none of its constants. |
 | `permanent` is implemented | Three more lines, and diffed. S1 passes `false`. |
@@ -423,6 +375,64 @@ What `bootutil_public.c` does, reproduced and compared with the oracle
 | `set_confirmed`, bad magic | `BOOT_EBADVECT` (4). |
 | `set_confirmed`, `image_ok` neither `0x01` nor erased | 0, nothing written; `boot_swap_type` is `NONE`, so the image stays. |
 | A failed write | The oracle's flash has already cleared the bits. `RamSlot` does the same. |
+
+### I1 — `bm-image`
+
+`bm-image/README.md` is the contract. For L1:
+
+| Need | Where |
+|---|---|
+| The runner's and CI's command | `bm-image dfu <elf> [--key <pem>] -o <out.dfu.bin>`, then `bm-image info <out.dfu.bin>`. Exit 1 with one line on stderr and no file on failure. |
+| Running it from `bm-devkit/` | `cargo run --manifest-path ../Cargo.toml -p bm-image` there builds `bm-image` for the thumb target, which fails: cargo reads `bm-devkit/.cargo/config.toml` from the working directory. Run cargo from the repository root, or pass `--target` with the host triple. |
+| What `dfu` wants of the ELF | A loaded section starting at exactly `0x0800C200` and none below it; a `versionInfo_t` anywhere in the loaded bytes. It is found by its magic, not by parsing ELF notes, and its offset is not checked. |
+| Where the note is | `info` prints the magic's file offset. In the C image and in `bm-image/testdata/app.elf` it is `0x44C`: the note section at `0x438`, then the 12-byte note header and the 8-byte name. `testdata/app.s` and `app.ld` are a section layout that produces it. |
+| `ih_ver` | `maj.min.rev+gitSHA` from the note. All three of `maj`, `min`, `rev` at `0xFF` become `0.0.0`, as `git_version.cmake` writes for an untagged build. |
+| The body's limit | `0xF0520` signed, `0xF0588` unsigned: `bm_image::MAX_IMAGE_LEN` (`0xF07B0`) less the header and the TLV area. `memory.x`'s `0xF0520` fits both. |
+| `unified` | The bootloader as an ELF with a section at `0x08000000`, or a flat binary; at most `0xC000` bytes. |
+
+Observed, asserted in `bm-image/tests/oracle.rs`, from slot 1 and from slot 2
+after `bm_mcuboot::set_pending`:
+
+| Image | Unsigned bootloader | Signing bootloader |
+|---|---|---|
+| unsigned | boots | refused |
+| signed with its key | boots | boots |
+| signed with another key | not run | refused |
+| signed, a body byte flipped | refused | refused |
+| signed, `0xF07B0` bytes | not run | boots |
+
+Refused from slot 2: `boot_go` erases slot 2 and boots slot 1's image, and
+`boot_swap_type` is `NONE`. B1's "Rust, signed → Rust, unsigned" row is
+this case.
+
+Checked by hand against bm_protocol's build at `62d8b5d0`, not in a test:
+
+| Input | Result |
+|---|---|
+| `bm-image unified` of the C bootloader ELF and the C `hello_world` `.dfu.bin` | the C `.unified.bin`, byte for byte |
+| `bm-image dfu` of the C `hello_world` ELF | the C `.dfu.bin` except 15 gap bytes and the hash |
+| `imgtool` on a body one byte past the limit, unsigned and signed | refused, `Image size (0xf07b1) + trailer (0x1850) exceeds requested size 0xf2000`; at the limit, accepted |
+
+Decisions:
+
+| Decision | Reason |
+|---|---|
+| Gaps between sections are `0xFF`, where bm_protocol's `objcopy -O binary` writes `0x00` | The card's rule: erased flash. The gaps are alignment padding nothing reads. |
+| The ELF is read by `src/elf.rs`, not the `object` crate | ELF32 little-endian section and program headers are all it needs. |
+| Sections, not segments, placed by the segment holding their file bytes | As `objcopy`; a linker may put the ELF headers in the first segment. |
+| `ed25519-dalek` 3 with `pkcs8` and `pem`, `sha2` 0.11 | The PEM is parsed by the library that defines it. Only the root `Cargo.lock` moved. |
+| `bm-image` depends on `bm-wire` | `info`'s CRC is `bm_wire::crc::crc16_ccitt`, the function the DFU client checks an image with. |
+| `info` does not verify the signature | The file holds the key's hash, not the key. |
+| The test ELF is assembled and committed, with its sources | CI has no ARM toolchain or `imgtool`. |
+| Arguments parsed by hand | Three commands, two options. |
+
+Limits:
+
+- No encryption, no `--pad`, no protected TLVs, no Intel HEX.
+- `info` reads a `.dfu.bin`, not a `.unified.bin`.
+- An ELF with no section headers is refused.
+- A signed gold image exists for the test key only; bm_protocol's
+  development key is not in this repo.
 
 ### N1, for S1
 

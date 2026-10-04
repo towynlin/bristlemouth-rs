@@ -117,7 +117,7 @@ jobs:
       - name: Docs
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features --locked -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys -p bm-mcuboot -p bm-mcuboot-diff
+        run: cargo doc --no-deps --all-features --locked -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys -p bm-mcuboot -p bm-mcuboot-diff -p bm-image
 
   embedded:
     name: bare-metal builds
