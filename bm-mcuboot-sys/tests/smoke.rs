@@ -167,15 +167,13 @@ fn a_confirmed_image_stays() {
 #[test]
 fn the_builds_have_separate_flash() {
     let a = image(b"image a", 1);
-    {
-        let mut unsigned = fresh(Build::Unsigned);
-        unsigned.write(Area::Primary, 0, &a);
-    }
-    {
-        let signing = fresh(Build::Ed25519);
-        assert!(!holds(&signing, Area::Primary, &a));
-    }
-    assert!(holds(&lock(Build::Unsigned), Area::Primary, &a));
+    // One lock throughout: another test's reset must not come between.
+    let mut unsigned = fresh(Build::Unsigned);
+    unsigned.write(Area::Primary, 0, &a);
+    let mut signing = unsigned.switch(Build::Ed25519);
+    signing.reset();
+    assert!(!holds(&signing, Area::Primary, &a));
+    assert!(holds(&signing.switch(Build::Unsigned), Area::Primary, &a));
 }
 
 #[test]

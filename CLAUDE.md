@@ -214,6 +214,27 @@ A cargo workspace.
   - `testdata/` — `test_ed25519_key.pem`, a test-only private key whose
     public half the signing build trusts, and an image `imgtool` signed
     with it.
+- `bm-mcuboot/` — MCUboot's image header, TLV area and slot trailer.
+  `no_std`, no `alloc`, no dependencies, `forbid(unsafe_code)`; no SHA-256
+  and no signing. **Must never depend on `bm-mcuboot-sys`.**
+  - `src/image.rs` — `Header` and `Version`: `struct image_header`,
+    `struct image_version`.
+  - `src/tlv.rs` — `encode_unsigned` and `encode_ed25519`, the two TLV areas
+    bm_protocol's build makes; `TlvArea`, `tlv.c`'s walk over a byte slice.
+  - `src/trailer.rs` — `Trailer` (the offsets), the `Flash` trait,
+    `set_pending`, `set_confirmed`, `read_swap_state` and `swap_type`:
+    `bootutil_public.c`. Its module doc lists what the C does that its
+    comments do not say.
+- `bm-mcuboot-diff/` — `bm-mcuboot` against `bm-mcuboot-sys`. Host-only.
+  Separate from `bm-wire-diff` so that the fuzz workspace does not build
+  MCUboot.
+  - `src/lib.rs` — `RamSlot`, a copy of an oracle slot with the oracle's
+    flash rules; `image`, an unsigned image from `bm-mcuboot`'s encoders.
+  - `tests/trailer.rs` — every marking function on both sides from the same
+    flash: results, slot bytes and swap type must agree, over named cases
+    and 5000 random trailers; `boot_go` on Rust's marks against its own.
+  - `tests/image.rs` — the codecs on `imgtool`'s signed image and on images
+    `boot_go` boots.
 - `docs/c-divergences.md` — the upstream defect list.
 - `docs/hello-world-todo.md` — the plan for a Rust hello-world app on a dev
   kit (UDP, pub/sub, `spotter_log`, board support). **Complete and closed; no
@@ -275,14 +296,18 @@ cargo run -p bm-stack --example hello_node                 # the public API, end
 cargo build -p bm-wire --target thumbv7em-none-eabihf      # proves no_std, alloc-free
 cargo build -p bm-wire --target thumbv8m.main-none-eabihf  # the dev kit's Cortex-M33
 cargo build -p bm-stack --target thumbv8m.main-none-eabihf
+cargo build -p bm-mcuboot --target thumbv7em-none-eabihf
+cargo build -p bm-mcuboot --target thumbv8m.main-none-eabihf
 cd bm-phy-adin2111 && cargo test                           # own workspace, needs network
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
 cd bm-devkit && cargo build && cargo build --release      # own workspace, thumb only
 cargo +1.97 check --workspace --all-targets                # the declared MSRV
 cargo tree -p bm-wire                                      # only cbor2, serde, serde_core
+cargo tree -p bm-mcuboot                                   # no dependencies
 ./bm-wire-sys/scripts/check_symbols.sh --check             # only libc may be unresolved
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features \
-  -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys # -D warnings, as CI does
+  -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys \
+  -p bm-mcuboot -p bm-mcuboot-diff                         # -D warnings, as CI does
 cd bm-wire/fuzz && mkdir -p corpus/<target>                # libFuzzer wants it to exist
 cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 ```

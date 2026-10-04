@@ -100,9 +100,12 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
    writes them.
 3. **Link address.** The vector table is at `0x0800C200`: the bootloader
    sets `VTOR` and loads SP and PC from `0x0800C000 + ih_hdr_size`
-   (`app_main.c:57-78`). The image and its 40-byte TLV area must fit in the
-   slot ahead of the trailer and MCUboot's swap status area; I1 computes the
-   limit and L1 puts it in `memory.x`.
+   (`app_main.c:57-78`). Header, body and TLV area together are at most
+   `0xF07B0` bytes, the limit `imgtool` enforces for a bm_protocol build
+   and the strictest of the three M1 found (below); chosen so that any
+   image built here is one bm_protocol's tooling accepts. With the 512-byte
+   header and the signed TLV area's 144 bytes, the body is at most
+   `0xF0520`, which is `memory.x`'s `FLASH` length (L1).
 4. **The bootloader validates slot 1 on every boot**
    (`MCUBOOT_VALIDATE_PRIMARY_SLOT`). A bare ELF programmed at `0x0800C200`
    does not boot; `boot_go` fails and the bootloader panics. Every flashing
@@ -176,24 +179,6 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ## Cards
 
-### M1 — Header, TLVs and trailer
-
-- **Rust:** new crate `bm-mcuboot`: `no_std`, no `alloc`, no dependencies,
-  `forbid(unsafe_code)`. Explicit little-endian codecs for `image_header`,
-  `image_version` and the TLV area; the trailer offsets for a slot of a
-  given size and alignment (`boot_magic_off`, `boot_image_ok_off`,
-  `boot_copy_done_off`, `boot_swap_info_off`); `set_pending` and
-  `set_confirmed` over a small flash trait (`read`, `write`), each making
-  the writes `boot_set_pending(0)` and `boot_set_confirmed()` make,
-  including when they refuse (bad magic, already set).
-- **Diff:** tests against O1, in a host-only test crate or `bm-wire-diff`:
-  from the same starting flash, both sides' slot bytes are equal after
-  `set_pending`, and after a swap and `set_confirmed`. Starting states: an
-  erased trailer, a pending one, a confirmed one, a slot with no image.
-- **Blocked by:** nothing.
-- **Done:** the diff tests pass; `cargo build -p bm-mcuboot --target
-  thumbv8m.main-none-eabihf`.
-
 ### I1 — Image tool
 
 - **Rust:** new host crate `bm-image` in the root workspace; the SHA-256
@@ -206,7 +191,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   | `bm-image unified <bootloader> <dfu.bin> -o <out.unified.bin>` | The bootloader, an ELF or a flat binary given by path (in a bm_protocol checkout, `preset-builds/bootloader/src/bootloader-bootloader.elf`), padded with `0xFF` to `0xC000`, then the `.dfu.bin` (`src/CMakeLists.txt:683-684`). |
   | `bm-image info <file>` | Header, TLVs (signed or not, and the key hash), version note, CRC-16 (kermit) and size: `BmDfuImgInfo`'s fields. |
 
-  Rejects an image too large for the slot (contract 3) and states the limit.
+  Rejects a file longer than `0xF07B0` bytes (contract 3) and states the limit.
 - **Gold:** a small binary run through bm_protocol's `imgtool.py` with
   contract 2's arguments, once without a key and once with O1's test key;
   input and both outputs committed as test data with the commands;
@@ -219,7 +204,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   signed on both. On the signing build an unsigned image, one signed with
   another key, and one with a flipped body byte are each refused; assert
   what `boot_go` does with slot 2 and which image it boots.
-- **Blocked by:** M1.
+- **Blocked by:** nothing.
 - **Done:** gold and oracle tests pass in `cargo test`.
 
 ### L1 — Link for slot 1
@@ -228,7 +213,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
   | Change | Detail |
   |---|---|
-  | `memory.x` | `FLASH` origin `0x0800C200`, length from contract 3. No other layout. |
+  | `memory.x` | `FLASH` origin `0x0800C200`, length `0xF0520` (contract 3). No other layout. |
   | Version note | A `#[used]` static in the C's layout (contract 8), in a section a linker fragment places at `0x0800C438`, padding after the vector table if cortex-m-rt's ends earlier. Fields from the values `DevkitIdentity` reports. |
   | Watchdog | Fed from a task spawned in `start`, period 1 s, before anything that can wait. |
   | Clocks | `config()` reaches the same tree from the bootloader's state (contract 6) as from reset. |
@@ -267,7 +252,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 - **Bench:** a dev kit running Rust `hello_world` accepts a Rust
   `.dfu.bin` with a different git SHA from a Bridge, reboots into it, and
   the Bridge reports success.
-- **Blocked by:** M1, L1.
+- **Blocked by:** L1.
 - **Done:** the bench line.
 
 ### B1 — On a bus
@@ -302,17 +287,16 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | M1 | nothing |
-| 2 | I1 | M1 |
-| 3 | L1 | I1 |
-| 4 | S1 | M1, L1 |
-| 5 | B1 | S1 |
+| 1 | I1 | nothing |
+| 2 | L1 | I1 |
+| 3 | S1 | L1 |
+| 4 | B1 | S1 |
 
 Cards within a wave can run in parallel.
 
 ## What the landed cards left for the rest
 
-Landed: O1, N1.
+Landed: O1, N1, M1.
 
 ### O1 — `bm-mcuboot-sys`
 
@@ -320,7 +304,7 @@ Landed: O1, N1.
 
 | Need | Where |
 |---|---|
-| The oracle | `bm_mcuboot_sys::lock(Build) -> Oracle`. One process-global lock for both builds; flash persists between locks, so start with `reset()`. |
+| The oracle | `bm_mcuboot_sys::lock(Build) -> Oracle`. One process-global lock for both builds; flash persists between locks, so start with `reset()`. `Oracle::switch(build)` changes build without releasing it. |
 | Flash | `Oracle::read(area, off, &mut buf)`, `read_area(area) -> Vec<u8>`, `write(area, off, &data)`, over `Area::{Bootloader, Primary, Secondary, Scratch}` with `offset()` and `size()`. `write` stores bytes with no flash semantics. |
 | `bootutil` | `set_pending(permanent: bool)`, `set_confirmed()`, `swap_type()` (`swap_type::{NONE, TEST, PERM, REVERT, FAIL, PANIC}`), `boot_go() -> Result<Booted, Refusal>`. `Booted` is `image_off` (`0xC000`), `flash_dev_id` and the 32 header bytes. |
 | The two builds | `Build::Unsigned` and `Build::Ed25519`, both linked into every binary, each with its own flash. No feature or environment variable. |
@@ -358,6 +342,87 @@ Left open:
 - CI and `session-start.sh` check out `vendor/mcuboot` without
   `--recursive`. A job that adds `submodules: recursive` would clone
   MCUboot's mbedtls, esp-idf and Cypress submodules.
+
+### M1 — `bm-mcuboot`, `bm-mcuboot-diff`
+
+`bm-mcuboot` has no SHA-256 and no signing. For I1:
+
+| Need | Call |
+|---|---|
+| The header | `Header::new(img_size, Version { major, minor, revision, build_num }).encode() -> [u8; 32]`, then `0xFF` to `image::BM_HDR_SIZE` |
+| The TLV area | `tlv::encode_unsigned(&sha256) -> [u8; 40]`, `tlv::encode_ed25519(&sha256, &keyhash, &signature) -> [u8; 144]`. I1 computes the three inputs. |
+| `info` | `Header::decode(bytes)`, `TlvArea::parse(bytes, &header)`, then `iter()`, `find(tlv::KEYHASH)`, `end()` (the file's length) |
+| The slot limit | `Trailer::BM.status_off(trailer::BM_MAX_IMG_SECTORS)`, `0xF0900`: where the bootloader's trailer starts. See the table below. |
+| An image in slot 2, marked by Rust | `bm_mcuboot_diff::RamSlot::of(&oracle, Area::Secondary)`, `set_pending(&mut slot, &Trailer::BM, false)`, `oracle.write(Area::Secondary, 0, &slot.bytes)` |
+| An unsigned test image | `bm_mcuboot_diff::image(body, version)`, hashed with the oracle's `sha256` |
+
+For S1:
+
+| `DfuSlot` method | Call |
+|---|---|
+| `set_pending_and_reset` | `bm_mcuboot::set_pending(&mut slot2, &Trailer::BM, false)` |
+| `set_confirmed` | `bm_mcuboot::set_confirmed(&mut slot1, &Trailer::BM)` |
+
+Both take a `bm_mcuboot::Flash`: `read(off, buf)`, `write(off, data)`,
+`erase(off, len)`, offsets from the start of the slot, each
+`Result<(), FlashError>`. S1 implements it once per slot.
+
+| `Flash` method | What S1's must do |
+|---|---|
+| `write` | Each call is 16 bytes at a multiple of 16: one quad-word. Verify by reading back, as `port_flash.c` does, or a failed write returns `Ok` where the C returns `BOOT_EFLASH`. |
+| `erase` | Called only by `set_pending`, with `(0, 0xF2000)`, when slot 2's magic is neither good nor erased. It must feed the IWDG (contract 5). Its result is ignored. |
+
+Limits of the slot's contents, from the start of the slot:
+
+| Limit | Value | From |
+|---|---|---|
+| The bootloader's trailer | `0xF0900` (`0xF2000` - 5888) | `boot_trailer_sz`: 121 sectors × 3 × 16, plus 80 |
+| `imgtool`'s check of header, body and TLVs | `0xF07B0` (`0xF2000` - 6224) | `image.py` `_trailer_size` with bm_protocol's arguments: its default 128 sectors × 3 × 16, plus 80 |
+| The bootloader's own check | `ih_hdr_size + ih_img_size < 0xF2000` | `loader.c` `boot_is_header_valid`; v1.9.0 does not compare the image with the trailer |
+
+The C build is held to `imgtool`'s.
+
+Limits of the crate:
+
+- `Trailer` has one `align` for `BOOT_MAX_ALIGN` and `flash_area_align`.
+  8 and 32 follow the C by reading and have unit tests only; the oracle
+  is 16.
+- `Trailer::new` refuses a slot that is not a multiple of `align` or is
+  smaller than the trailer's fields.
+- TLV decoding refuses what `tlv.c` reads past (`src/tlv.rs`, module doc).
+  Protected TLVs are unit-tested on hand-built bytes; there is no `imgtool`
+  sample with one.
+- No encryption fields.
+- Flash read failures are unit-tested only: the oracle's reads cannot fail
+  inside a slot.
+- No cargo-fuzz target. `tests/trailer.rs` `random_trailers` is 5000
+  trailers from a fixed seed.
+
+Decisions:
+
+| Decision | Reason |
+|---|---|
+| `bm-mcuboot-diff`, not `bm-wire-diff` | Only the root `Cargo.lock` moved, and `fuzz.yml` does not need `vendor/mcuboot`. |
+| `Flash` has `erase`, which the card did not list | `boot_set_pending` erases the slot on a bad magic. |
+| `FlashError` is a unit struct, not an associated type | `bootutil` reports every flash failure as `BOOT_EFLASH`. |
+| `Trailer` is a value passed to free functions, with `Trailer::BM` | One `Flash` per slot serves both functions; I1 uses the offsets without flash. |
+| `Header::decode` checks nothing | The C casts the bytes. Validation is `boot_go`'s, on the oracle. |
+| `SwapState::swap_type` is a `u8` | The C keeps a `swap_info` nibble of 0, which is none of its constants. |
+| `permanent` is implemented | Three more lines, and diffed. S1 passes `false`. |
+
+What `bootutil_public.c` does, reproduced and compared with the oracle
+(`bm-mcuboot/src/trailer.rs`, module doc):
+
+| Case | Result |
+|---|---|
+| `set_pending` or `set_confirmed` on a slot with no image | Neither reads the image. An empty slot 2 is marked pending; `boot_go` then erases it. |
+| `set_pending(permanent)` on a slot pending a test | 0, nothing written: the swap stays a test. |
+| `set_pending`, bad magic | Slot erased, `BOOT_EBADIMAGE` (3). |
+| `set_pending`, `swap_info`'s block not erased | `BOOT_EFLASH` (1) with the magic written: the slot is pending, and `boot_swap_type` says `TEST`. |
+| `set_confirmed`, no magic | 0, nothing written: an image that was not swapped in has nothing to confirm. |
+| `set_confirmed`, bad magic | `BOOT_EBADVECT` (4). |
+| `set_confirmed`, `image_ok` neither `0x01` nor erased | 0, nothing written; `boot_swap_type` is `NONE`, so the image stays. |
+| A failed write | The oracle's flash has already cleared the bits. `RamSlot` does the same. |
 
 ### N1, for S1
 
