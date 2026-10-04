@@ -75,7 +75,7 @@ jobs:
       # The firmware view. The host lint above never compiles this cfg, and
       # bare-metal is where bm-wire and bm-stack actually have to hold up.
       - name: Cortex-M33
-        run: cargo clippy -p bm-wire -p bm-stack --features bm-stack/channel --target thumbv8m.main-none-eabihf --locked -- -D warnings
+        run: cargo clippy -p bm-wire -p bm-stack -p bm-mcuboot --features bm-stack/channel --target thumbv8m.main-none-eabihf --locked -- -D warnings
 
   test:
     name: test
@@ -117,7 +117,7 @@ jobs:
       - name: Docs
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --all-features --locked -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys
+        run: cargo doc --no-deps --all-features --locked -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys -p bm-mcuboot -p bm-mcuboot-diff
 
   embedded:
     name: bare-metal builds
@@ -144,6 +144,10 @@ jobs:
         run: cargo build -p bm-wire --target thumbv8m.main-none-eabihf --locked
       - name: bm-stack (thumbv8m)
         run: cargo build -p bm-stack --target thumbv8m.main-none-eabihf --locked
+      - name: bm-mcuboot (thumbv7em)
+        run: cargo build -p bm-mcuboot --target thumbv7em-none-eabihf --locked
+      - name: bm-mcuboot (thumbv8m)
+        run: cargo build -p bm-mcuboot --target thumbv8m.main-none-eabihf --locked
 
   msrv:
     name: msrv
@@ -205,11 +209,19 @@ jobs:
               exit 1
             fi
           done
+      - name: bm-mcuboot has no dependencies
+        run: |
+          got=$(cargo tree --locked -p bm-mcuboot --all-features --prefix none \
+                  | awk 'NF {print $1}' | sort -u | tr '\n' ' ' | sed 's/ $//')
+          if [ "$got" != "bm-mcuboot" ]; then
+            echo "::error::bm-mcuboot has dependencies: $got"
+            exit 1
+          fi
       # The host-only oracles must never be reachable from a crate that ships.
       - name: The oracles stay out of the firmware crates
         run: |
           status=0
-          for pkg in bm-wire bm-stack; do
+          for pkg in bm-wire bm-stack bm-mcuboot; do
             for oracle in bm-wire-sys bm-mcuboot-sys; do
               if cargo tree --locked -p "$pkg" --all-features | grep -q "$oracle"; then
                 echo "::error::$pkg reaches $oracle; the oracle would end up in firmware"
