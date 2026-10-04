@@ -8,6 +8,8 @@ is the hello-world app.
 cd bm-devkit && cargo build --target thumbv8m.main-none-eabihf
 cd bm-devkit && cargo run --release --bin bringup     # probe-rs, defmt over RTT
 cd bm-devkit && cargo run --release --bin hello_world
+# The runner passes --no-catch-reset, so logging continues across a reset.
+# probe-rs 0.21 has no such flag: cargo install probe-rs-tools --locked
 ```
 
 Its own workspace, beside `bm-phy-adin2111` and for the same reason (git

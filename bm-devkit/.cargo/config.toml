@@ -1,6 +1,8 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
 # The part bm_protocol's bm_mote_v1.0.ioc names (`Mcu.UserName`).
-runner = "probe-rs run --chip STM32U575CITxQ"
+# `--no-catch-reset`: stay attached across a reset, the button's or the
+# firmware's own. Needs a probe-rs that has the flag (0.32 does; 0.21 does not).
+runner = "probe-rs run --chip STM32U575CITxQ --no-catch-reset"
 
 [build]
 target = "thumbv8m.main-none-eabihf"
