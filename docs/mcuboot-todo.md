@@ -7,8 +7,8 @@ one agent each. Same card format as `docs/services-todo.md`.
 
 Why: a deployed module is potted. USB and SWD are not reachable; the only way
 in is Bristlemouth DFU of a `.dfu.bin` from a Spotter's SD card, through a
-Bridge, into MCUboot's secondary slot. `bm-devkit` today links at
-`0x08000000`, overwrites the bootloader, and has `NoDfu`.
+Bridge, into MCUboot's secondary slot. `bm-devkit` links for slot 1 and
+has `NoDfu`.
 
 | In scope | Source |
 |---|---|
@@ -182,6 +182,12 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 ### L1 — Link for slot 1
 
 **Taken:** mcuboot-l1-link
+
+**Bench pending:** https://github.com/towynlin/bristlemouth-rs/pull/70.
+The code is in. Run on a kit: `cargo run` boots, logs and stays up 40 s on
+a bus with a Bridge; the `.unified.bin` programmed with `probe-rs` boots
+the same. Left: the node in the Bridge's topology listing, and `dfu-util`
+as the `.unified.bin`'s transport.
 
 - **Rust, `bm-devkit`:**
 
@@ -435,6 +441,29 @@ Limits:
 - An ELF with no section headers is refused.
 - A signed gold image exists for the test key only; bm_protocol's
   development key is not in this repo.
+
+### L1, for S1
+
+Bench pending; the code is in. `bm-devkit/README.md`, "Flash layout,
+bootloader, no-init RAM", is the record.
+
+| Item | Use |
+|---|---|
+| `bm_devkit::watchdog::feed()` | Call between page erases. `watchdog::task` cannot run while `erase` holds the executor. |
+| `bm_devkit::start(spawner)` | Takes the `Spawner` and spawns `watchdog::task`. |
+| `bm_devkit::version` | `GIT_SHA`, `MAJOR`, `MINOR`, `REVISION`: what `DevkitIdentity` reports and what the note carries. A build with another SHA is another commit, or `BM_DEVKIT_GIT_SHA` forced in `build.rs`. |
+| `cargo run` | `runner.sh`: writes slot 1 only. A pending image in slot 2 is swapped in by the bootloader on the reset that follows. |
+| `embassy_stm32::init` | Drops `p.FLASH` unless `start` keeps it; `Board` needs a field for S1's slot. |
+
+Decisions:
+
+| Decision | Reason |
+|---|---|
+| `devkit.x`, a copy of cortex-m-rt 0.7.7's `link.x`, with the crate pinned | Its vector table assertion wants `0x400` alignment for a `0x238`-byte table and cannot be overridden from `memory.x`. ARMv8-M needs 128. |
+| The IWDG is fed, not reconfigured | The bootloader's 4.1 s stands, as in the C. `feed` writes `IWDG_KR` through the PAC, so S1's `erase` needs no handle. |
+| `config()` unchanged | `embassy_stm32::init` moves SYSCLK to HSI first. Registers read on a bench match. |
+| The dirty flag is not in the note | `build.rs` reruns when `HEAD` moves, not when the tree changes. |
+| The runner resets and attaches rather than `probe-rs run` | `run` programs the ELF, which has no MCUboot header. Logs between reset and attach wait in the RTT buffer. |
 
 ### N1, for S1
 
