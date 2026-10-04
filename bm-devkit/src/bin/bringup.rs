@@ -88,6 +88,7 @@ async fn main(spawner: Spawner) {
             board.node_id,
             board.flash,
             board.rtc,
+            board.slot,
         )
     });
     log_config(&node.config().store);

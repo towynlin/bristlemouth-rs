@@ -356,6 +356,42 @@ memfault's U5 core, or with another `.noinit` object linked ahead of
 `bm_devkit::node` still builds its node with `NoDfu`: `Node` takes one type
 for `DfuSlot` and `NoInitRam`, so `NoInit` goes in with the slot.
 
+### DFU slot
+
+`src/slot.rs` `DevkitSlot` is `bm_stack::DfuSlot` on slot 2 and
+`bm_stack::NoInitRam` through `noinit::NoInit`. `start` builds it from
+`p.FLASH`; `node` passes it to `Node::with_dfu`.
+
+| Hook | C | Here |
+|---|---|---|
+| open, close, size | `bm_dfu_wrapper.cpp:35-65`, `port_flash.c:77-88` | `true`, `true`, `0xF2000` |
+| erase | `port_flash.c:140-169`, `stm32_flash_u5.c:8-93`: page-aligned whole pages, else failure; erased per bank; read back as `0xFF` | the same, one page per `embassy_stm32::flash::Flash::blocking_erase`, `watchdog::feed` before each |
+| write | `port_flash.c:110-137`, `stm32_flash_u5.c:95-125`: quad-words, then a `memcmp` of `len` bytes | the same, one quad-word per `blocking_write` |
+| read | the host's `bm_dfu_host_get_chunk` reads the W25 `dfu` partition (`bm_dfu_wrapper.cpp:67-75`) | slot 2, memory-mapped |
+| `set_pending_and_reset` | `boot_set_pending(0)`, result ignored; `resetSystem(RESET_REASON_MCUBOOT)` (`bm_dfu_wrapper.cpp:24-28`) | `bm_mcuboot::set_pending(slot 2, Trailer::BM, false)`, result logged; `noinit::reset(ResetReason::Mcuboot)` |
+| `set_confirmed` | `boot_set_confirmed()` on slot 1 (`:17-22`) | `bm_mcuboot::set_confirmed(slot 1, Trailer::BM)` |
+| `fail_update_and_reset` | `resetSystem(RESET_REASON_UPDATE_FAILED)` (`:30-33`) | `noinit::reset(ResetReason::UpdateFailed)` |
+
+Where the C's behaviour is not reproduced:
+
+| Case | C | Here |
+|---|---|---|
+| A write's tail shorter than 16 bytes | `flashWrite` copies 16 bytes from the source (`stm32_flash_u5.c:103`), past its end, and programs them | `0xFF` past the tail |
+| An erase past the slot's end | `flash_area_erase` does not check `fa_size`; `flashErase` checks only the chip's flash, so it erases into the next area | `false` |
+| A write at an offset not a multiple of 16 | `HAL_FLASH_Program` fails, `flashWrite` returns `true` regardless (`:119`), the read-back fails | `false`, nothing programmed |
+
+bm_core's client writes 2048-byte pages and one remainder from offset 0, so
+only the first case occurs; it changes bytes past the image that nothing
+reads.
+
+The ICACHE is off: neither the bootloader nor `embassy_stm32::init`
+enables it, so reads after an erase or write see flash.
+
+`erase` blocks the executor for the whole slot, as `flashErase` blocks the
+C's DFU task; the ADIN2111 runner and the node's timers wait. It logs its
+duration. Not measured yet: the time to erase the slot, and whether a
+neighbour times the node out meanwhile.
+
 ## DFU image locations
 
 The client receives into internal flash; only the host reads the NOR flash.

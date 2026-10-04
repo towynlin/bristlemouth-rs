@@ -4,7 +4,8 @@
 //! from: heartbeats, echo requests, and publications received. It also
 //! subscribes to [`utc_time::TOPIC`] and sets the node's clock from it, as C
 //! dev kits do, and logs BCMP time messages, each set, and every 10 s the
-//! node's RTC reading.
+//! node's RTC reading. It takes updates over DFU into slot 2 and logs their
+//! progress.
 //!
 //! It lists the services a C dev kit lists, in `app_main.cpp`'s order:
 //! metrics at construction, then echo, sys_info and config_map, so a
@@ -37,6 +38,18 @@ use {defmt_rtt as _, panic_probe as _};
 const SUBSCRIPTION: &[u8] = b"spotter/*";
 
 const HELLO: &[u8] = b"hello world";
+
+/// The DFU messages logged: all but the per-chunk `DFU_PAYLOAD_REQ` and
+/// `DFU_PAYLOAD`. `bm_devkit::slot` logs the erase and every 64 KiB written.
+const DFU_MESSAGES: [MessageType; 7] = [
+    MessageType::DFU_START,
+    MessageType::DFU_END,
+    MessageType::DFU_ACK,
+    MessageType::DFU_ABORT,
+    MessageType::DFU_REBOOT_REQ,
+    MessageType::DFU_REBOOT,
+    MessageType::DFU_BOOT_COMPLETE,
+];
 
 #[embassy_executor::task]
 async fn adin(runner: AdinRunner) -> ! {
@@ -143,6 +156,16 @@ impl App<Devkit> for Hello {
                     Err(_) => warn!("short time response from {=u64:016x}", source),
                 }
             }
+            Event::Message {
+                message_type,
+                source,
+                ..
+            } if DFU_MESSAGES.contains(&message_type) => {
+                info!("dfu: {=u16:#x} from {=u64:016x}", message_type.0, source);
+            }
+            Event::DfuUpdateFinished(finished) => {
+                info!("dfu: finished {}", defmt::Debug2Format(&finished));
+            }
             Event::Publication {
                 source,
                 subscription,
@@ -175,6 +198,7 @@ async fn main(spawner: Spawner) {
             board.node_id,
             board.flash,
             board.rtc,
+            board.slot,
         )
     });
     // `app_main.cpp:412-415`: the utc-time subscription, then the services.

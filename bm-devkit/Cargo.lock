@@ -87,6 +87,7 @@ dependencies = [
 name = "bm-devkit"
 version = "0.1.0"
 dependencies = [
+ "bm-mcuboot",
  "bm-phy-adin2111",
  "bm-stack",
  "bm-wire",
@@ -102,6 +103,10 @@ dependencies = [
  "panic-probe",
  "static_cell",
 ]
+
+[[package]]
+name = "bm-mcuboot"
+version = "0.1.0"
 
 [[package]]
 name = "bm-phy-adin2111"

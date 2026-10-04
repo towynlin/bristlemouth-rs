@@ -30,6 +30,7 @@ bench = false
 [dependencies]
 bm-stack = { path = "../bm-stack" }
 bm-wire = { path = "../bm-wire" }
+bm-mcuboot = { path = "../bm-mcuboot" }
 bm-phy-adin2111 = { path = "../bm-phy-adin2111" }
 
 cortex-m = { version = "0.7.6", features = ["inline-asm", "critical-section-single-core"] }

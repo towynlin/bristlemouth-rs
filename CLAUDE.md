@@ -130,12 +130,13 @@ A cargo workspace.
   ADIN2111 on SPI3, W25Q64JV NOR flash on SPI2): `start` spawns the watchdog task, powers and
   brings up the ADIN2111, sets up the flash and starts the RTC, `node` builds a
   `Devkit` node with the chip's node id, the binary's name as `app_name`, the
-  RTC and its config partitions in flash; `src/bin/bringup.rs`
+  RTC, its config partitions in flash and its DFU slot; `src/bin/bringup.rs`
   runs one and logs the config keys it loaded, each as a
   `bm_wire::configuration::Entry`; `src/bin/hello_world.rs` is
   the hello-world app: subscribes to `spotter/*`, sends `hello world` with
-  `spotter_log` every 10 s, sets the RTC from `spotter/utc-time`, and
-  lists echo, sys_info and config_map after metrics, as a C dev kit does.
+  `spotter_log` every 10 s, sets the RTC from `spotter/utc-time`,
+  lists echo, sys_info and config_map after metrics, as a C dev kit does,
+  and logs DFU progress.
   **Its own workspace**, for
   bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
   `.cargo/config.toml` sets the thumb target and `runner.sh` as the runner.
@@ -161,6 +162,9 @@ A cargo workspace.
     `take_reset_reason`, bm_protocol's `reset_reason.c`.
   - `src/storage.rs` — `FlashConfigStorage`, `bm_stack::ConfigStorage` at
     bm_protocol's partition offsets.
+  - `src/slot.rs` — `DevkitSlot`, `bm_stack::DfuSlot` on MCUboot's slot 2
+    over `embassy_stm32::flash`, with `bm_mcuboot`'s pending and confirm
+    marks; `NoInitRam` through `noinit::NoInit`.
 - `bm-wire-diff/` — the differential harness. Host-only. One comparator per
   surface, shared by the fuzz targets and by ordinary `#[test]`s.
   - `src/frames.rs` — BCMP, UDP and publication frames a peer sends, for
