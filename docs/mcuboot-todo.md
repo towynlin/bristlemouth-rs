@@ -25,7 +25,9 @@ Out of scope:
 | Item | Why |
 |---|---|
 | A bootloader in Rust | Deployed nodes have the C one; it is used unchanged. |
-| Signed or encrypted images | `CMakePresets.json` builds with `SIGN_IMAGES` 0 and no encryption. See "Open questions". |
+| Signed or encrypted images | Contract 13. Dev kits take unsigned images, and those are the target. |
+| A no-bootloader link at `0x08000000` | One layout, the deployed one. |
+| Vendoring bm_protocol | Never. The bootloader comes by path (I1). |
 | DFU host on a dev kit (image in the W25 `dfu` partition) | The Bridge is the host. `bm-devkit/README.md`, "DFU image locations". |
 | Memfault reboot tracking and coredumps | Rust firmware has no memfault. Its no-init bytes are left untouched. |
 | `update confirm`, `mcuboot_cli.c` | USB console. |
@@ -38,8 +40,7 @@ Before starting:
    **Taken** line. Add `**Taken:** <branch>` under its title as the first
    commit of the branch, so parallel agents do not collide. If the card turns
    out to be two, split it here in that commit.
-2. Read "MCUboot contract", "Open questions" and "What the landed cards left
-   for the rest".
+2. Read "MCUboot contract" and "What the landed cards left for the rest".
 
 One branch and one PR per card; open the PR without being asked
 (`CLAUDE.md`, "Pull requests"). When the code is done and verified, edit
@@ -51,7 +52,6 @@ this file in a separate commit, the last of the branch:
 | What the landed cards left for the rest | Add what a remaining card needs: API shape, a limit or gap left open, and **the reason for any decision between options**. Delete entries no remaining card needs. Keep the heading's card list current. |
 | Other cards | Remove the card from every **Blocked by**; write "nothing" where none remain. |
 | Order | Remove it from the graph. |
-| Open questions | Answered: move the answer into the contract or a card, delete the row. |
 
 New files, crates or verify commands go into `CLAUDE.md`'s layout and
 "Verifying" sections in the card's code commits. bm_protocol facts (addresses,
@@ -124,11 +124,15 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
    | Where | Read by |
    |---|---|
    | `Identity::device_info().git_sha`, `ver_major`, `ver_minor` | the running node, after the swap |
-   | `versionInfo_t` in the image (`version.h`; magic `0xDF7F9AFDEC06627C`, then `gitSHA`, `maj`, `min`, `rev`, `hwVersion`, `flags`, `versionStrLen`, `versionStr[96]`, packed) inside an ELF note named `VERSION`, type `0x10` | tools that scan a `.dfu.bin` for the magic (`tools/scripts/util/fwinfo.py`, `tools/scripts/dfu/bm_load_img_to_flash.py`) to fill `BmDfuImgInfo`; assumed of the Spotter too |
+   | `versionInfo_t` in the image (`version.h`; magic `0xDF7F9AFDEC06627C`, then `gitSHA`, `maj`, `min`, `rev`, `hwVersion`, `flags`, `versionStrLen`, `versionStr[96]`, packed) inside an ELF note named `VERSION`, type `0x10` | tools that scan a `.dfu.bin` for the magic (`tools/scripts/util/fwinfo.py`, `tools/scripts/dfu/bm_load_img_to_flash.py`) to fill `BmDfuImgInfo` |
    | `ih_ver` in the MCUboot header | MCUboot logs only (no downgrade prevention configured) |
 
    In the C image the note follows the vector table: `0x0800C438`, file
-   offset `0x438`.
+   offset `0x438`. The Spotter is a conduit and checks no version; only the
+   updating mote does. The Bridge takes `gitSHA`, `major_ver` and
+   `minor_ver` from the Spotter's `dfu_start` message
+   (`src/lib/bm_ncp/ncp_dfu.cpp:124-127`); how the Spotter reads them from
+   the file is not in bm_protocol, so the note goes at the C's offset.
 9. **No-init RAM**, top 512 bytes of RAM from `0x200BFE00`, in
    `bm_mote_v1.0-hello_world-dbg.elf.map`:
 
@@ -155,16 +159,15 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
     dev kits. `dfu-util` of a C `.elf.unified.bin` at `0x08000000` restores
     one.
 
-## Open questions
-
-For the repo owner. Cards proceed on the "Assumed" column.
-
-| Question | Assumed |
-|---|---|
-| Do deployed bootloaders require signed images (`SIGN_IMAGES=1`, ed25519)? | No: unsigned, SHA-256 TLV only, as the presets build. If yes, I1 gains `--key` and a card for key handling. |
-| Does the Spotter find an image's version by scanning for `VERSION_MAGIC`, or at a fixed offset? | Scanning. L1 places the note at the C's offset `0x438` anyway. |
-| Which bootloader ELF does `.unified.bin` take? | A path given to the tool; bm_protocol is not vendored. `preset-builds/bootloader/src/bootloader-bootloader.elf` in a bm_protocol checkout. |
-| Should `bm-devkit` keep a no-bootloader link at `0x08000000`? | No. One layout, the deployed one. |
+13. **Signing depends on the module.** Dev kits ship `hello_world` behind a
+    bootloader that takes unsigned images, and their owners may flash any
+    firmware. So do some third-party modules built on Sofar's line. Modules
+    Sofar sells have a bootloader that checks an ed25519 signature
+    (`SIGN_IMAGES=1`); an image for those is signed with Sofar's key, which
+    this repo does not hold. `bm-image` builds unsigned images. Expected on
+    a signature-checking bootloader, not verified: MCUboot refuses the image
+    in slot 2, keeps the running one, and the client reports
+    `BmDfuErrWrongVer`.
 
 ## Cards
 
@@ -219,7 +222,7 @@ For the repo owner. Cards proceed on the "Assumed" column.
   | Command | Output |
   |---|---|
   | `bm-image dfu <elf> -o <out.dfu.bin>` | Contract 2's file. The binary is the ELF's loadable sections from `0x0800C200`, gaps `0xFF`. Version and git SHA come from the image's own `versionInfo_t` (contract 8), so the header cannot disagree with it; an ELF without one is an error. |
-  | `bm-image unified <bootloader.elf> <dfu.bin> -o <out.unified.bin>` | The bootloader's binary padded with `0xFF` to `0xC000`, then the `.dfu.bin` (`src/CMakeLists.txt:683-684`). |
+  | `bm-image unified <bootloader> <dfu.bin> -o <out.unified.bin>` | The bootloader, an ELF or a flat binary given by path (in a bm_protocol checkout, `preset-builds/bootloader/src/bootloader-bootloader.elf`), padded with `0xFF` to `0xC000`, then the `.dfu.bin` (`src/CMakeLists.txt:683-684`). |
   | `bm-image info <file>` | Header, TLVs, version note, CRC-16 (kermit) and size: `BmDfuImgInfo`'s fields. |
 
   Rejects an image too large for the slot (contract 3) and states the limit.
@@ -239,8 +242,8 @@ For the repo owner. Cards proceed on the "Assumed" column.
 
   | Change | Detail |
   |---|---|
-  | `memory.x` | `FLASH` origin `0x0800C200`, length from contract 3. |
-  | Version note | A `#[used]` static in the C's layout (contract 8), in a section a linker fragment places after the vector table, at `0x0800C438` if cortex-m-rt's table ends where the C's does; say in the README if it cannot. Fields from the values `DevkitIdentity` reports. |
+  | `memory.x` | `FLASH` origin `0x0800C200`, length from contract 3. No other layout. |
+  | Version note | A `#[used]` static in the C's layout (contract 8), in a section a linker fragment places at `0x0800C438`, padding after the vector table if cortex-m-rt's ends earlier. Fields from the values `DevkitIdentity` reports. |
   | Watchdog | Fed from a task spawned in `start`, period 1 s, before anything that can wait. |
   | Clocks | `config()` reaches the same tree from the bootloader's state (contract 6) as from reset. |
   | Runner | `.cargo/config.toml`'s runner builds the `.dfu.bin` with `bm-image`, programs it at `0x0800C000`, and attaches for defmt. `cargo run` keeps working and no longer touches the bootloader. |
