@@ -8,6 +8,7 @@
  * The top 512 bytes of RAM are left out, as in bm_protocol's
  * src/bsp/common/linker/bs_stm32u575.ld (`_noinit_size`), where the C
  * firmware keeps the no-init block that carries a DFU across a reset.
+ * src/noinit.rs reads and writes it at fixed addresses.
  */
 MEMORY
 {
