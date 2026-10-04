@@ -100,9 +100,12 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
    writes them.
 3. **Link address.** The vector table is at `0x0800C200`: the bootloader
    sets `VTOR` and loads SP and PC from `0x0800C000 + ih_hdr_size`
-   (`app_main.c:57-78`). The image and its 40-byte TLV area must fit in the
-   slot ahead of the trailer and MCUboot's swap status area; I1 computes the
-   limit and L1 puts it in `memory.x`.
+   (`app_main.c:57-78`). Header, body and TLV area together are at most
+   `0xF07B0` bytes, the limit `imgtool` enforces for a bm_protocol build
+   and the strictest of the three M1 found (below); chosen so that any
+   image built here is one bm_protocol's tooling accepts. With the 512-byte
+   header and the signed TLV area's 144 bytes, the body is at most
+   `0xF0520`, which is `memory.x`'s `FLASH` length (L1).
 4. **The bootloader validates slot 1 on every boot**
    (`MCUBOOT_VALIDATE_PRIMARY_SLOT`). A bare ELF programmed at `0x0800C200`
    does not boot; `boot_go` fails and the bootloader panics. Every flashing
@@ -188,7 +191,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   | `bm-image unified <bootloader> <dfu.bin> -o <out.unified.bin>` | The bootloader, an ELF or a flat binary given by path (in a bm_protocol checkout, `preset-builds/bootloader/src/bootloader-bootloader.elf`), padded with `0xFF` to `0xC000`, then the `.dfu.bin` (`src/CMakeLists.txt:683-684`). |
   | `bm-image info <file>` | Header, TLVs (signed or not, and the key hash), version note, CRC-16 (kermit) and size: `BmDfuImgInfo`'s fields. |
 
-  Rejects an image too large for the slot (contract 3) and states the limit.
+  Rejects a file longer than `0xF07B0` bytes (contract 3) and states the limit.
 - **Gold:** a small binary run through bm_protocol's `imgtool.py` with
   contract 2's arguments, once without a key and once with O1's test key;
   input and both outputs committed as test data with the commands;
@@ -210,7 +213,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
   | Change | Detail |
   |---|---|
-  | `memory.x` | `FLASH` origin `0x0800C200`, length from contract 3. No other layout. |
+  | `memory.x` | `FLASH` origin `0x0800C200`, length `0xF0520` (contract 3). No other layout. |
   | Version note | A `#[used]` static in the C's layout (contract 8), in a section a linker fragment places at `0x0800C438`, padding after the vector table if cortex-m-rt's ends earlier. Fields from the values `DevkitIdentity` reports. |
   | Watchdog | Fed from a task spawned in `start`, period 1 s, before anything that can wait. |
   | Clocks | `config()` reaches the same tree from the bootloader's state (contract 6) as from reset. |
