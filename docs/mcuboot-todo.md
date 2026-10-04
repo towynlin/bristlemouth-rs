@@ -274,6 +274,8 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ### N1 — No-init RAM and reset reason
 
+**Taken:** claude/mcuboot-n1-noinit
+
 - **Rust, `bm-devkit`:** `src/noinit.rs`: `bm_stack::NoInitRam` at
   `0x200BFE4C` through `RebootInfo::encode`/`decode`; a reset function that
   writes `resetReason` and its magic, then `SCB::sys_reset`; a read of the
