@@ -181,6 +181,8 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ### L1 — Link for slot 1
 
+**Taken:** mcuboot-l1-link
+
 - **Rust, `bm-devkit`:**
 
   | Change | Detail |
