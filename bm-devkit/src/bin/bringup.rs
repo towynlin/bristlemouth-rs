@@ -76,7 +76,7 @@ fn log_config(store: &ConfigStore) {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let mut board = bm_devkit::start().await;
+    let mut board = bm_devkit::start(spawner).await;
     info!("node id {=u64:016x}", board.node_id);
     info!("reset reason: {}", board.reset_reason);
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));

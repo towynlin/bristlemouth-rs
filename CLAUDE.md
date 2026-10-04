@@ -127,8 +127,8 @@ A cargo workspace.
   must be spawned by the firmware — it owns the SPI bus, and until it runs no
   frame moves.
 - `bm-devkit/` — board support for the dev kit's mote (STM32U575CI,
-  ADIN2111 on SPI3, W25Q64JV NOR flash on SPI2): `start` powers and brings up
-  the ADIN2111, sets up the flash and starts the RTC, `node` builds a
+  ADIN2111 on SPI3, W25Q64JV NOR flash on SPI2): `start` spawns the watchdog task, powers and
+  brings up the ADIN2111, sets up the flash and starts the RTC, `node` builds a
   `Devkit` node with the chip's node id, the binary's name as `app_name`, the
   RTC and its config partitions in flash; `src/bin/bringup.rs`
   runs one and logs the config keys it loaded, each as a
@@ -138,7 +138,13 @@ A cargo workspace.
   lists echo, sys_info and config_map after metrics, as a C dev kit does.
   **Its own workspace**, for
   bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
-  `.cargo/config.toml` sets the thumb target and a `probe-rs run` runner.
+  `.cargo/config.toml` sets the thumb target and `runner.sh` as the runner.
+  Images link for MCUboot slot 1 and run behind bm_protocol's bootloader:
+  `memory.x` starts `FLASH` at `0x0800C200`, and `devkit.x` is cortex-m-rt
+  0.7.7's `link.x` (pinned in `Cargo.toml`) with the version note's section
+  and a 128-byte vector table alignment check.
+  `runner.sh` builds `<elf>.dfu.bin` with `bm-image` (signed when
+  `BM_IMAGE_KEY` is set), programs it at `0x0800C000` and attaches.
   `README.md` is the record of bm_protocol's BSP (pins, clocks, ADIN2111
   sequence, node id, config flash layout), with file and line references —
   bm_protocol is not vendored, so read it there rather than re-deriving it.
@@ -146,6 +152,10 @@ A cargo workspace.
     `embedded-hal` traits only.
   - `src/rtc.rs` — `DevkitRtc`, `bm_stack::Rtc` over the STM32 RTC on LSE,
     as bm_protocol's `stm32_rtc.c`.
+  - `src/version.rs` — the git SHA and version `DevkitIdentity` reports, and
+    `NOTE`, bm_protocol's `versionNote`, which `bm-image` reads them from.
+  - `src/watchdog.rs` — `feed` and the task `start` spawns: the bootloader
+    starts the IWDG and it cannot be stopped.
   - `src/noinit.rs` — the no-init RAM C images and the bootloader share, at
     fixed addresses: `NoInit`, `bm_stack::NoInitRam`; `reset` and
     `take_reset_reason`, bm_protocol's `reset_reason.c`.
@@ -320,6 +330,8 @@ cargo build -p bm-mcuboot --target thumbv8m.main-none-eabihf
 cd bm-phy-adin2111 && cargo test                           # own workspace, needs network
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
 cd bm-devkit && cargo build && cargo build --release      # own workspace, thumb only
+cargo run -p bm-image -- dfu bm-devkit/target/thumbv8m.main-none-eabihf/release/hello_world \
+  -o bm-devkit/target/hello_world.dfu.bin                  # from the root; then `info` on it
 cargo +1.97 check --workspace --all-targets                # the declared MSRV
 cargo tree -p bm-wire                                      # only cbor2, serde, serde_core
 cargo tree -p bm-mcuboot                                   # no dependencies

@@ -17,7 +17,9 @@
 pub mod noinit;
 pub mod rtc;
 pub mod storage;
+pub mod version;
 pub mod w25;
+pub mod watchdog;
 
 use bm_phy_adin2111::{Adin2111Phy, Runner, State, Tc6};
 use bm_stack::node::{
@@ -28,6 +30,7 @@ use bm_wire::bcmp::DeviceInfo;
 use bm_wire::bcmp::info::CACHED_STRING_BYTES;
 use bm_wire::bcmp::resource::RESOURCE_NAME_BYTES;
 use bm_wire::configuration::Layout;
+use embassy_executor::Spawner;
 use embassy_stm32::exti::{self, ExtiInput};
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::mode::{Async, Blocking};
@@ -131,6 +134,11 @@ pub struct Board {
 
 /// The clock tree `SystemClock_Config` sets up: MSIS at 48 MHz, PLL1 `/3 *10
 /// /1`, SYSCLK 160 MHz; LSE on, drive high, clocking the RTC.
+///
+/// The bootloader jumps here with SYSCLK on PLL1 from MSIS at 16 MHz
+/// (`README.md`, "What the bootloader leaves"). `embassy_stm32::init` moves
+/// SYSCLK to HSI before it touches MSIS or a PLL, so the same config applies
+/// from that state as from reset.
 #[must_use]
 pub fn config() -> embassy_stm32::Config {
     use embassy_stm32::rcc::{
@@ -159,9 +167,12 @@ pub fn config() -> embassy_stm32::Config {
     config
 }
 
-/// Initialise the chip with [`config`], power the ADIN2111 and bring it up,
-/// set up SPI2 for the NOR flash, start the RTC, and take the reset reason
-/// from no-init RAM.
+/// Initialise the chip with [`config`], spawn [`watchdog::task`], power the
+/// ADIN2111 and bring it up, set up SPI2 for the NOR flash, start the RTC,
+/// and take the reset reason from no-init RAM.
+///
+/// The watchdog task is spawned before the first await, so it is fed while
+/// the ADIN2111 comes up.
 ///
 /// Consumes every peripheral; the ones not listed in `README.md` are dropped.
 ///
@@ -169,10 +180,12 @@ pub fn config() -> embassy_stm32::Config {
 ///
 /// If called twice, and wherever the driver panics: an ADIN2111 that never
 /// answers or never completes reset.
-pub async fn start() -> Board {
+pub async fn start(spawner: Spawner) -> Board {
     static STATE: StaticCell<State<8, 8>> = StaticCell::new();
 
+    watchdog::feed();
     let p = embassy_stm32::init(config());
+    spawner.spawn(watchdog::task().expect("one watchdog task"));
     let node_id = node_id();
     let reset_reason = noinit::take_reset_reason();
     let rtc = DevkitRtc::new(p.RTC);
@@ -279,24 +292,9 @@ pub fn uid_string(uid: &[u8; 12]) -> [u8; 24] {
     out
 }
 
-/// The first 8 hex digits of the commit built, as bm_protocol reports its
-/// own; 0 outside a git checkout.
-const GIT_SHA: u32 = match u32::from_str_radix(env!("BM_DEVKIT_GIT_SHA"), 16) {
-    Ok(sha) => sha,
-    Err(_) => 0,
-};
-
-/// A Cargo version component as a `u8`, saturating, as `DeviceInfo` carries it.
-const fn version_part(part: &str) -> u8 {
-    match u8::from_str_radix(part, 10) {
-        Ok(n) => n,
-        Err(_) => u8::MAX,
-    }
-}
-
 /// What a dev kit says about itself, as `bcl_init` fills `DeviceCfg`: vendor,
 /// product and hardware version 0, the placeholder serial number, and the UID
-/// string as device name. Firmware version and git SHA are this crate's; the
+/// string as device name. Firmware version and git SHA are [`version`]'s; the
 /// app name, sent in a sys_info reply, is the binary's.
 #[derive(Debug, Clone, Copy)]
 pub struct DevkitIdentity {
@@ -326,22 +324,16 @@ impl Identity for DevkitIdentity {
     fn device_info(&self) -> DeviceInfo {
         DeviceInfo {
             serial_num: *b"0123456789abcdef",
-            git_sha: GIT_SHA,
-            ver_major: version_part(env!("CARGO_PKG_VERSION_MAJOR")),
-            ver_minor: version_part(env!("CARGO_PKG_VERSION_MINOR")),
-            ver_rev: version_part(env!("CARGO_PKG_VERSION_PATCH")),
+            git_sha: version::GIT_SHA,
+            ver_major: version::MAJOR,
+            ver_minor: version::MINOR,
+            ver_rev: version::REVISION,
             ..DeviceInfo::default()
         }
     }
 
     fn version_string(&self) -> &[u8] {
-        concat!(
-            "bm-devkit@v",
-            env!("CARGO_PKG_VERSION"),
-            "+",
-            env!("BM_DEVKIT_GIT_SHA")
-        )
-        .as_bytes()
+        version::VERSION_STRING.as_bytes()
     }
 
     fn device_name(&self) -> &[u8] {

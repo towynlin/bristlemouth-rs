@@ -1,5 +1,5 @@
-//! Link scripts for the binaries: cortex-m-rt's `link.x`, which includes
-//! `memory.x` from this directory, and defmt's. `BM_DEVKIT_GIT_SHA`: the
+//! Link scripts for the binaries: `devkit.x`, which is cortex-m-rt's `link.x`
+//! with the version note and includes `memory.x`, and defmt's. `BM_DEVKIT_GIT_SHA`: the
 //! first 8 hex digits of `HEAD`, or `0` outside a git checkout, for
 //! `DevkitIdentity`.
 
@@ -9,8 +9,9 @@ fn main() {
     let dir = std::env::var("CARGO_MANIFEST_DIR").expect("set by cargo");
     println!("cargo:rustc-link-search={dir}");
     println!("cargo:rerun-if-changed=memory.x");
+    println!("cargo:rerun-if-changed=devkit.x");
     println!("cargo:rustc-link-arg-bins=--nmagic");
-    println!("cargo:rustc-link-arg-bins=-Tlink.x");
+    println!("cargo:rustc-link-arg-bins=-Tdevkit.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
 
     let sha = git(&["rev-parse", "HEAD"])
