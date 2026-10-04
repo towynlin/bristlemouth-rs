@@ -146,6 +146,9 @@ A cargo workspace.
     `embedded-hal` traits only.
   - `src/rtc.rs` — `DevkitRtc`, `bm_stack::Rtc` over the STM32 RTC on LSE,
     as bm_protocol's `stm32_rtc.c`.
+  - `src/noinit.rs` — the no-init RAM C images and the bootloader share, at
+    fixed addresses: `NoInit`, `bm_stack::NoInitRam`; `reset` and
+    `take_reset_reason`, bm_protocol's `reset_reason.c`.
   - `src/storage.rs` — `FlashConfigStorage`, `bm_stack::ConfigStorage` at
     bm_protocol's partition offsets.
 - `bm-wire-diff/` — the differential harness. Host-only. One comparator per

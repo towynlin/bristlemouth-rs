@@ -6,6 +6,7 @@ use bm_wire::configuration::Partition;
 use embedded_hal::delay::DelayNs;
 use embedded_hal::spi::SpiDevice;
 
+use crate::noinit::{self, ResetReason};
 use crate::w25::W25;
 
 /// Size of each config partition. `*_CONFIG_FLASH_SIZE_BYTES`.
@@ -90,9 +91,8 @@ impl<SPI: SpiDevice, D: DelayNs> ConfigStorage for FlashConfigStorage<SPI, D> {
         }
     }
 
-    /// `bm_config_reset`: `resetSystem(RESET_REASON_CONFIG)`, less the reset
-    /// reason, which the C keeps in no-init RAM this crate does not place.
+    /// `bm_config_reset`: `resetSystem(RESET_REASON_CONFIG)`.
     fn reset(&mut self) {
-        cortex_m::peripheral::SCB::sys_reset();
+        noinit::reset(ResetReason::Config);
     }
 }

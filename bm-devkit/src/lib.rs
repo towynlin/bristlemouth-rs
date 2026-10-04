@@ -4,7 +4,8 @@
 //! [`start`] brings the board up and returns a [`Board`]: the ADIN2111 as a
 //! [`bm_stack::Phy`], the driver runner the firmware must spawn, and the node
 //! id the C firmware would use on the same chip, and the NOR flash that holds
-//! the config partitions, and the RTC. [`Devkit`] is the node type with this
+//! the config partitions, the RTC, and the reason for the last reset.
+//! [`Devkit`] is the node type with this
 //! board's identity, clock and config store.
 //!
 //! Every pin, clock and sequence here is taken from bm_protocol's
@@ -13,6 +14,7 @@
 #![no_std]
 #![warn(missing_docs)]
 
+pub mod noinit;
 pub mod rtc;
 pub mod storage;
 pub mod w25;
@@ -37,6 +39,7 @@ use embassy_time::{Delay, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use static_cell::StaticCell;
 
+use crate::noinit::ResetReason;
 use crate::rtc::DevkitRtc;
 use crate::storage::FlashConfigStorage;
 use crate::w25::W25;
@@ -122,6 +125,8 @@ pub struct Board {
     pub flash: Flash,
     /// The RTC on LSE. [`node`] takes it.
     pub rtc: DevkitRtc,
+    /// Why the chip last reset: [`noinit::take_reset_reason`], read once.
+    pub reset_reason: ResetReason,
 }
 
 /// The clock tree `SystemClock_Config` sets up: MSIS at 48 MHz, PLL1 `/3 *10
@@ -155,7 +160,8 @@ pub fn config() -> embassy_stm32::Config {
 }
 
 /// Initialise the chip with [`config`], power the ADIN2111 and bring it up,
-/// set up SPI2 for the NOR flash, and start the RTC.
+/// set up SPI2 for the NOR flash, start the RTC, and take the reset reason
+/// from no-init RAM.
 ///
 /// Consumes every peripheral; the ones not listed in `README.md` are dropped.
 ///
@@ -168,6 +174,7 @@ pub async fn start() -> Board {
 
     let p = embassy_stm32::init(config());
     let node_id = node_id();
+    let reset_reason = noinit::take_reset_reason();
     let rtc = DevkitRtc::new(p.RTC);
 
     // ADIN_PWR (PH1) drives the ADIN2111's load switches.
@@ -208,6 +215,7 @@ pub async fn start() -> Board {
         adin_power,
         flash,
         rtc,
+        reset_reason,
     }
 }
 
