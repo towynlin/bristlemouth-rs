@@ -33,7 +33,11 @@ log() { printf '[session-start] %s\n' "$*"; }
 # bm-wire-sys/vendor/bm_core, plus its own nested submodules, which tier T2 and
 # above of bm-wire-sys/build.rs need.
 log 'checking out bm_core and its nested submodules'
-git submodule update --init --recursive
+git submodule update --init --recursive bm-wire-sys/vendor/bm_core
+# bm-mcuboot-sys/vendor/mcuboot. Not recursive: bm-mcuboot-sys/build.rs uses
+# none of its nested submodules (mbedtls, esp-idf, the Cypress libraries).
+log 'checking out mcuboot'
+git submodule update --init bm-mcuboot-sys/vendor/mcuboot
 
 # --- toolchains ------------------------------------------------------------
 # Read the MSRV rather than hardcoding it, so this does not rot the next time

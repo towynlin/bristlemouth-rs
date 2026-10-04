@@ -176,33 +176,6 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ## Cards
 
-### O1 — MCUboot oracle
-
-- **Rust:** new host-only crate `bm-mcuboot-sys` in the root workspace.
-  `vendor/mcuboot` is a submodule at v1.9.0 (`c657cbea`, what bm_protocol
-  pins). Compiles `bootutil` (`bootutil_public.c`, `bootutil_misc.c`,
-  `loader.c`, `swap_scratch.c`, `swap_misc.c`, `image_validate.c`, `tlv.c`
-  and what they need for SHA-256 with tinycrypt) with a `mcuboot_config.h`
-  in `csrc/` carrying bm_protocol's settings (swap with scratch,
-  `MCUBOOT_VALIDATE_PRIMARY_SLOT`, `MCUBOOT_MAX_IMG_SECTORS` 121, one image,
-  no encryption) and a `flash_map_backend` over a RAM array with contract
-  1's map. Built twice, as `build.rs` builds `libbm_core_release.a` beside
-  `libbm_core.a`: without a signature type, and with `MCUBOOT_SIGN_ED25519`
-  and the public half of a test-only key committed with the crate.
-- **API:** reset flash; read and write an area; `boot_set_pending(0)`;
-  `boot_set_confirmed()`; `boot_go`, returning the result, `br_image_off`
-  and the header.
-- **Smoke test:** an image with a hand-built header in slot 1 boots; the
-  same in slot 2 with `boot_set_pending(0)` swaps, and swaps back on the
-  next `boot_go` without `boot_set_confirmed()`. The signing build refuses
-  that unsigned image.
-- **Conventions:** deterministic `csrc/`, a process-global lock, as
-  `bm-wire-sys`. Never edit `vendor/`. Update `session-start.sh` and CI for
-  the new submodule.
-- **Blocked by:** nothing.
-- **Done:** `cargo test` passes with the smoke tests; `bm-wire` and
-  `bm-stack` do not depend on the crate.
-
 ### M1 — Header, TLVs and trailer
 
 - **Rust:** new crate `bm-mcuboot`: `no_std`, no `alloc`, no dependencies,
@@ -217,7 +190,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   from the same starting flash, both sides' slot bytes are equal after
   `set_pending`, and after a swap and `set_confirmed`. Starting states: an
   erased trailer, a pending one, a confirmed one, a slot with no image.
-- **Blocked by:** O1.
+- **Blocked by:** nothing.
 - **Done:** the diff tests pass; `cargo build -p bm-mcuboot --target
   thumbv8m.main-none-eabihf`.
 
@@ -346,15 +319,59 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | O1, N1 | nothing |
-| 2 | M1 | O1 |
-| 3 | I1 | M1 |
-| 4 | L1 | I1 |
-| 5 | S1 | M1, L1, N1 |
-| 6 | B1 | S1 |
+| 1 | M1, N1 | nothing |
+| 2 | I1 | M1 |
+| 3 | L1 | I1 |
+| 4 | S1 | M1, L1, N1 |
+| 5 | B1 | S1 |
 
 Cards within a wave can run in parallel.
 
 ## What the landed cards left for the rest
 
-Nothing has landed.
+Landed: O1.
+
+### O1 — `bm-mcuboot-sys`
+
+`bm-mcuboot-sys/README.md` is the contract. For M1 and I1:
+
+| Need | Where |
+|---|---|
+| The oracle | `bm_mcuboot_sys::lock(Build) -> Oracle`. One process-global lock for both builds; flash persists between locks, so start with `reset()`. |
+| Flash | `Oracle::read(area, off, &mut buf)`, `read_area(area) -> Vec<u8>`, `write(area, off, &data)`, over `Area::{Bootloader, Primary, Secondary, Scratch}` with `offset()` and `size()`. `write` stores bytes with no flash semantics. |
+| `bootutil` | `set_pending(permanent: bool)`, `set_confirmed()`, `swap_type()` (`swap_type::{NONE, TEST, PERM, REVERT, FAIL, PANIC}`), `boot_go() -> Result<Booted, Refusal>`. `Booted` is `image_off` (`0xC000`), `flash_dev_id` and the 32 header bytes. |
+| The two builds | `Build::Unsigned` and `Build::Ed25519`, both linked into every binary, each with its own flash. No feature or environment variable. |
+| The test key | Private: `bm-mcuboot-sys/testdata/test_ed25519_key.pem`, as `imgtool keygen -t ed25519` writes it. Public: `bm-mcuboot-sys/csrc/test_ed25519_pub_key.c`. |
+| A signed example | `bm-mcuboot-sys/testdata/body.signed.dfu.bin`, from `body.bin` with contract 2's arguments; the command is in the README. Its TLV area is 144 bytes: SHA-256, `KEYHASH`, `ED25519`. |
+| `imgtool` | `bm-mcuboot-sys/vendor/mcuboot/scripts/imgtool.py`; needs `cryptography`, `intelhex`, `click`, `cbor2`. bm_protocol's pixi environment has them. |
+
+Observed on the oracle, asserted in `bm-mcuboot-sys/tests/smoke.rs`:
+
+| Case | Result |
+|---|---|
+| Slot 1 holds no image `boot_go` accepts | `Err(Refusal::Code(1))`, from `boot_validate_slot`; not `FIH_FAILURE` (-1) |
+| Slot 2 pending, its image refused | slot 2 is erased; slot 1 boots |
+| Signed image on the unsigned build | boots; the extra TLVs are ignored, and a changed signature still boots |
+| After a test swap, before `set_confirmed` | `swap_type()` is `REVERT` |
+
+Decisions:
+
+| Decision | Reason |
+|---|---|
+| Both builds in one binary, the signing build's symbols prefixed `ed25519_` by a generated force-included header | I1's tests need both builds in one `cargo test`; a cargo feature would give one per build of the crate. `build.rs` needs `nm`. |
+| A bootutil `assert` returns `Refusal::Asserted` | The bootloader resets there; aborting would end the test process. |
+| `flash_area_write` clears bits and compares, as `port_flash.c`'s read-back does | A second write to bytes that are not erased fails unless it changes nothing. A flash trait M1 compares against needs the same rule. |
+| No bindgen | The API is this crate's own eight C functions. |
+| `sha256` exported | Test images need a hash TLV and the crate has no Rust dependencies. I1 has its own. |
+
+Left open:
+
+- M1's diff tests in `bm-wire-diff` would make it depend on
+  `bm-mcuboot-sys`: all four lockfiles move, and `fuzz.yml`, which checks
+  out `bm_core` only, would need `vendor/mcuboot`. A separate host-only
+  test crate avoids both.
+- The oracle does not model the U5 refusing to program a quad-word that is
+  not erased, bank boundaries, or power loss mid-swap.
+- CI and `session-start.sh` check out `vendor/mcuboot` without
+  `--recursive`. A job that adds `submodules: recursive` would clone
+  MCUboot's mbedtls, esp-idf and Cypress submodules.
