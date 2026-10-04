@@ -17,6 +17,8 @@ use embassy_sync::channel::{Channel, Receiver, Sender};
 use heapless::Vec;
 
 use bm_wire::bcmp::resource::RESOURCE_NAME_BYTES;
+use bm_wire::service::power_info::PowerInfoReply;
+use bm_wire::service::{REPLY_DATA_LEN, config_map, metrics, power_info, service_name, sys_info};
 use bm_wire::spotter::{self, NetworkType};
 use bm_wire::util::BmIpAddr;
 
@@ -24,7 +26,7 @@ use crate::app::App;
 use crate::config::Configuration;
 use crate::node::{Event, Node, Outbound, PING_PAYLOAD_BYTES};
 use crate::port::{DfuSlot, Identity, NoInitRam, Rtc};
-use crate::service::Services;
+use crate::service::{SERVICE_NAME_BYTES, ServiceRequestError, Services};
 
 /// Longest topic a [`Command`] or [`Notification`] carries: the default
 /// `RESOURCE_NAME`, which bounds a [`Node`] subscription's topic.
@@ -40,10 +42,16 @@ pub const DATA_BYTES: usize = 256;
 /// [`Node::spotter_log`] accepts.
 pub const FILE_NAME_BYTES: usize = spotter::MAX_FILE_NAME_LEN - 1;
 
+/// Most data a [`Notification::ServiceReply`] carries: the most a C node's
+/// handler can write, [`REPLY_DATA_LEN`]. A reply with more is counted by
+/// [`ChannelApp::dropped`].
+pub const REPLY_BYTES: usize = REPLY_DATA_LEN;
+
 /// Something an application asks the node to do.
 ///
-/// Nothing reports whether a command succeeded; an application that needs to
-/// know uses [`App`].
+/// Only a service request reports whether it succeeded, as
+/// [`Notification::ServiceRequested`]; for the rest, an application that
+/// needs to know uses [`App`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 #[allow(
@@ -100,6 +108,51 @@ pub enum Command {
         /// The network to send it over.
         network: NetworkType,
     },
+    /// [`Node::service_request_with`]. Reports
+    /// [`Notification::ServiceRequested`], then
+    /// [`Notification::ServiceReply`] or [`Notification::ServiceTimeout`].
+    ServiceRequest {
+        /// The service, such as `<node id>/echo`.
+        service: Vec<u8, SERVICE_NAME_BYTES>,
+        /// The request's data.
+        data: Vec<u8, DATA_BYTES>,
+        /// Seconds to wait for the reply.
+        timeout_s: u32,
+    },
+    /// [`Node::sys_info_request_with`]. Reports as
+    /// [`Command::ServiceRequest`] does, for `<target>/sys_info`.
+    SysInfoRequest {
+        /// The node to ask.
+        target_node_id: u64,
+        /// Seconds to wait for the reply.
+        timeout_s: u32,
+    },
+    /// [`Node::config_map_request_with`]. Reports as
+    /// [`Command::ServiceRequest`] does, for `<target>/config_map`.
+    ConfigMapRequest {
+        /// The node to ask.
+        target_node_id: u64,
+        /// `config_map::PARTITION_ID_*`.
+        partition_id: u32,
+        /// Seconds to wait for the reply.
+        timeout_s: u32,
+    },
+    /// [`Node::metrics_request_with`]. Reports as
+    /// [`Command::ServiceRequest`] does, for `<target>/metrics`.
+    MetricsRequest {
+        /// The node to ask.
+        target_node_id: u64,
+        /// Seconds to wait for the reply.
+        timeout_s: u32,
+    },
+    /// [`Node::power_info_request_with`]. Reports
+    /// [`Notification::ServiceRequested`] for
+    /// [`power_info::SERVICE`], then [`Notification::PowerInfoReply`] if a
+    /// reply decodes (divergence #96).
+    PowerInfoRequest {
+        /// Seconds to wait for the reply.
+        timeout_s: u32,
+    },
 }
 
 /// An [`Event`], owned, for sending to another task.
@@ -136,11 +189,48 @@ pub enum Notification {
         /// The data.
         data: Vec<u8, DATA_BYTES>,
     },
+    /// What a service request command came to: the request's id, or why
+    /// the node refused it. Not an [`Event`]: the id is what
+    /// [`Node::service_request_with`] returns.
+    ///
+    /// After an `Err` carrying an id
+    /// ([`ServiceRequestError::NotSubscribed`],
+    /// [`ServiceRequestError::NotSent`]) the request still times out.
+    ServiceRequested {
+        /// The service asked.
+        service: Vec<u8, SERVICE_NAME_BYTES>,
+        /// The request's id, or the error.
+        result: Result<u32, ServiceRequestError>,
+    },
+    /// [`Event::ServiceReply`].
+    ServiceReply {
+        /// The request's id.
+        id: u32,
+        /// The service the request named.
+        service: Vec<u8, SERVICE_NAME_BYTES>,
+        /// The reply's data.
+        data: Vec<u8, REPLY_BYTES>,
+    },
+    /// [`Event::ServiceTimeout`].
+    ServiceTimeout {
+        /// The request's id.
+        id: u32,
+        /// The service the request named.
+        service: Vec<u8, SERVICE_NAME_BYTES>,
+    },
+    /// [`Event::PowerInfoReply`].
+    PowerInfoReply {
+        /// The id of the request whose callback this is.
+        id: u32,
+        /// The reply.
+        reply: PowerInfoReply,
+    },
 }
 
 impl Notification {
     /// The owned form of `event`, or `None` for an event with no
-    /// [`Notification`] yet or a publication with more than [`DATA_BYTES`].
+    /// [`Notification`] yet, a publication with more than [`DATA_BYTES`] or
+    /// a service reply with more than [`REPLY_BYTES`].
     #[must_use]
     pub fn from_event(event: &Event<'_>) -> Option<Self> {
         match *event {
@@ -171,6 +261,17 @@ impl Notification {
                 version,
                 data: Vec::from_slice(data).ok()?,
             }),
+            Event::ServiceReply { id, service, data } => Some(Self::ServiceReply {
+                id,
+                service: Vec::from_slice(service).ok()?,
+                data: Vec::from_slice(data).ok()?,
+            }),
+            Event::ServiceTimeout { id, service } => Some(Self::ServiceTimeout {
+                id,
+                // A request's service is at most `SERVICE_NAME_BYTES` long.
+                service: Vec::from_slice(service).ok()?,
+            }),
+            Event::PowerInfoReply { id, reply } => Some(Self::PowerInfoReply { id, reply }),
             _ => None,
         }
     }
@@ -342,6 +443,57 @@ impl<M: RawMutex, const DEPTH: usize> NodeHandle<'_, M, DEPTH> {
         true
     }
 
+    /// Ask `service`; see [`Command::ServiceRequest`].
+    ///
+    /// Returns `false` without queueing anything when `service` is longer
+    /// than [`SERVICE_NAME_BYTES`] or `data` than [`DATA_BYTES`].
+    pub async fn service_request(&self, service: &[u8], data: &[u8], timeout_s: u32) -> bool {
+        let (Ok(service), Ok(data)) = (Vec::from_slice(service), Vec::from_slice(data)) else {
+            return false;
+        };
+        self.send(Command::ServiceRequest {
+            service,
+            data,
+            timeout_s,
+        })
+        .await;
+        true
+    }
+
+    /// Ask `target_node_id` for its sys_info; see [`Command::SysInfoRequest`].
+    pub async fn sys_info_request(&self, target_node_id: u64, timeout_s: u32) {
+        self.send(Command::SysInfoRequest {
+            target_node_id,
+            timeout_s,
+        })
+        .await;
+    }
+
+    /// Ask `target_node_id` for a configuration partition; see
+    /// [`Command::ConfigMapRequest`].
+    pub async fn config_map_request(&self, target_node_id: u64, partition_id: u32, timeout_s: u32) {
+        self.send(Command::ConfigMapRequest {
+            target_node_id,
+            partition_id,
+            timeout_s,
+        })
+        .await;
+    }
+
+    /// Ask `target_node_id` for its metrics; see [`Command::MetricsRequest`].
+    pub async fn metrics_request(&self, target_node_id: u64, timeout_s: u32) {
+        self.send(Command::MetricsRequest {
+            target_node_id,
+            timeout_s,
+        })
+        .await;
+    }
+
+    /// Ask the bus for its power timing; see [`Command::PowerInfoRequest`].
+    pub async fn power_info_request(&self, timeout_s: u32) {
+        self.send(Command::PowerInfoRequest { timeout_s }).await;
+    }
+
     /// The next notification, waiting for one.
     pub async fn notification(&self) -> Notification {
         self.notifications.receive().await
@@ -358,17 +510,18 @@ pub struct ChannelApp<'a, M: RawMutex, const DEPTH: usize> {
 }
 
 impl<M: RawMutex, const DEPTH: usize> ChannelApp<'_, M, DEPTH> {
-    /// Notifications discarded because the queue was full, or publications
-    /// with more than [`DATA_BYTES`]. The node never waits on the application,
-    /// so a task that stops reading loses them.
+    /// Notifications discarded because the queue was full, publications
+    /// with more than [`DATA_BYTES`], or service replies with more than
+    /// [`REPLY_BYTES`]. The node never waits on the application, so a task
+    /// that stops reading loses them.
     #[must_use]
     pub fn dropped(&self) -> u32 {
         self.dropped
     }
 }
 
-/// Queue `event` as a [`Notification`], counting it in `dropped` if it is a
-/// publication too large to own or the queue is full.
+/// Queue `event` as a [`Notification`], counting it in `dropped` if it is
+/// too large to own or the queue is full.
 fn notify<M: RawMutex, const DEPTH: usize>(
     notifications: &Sender<'_, M, Notification, DEPTH>,
     dropped: &mut u32,
@@ -376,11 +529,47 @@ fn notify<M: RawMutex, const DEPTH: usize>(
 ) {
     let sent = match Notification::from_event(event) {
         Some(notification) => notifications.try_send(notification).is_ok(),
-        None => !matches!(event, Event::Publication { .. }),
+        None => !matches!(
+            event,
+            Event::Publication { .. } | Event::ServiceReply { .. } | Event::ServiceTimeout { .. }
+        ),
     };
     if !sent {
         *dropped = dropped.wrapping_add(1);
     }
+}
+
+/// Queue [`Notification::ServiceRequested`] for `service`, and return the
+/// request's frame.
+fn requested<'n, M: RawMutex, const DEPTH: usize>(
+    notifications: &Sender<'_, M, Notification, DEPTH>,
+    dropped: &mut u32,
+    service: &[u8],
+    result: Result<(u32, Outbound<'n>), ServiceRequestError>,
+) -> Option<Outbound<'n>> {
+    let (result, outbound) = match result {
+        Ok((id, outbound)) => (Ok(id), Some(outbound)),
+        Err(error) => (Err(error), None),
+    };
+    // Every service the commands name fits: they carry at most
+    // `SERVICE_NAME_BYTES`, and the built-ins' names are shorter.
+    let sent = Vec::from_slice(service).is_ok_and(|service| {
+        notifications
+            .try_send(Notification::ServiceRequested { service, result })
+            .is_ok()
+    });
+    if !sent {
+        *dropped = dropped.wrapping_add(1);
+    }
+    outbound
+}
+
+/// `<target_node_id><suffix>`, as the node's built-in requests name it.
+fn built_in(target_node_id: u64, suffix: &[u8]) -> Vec<u8, SERVICE_NAME_BYTES> {
+    let mut name = [0u8; SERVICE_NAME_BYTES];
+    // Cannot fail: at most 27 bytes.
+    let len = service_name(&mut name, target_node_id, suffix).unwrap_or(0);
+    Vec::from_slice(&name[..len]).unwrap_or_default()
 }
 
 impl<
@@ -500,6 +689,70 @@ impl<
                     notify(notifications, dropped, &event);
                 })
                 .ok()
+            }
+            Command::ServiceRequest {
+                service,
+                data,
+                timeout_s,
+            } => {
+                let (notifications, dropped) = (&self.notifications, &mut self.dropped);
+                let result =
+                    node.service_request_with(now_ms, &service, &data, timeout_s, |event| {
+                        notify(notifications, dropped, &event);
+                    });
+                requested(&self.notifications, &mut self.dropped, &service, result)
+            }
+            Command::SysInfoRequest {
+                target_node_id,
+                timeout_s,
+            } => {
+                let (notifications, dropped) = (&self.notifications, &mut self.dropped);
+                let result =
+                    node.sys_info_request_with(now_ms, target_node_id, timeout_s, |event| {
+                        notify(notifications, dropped, &event);
+                    });
+                let service = built_in(target_node_id, sys_info::SUFFIX);
+                requested(&self.notifications, &mut self.dropped, &service, result)
+            }
+            Command::ConfigMapRequest {
+                target_node_id,
+                partition_id,
+                timeout_s,
+            } => {
+                let (notifications, dropped) = (&self.notifications, &mut self.dropped);
+                let result = node.config_map_request_with(
+                    now_ms,
+                    target_node_id,
+                    partition_id,
+                    timeout_s,
+                    |event| notify(notifications, dropped, &event),
+                );
+                let service = built_in(target_node_id, config_map::SUFFIX);
+                requested(&self.notifications, &mut self.dropped, &service, result)
+            }
+            Command::MetricsRequest {
+                target_node_id,
+                timeout_s,
+            } => {
+                let (notifications, dropped) = (&self.notifications, &mut self.dropped);
+                let result =
+                    node.metrics_request_with(now_ms, target_node_id, timeout_s, |event| {
+                        notify(notifications, dropped, &event);
+                    });
+                let service = built_in(target_node_id, metrics::SUFFIX);
+                requested(&self.notifications, &mut self.dropped, &service, result)
+            }
+            Command::PowerInfoRequest { timeout_s } => {
+                let (notifications, dropped) = (&self.notifications, &mut self.dropped);
+                let result = node.power_info_request_with(now_ms, timeout_s, |event| {
+                    notify(notifications, dropped, &event);
+                });
+                requested(
+                    &self.notifications,
+                    &mut self.dropped,
+                    power_info::SERVICE,
+                    result,
+                )
             }
         }
     }

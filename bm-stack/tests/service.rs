@@ -1267,3 +1267,212 @@ fn metrics_request_asks_the_target() {
     let request = node.service_requests().iter().next().unwrap();
     assert_eq!(request.service(), b"0000000055aa0011/metrics");
 }
+
+// ---------------------------------------------------------------------------
+// Requests through a channel -- card E5.
+// ---------------------------------------------------------------------------
+
+type TestChannels = bm_stack::Channels<embassy_sync::blocking_mutex::raw::NoopRawMutex, 4>;
+type TestChannelApp<'a> =
+    bm_stack::ChannelApp<'a, embassy_sync::blocking_mutex::raw::NoopRawMutex, 4>;
+
+/// Run the command the handle queued, as [`TestNode::run_app`] would, and
+/// return what it sent.
+fn act(app: &mut TestChannelApp<'_>, node: &mut TestNode, now_ms: u32) -> Option<Vec<u8>> {
+    use bm_stack::App;
+    embassy_futures::block_on(App::<TestNode>::ready(app));
+    app.act(node, now_ms)
+        .map(|outbound| outbound.frame().to_vec())
+}
+
+/// The notifications waiting, without waiting for more.
+fn drain(channels: &TestChannels) -> Vec<bm_stack::Notification> {
+    let handle = channels.handle();
+    let mut out = Vec::new();
+    while let embassy_futures::select::Either::First(n) = embassy_futures::block_on(
+        embassy_futures::select::select(handle.notification(), core::future::ready(())),
+    ) {
+        out.push(n);
+    }
+    out
+}
+
+fn owned<const N: usize>(bytes: &[u8]) -> heapless::Vec<u8, N> {
+    heapless::Vec::from_slice(bytes).unwrap()
+}
+
+#[test]
+fn a_channel_request_reports_its_id_then_the_reply() {
+    use bm_stack::{App, Notification};
+    let channels = TestChannels::new();
+    let handle = channels.handle();
+    let mut app = channels.app();
+    let mut node = node();
+
+    embassy_futures::block_on(handle.sys_info_request(PEER_ID, 5));
+    let frame = act(&mut app, &mut node, 0).expect("the request");
+    let datagram = udp::accept(&frame).unwrap();
+    let publication = pubsub::decode(datagram.payload).unwrap();
+    assert_eq!(publication.topic, b"0000000055aa0011/sys_info/req");
+    let service = b"0000000055aa0011/sys_info";
+    assert_eq!(
+        drain(&channels),
+        [Notification::ServiceRequested {
+            service: owned(service),
+            result: Ok(0),
+        }]
+    );
+
+    let mut body = [0u8; 128];
+    let len = SysInfoReply::new(PEER_ID, 1, 2, b"peer")
+        .encode(&mut body)
+        .unwrap();
+    let mut reply = frames::service_reply(PEER_ID, service, NODE_ID, 0, &body[..len]);
+    node.on_frame_with(10, 1, &mut reply, |event| {
+        App::<TestNode>::on_event(&mut app, event)
+    });
+    assert_eq!(
+        drain(&channels),
+        [Notification::ServiceReply {
+            id: 0,
+            service: owned(service),
+            data: owned(&body[..len]),
+        }]
+    );
+    assert_eq!(app.dropped(), 0);
+}
+
+#[test]
+fn a_channel_request_reports_its_timeout() {
+    use bm_stack::{App, Notification};
+    let channels = TestChannels::new();
+    let handle = channels.handle();
+    let mut app = channels.app();
+    let mut node = node();
+
+    assert!(embassy_futures::block_on(
+        handle.service_request(PEER_ECHO, b"hi", 1)
+    ));
+    let frame = act(&mut app, &mut node, 0).expect("the request");
+    let publication = pubsub::decode(udp::accept(&frame).unwrap().payload).unwrap();
+    assert_eq!(publication.data, b"\0\0\0\0\x02\0\0\0hi");
+    node.on_service_expiry(1500, |event| App::<TestNode>::on_event(&mut app, event));
+    assert_eq!(
+        drain(&channels),
+        [
+            Notification::ServiceRequested {
+                service: owned(PEER_ECHO),
+                result: Ok(0),
+            },
+            Notification::ServiceTimeout {
+                id: 0,
+                service: owned(PEER_ECHO),
+            },
+        ]
+    );
+}
+
+#[test]
+fn a_refused_channel_request_reports_why() {
+    use bm_stack::Notification;
+    let channels = TestChannels::new();
+    let handle = channels.handle();
+    let mut app = channels.app();
+    let mut node = node();
+    for _ in 0..SERVICE_REQUESTS {
+        node.service_request(0, PEER_ECHO, b"", 5).unwrap();
+    }
+    embassy_futures::block_on(handle.metrics_request(PEER_ID, 5));
+    assert_eq!(act(&mut app, &mut node, 0), None);
+    assert_eq!(
+        drain(&channels),
+        [Notification::ServiceRequested {
+            service: owned(b"0000000055aa0011/metrics"),
+            result: Err(ServiceRequestError::Full),
+        }]
+    );
+    assert!(!embassy_futures::block_on(handle.service_request(
+        &[b'x'; bm_stack::service::SERVICE_NAME_BYTES + 1],
+        b"",
+        5
+    )));
+}
+
+#[test]
+fn a_channel_config_map_request_names_the_partition() {
+    use bm_stack::Notification;
+    let channels = TestChannels::new();
+    let handle = channels.handle();
+    let mut app = channels.app();
+    let mut node = node();
+    embassy_futures::block_on(handle.config_map_request(PEER_ID, config_map::PARTITION_ID_SYS, 5));
+    let frame = act(&mut app, &mut node, 0).expect("the request");
+    let publication = pubsub::decode(udp::accept(&frame).unwrap().payload).unwrap();
+    assert_eq!(publication.topic, b"0000000055aa0011/config_map/req");
+    assert_eq!(
+        &publication.data[RequestHeader::LEN..],
+        config_map_request(config_map::PARTITION_ID_SYS)
+    );
+    assert_eq!(
+        drain(&channels),
+        [Notification::ServiceRequested {
+            service: owned(b"0000000055aa0011/config_map"),
+            result: Ok(0),
+        }]
+    );
+}
+
+#[test]
+fn a_channel_power_info_request_reports_the_decoded_reply() {
+    use bm_stack::{App, Notification};
+    let channels = TestChannels::new();
+    let handle = channels.handle();
+    let mut app = channels.app();
+    let mut node = node();
+    embassy_futures::block_on(handle.power_info_request(5));
+    assert!(act(&mut app, &mut node, 0).is_some());
+    let mut reply = frames::service_reply(
+        PEER_ID,
+        bm_wire::service::power_info::SERVICE,
+        NODE_ID,
+        0,
+        &power_info_body(STATS),
+    );
+    node.on_frame_with(10, 1, &mut reply, |event| {
+        App::<TestNode>::on_event(&mut app, event)
+    });
+    assert_eq!(
+        drain(&channels),
+        [
+            Notification::ServiceRequested {
+                service: owned(bm_wire::service::power_info::SERVICE),
+                result: Ok(0),
+            },
+            Notification::PowerInfoReply {
+                id: 0,
+                reply: STATS
+            },
+        ]
+    );
+}
+
+/// A reply longer than a C handler can write is counted, not truncated.
+#[test]
+fn a_channel_drops_a_reply_past_reply_bytes() {
+    use bm_stack::App;
+    let channels = TestChannels::new();
+    let handle = channels.handle();
+    let mut app = channels.app();
+    let mut node = node();
+    embassy_futures::block_on(handle.service_request(PEER_ECHO, b"", 5));
+    act(&mut app, &mut node, 0).expect("the request");
+    drain(&channels);
+    let data = vec![0u8; bm_stack::channel::REPLY_BYTES + 1];
+    let mut reply = frames::service_reply(PEER_ID, PEER_ECHO, NODE_ID, 0, &data);
+    node.on_frame_with(10, 1, &mut reply, |event| {
+        App::<TestNode>::on_event(&mut app, event)
+    });
+    assert_eq!(drain(&channels), []);
+    assert_eq!(app.dropped(), 1);
+    assert!(node.service_requests().is_empty(), "answered all the same");
+}

@@ -105,13 +105,16 @@ A cargo workspace.
   - `src/channel.rs` — behind the `channel` feature: `Channels`, an
     `embassy-sync` `NodeHandle` for an application in a task of its own:
     owned `Command`s in, owned `Notification`s out, run by `ChannelApp`, an
-    `App`. Off by default, so a single-task firmware carries neither
-    `embassy-sync` nor `heapless`.
+    `App`. A service request command reports
+    `Notification::ServiceRequested` with its id, then the reply, timeout or
+    power_info notification. Off by default, so a single-task firmware
+    carries neither `embassy-sync` nor `heapless`.
   - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
     `src/mock/frames.rs` builds the peer frames a script feeds it; use it
     rather than a local builder.
   - `examples/hello_node.rs` — a node on the mock PHY through the public API
-    only: a scripted neighbour, an `App` that pings it. Panics on a wrong
+    only: a scripted neighbour, an `App` that pings it, publishes, logs to
+    the Spotter and asks for its sys_info. Panics on a wrong
     outcome, so CI runs it.
 - `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
   SPI, on the per-port frame I/O of
@@ -126,11 +129,12 @@ A cargo workspace.
 - `bm-devkit/` — board support for the dev kit's mote (STM32U575CI,
   ADIN2111 on SPI3, W25Q64JV NOR flash on SPI2): `start` powers and brings up
   the ADIN2111, sets up the flash and starts the RTC, `node` builds a
-  `Devkit` node with the chip's node id, the RTC and its config partitions
-  in flash; `src/bin/bringup.rs`
+  `Devkit` node with the chip's node id, the binary's name as `app_name`, the
+  RTC and its config partitions in flash; `src/bin/bringup.rs`
   runs one and logs the config keys it loaded; `src/bin/hello_world.rs` is
   the hello-world app: subscribes to `spotter/*`, sends `hello world` with
-  `spotter_log` every 10 s, and sets the RTC from `spotter/utc-time`.
+  `spotter_log` every 10 s, sets the RTC from `spotter/utc-time`, and
+  lists echo, sys_info and config_map after metrics, as a C dev kit does.
   **Its own workspace**, for
   bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
   `.cargo/config.toml` sets the thumb target and a `probe-rs run` runner.
@@ -193,9 +197,9 @@ A cargo workspace.
 - `docs/hello-world-todo.md` — the plan for a Rust hello-world app on a dev
   kit (UDP, pub/sub, `spotter_log`, board support). **Complete and closed; no
   work there.** Kept as documentation of what was built and why.
-- `docs/services-todo.md` — **the open plan**: `bm_service*.c` and the
-  built-in services (echo, sys_info, config_map, power_info, metrics). Its
-  "Working a card" says how to pick, claim and close a card.
+- `docs/services-todo.md` — the plan for `bm_service*.c` and the built-in
+  services (echo, sys_info, config_map, power_info, metrics). **Complete and
+  closed; no work there.** Kept as documentation of what was built and why.
 - `docs/bcmp-port-todo.md` — the BCMP port. Complete and closed to new
   cards; its shared contract is the record of the porting rules.
 - `docs/embassy-port-tracking-prompt.md` — the brief that produced

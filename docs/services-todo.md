@@ -1,6 +1,14 @@
 # Services todo
 
-Open. The port of bm_core's service layer and built-in services, as
+> **Complete and closed. There is no work here.** Every card has landed and
+> on a bench a Bridge's samplers listed `hello_world` with its correct
+> `sys_config_crc`. Do not add cards, pick work from this file, or edit it as
+> part of a card. It is kept as documentation: the sections below record what
+> was built, the API shapes, and the reasons for decisions. "Working a card"
+> and the "Order" section describe the process the plan followed and are
+> historical.
+
+The port of bm_core's service layer and built-in services, as
 dependency-ordered cards sized for one agent each. Same card format as
 `docs/bcmp-port-todo.md`, whose "The shared contract" applies in full; the
 "Services contract" below adds to it.
@@ -19,8 +27,8 @@ Out of scope: `middleware/bm_mavlink.c` (no pub/sub; not a service);
 
 Why: a Bridge's `topology_sampler.cpp` and `sensorController.cpp` request
 `sys_info` and `config_map` from every node, and `metrics_sampler.cpp`
-requests `metrics` (bm_protocol `src/apps/bridge/`). A Rust node answers none
-of them today.
+requests `metrics` (bm_protocol `src/apps/bridge/`). A Rust node now answers
+all three.
 
 ## Working a card
 
@@ -102,8 +110,8 @@ two plans are.
 9. **Gold vectors (recipe step 4).** None on the wire. Available: the
    91-byte map in `the_cbor_service_helper_gold_map`; round-trip values in
    `test/src/metrics_reply_msg_test.cpp` and
-   `bm_common_messages/test/power_info_ut.cpp`. E5 records a capture of a C
-   dev kit answering a Bridge; that becomes the gold set.
+   `bm_common_messages/test/power_info_ut.cpp`. No capture of a C dev kit
+   answering a Bridge was recorded; E6 closed on the bench check alone.
 10. **Compare notifications**: handler calls and `BmServiceReplyCb`
     arguments (`ack`, `msg_id`, data), not only frames.
 
@@ -113,140 +121,59 @@ None open.
 
 ## Cards
 
-### E5 — On a bus
-
-- **Rust:** `bm_stack::channel` `Command`/`Notification` variants for
-  service requests and replies; `bm-devkit/src/bin/hello_world.rs` registers
-  in `app_main.cpp`'s order; `hello_node` makes one request.
-- **Capture:** a C dev kit answering a Bridge's samplers, as
-  `bm-wire-diff/testdata/services-*.pcap`, asserted by
-  `tests/capture_services.rs` (pattern: `capture_h0.rs`).
-- **Blocked by:** nothing.
-- **Done:** on a bench, a Bridge's topology and metrics samplers list the
-  Rust node with its correct `sys_config_crc`.
+None remain.
 
 ## Order
 
-| Wave | Cards | Each needs |
-|---|---|---|
-| 1 | E5 | nothing |
+No cards remain.
 
-Cards within a wave can run in parallel.
+## What the landed cards left for the rest (M1, M2, C1, S1, S2, E1, E2, E3, E4, E5, E6)
 
-## What the landed cards left for the rest (M1, M2, C1, S1, S2, E1, E2, E3, E4)
+- **Bench result (E6).** With a Bridge, a C dev kit on bm_protocol's
+  `bm_devkit/hello_world` and `bm-devkit`'s `hello_world`: `bmsrv req
+  sysinfo` returned the Rust node's id, git SHA, `sys_config_crc` and app
+  name `hello_world`; the topology sampler reported the logged
+  `sys_config_crc`; a metrics request returned `{"version": 1, "node_id":
+  ..., "uptime_ms": ..., "data": {}}`. Three checklist items of PR #60 were
+  not run, among them the sysinfo control against the C dev kit and the
+  capture. No pcap was recorded, so there is no `capture_services.rs`.
 
-- **The service list is `bm_wire::service::ServiceTable<H, N, NAME>`**, the
-  C's walk included (#89): `lookup` returns the first service whose name
-  `strncmp`-prefixes the topic and what its checks made of the request;
-  `remove` is the prefix removal. `bm_stack::Node` holds one with `H =
-  bm_stack::service::ServiceHandler`, `SERVICES` (16) names of up to 48 bytes.
-- **Built-ins are `ServiceHandler` variants; the application's are
-  `Services::handle`.** Echo is `ServiceHandler::Echo`, sys_info
-  `ServiceHandler::SysInfo`, config_map `ServiceHandler::ConfigMap`,
-  power_info `ServiceHandler::PowerInfo`, metrics `ServiceHandler::Metrics`,
-  all answered in `Node::serve`, which takes `&I`, `&C` and the time
-  `on_frame` was given. A built-in's handler body is a sans-io function
-  beside its codec (`bm_wire::service::sys_info::handle`,
-  `config_map::handle`, `power_info::handle`, `metrics::handle`), and its
-  registration a `Node::register_<name>_service` building `<id><SUFFIX>`.
-  `Services` has `handle`, `power_info` (the stats callback, default
-  `None`, which sends no reply), `METRICS` and `metrics`.
-- **`Identity::git_sha` and `Identity::app_name`** (contract 7). `git_sha`
-  defaults to `device_info().git_sha` and is what the device-info reply
-  and DFU now read. `app_name` defaults to empty. `bm-devkit`'s
-  `DevkitIdentity` does not set it: bm_protocol's `bm_app_name` is the
-  CMake `APP_NAME` of the app built, which E5 should look up there.
+- **The Rust node on the bench is `bm-devkit`'s `hello_world`.** It lists
+  `<id>/metrics` at construction, then echo, sys_info and config_map after
+  its `spotter/*` and `spotter/utc-time` subscriptions, as `app_main.cpp`
+  does after `bm_sub(APP_PUB_SUB_UTC_TOPIC, ...)`. At start it logs over
+  defmt each listed service and `sys_config_crc`, the CRC-32 of the system
+  partition as a CBOR map (`ConfigPartition::cbor_map_crc32`): the value a
+  Bridge's topology sampler should report for it.
+- **`Identity::app_name` on a dev kit is the binary's name**
+  (`CARGO_BIN_NAME`, passed to `bm_devkit::node`), so `hello_world`, as
+  bm_protocol's `APP_NAME` for `src/apps/bm_devkit/hello_world` (the app
+  directory's name, `src/CMakeLists.txt`). Decided over a constant per
+  binary because it is the rule CMake applies.
+- **Known differences from a C dev kit's replies:** `git_sha` is this repo's `HEAD`, not bm_protocol's; the
+  metrics reply has no components, where a C dev kit's has `memory_metrics.c`'s
+  `memory`; the device-info version string is `bm-devkit@v<version>+<sha>`.
+- **`bm_devkit::RESOURCES` is 16**, not `RESOURCES_DEFAULT` (9):
+  `hello_world` advertises 11 topics. Past the ceiling a service reply is
+  still sent, but its `/rep` topic is not advertised, where a C node's
+  `PUB_LIST` lists it.
+- **`bm_stack::channel` carries requests.** `Command::{ServiceRequest,
+  SysInfoRequest, ConfigMapRequest, MetricsRequest, PowerInfoRequest}`; each
+  reports `Notification::ServiceRequested` with the id or the
+  `ServiceRequestError`, then `ServiceReply`, `ServiceTimeout` or
+  `PowerInfoReply`. `ServiceRequested` exists because a channel
+  application cannot see the id `Node::service_request` returns, and a
+  refused request otherwise reports nothing. `ServiceReply` holds up to
+  `REPLY_BYTES` (`REPLY_DATA_LEN`, 1008), so every reply a C handler can
+  write fits; decided over `DATA_BYTES` (256) because a config_map reply of
+  a real system partition can exceed it, at the cost of a larger
+  `Notification`.
 - **`sys_config_crc` with `NoConfig`** is the empty map's CRC
   (`crc32_ieee(&[0xa0])`), what a C node with an empty system partition
   sends, rather than 0, which the C sends only when the map fails.
-- **Metrics is listed at construction.** `Node::with_services` lists
-  `<id>/metrics` before anything else when `Services::METRICS` (default
-  true, as bm_protocol's `bm_metrics_enabled`), so `hello_world` gets it
-  without a call, ahead of `app_main.cpp`'s echo, sys_info and config_map.
-  There is no public `register_metrics_service`: a second listing would be
-  a second entry (#89). `Services::metrics(encode)` calls `encode` once with
-  the components, a key and `&[Entry]` each; the default has none, which a
-  C node with no component added sends. bm_protocol's dev kits also add
-  `memory_metrics.c`'s `memory` component, which reads FreeRTOS heap
-  statistics and has no counterpart here. Decided as a generic method
-  taking a closure because a component borrows its entries, which an
-  implementation cannot return from `&mut self`. A reply over 1008 bytes or
-  with a `Field::String` is no reply (#85, #97). `RESOURCES_DEFAULT` and
-  `SUBSCRIPTIONS_DEFAULT` are 9, one for the metrics subscription.
-- **A topic's subscribers are a list.** `bm_wire::pubsub::Subscriptions`
-  keeps `Subscriber::Application`, `Subscriber::Service` and
-  `Subscriber::Reply` (`_service_request_cb` on `<svc>/rep`) callbacks per
-  topic as the C does, #79 included. `Node::deliver_publication` calls each
-  service and reply callback once per publication.
-- **One reply per received publication**, in `Owed::reply`, built in the
-  node's transmit buffer. The C calls the service callback once per listing
-  on each matching subscription and replies each time (#89); the comparator
-  asserts the C's replies, handler calls and local deliveries are the Rust
-  node's one repeated.
-- **A node's own publication is not dispatched to its services**, so
-  `Node::service_request` to the node's own service times out where the C
-  answers it a pump later. Decided in S2: answering would owe a second frame
-  (request, then reply) from one call, and the node has one transmit buffer
-  and no queue for it; no caller needs it. Local deliveries reach
-  application and reply callbacks only (`Node::deliver_locally`). The
-  comparator skips such a request.
-- **`bm_stack::mock::frames::service_request`** and `service_reply` build a
-  peer's request and reply frames.
-- **Requests: `Node::service_request(now_ms, service, data, timeout_s)`**
-  returns `(id, Outbound)`; the answer is `Event::ServiceReply { id,
-  service, data }` from `on_frame_with` or `Event::ServiceTimeout { id,
-  service }` from `Node::on_service_expiry`. The C's per-request
-  `reply_cb` is not carried: `Node::sys_info_request(_with)(now_ms,
-  target, timeout_s)` builds `<target>/sys_info` and calls
-  `service_request_with` with no data;
-  `Node::config_map_request(_with)(now_ms, target, partition_id,
-  timeout_s)` does the same with a `ConfigMapRequest`, and
-  `Node::metrics_request(_with)(now_ms, target, timeout_s)` with no data.
-  The application tells replies apart by `service` or
-  by the id it kept, and decodes the data itself
-  (`DecodedSysInfoReply::decode_into`, `DecodedConfigMapReply::decode_into`,
-  `metrics::decode`).
-  `service` is the request's, not the reply's topic (#92). `data` is
-  `data_size` bytes or what arrived if fewer (#92), so a decoder sees a
-  short body where the C reads past the publication.
-- **power_info's requester is the exception.** `power_info_service_request`
-  queues the caller's callback and makes every request's `reply_cb` its
-  own, which dequeues the oldest callback (#96).
-  `Node::power_info_request(_with)(now_ms, timeout_s)` queues one in
-  `bm_wire::service::power_info::Callbacks`, named by the request's id; its
-  requests report `Event::PowerInfoReply { id, reply }` with the dequeued
-  callback's id, only for a reply that decodes, and never `ServiceReply` or
-  `ServiceTimeout`. Decided so the events are the C's callbacks one for
-  one. The comparator tells the oracle's callbacks apart as
-  `C_POWER_REPLY`, eight functions, since a `BmPowerInfoReplyCb` takes no
-  context.
-- **Ceilings:** `bm_stack::service::SERVICE_REQUESTS` (8) requests, names of
-  `SERVICE_NAME_BYTES`. `bm_wire::service::Requests<N, NAME>` is the list,
-  id counter and sweep phase; `resuming(next_id, next_sweep_ms)` lines one up
-  with a running C.
-- **The request sweep is the third timer**, `Node::on_service_expiry`, with
-  its own arm in `Node::run_app` and phased from construction. `on_tick`
-  runs it too. An `App` ticker on a multiple of 500 ms now loses its tie to
-  that arm, as one on the 150 ms grid already did.
-- **The oracle's codecs are a release build.** `bm-wire-sys/build.rs`
-  `T2_RELEASE` compiles `sys_info_svc_reply_msg.c`,
-  `config_cbor_map_srv_{request,reply}_msg.c` and `power_info_reply_msg.c`
-  with `NDEBUG`, because a debug build aborts on a non-uint value (#82).
-  `config_cbor_map_service.c`, in T3, calls the release decoder, so the
-  `services` stack target sees release behaviour too. A debug-built C node
-  aborts on a `config_map` request such as `{"p": "ab"}`; the Rust server
-  does what a release node does.
-- **Decoders write into `&mut self`** (`decode_into`) rather than returning a
-  value, because the C writes fields as it reads them.
-- **Encoders return `Err(CborError::OutOfMemory)` where the C's handler
-  returns false**: no reply (contract 8). `config_map::handle` writes the reply's fields and then the
-  map into that buffer, measuring the map first; a reply that does not fit
-  is no reply (#94).
-- **Decoded strings are `CborString`s**, borrowed from the body, chunked or
-  not; `copy_to` and `eq_bytes` read them. No allocation.
-- **A partition as a map: `ConfigPartition::cbor_map(&mut [u8])`** returns
-  the map's length, or a `MapError`: `NoMap` where the C returns `NULL`,
-  `TooSmall(n)` where the buffer is short (the C allocates), `Unreachable`
-  where the C is undefined. `cbor_map_crc32` is 0 for any error; it is
-  `sys_config_crc`. A node with `NoConfig` maps every partition as the
-  empty map, `a0`.
+- **Decoders** for service bodies: `DecodedSysInfoReply::decode_into`,
+  `DecodedConfigMapReply::decode_into`, `metrics::decode`,
+  `PowerInfoReply::decode_into`; headers `bm_wire::service::{RequestHeader,
+  ReplyHeader}`. `bm-wire-diff/src/pcap.rs` reads captures.
+- **The oracle's codecs are a release build** (`T2_RELEASE`, #82): a C dev
+  kit built for release behaves as the oracle does.

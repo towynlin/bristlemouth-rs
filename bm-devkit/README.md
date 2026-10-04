@@ -105,6 +105,26 @@ name `getUIDStr()` (`%08x%08x%08x` of `UID[2]`, `UID[1]`, `UID[0]`,
 digits of `HEAD` (`build.rs`); its version string is
 `bm-devkit@v<version>+<sha>`, after the C's `<app>@<describe>+<sha>`.
 
+`bm_app_name`, sent in a sys_info reply, is `APP_NAME`
+(`src/lib/bm_integration/bm_config.h`), the app directory's name
+(`src/CMakeLists.txt`: `get_filename_component(APP_NAME ${APP} NAME)`), so
+`hello_world` for `src/apps/bm_devkit/hello_world`. `bm_devkit::node` takes it;
+each binary passes `env!("CARGO_BIN_NAME")`.
+
+## Services
+
+| Order | C | Here |
+|---|---|---|
+| 1 | `metrics_service_init`, from `bristlemouth_init` (`bm_metrics_enabled`), in `bcl_init` | `Node::with_config`, as `Services::METRICS` defaults to true |
+| 2 | `echo_service_init()`, `app_main.cpp:413` | `hello_world`: `Node::register_echo_service` |
+| 3 | `sys_info_service_init()`, `app_main.cpp:414` | `Node::register_sys_info_service` |
+| 4 | `config_cbor_map_service_init()`, `app_main.cpp:415` | `Node::register_config_map_service` |
+
+Not reproduced: `memory_metrics_init()`, after `bcl_init()` in
+`defaultTask`, adds a `memory` metrics component of FreeRTOS heap
+statistics, so a C dev kit's metrics reply has one component and
+`hello_world`'s has none.
+
 ## Configuration storage
 
 **External NOR flash, not internal.** `app_main.cpp` (`defaultTask`) builds a

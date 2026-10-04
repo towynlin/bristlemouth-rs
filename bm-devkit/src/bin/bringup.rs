@@ -86,7 +86,14 @@ async fn main(spawner: Spawner) {
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));
 
     static NODE: StaticCell<Devkit> = StaticCell::new();
-    let node = NODE.init_with(|| bm_devkit::node(board.node_id, board.flash, board.rtc));
+    let node = NODE.init_with(|| {
+        bm_devkit::node(
+            env!("CARGO_BIN_NAME"),
+            board.node_id,
+            board.flash,
+            board.rtc,
+        )
+    });
     log_config(&node.config().store);
     let error = node.run_app(&mut board.phy, &mut Log).await;
     warn!("node stopped: {}", defmt::Debug2Format(&error));
