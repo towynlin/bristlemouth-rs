@@ -1,3 +1,6 @@
 [submodule "vendor/bm_core"]
 	path = bm-wire-sys/vendor/bm_core
 	url = https://github.com/bristlemouth/bm_core.git
+[submodule "vendor/mcuboot"]
+	path = bm-mcuboot-sys/vendor/mcuboot
+	url = https://github.com/mcu-tools/mcuboot

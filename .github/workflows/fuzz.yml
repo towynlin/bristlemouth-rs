@@ -77,8 +77,11 @@ jobs:
         working-directory: bm-wire/fuzz
     steps:
       - uses: actions/checkout@v7
-        with:
-          submodules: recursive
+      # bm_core only: the fuzz workspace does not build bm-mcuboot-sys. Run
+      # from the repository root, since the paths are relative to it.
+      - name: Submodules
+        working-directory: .
+        run: git submodule update --init --recursive --depth 1 bm-wire-sys/vendor/bm_core
       - name: libclang, for bindgen
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libclang-dev
       # cargo-fuzz needs nightly: the sanitizer flags on the Rust side are
