@@ -8,7 +8,7 @@ one agent each. Same card format as `docs/services-todo.md`.
 Why: a deployed module is potted. USB and SWD are not reachable; the only way
 in is Bristlemouth DFU of a `.dfu.bin` from a Spotter's SD card, through a
 Bridge, into MCUboot's secondary slot. `bm-devkit` links for slot 1 and
-has `NoDfu`.
+takes updates into slot 2 (S1, bench pending).
 
 | In scope | Source |
 |---|---|
@@ -182,6 +182,9 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 ### S1 — The slot
 
 **Taken:** claude/mcuboot-s1
+
+**Bench pending:** https://github.com/towynlin/bristlemouth-rs/pull/71.
+The code is in. Left: the bench line and both measurements.
 
 - **Rust, `bm-devkit`:** `src/slot.rs`: `bm_stack::DfuSlot` on slot 2 over
   `embassy_stm32::flash` (blocking), per contract 10.
@@ -411,6 +414,32 @@ Limits:
 - An ELF with no section headers is refused.
 - A signed gold image exists for the test key only; bm_protocol's
   development key is not in this repo.
+
+### S1, for B1
+
+Bench pending; the code is in. `bm-devkit/README.md`, "DFU slot", is the
+record.
+
+| Item | Use |
+|---|---|
+| `bm_devkit::slot::DevkitSlot` | `Board::slot`, the `D` of `Devkit`. `node` takes it. |
+| An image that never confirms | Make `DevkitSlot::set_confirmed` do nothing: it is the only call to `bm_mcuboot::set_confirmed`. |
+| Another git SHA | Another commit, or `BM_DEVKIT_GIT_SHA` forced in `build.rs` (L1). |
+| Log lines | `slot: erased … in N ms`; `slot: N bytes written` every 64 KiB; `slot: pending (code), resetting`; after the swap `reset reason: Mcuboot`, then `slot: image confirmed`; `dfu: 0x… from …` for each DFU message except payloads. |
+
+Decisions:
+
+| Decision | Reason |
+|---|---|
+| One `blocking_erase` per page, `watchdog::feed` before each | Contract 5; `watchdog::task` cannot run while `erase` holds the executor. |
+| One `blocking_write` per quad-word | The tail pad and the read-back are per quad-word anyway; no call spans the bank boundary. |
+| A write's short tail padded with `0xFF`, not the source's following bytes | The C reads past its buffer (`stm32_flash_u5.c:103`). The bytes are past the image. |
+| An erase past the slot's end refused | `flash_area_erase` does not check `fa_size` and would erase scratch. bm_core never asks for it. |
+| `set_pending`'s result logged, not acted on | `bm_dfu_wrapper.cpp:25` ignores `boot_set_pending`'s. |
+| `read` is slot 2 | The C's host reads the W25 `dfu` partition, which is out of scope. |
+| ICACHE not invalidated | Neither the bootloader nor `embassy_stm32::init` enables it. |
+
+Not measured: the erase time; a neighbour timing the node out during it.
 
 ### L1, for S1
 
