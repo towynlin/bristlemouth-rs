@@ -181,6 +181,8 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ### I1 — Image tool
 
+**Taken:** claude/mcuboot-i1-image-tool
+
 - **Rust:** new host crate `bm-image` in the root workspace; the SHA-256
   dependency lives here, not in `bm-mcuboot`. A library over bytes and a
   CLI:
