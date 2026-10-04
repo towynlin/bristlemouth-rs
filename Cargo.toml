@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["bm-mcuboot", "bm-mcuboot-diff", "bm-mcuboot-sys","bm-stack", "bm-wire", "bm-wire-diff", "bm-wire-sys"]
+members = ["bm-image", "bm-mcuboot", "bm-mcuboot-diff", "bm-mcuboot-sys","bm-stack", "bm-wire", "bm-wire-diff", "bm-wire-sys"]
 
 [workspace.package]
 # Embassy's README promises only that it compiles on the latest stable, and

@@ -235,6 +235,25 @@ A cargo workspace.
     and 5000 random trailers; `boot_go` on Rust's marks against its own.
   - `tests/image.rs` — the codecs on `imgtool`'s signed image and on images
     `boot_go` boots.
+- `bm-image/` — builds and reads `.dfu.bin` and `.unified.bin`, as
+  bm_protocol's `imgtool` and `objcopy` steps make them. Host-only; a
+  library over bytes and a CLI (`dfu`, `unified`, `info`). The SHA-256 and
+  ed25519 dependencies live here, not in `bm-mcuboot`. `README.md` is its
+  contract.
+  - `src/elf.rs` — `flat`: an ELF32's loaded sections at their load
+    addresses, as `objcopy --gap-fill 0xFF -O binary`.
+  - `src/version.rs` — `VersionInfo`, bm_protocol's `versionInfo_t`, found
+    by its magic; the image's `ih_ver` comes from it.
+  - `src/image.rs` — `build`, `from_body`, `dfu`, `unified`, and
+    `MAX_IMAGE_LEN`, `imgtool`'s limit.
+  - `src/key.rs` — `Key`: a PKCS#8 PEM ed25519 key, its `KEYHASH` and
+    signature.
+  - `src/info.rs` — `Info`: header, TLVs, version note, and
+    `BmDfuImgInfo`'s size and CRC.
+  - `testdata/` — a small ELF, its `objcopy` binary and `imgtool`'s
+    unsigned and signed images of it.
+  - `tests/gold.rs` — byte-identical to `testdata/`; `tests/oracle.rs` —
+    what `bm-mcuboot-sys`'s `boot_go` boots and refuses.
 - `docs/c-divergences.md` — the upstream defect list.
 - `docs/hello-world-todo.md` — the plan for a Rust hello-world app on a dev
   kit (UDP, pub/sub, `spotter_log`, board support). **Complete and closed; no
@@ -307,7 +326,7 @@ cargo tree -p bm-mcuboot                                   # no dependencies
 ./bm-wire-sys/scripts/check_symbols.sh --check             # only libc may be unresolved
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features \
   -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys \
-  -p bm-mcuboot -p bm-mcuboot-diff                         # -D warnings, as CI does
+  -p bm-mcuboot -p bm-mcuboot-diff -p bm-image             # -D warnings, as CI does
 cd bm-wire/fuzz && mkdir -p corpus/<target>                # libFuzzer wants it to exist
 cd bm-wire/fuzz && cargo fuzz run <target> corpus/<target> seeds/<target>
 ```
