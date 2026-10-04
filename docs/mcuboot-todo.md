@@ -179,37 +179,6 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ## Cards
 
-### L1 — Link for slot 1
-
-**Taken:** mcuboot-l1-link
-
-**Bench pending:** https://github.com/towynlin/bristlemouth-rs/pull/70.
-The code is in. Run on a kit: `cargo run` boots, logs and stays up 40 s on
-a bus with a Bridge; the `.unified.bin` programmed with `probe-rs` boots
-the same. Left: the node in the Bridge's topology listing, and `dfu-util`
-as the `.unified.bin`'s transport.
-
-- **Rust, `bm-devkit`:**
-
-  | Change | Detail |
-  |---|---|
-  | `memory.x` | `FLASH` origin `0x0800C200`, length `0xF0520` (contract 3). No other layout. |
-  | Version note | A `#[used]` static in the C's layout (contract 8), in a section a linker fragment places at `0x0800C438`, padding after the vector table if cortex-m-rt's ends earlier. Fields from the values `DevkitIdentity` reports. |
-  | Watchdog | Fed from a task spawned in `start`, period 1 s, before anything that can wait. |
-  | Clocks | `config()` reaches the same tree from the bootloader's state (contract 6) as from reset. |
-  | Runner | `.cargo/config.toml`'s runner builds the `.dfu.bin` with `bm-image`, programs it at `0x0800C000`, and attaches for defmt, without the reset vector catch (`--no-catch-reset`): every DFU ends in a reset. `BM_IMAGE_KEY`, when set, is the `--key` path. `cargo run` keeps working and no longer touches the bootloader. |
-  | CI | builds a `.dfu.bin` for `hello_world` and runs `bm-image info` on it. |
-
-- **README:** replace "Flash layout, bootloader, no-init RAM"'s
-  no-bootloader paragraph; add how to install the C bootloader once and how
-  to restore C firmware.
-- **Bench:** with the C bootloader installed, `cargo run --bin hello_world`
-  boots, logs, stays up past 10 s (the IWDG), and appears in a Bridge's
-  topology. `dfu-util` of a `.unified.bin` built from the Rust image boots
-  the same.
-- **Blocked by:** nothing.
-- **Done:** the bench line.
-
 ### S1 — The slot
 
 - **Rust, `bm-devkit`:** `src/slot.rs`: `bm_stack::DfuSlot` on slot 2 over
@@ -232,7 +201,7 @@ as the `.unified.bin`'s transport.
 - **Bench:** a dev kit running Rust `hello_world` accepts a Rust
   `.dfu.bin` with a different git SHA from a Bridge, reboots into it, and
   the Bridge reports success.
-- **Blocked by:** L1.
+- **Blocked by:** nothing.
 - **Done:** the bench line.
 
 ### B1 — On a bus
@@ -267,15 +236,14 @@ as the `.unified.bin`'s transport.
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | L1 | nothing |
-| 2 | S1 | L1 |
-| 3 | B1 | S1 |
+| 1 | S1 | nothing |
+| 2 | B1 | S1 |
 
 Cards within a wave can run in parallel.
 
 ## What the landed cards left for the rest
 
-Landed: O1, N1, M1, I1.
+Landed: O1, N1, M1, I1, L1.
 
 ### O1 — `bm-mcuboot-sys`
 
@@ -444,8 +412,8 @@ Limits:
 
 ### L1, for S1
 
-Bench pending; the code is in. `bm-devkit/README.md`, "Flash layout,
-bootloader, no-init RAM", is the record.
+`bm-devkit/README.md`, "Flash layout, bootloader, no-init RAM", is the
+record, bench results included.
 
 | Item | Use |
 |---|---|

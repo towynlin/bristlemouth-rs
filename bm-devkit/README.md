@@ -312,9 +312,8 @@ bus with a Bridge and a C dev kit:
 |---|---|
 | `cargo run --release --bin hello_world` | boots; logs node id, services, both neighbours' heartbeats and the Bridge's `spotter/utc-time`; no reset in 40 s |
 | `bm-image unified` of that bootloader and the Rust `.dfu.bin`, programmed at `0x08000000` with `probe-rs download` | the same, 25 s |
-
-Not run: `dfu-util` as the transport for the `.unified.bin`; the Bridge's
-topology listing.
+| the same `.unified.bin` with `dfu-util`, from the ROM bootloader | boots the same |
+| the topology a Spotter reports from the Bridge | lists the node |
 
 ### No-init RAM
 
