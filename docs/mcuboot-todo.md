@@ -178,6 +178,8 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ### O1 — MCUboot oracle
 
+**Taken:** claude/mcuboot-o1-oracle
+
 - **Rust:** new host-only crate `bm-mcuboot-sys` in the root workspace.
   `vendor/mcuboot` is a submodule at v1.9.0 (`c657cbea`, what bm_protocol
   pins). Compiles `bootutil` (`bootutil_public.c`, `bootutil_misc.c`,
