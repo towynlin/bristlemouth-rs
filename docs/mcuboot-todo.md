@@ -15,7 +15,7 @@ Bridge, into MCUboot's secondary slot. `bm-devkit` today links at
 | Linking for slot 1, behind the C bootloader | bm_protocol `src/CMakeLists.txt:72-135`, `src/bsp/common/linker/bs_stm32u575.ld` |
 | What the bootloader leaves running | `src/apps/bootloader/app_main.c`, `src/bsp/bootloader/Core/Src/{main,iwdg}.c` |
 | The image: header, TLVs, version note | MCUboot v1.9.0 `scripts/imgtool`, `boot/bootutil/include/bootutil/image.h`; `cmake/git_version.cmake`, `src/lib/common/version.h` |
-| `.dfu.bin` and `.unified.bin` | `src/CMakeLists.txt:570-690` |
+| `.dfu.bin` and `.unified.bin`, unsigned and ed25519-signed | `src/CMakeLists.txt:372-400`, `:570-690` |
 | The slot trailer: pending, confirmed | MCUboot `boot/bootutil/src/bootutil_public.c` |
 | DFU's flash hooks | `src/lib/drivers/bm_dfu_wrapper.cpp`, `src/lib/mcuboot/port_flash.c`, `src/lib/drivers/stm32_flash_u5.c` |
 | No-init RAM | `bs_stm32u575.ld` `.noinit`, `src/lib/common/reset_reason.c`, `bootloader_helper.c`, bm_core `bcmp/dfu_core.c:27` |
@@ -25,7 +25,7 @@ Out of scope:
 | Item | Why |
 |---|---|
 | A bootloader in Rust | Deployed nodes have the C one; it is used unchanged. |
-| Signed or encrypted images | Contract 13. Dev kits take unsigned images, and those are the target. |
+| Encrypted images (`ENCRYPT_IMAGES`, x25519) | `CMakePresets.json` does not enable it. Signing is in scope: contract 13. |
 | A no-bootloader link at `0x08000000` | One layout, the deployed one. |
 | Vendoring bm_protocol | Never. The bootloader comes by path (I1). |
 | DFU host on a dev kit (image in the W25 `dfu` partition) | The Bridge is the host. `bm-devkit/README.md`, "DFU image locations". |
@@ -88,12 +88,16 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
    erases per bank.
 2. **The image** is `imgtool sign --header-size 0x200 --align 16 --slot-size
    0xF2000 --version <maj>.<min>.<rev>+<git sha, decimal> --pad-header`
-   with no key and no `--pad` (`src/CMakeLists.txt:590`). So: a 32-byte
+   with no `--pad`, and `--key <ED25519_KEY_FILE>` when `SIGN_IMAGES` is 1
+   (`src/CMakeLists.txt:570-590`). Unsigned: So: a 32-byte
    `image_header` (`ih_magic` `0x96f3b83d`, `ih_load_addr` 0, `ih_hdr_size`
    `0x200`, `ih_protect_tlv_size` 0, `ih_img_size`, `ih_flags` 0, `ih_ver`),
    `0xFF` to `0x200`, the binary, then a TLV area: info magic `0x6907`, total
    length 40, one TLV type `0x10` (SHA-256 of header and body). No trailer in
-   the file. The C build's file is 512 + image + 40 bytes.
+   the file. The C build's file is 512 + image + 40 bytes. Signed adds a
+   `KEYHASH` TLV (`0x01`, SHA-256 of the public key) and an `ED25519` TLV
+   (`0x24`, the signature of the SHA-256 digest), as imgtool's `image.py`
+   writes them.
 3. **Link address.** The vector table is at `0x0800C200`: the bootloader
    sets `VTOR` and loads SP and PC from `0x0800C000 + ih_hdr_size`
    (`app_main.c:57-78`). The image and its 40-byte TLV area must fit in the
@@ -159,15 +163,16 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
     dev kits. `dfu-util` of a C `.elf.unified.bin` at `0x08000000` restores
     one.
 
-13. **Signing depends on the module.** Dev kits ship `hello_world` behind a
-    bootloader that takes unsigned images, and their owners may flash any
-    firmware. So do some third-party modules built on Sofar's line. Modules
-    Sofar sells have a bootloader that checks an ed25519 signature
-    (`SIGN_IMAGES=1`); an image for those is signed with Sofar's key, which
-    this repo does not hold. `bm-image` builds unsigned images. Expected on
-    a signature-checking bootloader, not verified: MCUboot refuses the image
-    in slot 2, keeps the running one, and the client reports
-    `BmDfuErrWrongVer`.
+13. **Signing depends on the module, and this repo builds both.** Dev kits
+    ship `hello_world` behind a bootloader that takes unsigned images, and
+    their owners may flash any firmware. So do some third-party modules
+    built on Sofar's line. Modules Sofar sells have a bootloader built with
+    `SIGN_IMAGES=1` (`CONFIG_BOOT_SIGN_ED25519`), which refuses an image not
+    signed with its key. bm_protocol passes the key as a path,
+    `ED25519_KEY_FILE`, defaulting to the development key
+    `src/apps/bootloader/ed25519_key.pem`; here it is a path given to
+    `bm-image`. No private key is committed except a test-only one generated
+    for this repo's tests.
 
 ## Cards
 
@@ -180,14 +185,17 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   and what they need for SHA-256 with tinycrypt) with a `mcuboot_config.h`
   in `csrc/` carrying bm_protocol's settings (swap with scratch,
   `MCUBOOT_VALIDATE_PRIMARY_SLOT`, `MCUBOOT_MAX_IMG_SECTORS` 121, one image,
-  no signature, no encryption) and a `flash_map_backend` over a RAM array
-  with contract 1's map.
+  no encryption) and a `flash_map_backend` over a RAM array with contract
+  1's map. Built twice, as `build.rs` builds `libbm_core_release.a` beside
+  `libbm_core.a`: without a signature type, and with `MCUBOOT_SIGN_ED25519`
+  and the public half of a test-only key committed with the crate.
 - **API:** reset flash; read and write an area; `boot_set_pending(0)`;
   `boot_set_confirmed()`; `boot_go`, returning the result, `br_image_off`
   and the header.
 - **Smoke test:** an image with a hand-built header in slot 1 boots; the
   same in slot 2 with `boot_set_pending(0)` swaps, and swaps back on the
-  next `boot_go` without `boot_set_confirmed()`.
+  next `boot_go` without `boot_set_confirmed()`. The signing build refuses
+  that unsigned image.
 - **Conventions:** deterministic `csrc/`, a process-global lock, as
   `bm-wire-sys`. Never edit `vendor/`. Update `session-start.sh` and CI for
   the new submodule.
@@ -221,18 +229,23 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
   | Command | Output |
   |---|---|
-  | `bm-image dfu <elf> -o <out.dfu.bin>` | Contract 2's file. The binary is the ELF's loadable sections from `0x0800C200`, gaps `0xFF`. Version and git SHA come from the image's own `versionInfo_t` (contract 8), so the header cannot disagree with it; an ELF without one is an error. |
+  | `bm-image dfu <elf> [--key <ed25519.pem>] -o <out.dfu.bin>` | Contract 2's file. The binary is the ELF's loadable sections from `0x0800C200`, gaps `0xFF`. Version and git SHA come from the image's own `versionInfo_t` (contract 8), so the header cannot disagree with it; an ELF without one is an error. With `--key`, signed as contract 2 says; the key is a PEM as `imgtool keygen -t ed25519` writes, unencrypted. |
   | `bm-image unified <bootloader> <dfu.bin> -o <out.unified.bin>` | The bootloader, an ELF or a flat binary given by path (in a bm_protocol checkout, `preset-builds/bootloader/src/bootloader-bootloader.elf`), padded with `0xFF` to `0xC000`, then the `.dfu.bin` (`src/CMakeLists.txt:683-684`). |
-  | `bm-image info <file>` | Header, TLVs, version note, CRC-16 (kermit) and size: `BmDfuImgInfo`'s fields. |
+  | `bm-image info <file>` | Header, TLVs (signed or not, and the key hash), version note, CRC-16 (kermit) and size: `BmDfuImgInfo`'s fields. |
 
   Rejects an image too large for the slot (contract 3) and states the limit.
-- **Gold:** a small binary signed by bm_protocol's `imgtool.py` with
-  contract 2's arguments, input and output committed as test data with the
-  command; `bm-image`'s output is byte-identical. Header fields asserted
+- **Gold:** a small binary run through bm_protocol's `imgtool.py` with
+  contract 2's arguments, once without a key and once with O1's test key;
+  input and both outputs committed as test data with the commands;
+  `bm-image`'s outputs are byte-identical (ed25519 signatures are
+  deterministic). Header fields asserted
   against the C `hello_world` `.dfu.bin`'s first 32 bytes (`3db8f396
   00000000 0002 0000 b4da0300 00000000 000d0c00 d0b5d862 00000000`).
 - **Oracle:** O1's `boot_go` boots a `bm-image` file from slot 1, and from
-  slot 2 after `bm_mcuboot::set_pending`.
+  slot 2 after `bm_mcuboot::set_pending`: unsigned on the unsigned build,
+  signed on both. On the signing build an unsigned image, one signed with
+  another key, and one with a flipped body byte are each refused; assert
+  what `boot_go` does with slot 2 and which image it boots.
 - **Blocked by:** M1.
 - **Done:** gold and oracle tests pass in `cargo test`.
 
@@ -246,7 +259,7 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   | Version note | A `#[used]` static in the C's layout (contract 8), in a section a linker fragment places at `0x0800C438`, padding after the vector table if cortex-m-rt's ends earlier. Fields from the values `DevkitIdentity` reports. |
   | Watchdog | Fed from a task spawned in `start`, period 1 s, before anything that can wait. |
   | Clocks | `config()` reaches the same tree from the bootloader's state (contract 6) as from reset. |
-  | Runner | `.cargo/config.toml`'s runner builds the `.dfu.bin` with `bm-image`, programs it at `0x0800C000`, and attaches for defmt. `cargo run` keeps working and no longer touches the bootloader. |
+  | Runner | `.cargo/config.toml`'s runner builds the `.dfu.bin` with `bm-image`, programs it at `0x0800C000`, and attaches for defmt. `BM_IMAGE_KEY`, when set, is the `--key` path. `cargo run` keeps working and no longer touches the bootloader. |
   | CI | builds a `.dfu.bin` for `hello_world` and runs `bm-image info` on it. |
 
 - **README:** replace "Flash layout, bootloader, no-init RAM"'s
@@ -315,8 +328,17 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
   | Rust | a Rust image that hangs at start | reverted by the IWDG |
   | power removed mid-swap | — | swap completes on the next boot |
 
+  Then on a dev kit whose bootloader is built with `SIGN_IMAGES=1` and
+  bm_protocol's development key:
+
+  | From | To | Expect |
+  |---|---|---|
+  | C, signed | Rust, signed with that key | success, Rust running |
+  | Rust, signed | Rust, unsigned | previous image running; record the error the Bridge reports |
+  | Rust, signed | C, signed | success, C running |
+
 - **Docs:** results in `bm-devkit/README.md`; a "Releasing an image"
-  section: the commands from source to `.dfu.bin` and `.unified.bin`.
+  section: the commands from source to `.dfu.bin` and `.unified.bin`, unsigned and signed.
 - **Blocked by:** S1.
 - **Done:** every row run and recorded; this file marked complete.
 
