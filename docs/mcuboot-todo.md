@@ -184,7 +184,9 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 **Taken:** claude/mcuboot-s1
 
 **Bench pending:** https://github.com/towynlin/bristlemouth-rs/pull/71.
-The code is in. Left: the bench line and both measurements.
+The bench line passed: Rust to Rust with a new SHA from a Spotter, the
+Bridge reports the new SHA. Left: both measurements, by the steps in
+`bm-devkit/README.md`, "DFU slot", "On a bench".
 
 - **Rust, `bm-devkit`:** `src/slot.rs`: `bm_stack::DfuSlot` on slot 2 over
   `embassy_stm32::flash` (blocking), per contract 10.
@@ -232,8 +234,8 @@ The code is in. Left: the bench line and both measurements.
   | Rust, signed | Rust, unsigned | previous image running; record the error the Bridge reports |
   | Rust, signed | C, signed | success, C running |
 
-- **Docs:** results in `bm-devkit/README.md`; a "Releasing an image"
-  section: the commands from source to `.dfu.bin` and `.unified.bin`, unsigned and signed.
+- **Docs:** results in `bm-devkit/README.md`. Images come from
+  `bm-devkit/build.sh` (S1); the README's opening section has the commands.
 - **Blocked by:** S1.
 - **Done:** every row run and recorded; this file marked complete.
 
@@ -425,7 +427,8 @@ record.
 | `bm_devkit::slot::DevkitSlot` | `Board::slot`, the `D` of `Devkit`. `node` takes it. |
 | An image that never confirms | Make `DevkitSlot::set_confirmed` do nothing: it is the only call to `bm_mcuboot::set_confirmed`. |
 | Another git SHA | Another commit, or `BM_DEVKIT_GIT_SHA` forced in `build.rs` (L1). |
-| Log lines | `slot: erased … in N ms`; `slot: N bytes written` every 64 KiB; `slot: pending (code), resetting`; after the swap `reset reason: Mcuboot`, then `slot: image confirmed`; `dfu: 0x… from …` for each DFU message except payloads. |
+| Images | `cd bm-devkit && ./build.sh --release`: every binary's `.dfu.bin`; signed with `BM_IMAGE_KEY`; `.unified.bin` with `BM_BOOTLOADER`. Warns when the tree is dirty, since the image then carries HEAD's SHA. |
+| Log lines | `dfu: slot 2 erased in N ms` on the Spotter console; `slot: erased … in N ms`; `slot: N bytes written` every 64 KiB; `slot: pending (code), resetting`; after the swap `reset reason: Mcuboot`, then `slot: image confirmed`; `dfu: 0x… from …` for each DFU message except payloads. |
 
 Decisions:
 
@@ -438,6 +441,8 @@ Decisions:
 | `set_pending`'s result logged, not acted on | `bm_dfu_wrapper.cpp:25` ignores `boot_set_pending`'s. |
 | `read` is slot 2 | The C's host reads the W25 `dfu` partition, which is out of scope. |
 | ICACHE not invalidated | Neither the bootloader nor `embassy_stm32::init` enables it. |
+| The erase time also goes to the Spotter console | A potted node has no probe; `slot::take_erase_ms` is read by `hello_world`. |
+| `build.sh` and `image.sh`, scripts beside `runner.sh` | Cargo has no post-build step, and a stale `.dfu.bin` beside a new ELF was sent once by mistake. |
 
 Not measured: the erase time; a neighbour timing the node out during it.
 
