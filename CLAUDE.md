@@ -136,7 +136,7 @@ A cargo workspace.
   the hello-world app: subscribes to `spotter/*`, sends `hello world` with
   `spotter_log` every 10 s, sets the RTC from `spotter/utc-time`,
   lists echo, sys_info and config_map after metrics, as a C dev kit does,
-  and logs DFU progress.
+  logs DFU progress, and sends the slot's erase time to the Spotter console.
   **Its own workspace**, for
   bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
   `.cargo/config.toml` sets the thumb target and `runner.sh` as the runner.
@@ -144,8 +144,11 @@ A cargo workspace.
   `memory.x` starts `FLASH` at `0x0800C200`, and `devkit.x` is cortex-m-rt
   0.7.7's `link.x` (pinned in `Cargo.toml`) with the version note's section
   and a 128-byte vector table alignment check.
-  `runner.sh` builds `<elf>.dfu.bin` with `bm-image` (signed when
-  `BM_IMAGE_KEY` is set), programs it at `0x0800C000` and attaches.
+  `image.sh <elf>` builds `<elf>.dfu.bin` with `bm-image` (signed when
+  `BM_IMAGE_KEY` is set) and `<elf>.unified.bin` when `BM_BOOTLOADER` is;
+  `build.sh [cargo args]` runs `cargo build` then `image.sh` on every binary
+  it built; `runner.sh` runs `image.sh`, programs the `.dfu.bin` at
+  `0x0800C000` and attaches.
   `README.md` is the record of bm_protocol's BSP (pins, clocks, ADIN2111
   sequence, node id, config flash layout), with file and line references —
   bm_protocol is not vendored, so read it there rather than re-deriving it.
@@ -164,7 +167,7 @@ A cargo workspace.
     bm_protocol's partition offsets.
   - `src/slot.rs` — `DevkitSlot`, `bm_stack::DfuSlot` on MCUboot's slot 2
     over `embassy_stm32::flash`, with `bm_mcuboot`'s pending and confirm
-    marks; `NoInitRam` through `noinit::NoInit`.
+    marks; `NoInitRam` through `noinit::NoInit`; `take_erase_ms`.
 - `bm-wire-diff/` — the differential harness. Host-only. One comparator per
   surface, shared by the fuzz targets and by ordinary `#[test]`s.
   - `src/frames.rs` — BCMP, UDP and publication frames a peer sends, for
@@ -333,9 +336,7 @@ cargo build -p bm-mcuboot --target thumbv7em-none-eabihf
 cargo build -p bm-mcuboot --target thumbv8m.main-none-eabihf
 cd bm-phy-adin2111 && cargo test                           # own workspace, needs network
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
-cd bm-devkit && cargo build && cargo build --release      # own workspace, thumb only
-cargo run -p bm-image -- dfu bm-devkit/target/thumbv8m.main-none-eabihf/release/hello_world \
-  -o bm-devkit/target/hello_world.dfu.bin                  # from the root; then `info` on it
+cd bm-devkit && cargo build && ./build.sh --release       # own workspace, thumb only; ELFs and .dfu.bin
 cargo +1.97 check --workspace --all-targets                # the declared MSRV
 cargo tree -p bm-wire                                      # only cbor2, serde, serde_core
 cargo tree -p bm-mcuboot                                   # no dependencies

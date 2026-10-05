@@ -3,6 +3,8 @@
 //! `port_flash.c` and `stm32_flash_u5.c` implement it. `README.md`, "DFU
 //! slot", has the sources and the three cases that differ from the C.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use bm_mcuboot::{Flash as McubootFlash, FlashError, Trailer};
 use bm_stack::{DfuSlot, NoInitRam};
 use bm_wire::bcmp::dfu_core::RebootInfo;
@@ -27,6 +29,19 @@ pub const PAGE_SIZE: u32 = 0x2000;
 pub const WRITE_SIZE: usize = 16;
 
 const ERASED: u8 = 0xFF;
+
+/// The last erase's duration in ms, or `u32::MAX` once taken.
+static ERASE_MS: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// How long the last successful erase took, in ms, once: `None` until the
+/// next. For an application to report over the bus, where no probe is
+/// attached.
+pub fn take_erase_ms() -> Option<u32> {
+    match ERASE_MS.swap(u32::MAX, Ordering::Relaxed) {
+        u32::MAX => None,
+        ms => Some(ms),
+    }
+}
 
 /// Writes between two progress lines in the log.
 const PROGRESS_BYTES: u32 = 0x1_0000;
@@ -80,11 +95,11 @@ impl Area<'_> {
             }
         }
         watchdog::feed();
+        let ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX - 1);
+        ERASE_MS.store(ms, Ordering::Relaxed);
         info!(
-            "slot: erased {=u32:#x} bytes at {=u32:#x} in {=u64} ms",
-            len,
-            off,
-            started.elapsed().as_millis()
+            "slot: erased {=u32:#x} bytes at {=u32:#x} in {=u32} ms",
+            len, off, ms
         );
         true
     }
