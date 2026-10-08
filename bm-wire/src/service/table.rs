@@ -20,6 +20,7 @@
 //! | `echo_service_handler` copies a request of any length into a 1008-byte buffer | [`echo`] refuses one longer than the buffer | #90 |
 
 use crate::BmWireError;
+use crate::le;
 use crate::pubsub::TOPIC_MAX_LEN;
 
 /// `BM_SERVICE_REQ_STR`, appended to a service's name for its request topic.
@@ -57,10 +58,10 @@ impl RequestHeader {
     ///
     /// [`BmWireError::Truncated`] if `body` is shorter than [`Self::LEN`].
     pub fn decode(body: &[u8]) -> Result<Self, BmWireError> {
-        let b = body.get(..Self::LEN).ok_or(BmWireError::Truncated)?;
+        let b: &[u8; Self::LEN] = le::prefix(body)?;
         Ok(Self {
-            id: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            data_size: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            id: le::u32_at(b, 0),
+            data_size: le::u32_at(b, 4),
         })
     }
 
@@ -98,13 +99,11 @@ impl ReplyHeader {
     ///
     /// [`BmWireError::Truncated`] if `body` is shorter than [`Self::LEN`].
     pub fn decode(body: &[u8]) -> Result<Self, BmWireError> {
-        let b = body.get(..Self::LEN).ok_or(BmWireError::Truncated)?;
-        let mut id = [0u8; 8];
-        id.copy_from_slice(&b[..8]);
+        let b: &[u8; Self::LEN] = le::prefix(body)?;
         Ok(Self {
-            target_node_id: u64::from_le_bytes(id),
-            id: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
-            data_size: u32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+            target_node_id: le::u64_at(b, 0),
+            id: le::u32_at(b, 8),
+            data_size: le::u32_at(b, 12),
         })
     }
 

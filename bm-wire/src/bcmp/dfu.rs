@@ -37,6 +37,7 @@
 
 use crate::BmWireError;
 use crate::bcmp::MessageType;
+use crate::le;
 
 /// `bm_dfu_max_chunk_size`: the longest chunk a client accepts and a host may
 /// be asked to send. `dfu_client.c` ignores a longer [`DfuChunk`];
@@ -74,13 +75,10 @@ impl DfuAddress {
     ///
     /// [`BmWireError::Truncated`] if `buf` is shorter than [`Self::LEN`].
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let buf: &[u8; Self::LEN] = buf
-            .get(..Self::LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
+        let buf: &[u8; Self::LEN] = le::prefix(buf)?;
         Ok(Self {
-            src_node_id: u64::from_le_bytes(buf[0..8].try_into().expect("8 bytes")),
-            dst_node_id: u64::from_le_bytes(buf[8..16].try_into().expect("8 bytes")),
+            src_node_id: le::u64_at(buf, 0),
+            dst_node_id: le::u64_at(buf, 8),
         })
     }
 
@@ -139,18 +137,15 @@ impl ImgInfo {
     ///
     /// [`BmWireError::Truncated`] if `buf` is shorter than [`Self::LEN`].
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let b: &[u8; Self::LEN] = buf
-            .get(..Self::LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
+        let b: &[u8; Self::LEN] = le::prefix(buf)?;
         Ok(Self {
-            image_size: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
-            chunk_size: u16::from_le_bytes([b[4], b[5]]),
-            crc16: u16::from_le_bytes([b[6], b[7]]),
+            image_size: le::u32_at(b, 0),
+            chunk_size: le::u16_at(b, 4),
+            crc16: le::u16_at(b, 6),
             major_ver: b[8],
             minor_ver: b[9],
-            filter_key: u32::from_le_bytes([b[10], b[11], b[12], b[13]]),
-            git_sha: u32::from_le_bytes([b[14], b[15], b[16], b[17]]),
+            filter_key: le::u32_at(b, 10),
+            git_sha: le::u32_at(b, 14),
         })
     }
 
@@ -299,11 +294,7 @@ impl<'a> DfuMessage<'a> {
         let frame_type = *body.first().ok_or(BmWireError::Truncated)?;
         let addresses = DfuAddress::of_body(body)?;
         let tail = &body[Self::MIN_LEN..];
-        let two = |tail: &[u8]| -> Result<[u8; 2], BmWireError> {
-            tail.get(..2)
-                .and_then(|b| b.try_into().ok())
-                .ok_or(BmWireError::Truncated)
-        };
+        let two = |tail: &[u8]| -> Result<[u8; 2], BmWireError> { le::prefix(tail).copied() };
         let result = |tail: &[u8]| -> Result<DfuResult, BmWireError> {
             let [success, err_code] = two(tail)?;
             Ok(DfuResult {

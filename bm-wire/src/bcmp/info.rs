@@ -28,6 +28,7 @@
 //! for a port to reproduce.
 
 use crate::BmWireError;
+use crate::le;
 
 /// `BcmpDeviceInfoRequest`: ask one node, or every node, to describe itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -46,12 +47,8 @@ impl DeviceInfoRequest {
     ///
     /// [`BmWireError::Truncated`] if `buf` is too short.
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let bytes: [u8; 8] = buf
-            .get(..Self::LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
         Ok(Self {
-            target_node_id: u64::from_le_bytes(bytes),
+            target_node_id: u64::from_le_bytes(*le::prefix(buf)?),
         })
     }
 
@@ -100,18 +97,15 @@ impl DeviceInfo {
     ///
     /// [`BmWireError::Truncated`] if `buf` is too short.
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let buf: &[u8; Self::LEN] = buf
-            .get(..Self::LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
+        let buf: &[u8; Self::LEN] = le::prefix(buf)?;
         let mut serial_num = [0u8; 16];
         serial_num.copy_from_slice(&buf[12..28]);
         Ok(Self {
-            node_id: u64::from_le_bytes(buf[0..8].try_into().expect("8 bytes")),
-            vendor_id: u16::from_le_bytes([buf[8], buf[9]]),
-            product_id: u16::from_le_bytes([buf[10], buf[11]]),
+            node_id: le::u64_at(buf, 0),
+            vendor_id: le::u16_at(buf, 8),
+            product_id: le::u16_at(buf, 10),
             serial_num,
-            git_sha: u32::from_le_bytes(buf[28..32].try_into().expect("4 bytes")),
+            git_sha: le::u32_at(buf, 28),
             ver_major: buf[32],
             ver_minor: buf[33],
             ver_rev: buf[34],

@@ -170,7 +170,7 @@ mod tests {
 
         let checksum_offset = BCMP_HEADER_OFFSET + CHECKSUM_FIELD_OFFSET;
         assert_eq!(
-            u16::from_le_bytes([frame[checksum_offset], frame[checksum_offset + 1]]),
+            crate::le::u16_at(&frame, checksum_offset),
             0x3F0C,
             "must agree with the capture, not merely with the C"
         );

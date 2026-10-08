@@ -88,6 +88,20 @@ impl fmt::Write for Text {
     }
 }
 
+/// `text` to the Spotter console with `spotter_log`, logged over defmt too.
+fn log_to_spotter<'n>(node: &'n mut Devkit, text: &[u8]) -> Option<Outbound<'n>> {
+    match node.spotter_log(0, None, USE_TIMESTAMP, text) {
+        Ok(outbound) => {
+            info!("spotter_log: {=[u8]:a}", text);
+            Some(outbound)
+        }
+        Err(error) => {
+            warn!("spotter_log: {}", defmt::Debug2Format(&error));
+            None
+        }
+    }
+}
+
 struct Hello {
     ticker: Ticker,
     utc_time: UtcTimeSetter,
@@ -116,31 +130,13 @@ impl App<Devkit> for Hello {
         if let Some(ms) = slot::take_erase_ms() {
             let mut text = Text::new();
             let _ = write!(text, "dfu: slot 2 erased in {ms} ms");
-            return match node.spotter_log(0, None, USE_TIMESTAMP, text.as_bytes()) {
-                Ok(outbound) => {
-                    info!("spotter_log: {=[u8]:a}", text.as_bytes());
-                    Some(outbound)
-                }
-                Err(error) => {
-                    warn!("spotter_log: {}", defmt::Debug2Format(&error));
-                    None
-                }
-            };
+            return log_to_spotter(node, text.as_bytes());
         }
         match node.rtc().get() {
             Some(time) => info!("rtc: {=u64} us", time.to_utc_micros()),
             None => info!("rtc: not set"),
         }
-        match node.spotter_log(0, None, USE_TIMESTAMP, HELLO) {
-            Ok(outbound) => {
-                info!("spotter_log: {=[u8]:a}", HELLO);
-                Some(outbound)
-            }
-            Err(error) => {
-                warn!("spotter_log: {}", defmt::Debug2Format(&error));
-                None
-            }
-        }
+        log_to_spotter(node, HELLO)
     }
 
     fn on_event(&mut self, event: Event<'_>) {
@@ -149,61 +145,55 @@ impl App<Devkit> for Hello {
         }
         match event {
             Event::Message {
-                message_type,
+                message_type: MessageType::HEARTBEAT,
                 source,
                 ..
-            } if message_type == MessageType::HEARTBEAT => {
+            } => {
                 info!("heartbeat from {=u64:016x}", source);
             }
             Event::Message {
-                message_type,
+                message_type: MessageType::ECHO_REQUEST,
                 source,
                 ..
-            } if message_type == MessageType::ECHO_REQUEST => {
+            } => {
                 info!("echo request from {=u64:016x}", source);
             }
             Event::Message {
-                message_type,
+                message_type: MessageType::SYSTEM_TIME_REQUEST,
                 source,
                 payload,
                 ..
-            } if message_type == MessageType::SYSTEM_TIME_REQUEST => {
-                match SystemTimeRequest::decode(payload) {
-                    Ok(request) => info!(
-                        "time request from {=u64:016x} for {=u64:016x}",
-                        source, request.header.target_node_id
-                    ),
-                    Err(_) => warn!("short time request from {=u64:016x}", source),
-                }
-            }
+            } => match SystemTimeRequest::decode(payload) {
+                Ok(request) => info!(
+                    "time request from {=u64:016x} for {=u64:016x}",
+                    source, request.header.target_node_id
+                ),
+                Err(_) => warn!("short time request from {=u64:016x}", source),
+            },
             Event::Message {
-                message_type,
+                message_type: MessageType::SYSTEM_TIME_SET,
                 source,
                 payload,
                 ..
-            } if message_type == MessageType::SYSTEM_TIME_SET => {
-                match SystemTimeSet::decode(payload) {
-                    Ok(set) => info!(
-                        "time set from {=u64:016x} for {=u64:016x}: {=u64} us",
-                        source, set.header.target_node_id, set.utc_time_us
-                    ),
-                    Err(_) => warn!("short time set from {=u64:016x}", source),
-                }
-            }
+            } => match SystemTimeSet::decode(payload) {
+                Ok(set) => info!(
+                    "time set from {=u64:016x} for {=u64:016x}: {=u64} us",
+                    source, set.header.target_node_id, set.utc_time_us
+                ),
+                Err(_) => warn!("short time set from {=u64:016x}", source),
+            },
             Event::Message {
-                message_type,
+                message_type: MessageType::SYSTEM_TIME_RESPONSE,
                 source,
                 payload,
                 ..
-            } if message_type == MessageType::SYSTEM_TIME_RESPONSE => {
-                match SystemTimeResponse::decode(payload) {
-                    Ok(response) => info!(
-                        "time response from {=u64:016x}: {=u64} us",
-                        source, response.utc_time_us
-                    ),
-                    Err(_) => warn!("short time response from {=u64:016x}", source),
-                }
-            }
+            } => match SystemTimeResponse::decode(payload) {
+                Ok(response) => info!(
+                    "time response from {=u64:016x}: {=u64} us",
+                    source, response.utc_time_us
+                ),
+                Err(_) => warn!("short time response from {=u64:016x}", source),
+            },
             Event::Message {
                 message_type,
                 source,

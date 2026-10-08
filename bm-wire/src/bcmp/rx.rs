@@ -16,6 +16,7 @@ use crate::frame::{
     IPV6_INGRESS_EGRESS_PORTS_OFFSET, IPV6_NEXT_HEADER_OFFSET, IPV6_PAYLOAD_LENGTH_OFFSET,
     IPV6_SOURCE_ADDRESS_OFFSET, MIN_FRAME_WITH_ADDRESSES, ethernet_type,
 };
+use crate::le;
 use crate::util::BmIpAddr;
 
 /// Byte of the source address the legacy port clear zeroes.
@@ -125,7 +126,7 @@ pub fn accept(frame: &mut [u8]) -> Result<Received<'_>, RxError> {
     frame[IPV6_INGRESS_EGRESS_PORTS_OFFSET] &= 0x0F;
 
     let checksum_offset = BCMP_HEADER_OFFSET + CHECKSUM_FIELD_OFFSET;
-    let checksum_read = u16::from_le_bytes([frame[checksum_offset], frame[checksum_offset + 1]]);
+    let checksum_read = le::u16_at(frame, checksum_offset);
     frame[checksum_offset] = 0;
     frame[checksum_offset + 1] = 0;
 

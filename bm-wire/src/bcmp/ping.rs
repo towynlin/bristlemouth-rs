@@ -24,6 +24,7 @@
 //! did not check, which was divergence #29.
 
 use crate::BmWireError;
+use crate::le;
 
 /// Bytes before the payload in both messages, `sizeof(BcmpEchoRequest)` and
 /// `sizeof(BcmpEchoReply)` alike.
@@ -35,14 +36,11 @@ pub const MAX_ECHO_PAYLOAD: usize = u16::MAX as usize;
 /// Decode the part both messages share: the leading `u64`, the three `u16`s,
 /// and a payload whose declared length is checked against `buf`.
 fn decode_parts(buf: &[u8]) -> Result<(u64, u16, u16, &[u8]), BmWireError> {
-    let head: &[u8; ECHO_HEADER_LEN] = buf
-        .get(..ECHO_HEADER_LEN)
-        .and_then(|b| b.try_into().ok())
-        .ok_or(BmWireError::Truncated)?;
-    let node_id = u64::from_le_bytes(head[0..8].try_into().expect("8 bytes"));
-    let id = u16::from_le_bytes([head[8], head[9]]);
-    let seq_num = u16::from_le_bytes([head[10], head[11]]);
-    let payload_len = usize::from(u16::from_le_bytes([head[12], head[13]]));
+    let head: &[u8; ECHO_HEADER_LEN] = le::prefix(buf)?;
+    let node_id = le::u64_at(head, 0);
+    let id = le::u16_at(head, 8);
+    let seq_num = le::u16_at(head, 10);
+    let payload_len = usize::from(le::u16_at(head, 12));
 
     // The check bm_core does not do.
     let payload = buf

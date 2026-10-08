@@ -8,6 +8,7 @@
 
 use crate::BmWireError;
 use crate::frame::{IPV6_ADDRESS_SIZE, IPV6_DESTINATION_ADDRESS_OFFSET};
+use crate::le;
 
 /// Wire size of a BCMP header.
 ///
@@ -225,17 +226,14 @@ impl BcmpHeader {
     ///
     /// [`BmWireError::Truncated`] if `buf` is shorter than the header.
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let buf: &[u8; BCMP_HEADER_LEN] = buf
-            .get(..BCMP_HEADER_LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
+        let buf: &[u8; BCMP_HEADER_LEN] = le::prefix(buf)?;
 
         Ok(Self {
-            message_type: MessageType(u16::from_le_bytes([buf[0], buf[1]])),
-            checksum: u16::from_le_bytes([buf[2], buf[3]]),
+            message_type: MessageType(le::u16_at(buf, 0)),
+            checksum: le::u16_at(buf, 2),
             flags: buf[4],
             reserved: buf[5],
-            seq_num: u32::from_le_bytes([buf[6], buf[7], buf[8], buf[9]]),
+            seq_num: le::u32_at(buf, 6),
             frag_total: buf[10],
             frag_id: buf[11],
             next_header: buf[12],

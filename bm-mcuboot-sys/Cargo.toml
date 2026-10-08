@@ -3,6 +3,7 @@ name = "bm-mcuboot-sys"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
+publish = false
 links = "bm_mcuboot"
 
 [build-dependencies]

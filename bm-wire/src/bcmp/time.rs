@@ -26,6 +26,7 @@
 //! written down.
 
 use crate::BmWireError;
+use crate::le;
 
 /// `BcmpSystemTimeHeader`: who a system-time message is for, and who sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,13 +49,10 @@ impl SystemTimeHeader {
     ///
     /// [`BmWireError::Truncated`] if `buf` is shorter than [`Self::LEN`].
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let buf: &[u8; Self::LEN] = buf
-            .get(..Self::LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
+        let buf: &[u8; Self::LEN] = le::prefix(buf)?;
         Ok(Self {
-            target_node_id: u64::from_le_bytes(buf[0..8].try_into().expect("8 bytes")),
-            source_node_id: u64::from_le_bytes(buf[8..16].try_into().expect("8 bytes")),
+            target_node_id: le::u64_at(buf, 0),
+            source_node_id: le::u64_at(buf, 8),
         })
     }
 
@@ -170,17 +168,10 @@ macro_rules! timestamped {
             ///
             /// [`BmWireError::Truncated`] if `buf` is too short.
             pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-                let buf: &[u8; Self::LEN] = buf
-                    .get(..Self::LEN)
-                    .and_then(|b| b.try_into().ok())
-                    .ok_or(BmWireError::Truncated)?;
+                let buf: &[u8; Self::LEN] = le::prefix(buf)?;
                 Ok(Self {
                     header: SystemTimeHeader::decode(buf)?,
-                    utc_time_us: u64::from_le_bytes(
-                        buf[SystemTimeHeader::LEN..Self::LEN]
-                            .try_into()
-                            .expect("8 bytes"),
-                    ),
+                    utc_time_us: le::u64_at(buf, SystemTimeHeader::LEN),
                 })
             }
 
