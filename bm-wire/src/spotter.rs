@@ -82,6 +82,7 @@ pub const MAX_TX_LEN: usize = TX_HEADER_LEN + MAX_CELLULAR_LEN;
 /// `BmSerialNetworkType`: which network the Spotter sends data over. A `u8`,
 /// as in the C, which sends any value it is given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NetworkType(pub u8);
 
 impl NetworkType {
@@ -106,6 +107,7 @@ impl NetworkType {
 /// Why [`encode_log`] or [`encode_tx_data`] wrote nothing, with the `BmErr`
 /// the C returns for the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum EncodeError {
     /// The text is empty: `BmENODATA`.
     NoData,

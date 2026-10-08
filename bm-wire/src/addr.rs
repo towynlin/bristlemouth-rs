@@ -81,6 +81,7 @@ pub const IPV6_STR_LEN: usize = 40;
 ///
 /// Exists so [`format_ipv6`] can return a string without an allocator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Ipv6Str {
     buf: [u8; IPV6_STR_LEN],
     len: usize,

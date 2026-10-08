@@ -41,6 +41,7 @@ pub const MAX_SERVICE_LEN: usize = TOPIC_MAX_LEN - REQUEST_SUFFIX.len();
 
 /// `BmServiceRequestDataHeader`: the first eight bytes of a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RequestHeader {
     /// `id`, echoed in the reply.
     pub id: u32,
@@ -80,6 +81,7 @@ impl RequestHeader {
 
 /// `BmServiceReplyDataHeader`: the first sixteen bytes of a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ReplyHeader {
     /// `target_node_id`: the node the request came from.
     pub target_node_id: u64,
@@ -187,6 +189,7 @@ fn strncmp_eq(a: &[u8], n: usize, b_at: impl Fn(usize) -> Option<u8>) -> Result<
 
 /// What `_service_request_received_cb` makes of one publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Lookup<'a, H> {
     /// No service's name `strncmp`-matches the topic: nothing is called.
     NoService,
@@ -243,6 +246,7 @@ struct Service<H, const NAME: usize> {
 /// `bm_malloc` failure, after which `bm_service_register` returns false
 /// having listed nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TableFull;
 
 /// `BM_SERVICE_CONTEXT.service_list`: services by name, in registration
@@ -255,6 +259,7 @@ pub struct TableFull;
 ///
 /// `N` services of up to `NAME` bytes each; bm_core has neither ceiling.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ServiceTable<H, const N: usize, const NAME: usize> {
     services: [Option<Service<H, NAME>>; N],
     len: usize,

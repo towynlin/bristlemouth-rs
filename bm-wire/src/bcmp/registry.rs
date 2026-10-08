@@ -92,6 +92,7 @@ pub const PACKET_RETRY_COUNT: u8 = 3;
 /// sets both; `bcmp/config.c` is the only module that sets `sequenced_request`
 /// at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PacketCfg {
     /// This type is a reply: `serialize` stamps the caller's sequence number
     /// into the header rather than allocating one.
@@ -128,6 +129,7 @@ impl PacketCfg {
 /// to know what it asked — but matching ignores it, exactly as the C does.
 /// See divergence #21.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PendingRequest {
     /// The type of the request that was sent.
     pub message_type: MessageType,
@@ -162,6 +164,7 @@ impl PendingRequest {
 
 /// What a sweep did to an expired request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Expiry {
     /// Re-sent and restamped: `PACKET.cb.send(element->buf)`. The request is
     /// still outstanding, with [`PendingRequest::retries`] counting this one
@@ -175,6 +178,7 @@ pub enum Expiry {
 
 /// Why the registry refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum RegistryError {
     /// No [`PacketCfg`] is registered for this message type.
@@ -199,6 +203,7 @@ impl core::fmt::Display for RegistryError {
 /// What to stamp into an outgoing message's header, and whether a reply to it
 /// will be matched.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Outgoing {
     /// The sequence number for
     /// [`tx::serialize`][crate::bcmp::tx::serialize].
@@ -218,6 +223,7 @@ pub struct Outgoing {
 
 /// What a received message should be done with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Delivery {
     /// Nothing is registered for this type. The C returns `BmENODEV` without
     /// dispatching.
@@ -239,6 +245,7 @@ pub enum Delivery {
 /// linked lists; these are fixed-capacity arrays, because `bm-wire` has no
 /// allocator.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Registry<const TYPES: usize, const PENDING: usize> {
     types: [(MessageType, PacketCfg); TYPES],
     types_len: usize,

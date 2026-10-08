@@ -93,5 +93,5 @@ async fn main(spawner: Spawner) {
     });
     log_config(&node.config().store);
     let error = node.run_app(&mut board.phy, &mut Log).await;
-    warn!("node stopped: {}", defmt::Debug2Format(&error));
+    warn!("node stopped: {}", error);
 }

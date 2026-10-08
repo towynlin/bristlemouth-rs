@@ -72,6 +72,7 @@ fn encode_parts(
 
 /// `BcmpEchoRequest`: ask one node, or every node, to echo these bytes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct EchoRequest<'a> {
     /// Node that should answer, or zero for all of them.
     pub target_node_id: u64,
@@ -169,6 +170,7 @@ impl<'a> EchoRequest<'a> {
 
 /// `BcmpEchoReply`: the same bytes coming back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct EchoReply<'a> {
     /// Node that answered.
     ///

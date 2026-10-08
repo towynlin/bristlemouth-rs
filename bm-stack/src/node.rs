@@ -258,6 +258,7 @@ pub const UDP_PORTS: usize = 4;
 
 /// Why [`Node::subscribe`] refused, or subscribed without advertising.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SubscribeError {
     /// Not subscribed: the reason, as [`Subscriptions::subscribe`] gives it.
     Refused(SubscriptionError),
@@ -269,6 +270,7 @@ pub enum SubscribeError {
 
 /// Why [`Node::publish`] sent nothing, with the `BmErr` `bm_pub_wl` returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PublishError {
     /// The topic is empty: `BmEINVAL`. Nothing is delivered.
     EmptyTopic,
@@ -284,6 +286,7 @@ pub enum PublishError {
 /// Why [`Node::spotter_log`] or [`Node::spotter_tx_data`] sent nothing, with
 /// the `BmErr` `spotter_log` returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SpotterError {
     /// The text is empty: `BmENODATA`. Nothing is delivered.
     NoData,
@@ -309,6 +312,7 @@ fn spotter_error(e: EncodeError) -> SpotterError {
 
 /// Why [`Node::bind_udp`] refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum UdpBindError {
     /// The port is already bound, or is [`pubsub::PORT`].
     InUse,
@@ -560,6 +564,127 @@ pub enum Event<'a> {
     },
 }
 
+/// Payloads and frames as their length: a derive would send every byte.
+/// Topic, subscription and service names as ASCII.
+#[cfg(feature = "defmt")]
+impl defmt::Format for Event<'_> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        match self {
+            Self::Reply {
+                request,
+                message_type,
+                source,
+                payload,
+            } => defmt::write!(
+                f,
+                "Reply {{ request: {}, message_type: {}, source: {=u64:016x}, payload: {=usize} bytes }}",
+                request,
+                message_type,
+                source,
+                payload.len()
+            ),
+            Self::Timeout { request } => defmt::write!(f, "Timeout {{ request: {} }}", request),
+            Self::Message {
+                message_type,
+                seq_num,
+                source,
+                payload,
+            } => defmt::write!(
+                f,
+                "Message {{ message_type: {}, seq_num: {=u32}, source: {=u64:016x}, payload: {=usize} bytes }}",
+                message_type,
+                seq_num,
+                source,
+                payload.len()
+            ),
+            Self::EchoReply {
+                source,
+                reply,
+                round_trip_ms,
+            } => defmt::write!(
+                f,
+                "EchoReply {{ source: {=u64:016x}, reply: {}, round_trip_ms: {=u32} }}",
+                source,
+                reply,
+                round_trip_ms
+            ),
+            Self::DeviceInfo { source, reply } => defmt::write!(
+                f,
+                "DeviceInfo {{ source: {=u64:016x}, reply: {} }}",
+                source,
+                reply
+            ),
+            Self::NeighborTable { source, reply } => defmt::write!(
+                f,
+                "NeighborTable {{ source: {=u64:016x}, reply: {} }}",
+                source,
+                reply
+            ),
+            Self::ResourceTable { source, reply } => defmt::write!(
+                f,
+                "ResourceTable {{ source: {=u64:016x}, reply: {} }}",
+                source,
+                reply
+            ),
+            Self::NeighborTableTimeout { target_node_id } => defmt::write!(
+                f,
+                "NeighborTableTimeout {{ target_node_id: {=u64:016x} }}",
+                target_node_id
+            ),
+            Self::DfuUpdateFinished(finished) => {
+                defmt::write!(f, "DfuUpdateFinished({})", finished);
+            }
+            Self::Udp {
+                port,
+                src_port,
+                source,
+                payload,
+            } => defmt::write!(
+                f,
+                "Udp {{ port: {=u16}, src_port: {=u16}, source: {=u64:016x}, payload: {=usize} bytes }}",
+                port,
+                src_port,
+                source,
+                payload.len()
+            ),
+            Self::Publication {
+                source,
+                subscription,
+                topic,
+                kind,
+                version,
+                data,
+            } => defmt::write!(
+                f,
+                "Publication {{ source: {=u64:016x}, subscription: {=[u8]:a}, topic: {=[u8]:a}, \
+                 kind: {=u8}, version: {=u8}, data: {=usize} bytes }}",
+                source,
+                subscription,
+                topic,
+                kind,
+                version,
+                data.len()
+            ),
+            Self::ServiceReply { id, service, data } => defmt::write!(
+                f,
+                "ServiceReply {{ id: {=u32}, service: {=[u8]:a}, data: {=usize} bytes }}",
+                id,
+                service,
+                data.len()
+            ),
+            Self::ServiceTimeout { id, service } => defmt::write!(
+                f,
+                "ServiceTimeout {{ id: {=u32}, service: {=[u8]:a} }}",
+                id,
+                service
+            ),
+            Self::PowerInfoReply { id, reply } => {
+                defmt::write!(f, "PowerInfoReply {{ id: {=u32}, reply: {} }}", id, reply)
+            }
+        }
+    }
+}
+
 /// A frame the node wants transmitted, and the ports it goes out on.
 ///
 /// Mutable because stamping the egress port rewrites it, once per port. The
@@ -570,6 +695,19 @@ pub enum Event<'a> {
 pub struct Outbound<'a> {
     frame: &'a mut [u8],
     mask: u16,
+}
+
+/// The frame as its length, as [`Event`]'s payloads are.
+#[cfg(feature = "defmt")]
+impl defmt::Format for Outbound<'_> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(
+            f,
+            "Outbound {{ frame: {=usize} bytes, mask: {=u16:#06b} }}",
+            self.frame.len(),
+            self.mask
+        );
+    }
 }
 
 impl Outbound<'_> {
@@ -616,6 +754,20 @@ pub struct Owed<'f, 'n> {
     pub forward: Option<Reflood>,
 }
 
+// By hand: the derive's bounds on `Option<Outbound<'f>>` are ambiguous.
+#[cfg(feature = "defmt")]
+impl defmt::Format for Owed<'_, '_> {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(
+            f,
+            "Owed {{ relay: {}, reply: {}, forward: {} }}",
+            self.relay,
+            self.reply,
+            self.forward
+        );
+    }
+}
+
 impl Owed<'_, '_> {
     /// Whether there is nothing to transmit.
     #[must_use]
@@ -638,6 +790,7 @@ impl Owed<'_, '_> {
 /// re-flooded back out the port it came in on — see
 /// [`bm_wire::bcmp::forward::egress_ports`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Reflood {
     /// Offset of the first byte of the BCMP header within the received frame.
     pub start: usize,

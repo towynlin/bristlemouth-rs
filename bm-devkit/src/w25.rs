@@ -43,7 +43,7 @@ const SECTOR_ERASE_TIMEOUT_MS: u32 = 400;
 const POLL_US: u32 = 10;
 
 /// Why an operation failed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
 pub enum Error {
     /// The SPI transfer failed.
     Spi(ErrorKind),

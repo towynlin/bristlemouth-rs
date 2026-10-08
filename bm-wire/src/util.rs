@@ -10,6 +10,7 @@
 /// The C is `struct { uint8_t addr[16]; }`, so this is layout-compatible by
 /// construction and the harness can transmute between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BmIpAddr(pub [u8; 16]);
 
 impl BmIpAddr {
@@ -128,6 +129,7 @@ pub fn bm_wildcard_match(s: &[u8], pattern: &[u8]) -> bool {
 
 /// A broken-down UTC timestamp. Mirrors `UtcDateTime`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct UtcDateTime {
     /// Full year, e.g. 2026.
     pub year: u16,

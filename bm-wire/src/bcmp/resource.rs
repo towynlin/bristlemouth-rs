@@ -43,6 +43,7 @@ use crate::le;
 /// outside the enum reads as [`Self::Publisher`]. Nothing here can produce
 /// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ResourceType {
     /// `PUB`: a topic this node publishes to.
     Publisher,
@@ -52,6 +53,7 @@ pub enum ResourceType {
 
 /// `BcmpResourceTableRequest`: ask one node for its resource table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ResourceTableRequest {
     /// Node that is to answer.
     ///
@@ -107,6 +109,7 @@ impl ResourceTableRequest {
 /// `%.*s`. Exposed as bytes for that reason; use [`core::str::from_utf8`] if a
 /// caller needs text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Resource<'a> {
     /// The name, exactly `resource_len` bytes of it.
     pub name: &'a [u8],
@@ -150,6 +153,7 @@ impl<'a> Resource<'a> {
 /// `num_subs` more, advancing by each record's own declared length, and the
 /// only bound on any of it is where `bm_malloc` happened to put the frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ResourceTableReply<'a> {
     /// Node id of the replying node, which `bcmp_process_resource_discovery_reply`
     /// requires to equal the source address the frame arrived from.
@@ -330,6 +334,7 @@ fn write_records<'n>(
 
 /// Why [`ResourceTable::add`] added nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ResourceAddError {
     /// [`ResourceTable::find`] matched, the C's `BmEAGAIN`.
     ///
@@ -353,6 +358,7 @@ pub enum ResourceAddError {
 /// allocated with. A needle longer than an entry it reaches therefore reads
 /// past that entry's allocation. Divergence #38.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct FindReadsOutOfBounds {
     /// Index within its list of the entry the C would over-read.
     pub entry: usize,
@@ -381,6 +387,7 @@ pub struct FindReadsOutOfBounds {
 /// either, [`Self::add`] reports [`ResourceAddError::Full`] rather than
 /// truncating, because a truncated name is a different name on the wire.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ResourceTable<const N: usize, const NAME: usize = RESOURCE_NAME_BYTES> {
     entries: [Entry<NAME>; N],
     len: usize,
@@ -578,6 +585,7 @@ impl<const N: usize, const NAME: usize> ResourceTable<N, NAME> {
 /// `bcmp_resource_discovery_send_request`'s `fp` argument, as a choice rather
 /// than a pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ResourceRequestKind {
     /// `fp == NULL`. The reply is matched, consumed and printed with
     /// `bm_debug`; nothing reaches the application.
@@ -588,6 +596,7 @@ pub enum ResourceRequestKind {
 
 /// What `bcmp_process_resource_discovery_reply` made of a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ResourceReplyOutcome {
     /// `repl->node_id != ip_to_nodeid(data.src)`. The C returns `BmOK` having
     /// done nothing — it does not even look at the request list.
@@ -620,6 +629,7 @@ pub enum ResourceReplyOutcome {
 /// * **Thirty-two bit keys.** `LLItem::id` is a `uint32_t`, so the list is
 ///   keyed on the low half of a 64-bit node id. See divergence #33.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ResourceRequests<const N: usize> {
     entries: [(u32, ResourceRequestKind); N],
     len: usize,

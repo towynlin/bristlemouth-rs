@@ -64,11 +64,7 @@ impl<SPI: SpiDevice, D: DelayNs> ConfigStorage for FlashConfigStorage<SPI, D> {
         match self.flash.read(addr, buf) {
             Ok(()) => true,
             Err(e) => {
-                defmt::warn!(
-                    "config read at {=u32:#x}: {}",
-                    addr,
-                    defmt::Debug2Format(&e)
-                );
+                defmt::warn!("config read at {=u32:#x}: {}", addr, e);
                 false
             }
         }
@@ -81,11 +77,7 @@ impl<SPI: SpiDevice, D: DelayNs> ConfigStorage for FlashConfigStorage<SPI, D> {
         match self.flash.write(addr, buf) {
             Ok(()) => true,
             Err(e) => {
-                defmt::warn!(
-                    "config write at {=u32:#x}: {}",
-                    addr,
-                    defmt::Debug2Format(&e)
-                );
+                defmt::warn!("config write at {=u32:#x}: {}", addr, e);
                 false
             }
         }

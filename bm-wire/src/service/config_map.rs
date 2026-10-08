@@ -104,6 +104,7 @@ fn encode_head(
 
 /// `ConfigCborMapRequestData`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigMapRequest {
     /// `partition_id`.
     pub partition_id: u32,
@@ -140,6 +141,7 @@ impl ConfigMapRequest {
 
 /// `ConfigCborMapReplyData`, to encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigMapReply<'a> {
     /// `node_id`.
     pub node_id: u64,
@@ -178,6 +180,7 @@ impl ConfigMapReply<'_> {
 
 /// `ConfigCborMapReplyData`, as `config_cbor_map_reply_decode` fills it.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DecodedConfigMapReply<'a> {
     /// `node_id`.
     pub node_id: u64,

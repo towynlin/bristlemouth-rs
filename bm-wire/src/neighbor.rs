@@ -31,6 +31,7 @@ pub const HEARTBEAT_PERIOD_S: u32 = 10;
 
 /// One entry in the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Neighbor {
     /// The neighbour's node id.
     pub node_id: u64,
@@ -65,6 +66,7 @@ impl Neighbor {
 /// Flat rather than a list of events because the C's branches are flat, and
 /// because a fixed struct needs no allocator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct HeartbeatOutcome {
     /// A new entry was created for this neighbour.
     pub added: bool,
@@ -97,6 +99,7 @@ pub struct HeartbeatOutcome {
 ///
 /// `N` should be at least the number of ports the device has.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NeighborTable<const N: usize> {
     entries: [Neighbor; N],
     len: usize,

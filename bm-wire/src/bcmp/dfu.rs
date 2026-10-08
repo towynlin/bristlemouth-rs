@@ -58,6 +58,7 @@ const ADDRESS_OFFSET: usize = 1;
 /// broadcast: `dfu_copy_and_process_message` acts only on an exact match of
 /// `dst_node_id`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DfuAddress {
     /// Node that sent it.
     pub src_node_id: u64,
@@ -108,6 +109,7 @@ impl DfuAddress {
 
 /// `BmDfuImgInfo`: the image a `0xD0` offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ImgInfo {
     /// Image length in bytes.
     pub image_size: u32,
@@ -169,6 +171,7 @@ impl ImgInfo {
 
 /// `BmDfuEventImgInfo`, the body of `0xD0`: a host offering an image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DfuStart {
     /// Host, then client.
     pub addresses: DfuAddress,
@@ -178,6 +181,7 @@ pub struct DfuStart {
 
 /// `BmDfuEventChunkRequest`, the body of `0xD1`: a client asking for a chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DfuChunkRequest {
     /// Client, then host.
     pub addresses: DfuAddress,
@@ -187,6 +191,7 @@ pub struct DfuChunkRequest {
 
 /// `BmDfuEventImageChunk`, the body of `0xD2`: a host sending a chunk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DfuChunk<'a> {
     /// Host, then client.
     pub addresses: DfuAddress,
@@ -202,6 +207,7 @@ impl DfuChunk<'_> {
 
 /// `BmDfuEventResult`, the body of `0xD3`, `0xD4` and `0xD5`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DfuResult {
     /// Sender, then recipient.
     pub addresses: DfuAddress,
@@ -213,6 +219,7 @@ pub struct DfuResult {
 
 /// One DFU body, keyed on its `frame_type` byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DfuMessage<'a> {
     /// `0xD0`, `BcmpDfuStart`.
     Start(DfuStart),

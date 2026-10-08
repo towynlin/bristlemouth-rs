@@ -99,6 +99,27 @@ impl core::fmt::Debug for Client {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for Client {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(
+            f,
+            "Client {{ image_size: {=u32}, num_chunks: {=u16}, crc16: {=u16}, running_crc16: {=u16}, \
+             page_byte_counter: {=u16}, flash_offset: {=u32}, chunk_retry_num: {=u8}, \
+             current_chunk: {=u16}, host_node_id: {=u64}, .. }}",
+            self.image_size,
+            self.num_chunks,
+            self.crc16,
+            self.running_crc16,
+            self.page_byte_counter,
+            self.flash_offset,
+            self.chunk_retry_num,
+            self.current_chunk,
+            self.host_node_id
+        );
+    }
+}
+
 impl Default for Client {
     fn default() -> Self {
         Self::new()

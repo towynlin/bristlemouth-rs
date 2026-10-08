@@ -153,6 +153,7 @@ where
 
 /// A datagram [`accept`] took from a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Datagram<'a> {
     /// The sender's port.
     pub src_port: u16,

@@ -41,6 +41,7 @@ pub const FINISHED_LEN: usize = 4;
 /// One call of the `UpdateFinishCb` given to
 /// [`crate::Node::dfu_initiate_update`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DfuFinished {
     /// Whether the client reported success.
     pub success: bool,

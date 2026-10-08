@@ -77,14 +77,20 @@ contract.
 
 Dependencies:
 
-- `bm-wire`: `no_std`, no `alloc`, `forbid(unsafe_code)`, and one dependency:
-  `cbor2` at `default-features = false`. **Must never depend on
+- `bm-wire`: `no_std`, no `alloc`, `forbid(unsafe_code)`, and one dependency
+  by default: `cbor2` at `default-features = false`. **Must never depend on
   `bm-wire-sys`**, in any configuration. The `std` feature is for tests and
-  fuzzing only, and must not forward to `cbor2`.
+  fuzzing only, and must not forward to `cbor2` or enable `defmt`.
 - `bm-stack`: `no_std`, no `alloc` except behind the test-only `mock` feature.
   The only crate that knows about time or I/O. `channel` is off by default,
   so a single-task firmware carries neither `embassy-sync` nor `heapless`.
-- `bm-mcuboot`: `no_std`, no `alloc`, no dependencies, `forbid(unsafe_code)`.
+- `defmt`, off by default in `bm-wire`, `bm-stack`, `bm-mcuboot` and
+  `bm-phy-adin2111`, adds `defmt::Format` to every public type that has
+  `Debug`; `bm-stack/defmt` and `bm-phy-adin2111/defmt` forward downward.
+  Types borrowing frame bytes (`Event`, `Outbound`, `Owed`) implement it by
+  hand and print payloads as lengths. `bm-devkit` enables it.
+- `bm-mcuboot`: `no_std`, no `alloc`, no dependencies by default,
+  `forbid(unsafe_code)`.
   **Must never depend on `bm-mcuboot-sys`.** SHA-256 and ed25519 live in
   `bm-image`.
 - `bm-wire-sys`, `bm-mcuboot-sys`, `bm-wire-diff`, `bm-mcuboot-diff` and
@@ -196,8 +202,8 @@ cd bm-phy-adin2111 && cargo test                           # own workspace, need
 cd bm-phy-adin2111 && cargo build --target thumbv8m.main-none-eabihf
 cd bm-devkit && cargo build && ./build.sh --release       # own workspace, thumb only; ELFs and .dfu.bin
 cargo +1.97 check --workspace --all-targets                # the declared MSRV
-cargo tree -p bm-wire                                      # only cbor2, serde, serde_core
-cargo tree -p bm-mcuboot                                   # no dependencies
+cargo tree -p bm-wire                                      # only cbor2, serde, serde_core, by default
+cargo tree -p bm-mcuboot                                   # no dependencies, by default
 ./bm-wire-sys/scripts/check_symbols.sh --check             # only libc may be unresolved
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --all-features \
   -p bm-wire -p bm-stack -p bm-wire-diff -p bm-mcuboot-sys \
@@ -222,7 +228,7 @@ verification lines, not just the root's, and commit whichever lockfiles move.
 CI runs all of this on every push, plus four things this list leaves out:
 `cargo fmt --all --check` twice, since `bm-wire/fuzz` is its own workspace;
 `cargo clippy --workspace --all-targets -- -D warnings`; the same clippy for
-`thumbv8m.main-none-eabihf`; and `cargo test -p bm-wire` alone, the only run
+`thumbv8m.main-none-eabihf`, without and with the `defmt` features; and `cargo test -p bm-wire` alone, the only run
 with the `std` feature off. `.github/workflows/ci.yml` is the whole of it.
 Fuzzing is the exception — `cargo test` replays the committed seeds, and
 `fuzz.yml` does open-ended runs nightly and on demand.

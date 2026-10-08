@@ -14,6 +14,7 @@ use crate::cbor::parser::{CborString, Value};
 /// `Display` writes the name, the type as `data_type_enum_to_str` names it,
 /// and the value: `sensorsPollIntervalMs uint32 3000`.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Entry<'a> {
     /// `key_buf`'s first `key_len` bytes, up to a NUL: what bm_protocol's
     /// `cfg listkeys` prints.
@@ -26,6 +27,7 @@ pub struct Entry<'a> {
 
 /// A slot's value, read as the key's stored `value_type`.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum EntryValue<'a> {
     /// As `get_config_uint`.
     Uint(u32),

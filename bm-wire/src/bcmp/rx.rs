@@ -33,6 +33,7 @@ const LEGACY_PORT_CLEAR_OFFSET: usize = IPV6_SOURCE_ADDRESS_OFFSET + 4;
 /// `process_received_message`; they are split apart here because a firmware
 /// caller wants to count them separately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum RxError {
     /// Shorter than the headers it claims to carry.
@@ -65,6 +66,7 @@ impl core::fmt::Display for RxError {
 /// rather than pointers into the frame — the C hands out aliasing mutable
 /// pointers, which the port has no reason to reproduce.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Received<'a> {
     /// The decoded header.
     pub header: BcmpHeader,

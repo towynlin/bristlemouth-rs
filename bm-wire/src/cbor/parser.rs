@@ -17,6 +17,7 @@
 ///
 /// The discriminant is the C value, except [`Self::Unreachable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum CborError {
     /// `CborErrorUnknownLength`.
     UnknownLength,
@@ -118,6 +119,7 @@ const BREAK: u8 = 0xff;
 
 /// `CborValue`: an iterator positioned on one item.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Value<'a> {
     buf: &'a [u8],
     pos: usize,
@@ -129,6 +131,7 @@ pub struct Value<'a> {
 
 /// What [`Value::copy_string`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Copied {
     /// The string's whole length, which the C returns in `*buflen`.
     pub total: usize,
@@ -721,6 +724,7 @@ impl<'a> Value<'a> {
 /// A text or byte string item that has parsed cleanly, definite or chunked,
 /// borrowed from the buffer it was decoded from.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CborString<'a> {
     at: Value<'a>,
     len: usize,

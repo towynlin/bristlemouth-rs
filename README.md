@@ -19,7 +19,7 @@ reproduces it and records it in [docs/c-divergences.md](docs/c-divergences.md).
 | [`bm-stack`](bm-stack) | The node: timers, PHY and storage traits, pub/sub, services, DFU. `no_std`, on `embassy-time`. | any |
 | [`bm-phy-adin2111`](bm-phy-adin2111) | `bm_stack::Phy` for the ADIN2111. | any |
 | [`bm-devkit`](bm-devkit) | Board support and example firmware for the dev kit mote (STM32U575, ADIN2111). | thumbv8m |
-| [`bm-mcuboot`](bm-mcuboot) | MCUboot image header, TLVs and slot trailer. `no_std`, no dependencies. | any |
+| [`bm-mcuboot`](bm-mcuboot) | MCUboot image header, TLVs and slot trailer. `no_std`, no dependencies by default. | any |
 | [`bm-image`](bm-image) | Builds and inspects `.dfu.bin` and `.unified.bin` images. | host |
 | [`bm-wire-sys`](bm-wire-sys), [`bm-mcuboot-sys`](bm-mcuboot-sys) | The C oracles: bm_core and MCUboot's `bootutil`. | host |
 | [`bm-wire-diff`](bm-wire-diff), [`bm-mcuboot-diff`](bm-mcuboot-diff) | Differential tests of the ports against the oracles. | host |

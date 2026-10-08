@@ -65,6 +65,7 @@ pub trait Configuration {
 /// No configuration. A node built with this forwards config messages for
 /// other nodes and answers none addressed to it; a C node always has a store.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NoConfig;
 
 impl Configuration for NoConfig {
@@ -83,6 +84,7 @@ impl Configuration for NoConfig {
 
 /// A config store and the storage it loads from and saves to.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Config<S> {
     /// `CONFIGS`.
     pub store: ConfigStore,
