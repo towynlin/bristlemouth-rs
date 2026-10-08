@@ -4,9 +4,9 @@
 //! [`start`] brings the board up and returns a [`Board`]: the ADIN2111 as a
 //! [`bm_stack::Phy`], the driver runner the firmware must spawn, and the node
 //! id the C firmware would use on the same chip, and the NOR flash that holds
-//! the config partitions, the RTC, and the reason for the last reset.
-//! [`Devkit`] is the node type with this
-//! board's identity, clock and config store.
+//! the config partitions, the RTC, MCUboot's slots, and the reason for the
+//! last reset. [`Devkit`] is the node type with this board's identity,
+//! clock, config store and DFU slot.
 //!
 //! Every pin, clock and sequence here is taken from bm_protocol's
 //! `bm_mote_v1.0` BSP; `README.md` in this crate records each with its source.
@@ -16,6 +16,7 @@
 
 pub mod noinit;
 pub mod rtc;
+pub mod slot;
 pub mod storage;
 pub mod version;
 pub mod w25;
@@ -32,6 +33,7 @@ use bm_wire::bcmp::resource::RESOURCE_NAME_BYTES;
 use bm_wire::configuration::Layout;
 use embassy_executor::Spawner;
 use embassy_stm32::exti::{self, ExtiInput};
+use embassy_stm32::flash::Flash as InternalFlash;
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::mode::{Async, Blocking};
 use embassy_stm32::spi::mode::Master;
@@ -44,6 +46,7 @@ use static_cell::StaticCell;
 
 use crate::noinit::ResetReason;
 use crate::rtc::DevkitRtc;
+use crate::slot::DevkitSlot;
 use crate::storage::FlashConfigStorage;
 use crate::w25::W25;
 
@@ -96,8 +99,8 @@ pub type DevkitConfigStorage = FlashConfigStorage<FlashSpi, Delay>;
 /// is not advertised, where a C node's `PUB_LIST` would list it.
 pub const RESOURCES: usize = 16;
 
-/// A node on this board: [`DevkitIdentity`], the RTC, and the config
-/// partitions in NOR flash.
+/// A node on this board: [`DevkitIdentity`], the RTC, the config
+/// partitions in NOR flash, and MCUboot's slot 2 for DFU.
 pub type Devkit = Node<
     DevkitIdentity,
     DevkitRtc,
@@ -111,6 +114,7 @@ pub type Devkit = Node<
     RESOURCE_REQUESTS_DEFAULT,
     SUBSCRIPTIONS_DEFAULT,
     Config<DevkitConfigStorage>,
+    DevkitSlot,
 >;
 
 /// The brought-up board.
@@ -128,6 +132,8 @@ pub struct Board {
     pub flash: Flash,
     /// The RTC on LSE. [`node`] takes it.
     pub rtc: DevkitRtc,
+    /// MCUboot's slots in internal flash. [`node`] takes it.
+    pub slot: DevkitSlot,
     /// Why the chip last reset: [`noinit::take_reset_reason`], read once.
     pub reset_reason: ResetReason,
 }
@@ -169,7 +175,8 @@ pub fn config() -> embassy_stm32::Config {
 
 /// Initialise the chip with [`config`], spawn [`watchdog::task`], power the
 /// ADIN2111 and bring it up, set up SPI2 for the NOR flash, start the RTC,
-/// and take the reset reason from no-init RAM.
+/// take the internal flash for [`DevkitSlot`], and take the reset reason from
+/// no-init RAM.
 ///
 /// The watchdog task is spawned before the first await, so it is fed while
 /// the ADIN2111 comes up.
@@ -189,6 +196,7 @@ pub async fn start(spawner: Spawner) -> Board {
     let node_id = node_id();
     let reset_reason = noinit::take_reset_reason();
     let rtc = DevkitRtc::new(p.RTC);
+    let slot = DevkitSlot::new(InternalFlash::new_blocking(p.FLASH));
 
     // ADIN_PWR (PH1) drives the ADIN2111's load switches.
     let adin_power = Output::new(p.PH1, Level::High, Speed::Low);
@@ -228,24 +236,33 @@ pub async fn start(spawner: Spawner) -> Board {
         adin_power,
         flash,
         rtc,
+        slot,
         reset_reason,
     }
 }
 
 /// A [`Devkit`] node with id `node_id`, this chip's UID as its name and
 /// `app_name` as its `bm_app_name`, its config partitions loaded from `flash`
-/// in the layout `arm-none-eabi-gcc` gives bm_protocol's.
+/// in the layout `arm-none-eabi-gcc` gives bm_protocol's, and DFU into
+/// `slot`.
 ///
 /// bm_protocol's `bm_app_name` is the app directory's name
 /// (`src/CMakeLists.txt`, `get_filename_component(APP_NAME ${APP} NAME)`);
 /// a binary here passes `env!("CARGO_BIN_NAME")`, which is the same for
 /// `hello_world`.
 #[must_use]
-pub fn node(app_name: &'static str, node_id: u64, flash: Flash, rtc: DevkitRtc) -> Devkit {
-    Node::with_config(
+pub fn node(
+    app_name: &'static str,
+    node_id: u64,
+    flash: Flash,
+    rtc: DevkitRtc,
+    slot: DevkitSlot,
+) -> Devkit {
+    Node::with_dfu(
         DevkitIdentity::new(node_id, embassy_stm32::uid::uid(), app_name),
         rtc,
         Config::load(Layout::ARM_EABI_GCC, FlashConfigStorage::new(flash)),
+        slot,
         PORTS,
     )
 }

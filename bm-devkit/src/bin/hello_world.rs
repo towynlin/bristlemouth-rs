@@ -4,7 +4,9 @@
 //! from: heartbeats, echo requests, and publications received. It also
 //! subscribes to [`utc_time::TOPIC`] and sets the node's clock from it, as C
 //! dev kits do, and logs BCMP time messages, each set, and every 10 s the
-//! node's RTC reading.
+//! node's RTC reading. It takes updates over DFU into slot 2 and logs their
+//! progress; the slot's erase time also goes to the Spotter console, as
+//! `dfu: slot 2 erased in <n> ms`, in place of the next `hello world`.
 //!
 //! It lists the services a C dev kit lists, in `app_main.cpp`'s order:
 //! metrics at construction, then echo, sys_info and config_map, so a
@@ -18,7 +20,9 @@
 #![no_std]
 #![no_main]
 
-use bm_devkit::{AdinRunner, Devkit};
+use core::fmt::{self, Write};
+
+use bm_devkit::{AdinRunner, Devkit, slot};
 use bm_stack::utc_time::{self, UtcTimeSetter};
 use bm_stack::{App, Event, Outbound, Rtc};
 use bm_wire::bcmp::MessageType;
@@ -38,9 +42,50 @@ const SUBSCRIPTION: &[u8] = b"spotter/*";
 
 const HELLO: &[u8] = b"hello world";
 
+/// The DFU messages logged: all but the per-chunk `DFU_PAYLOAD_REQ` and
+/// `DFU_PAYLOAD`. `bm_devkit::slot` logs the erase and every 64 KiB written.
+const DFU_MESSAGES: [MessageType; 7] = [
+    MessageType::DFU_START,
+    MessageType::DFU_END,
+    MessageType::DFU_ACK,
+    MessageType::DFU_ABORT,
+    MessageType::DFU_REBOOT_REQ,
+    MessageType::DFU_REBOOT,
+    MessageType::DFU_BOOT_COMPLETE,
+];
+
 #[embassy_executor::task]
 async fn adin(runner: AdinRunner) -> ! {
     runner.run().await
+}
+
+/// A line of text for `spotter_log`, formatted without `alloc`. Truncated at
+/// its capacity.
+struct Text {
+    buf: [u8; 48],
+    len: usize,
+}
+
+impl Text {
+    const fn new() -> Self {
+        Self {
+            buf: [0; 48],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl fmt::Write for Text {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
 }
 
 struct Hello {
@@ -65,6 +110,22 @@ impl App<Devkit> for Hello {
                 warn!("rtc refused {=u64} us", time.to_utc_micros());
             }
             return None;
+        }
+        // In place of this tick's `hello world`: the Spotter console is
+        // where the erase time can be read without a probe.
+        if let Some(ms) = slot::take_erase_ms() {
+            let mut text = Text::new();
+            let _ = write!(text, "dfu: slot 2 erased in {ms} ms");
+            return match node.spotter_log(0, None, USE_TIMESTAMP, text.as_bytes()) {
+                Ok(outbound) => {
+                    info!("spotter_log: {=[u8]:a}", text.as_bytes());
+                    Some(outbound)
+                }
+                Err(error) => {
+                    warn!("spotter_log: {}", defmt::Debug2Format(&error));
+                    None
+                }
+            };
         }
         match node.rtc().get() {
             Some(time) => info!("rtc: {=u64} us", time.to_utc_micros()),
@@ -143,6 +204,16 @@ impl App<Devkit> for Hello {
                     Err(_) => warn!("short time response from {=u64:016x}", source),
                 }
             }
+            Event::Message {
+                message_type,
+                source,
+                ..
+            } if DFU_MESSAGES.contains(&message_type) => {
+                info!("dfu: {=u16:#x} from {=u64:016x}", message_type.0, source);
+            }
+            Event::DfuUpdateFinished(finished) => {
+                info!("dfu: finished {}", defmt::Debug2Format(&finished));
+            }
             Event::Publication {
                 source,
                 subscription,
@@ -175,6 +246,7 @@ async fn main(spawner: Spawner) {
             board.node_id,
             board.flash,
             board.rtc,
+            board.slot,
         )
     });
     // `app_main.cpp:412-415`: the utc-time subscription, then the services.

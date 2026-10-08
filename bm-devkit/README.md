@@ -5,18 +5,30 @@ board up; `src/bin/bringup.rs` runs a node on it, and `src/bin/hello_world.rs`
 is the hello-world app.
 
 ```
-cd bm-devkit && cargo build --target thumbv8m.main-none-eabihf
-cd bm-devkit && cargo run --release --bin bringup     # probe-rs, defmt over RTT
-cd bm-devkit && cargo run --release --bin hello_world
-BM_IMAGE_KEY=<ed25519.pem> cargo run --release --bin hello_world   # signed
+cd bm-devkit && ./build.sh --release                  # ELFs and their .dfu.bin
+cd bm-devkit && cargo run --release --bin hello_world  # program slot 1 with a probe, defmt over RTT
 ```
+
+`build.sh` runs `cargo build` with its arguments, then `image.sh` on every
+binary it built. Each ELF in `target/thumbv8m.main-none-eabihf/<profile>/`
+gets, beside it:
+
+| File | When | For |
+|---|---|---|
+| `<bin>.dfu.bin` | always; signed when `BM_IMAGE_KEY` names an ed25519 PEM | DFU from a Spotter's SD card; `probe-rs` at `0x0800C000` |
+| `<bin>.unified.bin` | when `BM_BOOTLOADER` names the bootloader ELF or binary | bootloader and image together, at `0x08000000` |
+
+It prints each image's version note. Only a commit changes the git SHA in
+it: with uncommitted changes `build.sh` warns, and a node already running
+HEAD refuses the image as `BmDfuErrSameVer`. A bare `cargo build` makes no
+image and leaves an older `.dfu.bin` in place.
 
 The images link for MCUboot slot 1 and need bm_protocol's bootloader on the
 chip: "Installing the C bootloader", below. `cargo run` is `runner.sh`:
 
 | Step | Command |
 |---|---|
-| Image | `bm-image dfu <elf> [--key $BM_IMAGE_KEY] -o <elf>.dfu.bin`, run from the repository root |
+| Image | `image.sh <elf>` |
 | Program slot 1 | `probe-rs download --binary-format bin --base-address 0x0800C000 <elf>.dfu.bin`. The bootloader's pages are not written. |
 | Start | `probe-rs reset`, so the bootloader runs first |
 | Log | `probe-rs attach --no-catch-reset <elf>`: logging continues across a reset. probe-rs 0.21 has no such flag: `cargo install probe-rs-tools --locked` |
@@ -284,7 +296,7 @@ or build a `.unified.bin`, bootloader and Rust image together, and program
 it at `0x08000000`:
 
 ```
-cargo run -p bm-image -- unified <bootloader.elf> <elf>.dfu.bin -o <elf>.unified.bin
+BM_BOOTLOADER=<bootloader.elf> ./build.sh --release      # in bm-devkit/: <elf>.unified.bin
 probe-rs download --chip STM32U575CITxQ --binary-format bin --base-address 0x08000000 <elf>.unified.bin
 dfu-util -a 0 -s 0x08000000:leave -D <elf>.unified.bin    # without a probe, from the ROM bootloader
 ```
@@ -355,6 +367,81 @@ memfault's U5 core, or with another `.noinit` object linked ahead of
 
 `bm_devkit::node` still builds its node with `NoDfu`: `Node` takes one type
 for `DfuSlot` and `NoInitRam`, so `NoInit` goes in with the slot.
+
+### DFU slot
+
+`src/slot.rs` `DevkitSlot` is `bm_stack::DfuSlot` on slot 2 and
+`bm_stack::NoInitRam` through `noinit::NoInit`. `start` builds it from
+`p.FLASH`; `node` passes it to `Node::with_dfu`.
+
+| Hook | C | Here |
+|---|---|---|
+| open, close, size | `bm_dfu_wrapper.cpp:35-65`, `port_flash.c:77-88` | `true`, `true`, `0xF2000` |
+| erase | `port_flash.c:140-169`, `stm32_flash_u5.c:8-93`: page-aligned whole pages, else failure; erased per bank; read back as `0xFF` | the same, one page per `embassy_stm32::flash::Flash::blocking_erase`, `watchdog::feed` before each |
+| write | `port_flash.c:110-137`, `stm32_flash_u5.c:95-125`: quad-words, then a `memcmp` of `len` bytes | the same, one quad-word per `blocking_write` |
+| read | the host's `bm_dfu_host_get_chunk` reads the W25 `dfu` partition (`bm_dfu_wrapper.cpp:67-75`) | slot 2, memory-mapped |
+| `set_pending_and_reset` | `boot_set_pending(0)`, result ignored; `resetSystem(RESET_REASON_MCUBOOT)` (`bm_dfu_wrapper.cpp:24-28`) | `bm_mcuboot::set_pending(slot 2, Trailer::BM, false)`, result logged; `noinit::reset(ResetReason::Mcuboot)` |
+| `set_confirmed` | `boot_set_confirmed()` on slot 1 (`:17-22`) | `bm_mcuboot::set_confirmed(slot 1, Trailer::BM)` |
+| `fail_update_and_reset` | `resetSystem(RESET_REASON_UPDATE_FAILED)` (`:30-33`) | `noinit::reset(ResetReason::UpdateFailed)` |
+
+Where the C's behaviour is not reproduced:
+
+| Case | C | Here |
+|---|---|---|
+| A write's tail shorter than 16 bytes | `flashWrite` copies 16 bytes from the source (`stm32_flash_u5.c:103`), past its end, and programs them | `0xFF` past the tail |
+| An erase past the slot's end | `flash_area_erase` does not check `fa_size`; `flashErase` checks only the chip's flash, so it erases into the next area | `false` |
+| A write at an offset not a multiple of 16 | `HAL_FLASH_Program` fails, `flashWrite` returns `true` regardless (`:119`), the read-back fails | `false`, nothing programmed |
+
+bm_core's client writes 2048-byte pages and one remainder from offset 0, so
+only the first case occurs; it changes bytes past the image that nothing
+reads.
+
+The ICACHE is off: neither the bootloader nor `embassy_stm32::init`
+enables it, so reads after an erase or write see flash.
+
+`erase` blocks the executor for the whole slot, as `flashErase` blocks the
+C's DFU task; the ADIN2111 runner, the heartbeat and the watchdog task wait.
+It records its duration: defmt logs `slot: erased 0xf2000 bytes at 0x0 in
+<n> ms`, and `hello_world` sends `dfu: slot 2 erased in <n> ms` to the
+Spotter console in place of its next `hello world`, within 10 s.
+
+A neighbour takes a node offline after two advertised heartbeat periods
+without a heartbeat: 20 s for bm_core's 10 s (`bm_wire::neighbor`,
+`Neighbor::lease_ms`). The Bridge logs each change of a neighbour on its own
+ports as `Neighbor <node id> added` or `Neighbor <node id> lost`
+(`src/apps/bridge/app_main.cpp:333-338`), to its console and on
+`bridge/printf`, its system log.
+
+#### On a bench
+
+| Step | Result |
+|---|---|
+| Rust `hello_world` to Rust `hello_world` with another git SHA, from a Spotter's SD card through a Bridge | success; the Bridge reports the new SHA |
+| Slot erase time | 240 ms, from `dfu: slot 2 erased in 240 ms` |
+| A neighbour timing the node out during the erase | none: no `Neighbor <node id> lost` from the Bridge |
+
+Measuring the last two again. The node must be cabled to the Bridge itself, and
+the image it runs **before** the update must already contain the erase
+report, since the old image is the one that erases:
+
+1. Bring the node to an image built from this code: `./build.sh --release`,
+   then DFU `target/thumbv8m.main-none-eabihf/release/hello_world.dfu.bin`
+   from the Spotter, or `cargo run --release --bin hello_world` with a
+   probe.
+2. Commit any change, so the next image's git SHA differs. Run
+   `./build.sh --release`; the printed note must show the new SHA. Copy the
+   new `hello_world.dfu.bin` to the SD card.
+3. Start the DFU from the Spotter, without force.
+4. Erase time: the node's `dfu: slot 2 erased in <n> ms` line on the
+   Spotter console. With a probe still attached from step 1, also the
+   `slot: erased …` defmt line. After the update's reset the attached
+   session decodes with the old ELF; re-attach with the new one
+   (`probe-rs attach --chip STM32U575CITxQ --no-catch-reset <new elf>`).
+5. Timeout: the Bridge's log from the DFU's start to the node's reset at
+   its end. Pass: no `Neighbor <node id> lost` for this node. One `Neighbor
+   <node id> added` after the reset is the restart (`bm_wire::neighbor`,
+   a lower `time_since_boot_us`), not a timeout.
+6. Record `<n>` and the result in this table.
 
 ## DFU image locations
 

@@ -296,11 +296,5 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo build --locked
       - run: cargo build --release --locked
-      # The image the bootloader and DFU take. `--target`: this directory's
-      # `.cargo/config.toml` would build bm-image for the Cortex-M33.
-      - name: hello_world.dfu.bin
-        run: |
-          host=$(rustc -vV | sed -n 's/^host: //p')
-          elf=target/thumbv8m.main-none-eabihf/release/hello_world
-          cargo run --locked --manifest-path ../Cargo.toml --target "$host" -p bm-image -- dfu "$elf" -o "$elf.dfu.bin"
-          cargo run --locked --manifest-path ../Cargo.toml --target "$host" -p bm-image -- info "$elf.dfu.bin"
+      # Every binary's `.dfu.bin`, the image the bootloader and DFU take.
+      - run: ./build.sh --release
