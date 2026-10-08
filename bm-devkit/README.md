@@ -18,8 +18,9 @@ gets, beside it:
 | `<bin>.dfu.bin` | always; signed when `BM_IMAGE_KEY` names an ed25519 PEM | DFU from a Spotter's SD card; `probe-rs` at `0x0800C000` |
 | `<bin>.unified.bin` | when `BM_BOOTLOADER` names the bootloader ELF or binary | bootloader and image together, at `0x08000000` |
 
-It prints each image's version note. Only a commit changes the git SHA in
-it: with uncommitted changes `build.sh` warns, and a node already running
+It prints each image's version note. The git SHA in it is HEAD's, or
+`BM_DEVKIT_GIT_SHA` (8 hex digits) when that is set in the environment:
+with uncommitted changes `build.sh` warns, and a node already running
 HEAD refuses the image as `BmDfuErrSameVer`. A bare `cargo build` makes no
 image and leaves an older `.dfu.bin` in place.
 
@@ -442,6 +443,68 @@ report, since the old image is the one that erases:
    <node id> added` after the reset is the restart (`bm_wire::neighbor`,
    a lower `time_since_boot_us`), not a timeout.
 6. Record `<n>` and the result in this table.
+
+#### On a bus
+
+`docs/mcuboot-todo.md` card B1, 2026-10-08. Each update is `bridge dfu <file>
+<node id> 120000` on a Spotter (v2.16.9) from its SD card, through a Bridge
+(v0.13.12) and a C `hello_world` mote, to a dev kit with a probe. C is
+bm_protocol `62d8b5d0`'s `hello-world` preset. Rust images are
+`./build.sh --release --bin hello_world` with `BM_DEVKIT_GIT_SHA` set per
+image. "Result" is the Spotter's `Update finished: <node> success: <s>
+err:<e>`, `e` a `BmDfuErr`.
+
+Behind the `bootloader` preset's bootloader (`Signature support: 0`):
+
+| From | To | Result | Then |
+|---|---|---|---|
+| C | Rust | 1, 0 | Rust running; `reset reason: Mcuboot`, `slot: image confirmed` |
+| Rust | Rust, new SHA | 1, 0 | new SHA in `bm info`; `slot: image confirmed` |
+| Rust | C | 1, 0 | C running; its console: `Reset Reason: MCUBoot reset`, `Boot confirmed!` |
+| Rust | Rust, same SHA | 0, 2 (`BmDfuErrSameVer`) at once | no erase, no reset |
+| Rust | Rust with `set_confirmed` doing nothing | 1, 0 | new image running; after `probe-rs reset`, the previous image |
+| Rust | Rust with `loop {}` first in `main` | 0, 8 (`BmDfuErrAborted`) after 60 s | previous image running 9.8 s after the update's reset, then `reset reason: UpdateFailed` and one more reset |
+| Rust | Rust, new SHA; bus power off 1.5 s after `set_pending` | 0, `ffffffff`: the Bridge lost power too | new image running 3 s after power returned |
+
+Notes:
+
+- C to Rust and Rust to C are the first runs in which one side reads the
+  other's `client_update_reboot_info` and reset reason; both confirmed.
+  C to Rust ran three times, once with the signing bootloader. The first
+  logged `reset reason: Invalid` and still confirmed; the log was attached
+  20 s after the boot. The other two logged `Mcuboot`.
+- A swap of a 108 KB Rust image takes 3 s, from the reset to `main`.
+- Hang: the bootloader's IWDG resets the new image after 4.1 s and the
+  bootloader swaps back. The previous image finds the update's
+  `RebootInfo` with another SHA and resets through `fail_update_and_reset`.
+- Power: bus power is the Spotter's `gpio clr 3v3_bridge_en`. Read over SWD
+  before the cut, slot 1's trailer held the magic, `swap_size`, `swap_info`
+  2, one status entry, and `copy_done` and `image_ok` erased; the slots'
+  headers were not yet exchanged. After power returned slot 1 held the new
+  image with `copy_done` 1. RAM, and the `RebootInfo` in it, was lost, so
+  the image did not confirm, and the next reset swapped the previous one
+  back.
+- After bus power returns, or after some resets, the Spotter's `bm topo`
+  can omit a node that answers `bm info 0`, and `bridge dfu` then fails
+  with 12 (`BmDfuErrUnkownNodeId`). Committing a config change to the node
+  (`bm cfg set <node id> s u x <n>`, `bm cfg commit <node id> s` from a C
+  mote's console) brought it back within a minute each time. Not
+  investigated.
+
+Behind a bootloader built with `SIGN_IMAGES=1` and bm_protocol's
+development key, `src/apps/bootloader/ed25519_key.pem` (`Signature support:
+1`); signed Rust images are built with `BM_IMAGE_KEY` naming that key, the
+signed C image by the `hello-world` preset with `-DSIGN_IMAGES=1`:
+
+| From | To | Result | Then |
+|---|---|---|---|
+| C, signed | Rust, signed | 1, 0 | Rust running; `reset reason: Mcuboot`, `slot: image confirmed` |
+| Rust, signed | Rust, unsigned, new SHA | 0, 8 (`BmDfuErrAborted`) after 60 s | previous image running 1 s after the update's reset, `reset reason: UpdateFailed`; slot 2 erased by the bootloader |
+| Rust, signed | C, signed | 1, 0 | C running; `Reset Reason: MCUBoot reset`, `Boot confirmed!` |
+
+Not run: a reset or power loss during the swap back; power loss during
+the upload other than once by mistake (the Spotter reported 0, 4 and the
+previous image kept running); images near the slot's size limit.
 
 ## DFU image locations
 
