@@ -5,7 +5,7 @@
 //! registering `bcmp/config.c`'s sequenced types would break the in-process
 //! property `bm_wire_diff::bcmp` relies on.
 //!
-//! Card C3's "done when": the ten handlers, the store mutations and the
+//! What must hold: the ten handlers, the store mutations and the
 //! forwarding decision all agree with the C. Eight of the ten have no gtest, so
 //! the comparator is the coverage.
 

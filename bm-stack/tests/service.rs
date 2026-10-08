@@ -362,7 +362,7 @@ fn registration_refuses_past_its_ceilings() {
 }
 
 // ---------------------------------------------------------------------------
-// Service requests -- card S2.
+// Service requests.
 // ---------------------------------------------------------------------------
 
 const PEER_ECHO: &[u8] = b"0000000055aa0011/echo";
@@ -612,7 +612,7 @@ fn the_run_loop_times_a_request_out() {
 }
 
 // ---------------------------------------------------------------------------
-// sys_info -- card E1.
+// sys_info.
 // ---------------------------------------------------------------------------
 
 const SYS_INFO: &[u8] = b"c0ffee0012345678/sys_info";
@@ -772,7 +772,7 @@ fn identity_git_sha_defaults_to_the_device_infos() {
 }
 
 // ---------------------------------------------------------------------------
-// config_map -- card E2.
+// config_map.
 // ---------------------------------------------------------------------------
 
 const CONFIG_MAP: &[u8] = b"c0ffee0012345678/config_map";
@@ -945,7 +945,7 @@ fn config_map_request_asks_the_target_for_a_partition() {
 }
 
 // ---------------------------------------------------------------------------
-// power_info -- card E3.
+// power_info.
 // ---------------------------------------------------------------------------
 
 const POWER_INFO: &[u8] = b"bus_power_controller/timing";
@@ -1269,7 +1269,7 @@ fn metrics_request_asks_the_target() {
 }
 
 // ---------------------------------------------------------------------------
-// Requests through a channel -- card E5.
+// Requests through a channel.
 // ---------------------------------------------------------------------------
 
 type TestChannels = bm_stack::Channels<embassy_sync::blocking_mutex::raw::NoopRawMutex, 4>;

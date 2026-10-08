@@ -10,8 +10,8 @@
 
 Running `bm-devkit` firmware under the MCUboot bootloader that C nodes carry,
 and updating it over Bristlemouth DFU, as dependency-ordered cards sized for
-one agent each. Same card format as `docs/services-todo.md`.
-`docs/bcmp-port-todo.md`'s "The shared contract" applies where a card ports C.
+one agent each. Same card format as `docs/history/services-todo.md`.
+`docs/history/bcmp-port-todo.md`'s "The shared contract" applies where a card ports C.
 
 Why: a deployed module is potted. USB and SWD are not reachable; the only way
 in is Bristlemouth DFU of a `.dfu.bin` from a Spotter's SD card, through a

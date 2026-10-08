@@ -1,7 +1,7 @@
 //! The hello-world app: subscribes to [`SUBSCRIPTION`], sends `hello world`
 //! to the Spotter console with `spotter_log` every 10 s, and logs over defmt
-//! what the four checks of `docs/hello-world-todo.md`'s "The target" are read
-//! from: heartbeats, echo requests, and publications received. It also
+//! what a bench check reads:
+//! heartbeats, echo requests, and publications received. It also
 //! subscribes to [`utc_time::TOPIC`] and sets the node's clock from it, as C
 //! dev kits do, and logs BCMP time messages, each set, and every 10 s the
 //! node's RTC reading. It takes updates over DFU into slot 2 and logs their

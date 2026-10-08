@@ -18,7 +18,7 @@ Status values:
 - **benign** — technically undefined, but every real toolchain produces the
   intended value and the port produces it by construction.
 - **c-only** — a defect in state or an API `bm-wire` has no counterpart for.
-- **open** — `bm-wire` does not yet match; the entry names the card that
+- **open** — `bm-wire` does not yet match; the entry says what
   changes it.
 - **fixed upstream** — bm_core has repaired it, the submodule includes the
   fix, and the port and the C agree. The entry is kept as the record.
@@ -30,8 +30,8 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 
 | Rank | # | Why now |
 |---|---|---|
-| 1 | [#12](#12-the-egress-port-checksum-patch-drops-the-end-around-carry) | Live frame loss on deployed hardware: ~1 BCMP frame in 40 000 leaves a two-port node with a checksum the far end rejects. Ports M1 and M2 raised the rate from theoretical to routine, and config/DFU bodies will raise it further. The fix is additive — a fixed node is strictly more interoperable. |
-| 2 | [#20](#20-ll_remove-leaves-lltail-pointing-at-a-freed-node) | Was a runner-up on reading; card M3 made it a measured remote write. `cargo fuzz run info` reaches the use-after-free in `ll_item_add` from three unauthenticated frames, because `INFO_REQUEST_LIST` is removed from out of insertion order on keys the sender chooses. Two lines to fix, but it needs a maintainer who can confirm the list invariants. |
+| 1 | [#12](#12-the-egress-port-checksum-patch-drops-the-end-around-carry) | Live frame loss on deployed hardware: ~1 BCMP frame in 40 000 leaves a two-port node with a checksum the far end rejects. The echo and system-time ports raised the rate from theoretical to routine, and config/DFU bodies will raise it further. The fix is additive — a fixed node is strictly more interoperable. |
+| 2 | [#20](#20-ll_remove-leaves-lltail-pointing-at-a-freed-node) | Was a runner-up on reading; the device-info port made it a measured remote write. `cargo fuzz run info` reaches the use-after-free in `ll_item_add` from three unauthenticated frames, because `INFO_REQUEST_LIST` is removed from out of insertion order on keys the sender chooses. Two lines to fix, but it needs a maintainer who can confirm the list invariants. |
 | 3 | [#14](#14-device-info-and-neighbour-table-replies-are-parsed-with-unchecked-lengths) | Same class as #29, fixed the same way, in two more parsers, reachable by any node on the link, and `topology.c`'s length also wraps in `uint16_t`. Not wire-visible to fix. |
 
 ## Index
@@ -79,7 +79,7 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 39 | `bcmp/resource_discovery.c` mishandles four allocations | c-only | reading |
 | 40 | A failed `cbor_parser_init` still reports a type, and still reports valid | c-only | reading, confirmed differentially |
 | 41 | `cbor_value_get_int64` overflows on the one negative integer it cannot hold | c-only | reading, confirmed differentially |
-| 42 | `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read | replicated; domain-limited (first key) | reading, confirmed differentially (card C1) |
+| 42 | `services_cbor_as_map` reads an uninitialised `CborValue` when a key's value cannot be read | replicated; domain-limited (first key) | reading, confirmed differentially |
 | 43 | bm_core reads only the 5-byte float encoding, so a preferred-serialization float is unreadable to it | replicated | reading, confirmed differentially |
 | 44 | The saved config partition's layout is the compiler's | replicated | reading, measured |
 | 45 | Storing a config key ignores `key_len`; looking one up stops at a NUL | replicated | reading, confirmed differentially |
@@ -107,34 +107,34 @@ bm_core `c77daa8` ([bristlemouth/bm_core#165](https://github.com/bristlemouth/bm
 | 67 | A DFU host ignores the chunk number it is asked for | replicated | reading, confirmed differentially |
 | 68 | A non-internal DFU host sends a whole chunk after a short read | domain-limited | reading |
 | 69 | A host update's `timeoutMs` of zero is a zero timer period | domain-limited | reading |
-| 70 | `bm_linux.c` writes a source MAC, hop limit and UDP source address that deployed nodes do not | replicated | capture, card H0 |
+| 70 | `bm_linux.c` writes a source MAC, hop limit and UDP source address that deployed nodes do not | replicated | capture |
 | 71 | `bm_linux.c` writes the UDP checksum byte-swapped, and a zero checksum as zero | replicated | differentially (byte order); reading lwIP (zero) |
 | 72 | `bm_linux.c` delivers a received datagram by its UDP length field; lwIP ignores the field | replicated | reading lwIP, confirmed differentially |
-| 73 | `bm_middleware_rx` dispatches on the datagram's source port | replicated | reading, confirmed differentially (card U2) |
+| 73 | `bm_middleware_rx` dispatches on the datagram's source port | replicated | reading, confirmed differentially |
 | 74 | `bm_wildcard_match` matches any topic a `*`-free pattern prefixes | replicated | reading, confirmed differentially |
 | 75 | `bm_handle_msg` wraps the data length of a topic longer than the payload | domain-limited | reading, confirmed differentially |
 | 76 | `bm_pub_wl` sizes its buffer in 16 bits and copies past it | domain-limited | reading |
 | 77 | `bm_pub_wl` with NULL data sends uninitialised bytes, and dereferences NULL for a local subscriber | c-only | reading |
 | 78 | `bm_get_subs` writes past its 256-byte buffer | c-only | reading |
-| 79 | `bm_sub_wl` checks only a topic's first callback for a duplicate | replicated | reading, confirmed differentially (cards P2, S1) |
-| 80 | `bm_unsub_wl` returns `BmEINVAL` for a topic not subscribed | replicated | reading, confirmed differentially (card P2) |
-| 81 | `spotter_log` budgets its text against `max_payload_len`, not the pub/sub message limit | replicated | reading, confirmed differentially (card S1) |
-| 82 | Service body decoders read uints with an unchecked `cbor_value_get_uint64` | replicated (release build); domain-limited (tags) | reading, confirmed differentially (card M1) |
-| 83 | `sys_info_reply_decode` sizes `app_name` from the sender's `app_name_strlen` | replicated; c-only (terminator, leak) | reading, confirmed differentially (card M1) |
-| 84 | `config_cbor_map_reply_decode` reads `cbor_data` only when `success` and a length are set | replicated; domain-limited (not a byte string) | reading, confirmed differentially (card M1) |
-| 85 | `BM_FIELD_STRING` is unimplemented in both field-table functions | replicated | reading, confirmed differentially (card M2) |
-| 86 | `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL | replicated | reading, confirmed differentially (card M2) |
-| 87 | A tagged field value makes `bm_decode_fields_from_table` advance past its map | domain-limited | `cargo fuzz run metrics_codec` (card M2) |
-| 88 | `services_cbor_as_map` reads each value by its key's stored type | replicated (release build); domain-limited (failed `cbor_assert`) | reading, confirmed differentially (card C1) |
-| 89 | `bm_service.c` matches services by `strncmp` prefix, and reads a request's header unchecked | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially (card S1) |
-| 90 | `echo_service_handler` copies a request of any length into its 1008-byte reply buffer | domain-limited | reading (card S1) |
-| 91 | A failed `bm_service_request` leaves its request listed, to time out; long timeouts wrap | replicated | reading, confirmed on the oracle (card S2) |
-| 92 | `_service_request_cb` reads a reply's header and `data_size` unchecked, and matches on id, not topic | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially (card S2) |
-| 93 | `bm_service_request` calls `memcpy` with a NULL source for an empty request | benign | UBSan, via `cargo fuzz run services` (card E1) |
-| 94 | `config_map_service_handler` sends no reply for a map over its buffer, and the same failure reply for an unknown partition and a map that fails | replicated | reading, confirmed differentially (card E2) |
-| 95 | `config_map_service_handler`'s failure reply encodes `cbor_data` from a NULL pointer | benign | UBSan, via `cargo fuzz run services` (card E2) |
-| 96 | `power_info_reply_cb` calls the oldest queued callback, not the request's own | replicated | reading, confirmed differentially (card E3) |
-| 97 | `metrics_service_handler` answers a request carrying data, sends nothing for a reply over its buffer, and reports a 32-bit uptime | replicated | reading, confirmed differentially (card E4) |
+| 79 | `bm_sub_wl` checks only a topic's first callback for a duplicate | replicated | reading, confirmed differentially |
+| 80 | `bm_unsub_wl` returns `BmEINVAL` for a topic not subscribed | replicated | reading, confirmed differentially |
+| 81 | `spotter_log` budgets its text against `max_payload_len`, not the pub/sub message limit | replicated | reading, confirmed differentially |
+| 82 | Service body decoders read uints with an unchecked `cbor_value_get_uint64` | replicated (release build); domain-limited (tags) | reading, confirmed differentially |
+| 83 | `sys_info_reply_decode` sizes `app_name` from the sender's `app_name_strlen` | replicated; c-only (terminator, leak) | reading, confirmed differentially |
+| 84 | `config_cbor_map_reply_decode` reads `cbor_data` only when `success` and a length are set | replicated; domain-limited (not a byte string) | reading, confirmed differentially |
+| 85 | `BM_FIELD_STRING` is unimplemented in both field-table functions | replicated | reading, confirmed differentially |
+| 86 | `metrics_reply_decode` checks no top-level key, and matches field keys up to a NUL | replicated | reading, confirmed differentially |
+| 87 | A tagged field value makes `bm_decode_fields_from_table` advance past its map | domain-limited | `cargo fuzz run metrics_codec` |
+| 88 | `services_cbor_as_map` reads each value by its key's stored type | replicated (release build); domain-limited (failed `cbor_assert`) | reading, confirmed differentially |
+| 89 | `bm_service.c` matches services by `strncmp` prefix, and reads a request's header unchecked | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially |
+| 90 | `echo_service_handler` copies a request of any length into its 1008-byte reply buffer | domain-limited | reading |
+| 91 | A failed `bm_service_request` leaves its request listed, to time out; long timeouts wrap | replicated | reading, confirmed on the oracle |
+| 92 | `_service_request_cb` reads a reply's header and `data_size` unchecked, and matches on id, not topic | replicated; domain-limited (reads past the datagram) | reading, confirmed differentially |
+| 93 | `bm_service_request` calls `memcpy` with a NULL source for an empty request | benign | UBSan, via `cargo fuzz run services` |
+| 94 | `config_map_service_handler` sends no reply for a map over its buffer, and the same failure reply for an unknown partition and a map that fails | replicated | reading, confirmed differentially |
+| 95 | `config_map_service_handler`'s failure reply encodes `cbor_data` from a NULL pointer | benign | UBSan, via `cargo fuzz run services` |
+| 96 | `power_info_reply_cb` calls the oldest queued callback, not the request's own | replicated | reading, confirmed differentially |
+| 97 | `metrics_service_handler` answers a request carrying data, sends nothing for a reply over its buffer, and reports a 32-bit uptime | replicated | reading, confirmed differentially |
 
 ---
 
@@ -747,7 +747,7 @@ so the expiry sweep never fires its callback — not with a payload, and not wit
 `ll_remove` is shared by every list in bm_core, so anything removing out of
 insertion order is exposed.
 
-**`INFO_REQUEST_LIST` reaches it from the network, and card M3 measured that.**
+**`INFO_REQUEST_LIST` reaches it from the network, measured.**
 `cargo fuzz run info` reported the heap-use-after-free at `ll.c:159` within
 four minutes of its first run, from a sequence any node on the link can send:
 
@@ -849,8 +849,8 @@ walk the clock against the real timer in the shim, and
 `the_first_expiry_ranges_from_24_to_173_milliseconds` in `bm-wire`'s unit
 tests asserts the shape.
 
-Card C3 is where it matters: `bcmp/config.c` is the only module issuing
-sequenced requests, and a config get whose reply arrives after the fourth
+It matters for `bcmp/config.c`, the only module issuing
+sequenced requests: a config get whose reply arrives after the fourth
 sweep is reported to the application as a failure and then delivered again as
 an unsolicited `BcmpConfigValue`.
 
@@ -1723,7 +1723,7 @@ Arguments above `1 << 63` wrap without overflowing and are merely wrong:
 `cbor_value_get_int64_checked` exists and rejects both, and nothing in bm_core
 calls it.
 
-Reachable from the wire once card C3 lands: a `ConfigSet` (`0xA2`) body is
+Reachable from the wire: a `ConfigSet` (`0xA2`) body is
 stored verbatim by `set_config_cbor`, which accepts it as `INT32`, and
 `get_config_int` then reads it with this function.
 `bm_wire::configuration::ConfigPartition::get_int` wraps, giving `-1` after
@@ -1791,7 +1791,7 @@ the stored `valueBuffer` not to preparse, which `set_config_cbor` and the five
 typed setters all prevent — so no wire-reachable path was established here. A
 partition loaded from NVM is trusted on its CRC32 alone, and that is the one
 path: a CRC-valid image can hold any bytes in a listed key's slot (#48).
-Card C2 found no other — a key `get_stored_keys` lists is always found again
+The configuration port found no other — a key `get_stored_keys` lists is always found again
 by `get_config_cbor` with its own `key_buf` and `key_len`, the 31-byte
 truncation of #45 included, since `strncmp` then compares `key_buf` with
 itself.
@@ -2540,9 +2540,9 @@ treating it as `bm_dfu_update_default_timeout_ms`.
 ## 70. `bm_linux.c` writes a source MAC, hop limit and UDP source address that deployed nodes do not
 
 The oracle's IP layer is `network/bm_linux.c`; deployed nodes use
-`network/bm_lwip.c` and lwIP. Card H0's capture from a `bm_protocol` dev kit
-(`bm-wire-diff/testdata/hello-pub-card-h0.pcap`, asserted by
-`bm-wire-diff/tests/capture_h0.rs`) differs from `bm_linux.c` in three fields:
+`network/bm_lwip.c` and lwIP. A capture from a `bm_protocol` dev kit
+(`bm-wire-diff/testdata/hello-pub.pcap`, asserted by
+`bm-wire-diff/tests/capture_hello_pub.rs`) differs from `bm_linux.c` in three fields:
 
 | Field | `bm_linux.c` | Deployed | Deployed value comes from |
 |---|---|---|---|
@@ -2568,7 +2568,7 @@ limit, and `ip_to_nodeid` reads only the address's low 64 bits.
 | Hop limit | `frame::HOP_LIMIT` is 255, for BCMP and UDP |
 | UDP source address | `udp::source_address`: lwIP's `ip6_select_source_address` over the netif's two addresses |
 
-Pinned by `bm-wire-diff/tests/capture_h0.rs`, which rebuilds all 2300 UDP
+Pinned by `bm-wire-diff/tests/capture_hello_pub.rs`, which rebuilds all 2300 UDP
 frames in the capture byte for byte, and by
 `bcmp::tx::tests::build_reproduces_a_deployed_heartbeat` for BCMP.
 Comparators against the oracle read its frames through `stack::drain`, which
@@ -2597,7 +2597,7 @@ so on every little-endian host the checksum's two bytes are reversed on the
 wire. It also sends a checksum that computes to zero as zero, which UDP
 reserves for "no checksum" and RFC 8200 section 8.1 forbids over IPv6. lwIP's
 `udp_sendto_if_chksum` writes the checksum in network order and replaces zero
-with `0xFFFF`; card H0's capture holds 2300 UDP frames with valid checksums.
+with `0xFFFF`; the capture holds 2300 UDP frames with valid checksums.
 
 Invisible between Bristlemouth nodes, because none checks a received UDP
 checksum (#70). A standard IPv6 stack drops these datagrams.

@@ -9,7 +9,7 @@
 
 What stood between the tree and a Rust hello-world app on a Bristlemouth dev
 kit, as dependency-ordered task cards sized for one agent each. Same card
-format and shared contract as `docs/bcmp-port-todo.md`, which is also
+format and shared contract as `docs/history/bcmp-port-todo.md`, which is also
 complete.
 
 ## Working a card
@@ -74,8 +74,8 @@ subscribes and calls `spotter_log` runs on the mock PHY
 Deployed C nodes send UDP through lwIP (`network/bm_lwip.c`). The oracle
 compiles `network/bm_linux.c`, a hand-written replacement. For BCMP the two
 paths share `bcmp/packet.c`; for UDP they do not. Observed in
-`bm-wire-diff/testdata/hello-pub-card-h0.pcap` and asserted by
-`bm-wire-diff/tests/capture_h0.rs` (divergence #70):
+`bm-wire-diff/testdata/hello-pub.pcap` and asserted by
+`bm-wire-diff/tests/capture_hello_pub.rs` (divergence #70):
 
 | Field | `bm_linux.c` | `bm_lwip.c` + lwIP, observed |
 |---|---|---|
@@ -154,7 +154,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   | `PAYLOAD_OFFSET`, `MAX_PAYLOAD_LEN` | 62; 65527 |
 
   Deployed nodes run lwIP, so every field where `bm_linux.c` differs follows
-  lwIP (#70, #71, #72); `capture_h0.rs` rebuilds all 2300 captured UDP frames
+  lwIP (#70, #71, #72); `capture_hello_pub.rs` rebuilds all 2300 captured UDP frames
   with `build`. `build` takes the source address rather than a node id so a
   comparator can build the frame `bm_linux.c` would, from `fe80::<id>`.
   `accept` does not filter on destination address or port.
@@ -204,13 +204,13 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   `spotter_tx_data(src, data, network)`. A comparator needing non-standard header bytes
   calls `write_headers` and mutates the result, as `bm-wire-diff/src/forward.rs`
   does.
-- **The capture: `bm-wire-diff/testdata/hello-pub-card-h0.pcap`.** 166 s,
+- **The capture: `bm-wire-diff/testdata/hello-pub.pcap`.** 166 s,
   2403 frames, from `bm_l2_register_pcap_callback` on a `bm_protocol` dev kit
   (`0b54ccce5c7978bf`, two ports) beside a Spotter bridge
   (`e4ce8ae3662e97df`, issued `bm info 0`) and a bm soft module
   (`e5d14eea4fc2db6b`, temperature). The callback sees received frames before
   `bm_l2_policy_rx_apply`, so none carries an ingress nibble, and it does not
-  record the port. `tests/capture_h0.rs` names the nodes and asserts the
+  record the port. `tests/capture_hello_pub.rs` names the nodes and asserts the
   header table above; `bm_wire_diff::pcap::records` reads the file.
   `node_spotter_calls_rebuild_the_dev_kits_frames` rebuilds all 51 of the
   dev kit's Spotter publications with `Node`. The dev kit published every 10 s:
@@ -234,7 +234,7 @@ discards its own, and confirmed ones get a number in `c-divergences.md`.
   | `PORT`, `HEADER_LEN`, `COMMON_VERSION`, `MAX_MESSAGE_LEN` | 4321; 5; 2; 1452, `max_payload_len_udp` |
 
   Matching stays `bm_wire::util::bm_wildcard_match`, where `common/util.c`
-  has it, with its prefix match (#74). `capture_h0.rs` re-encodes all 2300
+  has it, with its prefix match (#74). `capture_hello_pub.rs` re-encodes all 2300
   captured publications byte for byte.
 - **Pub/sub on the node.**
 

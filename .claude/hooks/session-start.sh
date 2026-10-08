@@ -102,7 +102,7 @@ fi
 log "stable is $stable_version, at or past the MSRV"
 
 # --- fuzzing ---------------------------------------------------------------
-# Best effort from here down. A card that never fuzzes should not fail to start
+# Best effort from here down. A session that never fuzzes should not fail to start
 # because crates.io was unreachable.
 if command -v cargo-fuzz >/dev/null 2>&1; then
   log 'cargo-fuzz already present'

@@ -1,7 +1,7 @@
 # BCMP porting todo
 
 > **Complete and closed.** Every card has landed. Do not add cards here or
-> edit this file as part of a card. `docs/hello-world-todo.md` is also
+> edit this file as part of a card. `docs/history/hello-world-todo.md` is also
 > complete and closed. "The shared contract" below is the record of the
 > porting rules.
 
@@ -37,7 +37,7 @@ or an unsolicited message arrives.
 
 Every card has landed. What bm_core has that the port does not is listed
 under "Explicitly out of scope"; pub/sub, UDP and `spotter.c` are planned in
-`docs/hello-world-todo.md`.
+`docs/history/hello-world-todo.md`.
 
 ---
 
@@ -533,8 +533,8 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
   divergences #14, #35 and #36 all bite: it is the only caller of
   `bcmp_request_neighbor_table` in bm_core.
 - **`middleware/pubsub.c`, `bm_service*.c` and the built-in services** — above
-  BCMP. Pub/sub, UDP and `spotter.c` are planned in `docs/hello-world-todo.md`.
-- **`bm-phy-adin2111`** — embassy#7024 is merged; `docs/embassy-port-tracking-prompt.md`
+  BCMP. Pub/sub, UDP and `spotter.c` are planned in `docs/history/hello-world-todo.md`.
+- **`bm-phy-adin2111`** — embassy#7024 is merged; `docs/history/embassy-port-tracking-prompt.md`
   keeps the design record.
 
 ---
@@ -542,5 +542,5 @@ target, any new port seam, the C quirks to reproduce, what blocks it, and what
 # Keeping this current
 
 Closed. Only "The shared contract" is maintained, because
-`docs/hello-world-todo.md` depends on it. When a hello-world card needs a new
+`docs/history/hello-world-todo.md` depends on it. When a hello-world card needs a new
 rule, add it to the contract.

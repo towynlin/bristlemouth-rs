@@ -1,5 +1,5 @@
 //! The files a Bristlemouth node's MCUboot bootloader and DFU take, as
-//! bm_protocol's build makes them (`docs/mcuboot-todo.md`, contract 2).
+//! bm_protocol's build makes them (`docs/history/mcuboot-todo.md`, contract 2).
 //! Host-only.
 //!
 //! | For | Call |

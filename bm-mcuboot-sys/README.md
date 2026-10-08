@@ -2,7 +2,7 @@
 
 [MCUboot](https://github.com/mcu-tools/mcuboot) v1.9.0's `bootutil`, compiled
 for the host with bm_protocol's bootloader configuration and its flash map
-over RAM. The oracle for `docs/mcuboot-todo.md`: what Rust writes to a slot is
+over RAM. The oracle for `docs/history/mcuboot-todo.md`: what Rust writes to a slot is
 compared with what `boot_set_pending` and `boot_set_confirmed` write, and an
 image Rust builds is one `boot_go` boots.
 

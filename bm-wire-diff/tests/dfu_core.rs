@@ -753,7 +753,7 @@ fn exchange_until_quiet<R: Roles>(pair: &mut Pair, peer: &mut Peer<R>) {
     panic!("still talking after 100 exchanges");
 }
 
-/// The card's test, one way round: a bm-wire host updates the C client, which
+/// A whole update, one way round: a bm-wire host updates the C client, which
 /// runs beside a bm-wire client given the same frames. Every frame the client
 /// side sends is compared at every step; the transfer completes, the client
 /// reboots into the image and confirms it, and the host hears success.
@@ -789,7 +789,7 @@ fn a_rust_host_updates_the_c_client() {
     assert_eq!(host.fx.finished, [(true, 0, NodeRef::This.id())]);
 }
 
-/// The card's test, the other way round: the C host updates a bm-wire
+/// A whole update, the other way round: the C host updates a bm-wire
 /// client, beside a bm-wire host given the same frames. Every frame the host
 /// side sends is compared at every step, and the finish callback too.
 #[test]

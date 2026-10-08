@@ -3,8 +3,8 @@
 //! Its own binary because `bm_wire_diff::time` brings bm_core's stack up; see
 //! `bm_wire_diff::stack` for the contract that forces it.
 //!
-//! The headline is [`our_response_to_a_time_request_is_byte_identical_to_the_c`]
-//! — card M2's "done when" — and the two quirk tests below it, which pin
+//! The headline is [`our_response_to_a_time_request_is_byte_identical_to_the_c`],
+//! and the two quirk tests below it pin
 //! divergences #27 and #28 against the C so that an upstream fix fails here
 //! first and says why.
 
@@ -41,7 +41,7 @@ fn input(message: TimeMessage, target: Target, ingress_port: u8) -> TimeInput {
     }
 }
 
-/// Card M2's acceptance test: a node with a clock answers a time request with
+/// A node with a clock answers a time request with
 /// the bytes bm_core would have sent.
 #[test]
 fn our_response_to_a_time_request_is_byte_identical_to_the_c() {

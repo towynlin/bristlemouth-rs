@@ -66,7 +66,7 @@ fn the_name_pool_is_shaped_the_way_the_domain_limit_assumes() {
     );
 }
 
-/// The exchange the card is about: advertise both kinds, then answer a
+/// The whole exchange: advertise both kinds, then answer a
 /// request for them.
 #[test]
 fn a_node_that_is_asked_answers_with_both_lists() {

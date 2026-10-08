@@ -10,7 +10,7 @@
 
 The port of bm_core's service layer and built-in services, as
 dependency-ordered cards sized for one agent each. Same card format as
-`docs/bcmp-port-todo.md`, whose "The shared contract" applies in full; the
+`docs/history/bcmp-port-todo.md`, whose "The shared contract" applies in full; the
 "Services contract" below adds to it.
 
 | In scope | C source |

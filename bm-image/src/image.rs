@@ -21,7 +21,7 @@ const IMGTOOL_MAX_SECTORS: u32 = 128;
 /// The longest header, body and TLV area `imgtool` accepts with
 /// bm_protocol's arguments, `0xF07B0`: the slot less `image.py`'s
 /// `_trailer_size`. The bootloader's own trailer is smaller
-/// (`docs/mcuboot-todo.md`, "Limits of the slot's contents").
+/// (`docs/history/mcuboot-todo.md`, "Limits of the slot's contents").
 pub const MAX_IMAGE_LEN: usize = match Trailer::BM.status_off(IMGTOOL_MAX_SECTORS) {
     Some(off) => off as usize,
     None => panic!("the slot holds imgtool's trailer"),
@@ -137,7 +137,7 @@ mod tests {
     }
 
     /// The C `hello_world` `.dfu.bin`'s first 32 bytes
-    /// (`docs/mcuboot-todo.md`, card I1).
+    /// (`docs/history/mcuboot-todo.md`, "Limits of the slot's contents").
     #[test]
     fn header_is_the_c_hello_worlds() {
         let body = vec![0; 0x3_dab4];

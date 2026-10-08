@@ -1,6 +1,6 @@
 use super::*;
 
-// Bodies from `bm-wire-diff/testdata/hello-pub-card-h0.pcap`, frames numbered
+// Bodies from `bm-wire-diff/testdata/hello-pub.pcap`, frames numbered
 // from 0: what follows the pub/sub header and topic in the dev kit's first
 // round of publications.
 

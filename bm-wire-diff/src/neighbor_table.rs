@@ -15,8 +15,8 @@
 //! Those three are the whole of what bm_core exposes: `TARGET_NODE_ID`,
 //! `NEIGHBOR_REQUEST_CB` and `NEIGHBOR_TIMER` are file-scope statics with no
 //! accessor. [`Model`] is this comparator's belief about what they hold, and
-//! it is asserted against both sides on every step rather than being trusted —
-//! the discipline card M2 arrived at.
+//! it is asserted against both sides on every step rather than being trusted,
+//! as the system-time comparator does.
 //!
 //! # The two divergences this found
 //!
@@ -49,8 +49,8 @@
 //! `(int32_t)(tick - due) >= 0`. That is
 //! [`time_remaining`] restated, which is what
 //! [`bm_wire::bcmp::neighbors::TableRequests`] compares with, so the two agree
-//! by construction rather than by comparison — as `bm_rtc_get` does for card
-//! M2. Everything downstream *is* compared: whether the timeout ran, and
+//! by construction rather than by comparison — as `bm_rtc_get` does for system
+//! time. Everything downstream *is* compared: whether the timeout ran, and
 //! whether a reply after it is still accepted.
 
 use std::sync::Mutex;
@@ -95,7 +95,7 @@ pub const NODE_IDS: &[u64] = &[
 
 /// Most port or neighbour entries a reply may declare.
 ///
-/// The card asks for a two-node table, and the arrays are what divergence
+/// A two-node table is enough, and the arrays are what divergence
 /// #14's unchecked lengths are read out of — so 0, 1 and 2 of each, with the
 /// declarations always matching what arrived.
 pub const MAX_ENTRIES: u8 = 2;
@@ -374,7 +374,7 @@ fn take_timeouts() -> usize {
 /// Deliberately a second implementation rather than a call into
 /// [`bm_wire::bcmp::neighbors::TableRequests`]: it is what says *why* each
 /// side did what it did, and a wrong belief here is a test failure rather than
-/// a silent agreement. Both of card M2's divergences came out of exactly this.
+/// a silent agreement. Divergences #27 and #28 were found this way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Model {
     /// `TARGET_NODE_ID`, which starts at zero and is never cleared.

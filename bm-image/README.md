@@ -1,7 +1,7 @@
 # bm-image
 
 Builds and reads the files a Bristlemouth node's MCUboot bootloader and DFU
-take, as bm_protocol's build makes them (`docs/mcuboot-todo.md`, contracts 2,
+take, as bm_protocol's build makes them (`docs/history/mcuboot-todo.md`, contracts 2,
 3, 8 and 13). Host-only. A library over bytes (`src/lib.rs`) and a CLI.
 
 ```

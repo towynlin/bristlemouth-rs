@@ -301,7 +301,7 @@ fn every_committed_seed_still_agrees_with_the_c() {
 }
 
 // ---------------------------------------------------------------------------
-// Service requests -- card S2.
+// Service requests.
 // ---------------------------------------------------------------------------
 
 fn asked(name: &[u8]) -> u8 {
@@ -535,7 +535,7 @@ fn every_subscription_at_once() {
 }
 
 // ---------------------------------------------------------------------------
-// sys_info -- card E1.
+// sys_info.
 // ---------------------------------------------------------------------------
 
 /// The reply carries the system partition's CRC as the C computes it, before
@@ -609,7 +609,7 @@ fn sys_info_request_answered_and_timed_out() {
 }
 
 // ---------------------------------------------------------------------------
-// config_map -- card E2.
+// config_map.
 // ---------------------------------------------------------------------------
 
 fn config_map_request(partition_id: u32) -> Vec<u8> {
@@ -730,7 +730,7 @@ fn config_map_request_answered_and_timed_out() {
 }
 
 // ---------------------------------------------------------------------------
-// power_info -- card E3.
+// power_info.
 // ---------------------------------------------------------------------------
 
 /// An empty request is answered with the stats both sides' callbacks return;
