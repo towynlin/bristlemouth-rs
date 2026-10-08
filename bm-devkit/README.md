@@ -223,7 +223,7 @@ only layout linked here; there is no build for `0x08000000`.
 
 | File | What |
 |---|---|
-| `memory.x` | `FLASH` from `0x0800C200`, `0xF0520` bytes: `bm-image`'s limit for a signed image's body (`docs/mcuboot-todo.md`, contract 3) |
+| `memory.x` | `FLASH` from `0x0800C200`, `0xF0520` bytes: `bm-image`'s limit for a signed image's body (`docs/history/mcuboot-todo.md`, contract 3) |
 | `devkit.x` | cortex-m-rt 0.7.7's `link.x` with two changes, below. `build.rs` links with it; `Cargo.toml` pins `cortex-m-rt = "=0.7.7"` |
 
 | `devkit.x` change | Why |
@@ -446,7 +446,7 @@ report, since the old image is the one that erases:
 
 #### On a bus
 
-`docs/mcuboot-todo.md` card B1, 2026-10-08. Each update is `bridge dfu <file>
+Bench run of 2026-10-08. Each update is `bridge dfu <file>
 <node id> 120000` on a Spotter (v2.16.9) from its SD card, through a Bridge
 (v0.13.12) and a C `hello_world` mote, to a dev kit with a probe. C is
 bm_protocol `62d8b5d0`'s `hello-world` preset. Rust images are

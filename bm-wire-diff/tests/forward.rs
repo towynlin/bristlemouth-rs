@@ -3,9 +3,8 @@
 //! Its own binary because `bm_wire_diff::forward` brings bm_core's stack up; see
 //! `bm_wire_diff::stack` for the contract that forces it.
 //!
-//! The headline is [`a_frame_on_port_one_leaves_port_two_byte_for_byte`]: that
-//! is card I2's "done when", and it is the reason a three-node chain can relay
-//! at all.
+//! The headline is [`a_frame_on_port_one_leaves_port_two_byte_for_byte`]: it
+//! is the reason a three-node chain can relay at all.
 
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, MessageType, forward, rx};
 use bm_wire::frame::{
@@ -35,7 +34,7 @@ fn input(
     }
 }
 
-/// Card I2's acceptance test, spelled out rather than only implied by `check`.
+/// Forwarding end to end, spelled out rather than only implied by `check`.
 ///
 /// A global-multicast frame injected on port 1 of bm_core's stack and of a
 /// `bm-stack` node has to produce the same bytes on port 2, or a chain of nodes

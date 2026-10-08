@@ -1176,7 +1176,7 @@ impl<
     /// If [`Services::METRICS`], the metrics service, `<node id>/metrics`, is
     /// listed and `<node id>/metrics/req` subscribed, as `bristlemouth_init`
     /// calls `metrics_service_init` before an application registers
-    /// anything (contract 4 of `docs/services-todo.md`). A request is
+    /// anything (contract 4 of `docs/history/services-todo.md`). A request is
     /// answered with [`Services::metrics`]; see
     /// [`bm_wire::service::metrics::handle`]. Otherwise no service is listed.
     pub fn with_services(
@@ -1268,8 +1268,8 @@ impl<
 
     /// Register a message type, as each module's init does with `packet_add`.
     ///
-    /// A card that ports a new exchange registers its types here, with the
-    /// flags its C module uses. Until a type is registered the node will
+    /// A newly ported exchange registers its types here, with the flags its
+    /// C module uses. Until a type is registered the node will
     /// neither send it nor dispatch it.
     ///
     /// # Errors

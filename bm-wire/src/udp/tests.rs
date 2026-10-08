@@ -1,11 +1,11 @@
 use super::*;
 
-/// Card H0's dev kit, the node that sent the frames below.
+/// The captured C dev kit, the node that sent the frames below.
 const DEV_KIT: u64 = 0x0b54_ccce_5c79_78bf;
 /// `BM_MIDDLEWARE_PORT`, pub/sub's source and destination port.
 const MIDDLEWARE_PORT: u16 = 4321;
 
-// Frames from `bm-wire-diff/testdata/hello-pub-card-h0.pcap`, numbered from 0
+// Frames from `bm-wire-diff/testdata/hello-pub.pcap`, numbered from 0
 // in file order: the dev kit's first round of publications.
 
 /// Frame 84: `spotter_log` to `spotter/fprintf`.

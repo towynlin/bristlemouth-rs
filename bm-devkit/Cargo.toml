@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 # Its own workspace, so it repeats the root's number; see bm-phy-adin2111.
 rust-version = "1.97"
+license = "Apache-2.0"
 publish = false
 description = "Board support for the Bristlemouth dev kit's mote: STM32U575 and ADIN2111"
 

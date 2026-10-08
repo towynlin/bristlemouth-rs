@@ -66,6 +66,7 @@ use crate::bcmp::dfu::{
 use crate::bcmp::header::BCMP_HEADER_LEN;
 use crate::configuration::{ConfigStore, Partition};
 use crate::frame::MIN_FRAME_WITH_ADDRESSES;
+use crate::le;
 use crate::{BmWireError, bcmp::MessageType};
 
 /// Depth of `dfu_event_queue`, from `bm_queue_create(5, ...)` in `bm_dfu_init`.
@@ -331,16 +332,13 @@ impl RebootInfo {
     ///
     /// [`BmWireError::Truncated`] if `buf` is shorter than [`Self::LEN`].
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let b: &[u8; Self::LEN] = buf
-            .get(..Self::LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
+        let b: &[u8; Self::LEN] = le::prefix(buf)?;
         Ok(Self {
-            magic: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            magic: le::u32_at(b, 0),
             major: b[4],
             minor: b[5],
-            host_node_id: u64::from_le_bytes(b[6..14].try_into().expect("8 bytes")),
-            git_sha: u32::from_le_bytes([b[14], b[15], b[16], b[17]]),
+            host_node_id: le::u64_at(b, 6),
+            git_sha: le::u32_at(b, 14),
         })
     }
 

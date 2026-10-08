@@ -229,7 +229,7 @@ fn our_global_multicast_reply_is_byte_identical_to_the_c() {
 }
 
 // ---------------------------------------------------------------------------
-// System time -- card M2.
+// System time.
 // ---------------------------------------------------------------------------
 
 /// A reading a human can check: 2026-09-21T12:34:56.789Z.
@@ -243,7 +243,7 @@ const NOON_ISH: RtcTimeAndDate = RtcTimeAndDate {
     ms: 789,
 };
 
-/// Card M2's "done when": a node with a clock answers a `0x10` with the frame
+/// A node with a clock answers a `0x10` with the frame
 /// bm_core would have sent, byte for byte.
 ///
 /// `bm_wire_diff::time` compares this for every message, target and port; this
@@ -355,7 +355,7 @@ fn our_addresses_match_the_oracles() {
 }
 
 // ---------------------------------------------------------------------------
-// The requests a node issues -- card I3.
+// The requests a node issues.
 // ---------------------------------------------------------------------------
 
 /// Some other node, the one a request is aimed at.
@@ -413,8 +413,9 @@ fn our_device_info_request_is_byte_identical_to_the_c() {
 /// Both counters start at zero here because this is the **only** test in this
 /// binary that issues a sequenced request: `message_count` is a function-level
 /// `static` inside `serialize` with nothing that resets it, so a second such
-/// test would have to say where the C had got to. Card C3, which ports config,
-/// is where that will matter.
+/// test would have to say where the C had got to. `bcmp/config.c`, the other
+/// issuer of sequenced requests, is compared in `tests/config.rs`, a binary
+/// of its own.
 ///
 /// Nothing answers, so the test then walks the clock a millisecond at a time
 /// until both sides have given up: every re-send `timer_traverse_cb` puts on

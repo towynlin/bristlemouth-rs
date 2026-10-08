@@ -3,6 +3,7 @@ name = "bm-mcuboot"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
+license.workspace = true
 description = "MCUboot v1.9.0's image header, TLV area and slot trailer: no_std, no alloc, no dependencies"
 
 # No dependencies, and no SHA-256 or signing: the hash and signature an image

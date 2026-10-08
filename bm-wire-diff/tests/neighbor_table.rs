@@ -28,7 +28,7 @@ fn reply(node: u8, ports: u8, neighbors: u8, revision: u8) -> Step {
 /// Past the 1 s timer, which is the only thing an advance can do here.
 const PAST_THE_TIMEOUT: Step = Step::Advance { ms: 1_001 };
 
-/// The exchange the card is about: ask one node, and walk the two-node table
+/// The whole exchange: ask one node, and walk the two-node table
 /// it answers with.
 #[test]
 fn a_node_that_answers_reports_its_whole_table() {

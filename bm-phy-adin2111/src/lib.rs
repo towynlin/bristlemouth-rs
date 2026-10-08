@@ -46,7 +46,7 @@ use embassy_net_adin1110::{
     TxPort, new_tc6,
 };
 use embassy_net_driver_channel::driver::{Driver, PacketBuf};
-use embedded_hal_1::digital::OutputPin;
+use embedded_hal::digital::OutputPin;
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::spi::SpiDevice;
 

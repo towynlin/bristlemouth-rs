@@ -28,6 +28,7 @@
 //! | Expiry | none (#19) | a 1 s one-shot timer that expires nothing (#36) |
 
 use crate::BmWireError;
+use crate::le;
 use crate::util::time_remaining;
 
 /// `bcmp_table_max_len`: longest reply `bcmp_send_neighbor_table` will build.
@@ -63,12 +64,8 @@ impl NeighborTableRequest {
     ///
     /// [`BmWireError::Truncated`] if `buf` is too short.
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let bytes: [u8; 8] = buf
-            .get(..Self::LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
         Ok(Self {
-            target_node_id: u64::from_le_bytes(bytes),
+            target_node_id: u64::from_le_bytes(*le::prefix(buf)?),
         })
     }
 
@@ -132,7 +129,7 @@ impl NeighborInfo {
 
     fn decode(buf: &[u8; Self::LEN]) -> Self {
         Self {
-            node_id: u64::from_le_bytes(buf[0..8].try_into().expect("8 bytes")),
+            node_id: le::u64_at(buf, 0),
             port: buf[8],
             online: buf[9],
         }
@@ -168,9 +165,9 @@ impl<'a> NeighborTableReply<'a> {
     /// shorter than the entry counts it declares.
     pub fn decode(buf: &'a [u8]) -> Result<Self, BmWireError> {
         let head = buf.get(..Self::HEADER_LEN).ok_or(BmWireError::Truncated)?;
-        let node_id = u64::from_le_bytes(head[0..8].try_into().expect("8 bytes"));
+        let node_id = le::u64_at(head, 0);
         let port_len = usize::from(head[8]);
-        let neighbor_len = usize::from(u16::from_le_bytes([head[9], head[10]]));
+        let neighbor_len = usize::from(le::u16_at(head, 9));
 
         // The check neither bm_core's neighbour code nor topology.c does.
         let ports_bytes = port_len * PortInfo::LEN;

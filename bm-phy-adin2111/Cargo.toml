@@ -5,6 +5,7 @@ edition = "2024"
 # Its own workspace, so it repeats what the root one says. Same number, and
 # here it is a hard floor rather than a policy: `cfg_select!` is 1.97.
 rust-version = "1.97"
+license = "Apache-2.0"
 publish = false
 description = "bm-stack Phy for the ADIN2111 over OPEN Alliance TC6 SPI"
 
@@ -19,7 +20,7 @@ description = "bm-stack Phy for the ADIN2111 over OPEN Alliance TC6 SPI"
 [dependencies]
 bm-stack = { path = "../bm-stack" }
 bm-wire = { path = "../bm-wire" }
-embedded-hal-1 = { package = "embedded-hal", version = "1.0" }
+embedded-hal = "1.0"
 embedded-hal-async = "1.0"
 
 # TEMPORARY: per-port frame I/O is merged (embassy-rs/embassy#7024) but not in

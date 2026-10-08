@@ -3,6 +3,7 @@ name = "bm-mcuboot-diff"
 version = "0.1.0"
 edition = "2024"
 rust-version.workspace = true
+license.workspace = true
 publish = false
 description = "Differential tests comparing bm-mcuboot against MCUboot's bootutil"
 

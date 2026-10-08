@@ -28,8 +28,7 @@ pub enum Egress {
 /// Bristlemouth encodes the ingress port into the source address of every
 /// frame it receives and picks an egress port per copy on transmit, so a
 /// driver that hides which port a frame came from cannot carry the protocol.
-/// `embassy-net-adin1110` currently hides it; see
-/// `docs/embassy-port-tracking-prompt.md`.
+/// `bm-phy-adin2111` implements it for the ADIN2111.
 #[allow(async_fn_in_trait)]
 pub trait Phy {
     /// Why a transfer failed.

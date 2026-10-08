@@ -170,15 +170,15 @@ mod tests {
 
         let checksum_offset = BCMP_HEADER_OFFSET + CHECKSUM_FIELD_OFFSET;
         assert_eq!(
-            u16::from_le_bytes([frame[checksum_offset], frame[checksum_offset + 1]]),
+            crate::le::u16_at(&frame, checksum_offset),
             0x3F0C,
             "must agree with the capture, not merely with the C"
         );
         assert_eq!(&frame[BCMP_HEADER_OFFSET + BCMP_HEADER_LEN..], &body);
     }
 
-    /// Frame 45 of `bm-wire-diff/testdata/hello-pub-card-h0.pcap`: card H0's
-    /// dev kit's heartbeat as it left on port 1. Pins the source MAC and hop
+    /// Frame 45 of `bm-wire-diff/testdata/hello-pub.pcap`: the C dev
+    /// kit's heartbeat as it left on port 1. Pins the source MAC and hop
     /// limit deployed nodes use (divergence #70) as well as the body.
     #[test]
     fn build_reproduces_a_deployed_heartbeat() {

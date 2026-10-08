@@ -1,5 +1,5 @@
 //! What a deployed C node puts on the wire, from
-//! `testdata/hello-pub-card-h0.pcap`.
+//! `testdata/hello-pub.pcap`.
 //!
 //! Captured with `bm_l2_register_pcap_callback` on a dev kit running
 //! `bm_protocol`'s hello-world app, modified to call `spotter_log`,
@@ -33,7 +33,7 @@ use bm_wire::frame::{
 use bm_wire::util::BmIpAddr;
 use bm_wire_diff::pcap::{self, Record};
 
-const CAPTURE: &[u8] = include_bytes!("../testdata/hello-pub-card-h0.pcap");
+const CAPTURE: &[u8] = include_bytes!("../testdata/hello-pub.pcap");
 
 const DEV_KIT: u64 = 0x0b54_ccce_5c79_78bf;
 const SOFT_MODULE: u64 = 0xe5d1_4eea_4fc2_db6b;

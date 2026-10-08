@@ -5,6 +5,7 @@
 //! nor a sequenced reply, so its header sequence number is always zero.
 
 use crate::BmWireError;
+use crate::le;
 
 /// A BCMP heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -29,15 +30,10 @@ impl Heartbeat {
     ///
     /// [`BmWireError::Truncated`] if `buf` is shorter than [`Self::LEN`].
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let buf: &[u8; Self::LEN] = buf
-            .get(..Self::LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
+        let buf: &[u8; Self::LEN] = le::prefix(buf)?;
         Ok(Self {
-            time_since_boot_us: u64::from_le_bytes([
-                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-            ]),
-            liveliness_lease_dur_s: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            time_since_boot_us: le::u64_at(buf, 0),
+            liveliness_lease_dur_s: le::u32_at(buf, 8),
         })
     }
 

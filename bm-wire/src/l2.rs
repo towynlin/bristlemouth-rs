@@ -27,6 +27,7 @@ use crate::frame::{
     IPV6_DESTINATION_ADDRESS_OFFSET, IPV6_INGRESS_EGRESS_PORTS_OFFSET, IPV6_NEXT_HEADER_OFFSET,
     MIN_FRAME_WITH_ADDRESSES, UDP_CHECKSUM_OFFSET, ethernet_type,
 };
+use crate::le;
 use crate::util::BmIpAddr;
 
 /// Byte of the BCMP header holding the checksum, as a frame offset.
@@ -285,10 +286,7 @@ fn patch(frame: &mut [u8], port: u8, op: Patch) -> Result<(), BmWireError> {
             // so the low half of this `u16` is the high byte of the checksum,
             // and a carry out of it lands where the one's-complement wrap
             // belongs.
-            let bytes: [u8; 2] = frame[BCMP_CHECKSUM_OFFSET..BCMP_CHECKSUM_OFFSET + 2]
-                .try_into()
-                .expect("two bytes");
-            let mut checksum = u16::from_le_bytes(bytes);
+            let mut checksum = le::u16_at(frame, BCMP_CHECKSUM_OFFSET);
             checksum ^= 0xFFFF;
             checksum = match op {
                 Patch::Add => checksum.wrapping_add(u16::from(port)),

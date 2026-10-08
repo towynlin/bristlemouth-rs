@@ -28,7 +28,7 @@ fn reply(node: u8, port: u8, strings: u8, revision: u8) -> Step {
     }
 }
 
-/// The exchange the card is about: a neighbour appears, the node asks, the
+/// The whole exchange: a neighbour appears, the node asks, the
 /// neighbour answers, and both nodes keep the answer.
 #[test]
 fn a_neighbour_that_answers_is_remembered() {

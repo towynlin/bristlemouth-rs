@@ -392,7 +392,7 @@ fn the_run_loop_answers_and_heartbeats() {
 }
 
 // ---------------------------------------------------------------------------
-// Forwarding between ports -- card I2.
+// Forwarding between ports.
 // ---------------------------------------------------------------------------
 
 /// The frames a node put on the wire for one received frame, in order.
@@ -628,7 +628,7 @@ fn a_link_local_message_is_re_flooded_as_a_fresh_frame_per_port() {
 }
 
 // ---------------------------------------------------------------------------
-// Requests, replies and timeouts -- card I3.
+// Requests, replies and timeouts.
 // ---------------------------------------------------------------------------
 
 /// An [`Event`], with the payload copied out so a test can keep it.
@@ -1172,7 +1172,7 @@ fn the_run_loop_retries_then_times_out_an_unanswered_request() {
 }
 
 // ---------------------------------------------------------------------------
-// Echo / ping -- card M1.
+// Echo / ping.
 //
 // The frames are compared against bm_core byte for byte in
 // `bm-wire-diff/tests/ping.rs`. What is here is the half that comparison
@@ -1494,7 +1494,7 @@ fn an_unregistered_echo_type_is_neither_sent_nor_answered() {
 }
 
 // ---------------------------------------------------------------------------
-// System time -- card M2.
+// System time.
 // ---------------------------------------------------------------------------
 
 /// 2026-09-21T12:34:56.789Z, a reading a human can check.
@@ -1865,7 +1865,7 @@ fn the_run_loop_answers_a_time_request() {
 }
 
 // ---------------------------------------------------------------------------
-// The Spotter's `spotter/utc-time` -- card T1.
+// The Spotter's `spotter/utc-time`.
 // ---------------------------------------------------------------------------
 
 const SPOTTER_ID: u64 = 0x5428_d5d7_3b4e_298a;
@@ -1999,7 +1999,7 @@ fn utc_time_with_another_version_sets_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// Device-information replies -- card M3.
+// Device-information replies.
 // ---------------------------------------------------------------------------
 
 /// A heartbeat frame from `node_id` rather than from the peer.
@@ -2200,7 +2200,7 @@ fn an_unregistered_request_type_records_nothing() {
 }
 
 // ---------------------------------------------------------------------------
-// Neighbour-table replies -- card M4.
+// Neighbour-table replies.
 // ---------------------------------------------------------------------------
 
 /// A neighbour-table reply frame from the peer, claiming `node_id` and
@@ -2287,7 +2287,7 @@ fn a_request_goes_to_the_address_it_was_given() {
     assert_eq!(phy.sent[0].egress, Egress::AllPorts);
 }
 
-/// The exchange the card is about: ask a node, get its table back.
+/// The whole exchange: ask a node, get its table back.
 #[test]
 fn a_neighbour_table_reply_answers_the_request_that_named_its_sender() {
     let mut node = node();
@@ -3009,7 +3009,7 @@ fn the_run_loop_answers_a_resource_request() {
 }
 
 // ---------------------------------------------------------------------------
-// UDP -- card U2.
+// UDP.
 // ---------------------------------------------------------------------------
 
 const MIDDLEWARE_PORT: u16 = 4321;
@@ -3232,7 +3232,7 @@ fn a_datagram_crosses_between_two_nodes() {
 }
 
 // ---------------------------------------------------------------------------
-// Application seam -- card A1.
+// Application seam.
 // ---------------------------------------------------------------------------
 
 /// Pings every node on a ticker of its own, and keeps what comes back.
@@ -3381,7 +3381,7 @@ fn an_app_task_pings_through_a_channel_and_sees_the_reply() {
 }
 
 // ---------------------------------------------------------------------------
-// Pub/sub -- card P2.
+// Pub/sub.
 // ---------------------------------------------------------------------------
 
 /// What an [`Event::Publication`] carried: `(source, subscription, topic,

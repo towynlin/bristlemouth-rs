@@ -40,6 +40,7 @@ use crate::configuration::{
     ConfigPartition, CopyError, Head, MAX_CONFIG_BUFFER_SIZE_BYTES, MAX_KEY_LEN_BYTES, ValueType,
     copy_string,
 };
+use crate::le;
 
 /// Longest key `bcmp_config_get` and `bcmp_config_set` will send,
 /// `MAX_KEY_LEN_BYTES`. `bcmp_config_del_key` does not check.
@@ -57,14 +58,6 @@ pub const MAX_VALUE_LEN: usize = MAX_CONFIG_BUFFER_SIZE_BYTES;
 /// first (divergence #8), so a body between 1449 and 1500 bytes passes this
 /// test and is then not sent.
 pub const STATUS_RESPONSE_MAX_LEN: usize = 1500;
-
-fn u64_at(buf: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(buf[at..at + 8].try_into().expect("8 bytes"))
-}
-
-fn u32_at(buf: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(buf[at..at + 4].try_into().expect("4 bytes"))
-}
 
 /// `buf[at..at + len]`, or [`BmWireError::Truncated`].
 fn slice(buf: &[u8], at: usize, len: usize) -> Result<&[u8], BmWireError> {
@@ -113,8 +106,8 @@ impl ConfigHeader {
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
         let buf = slice(buf, 0, Self::LEN)?;
         Ok(Self {
-            target_node_id: u64_at(buf, 0),
-            source_node_id: u64_at(buf, 8),
+            target_node_id: le::u64_at(buf, 0),
+            source_node_id: le::u64_at(buf, 8),
         })
     }
 
@@ -242,7 +235,8 @@ impl<'a> ConfigValue<'a> {
     pub fn decode(buf: &'a [u8]) -> Result<Self, BmWireError> {
         let header = ConfigHeader::decode(buf)?;
         let head = slice(buf, 0, Self::HEAD_LEN)?;
-        let data_length = usize::try_from(u32_at(head, 17)).map_err(|_| BmWireError::Truncated)?;
+        let data_length =
+            usize::try_from(le::u32_at(head, 17)).map_err(|_| BmWireError::Truncated)?;
         let data = slice(buf, Self::HEAD_LEN, data_length)?;
         Ok(Self {
             header,
@@ -307,7 +301,8 @@ impl<'a> ConfigSet<'a> {
         let header = ConfigHeader::decode(buf)?;
         let head = slice(buf, 0, Self::HEAD_LEN)?;
         let key_length = usize::from(head[17]);
-        let data_length = usize::try_from(u32_at(head, 18)).map_err(|_| BmWireError::Truncated)?;
+        let data_length =
+            usize::try_from(le::u32_at(head, 18)).map_err(|_| BmWireError::Truncated)?;
         let key = slice(buf, Self::HEAD_LEN, key_length)?;
         let data = slice(buf, Self::HEAD_LEN + key_length, data_length)?;
         Ok(Self {

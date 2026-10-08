@@ -393,7 +393,7 @@ mod tests {
     use crate::util::bm_wildcard_match;
 
     /// The first `spotter/transmit-data` publication in
-    /// `bm-wire-diff/testdata/hello-pub-card-h0.pcap`: the dev kit's
+    /// `bm-wire-diff/testdata/hello-pub.pcap`: the dev kit's
     /// `spotter_tx_data` of the counter 100, as `bm_pub_wl` wrote it.
     const TRANSMIT_DATA: [u8; 31] =
         *b"\x00\x00\x15\x01\x02spotter/transmit-data\x02\x64\x00\x00\x00";

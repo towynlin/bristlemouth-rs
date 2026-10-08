@@ -1,5 +1,5 @@
 //! This image's version, in the three places that must agree for a DFU to be
-//! confirmed (`docs/mcuboot-todo.md`, contract 8): [`crate::DevkitIdentity`]
+//! confirmed (`docs/history/mcuboot-todo.md`, contract 8): [`crate::DevkitIdentity`]
 //! reports these constants, [`NOTE`] carries them in the image, and
 //! `bm-image` copies them from the note into the MCUboot header.
 

@@ -34,6 +34,7 @@
 //! | Expiry | none (#19) | none (#19) |
 
 use crate::BmWireError;
+use crate::le;
 
 /// `ResourceType`: which of the two lists a resource belongs to.
 ///
@@ -82,12 +83,8 @@ impl ResourceTableRequest {
     ///
     /// [`BmWireError::Truncated`] if `buf` is too short.
     pub fn decode(buf: &[u8]) -> Result<Self, BmWireError> {
-        let bytes: [u8; 8] = buf
-            .get(..Self::LEN)
-            .and_then(|b| b.try_into().ok())
-            .ok_or(BmWireError::Truncated)?;
         Ok(Self {
-            target_node_id: u64::from_le_bytes(bytes),
+            target_node_id: u64::from_le_bytes(*le::prefix(buf)?),
         })
     }
 
@@ -137,7 +134,7 @@ impl<'a> Resource<'a> {
     /// shorter than the length the prefix declares.
     pub fn decode(buf: &'a [u8]) -> Result<(Self, usize), BmWireError> {
         let head = buf.get(..Self::HEADER_LEN).ok_or(BmWireError::Truncated)?;
-        let len = usize::from(u16::from_le_bytes([head[0], head[1]]));
+        let len = usize::from(le::u16_at(head, 0));
         let name = buf
             .get(Self::HEADER_LEN..Self::HEADER_LEN + len)
             .ok_or(BmWireError::Truncated)?;
@@ -180,9 +177,9 @@ impl<'a> ResourceTableReply<'a> {
     /// if the records it declares do not fit in what followed.
     pub fn decode(buf: &'a [u8]) -> Result<Self, BmWireError> {
         let head = buf.get(..Self::HEADER_LEN).ok_or(BmWireError::Truncated)?;
-        let node_id = u64::from_le_bytes(head[0..8].try_into().expect("8 bytes"));
-        let num_pubs = u16::from_le_bytes([head[8], head[9]]);
-        let num_subs = u16::from_le_bytes([head[10], head[11]]);
+        let node_id = le::u64_at(head, 0);
+        let num_pubs = le::u16_at(head, 8);
+        let num_subs = le::u16_at(head, 10);
 
         let records = &buf[Self::HEADER_LEN..];
         // The walk the C does, with the bound the C does not have.

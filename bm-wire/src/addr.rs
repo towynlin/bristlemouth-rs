@@ -220,8 +220,8 @@ mod tests {
         assert_eq!(&mac[1..], &[0xEF, 0x12, 0x34, 0x56, 0x78]);
     }
 
-    /// Card H0's dev kit, `0b54ccce5c7978bf`: the source MAC of every frame
-    /// it sent in `bm-wire-diff/testdata/hello-pub-card-h0.pcap`.
+    /// The captured C dev kit, `0b54ccce5c7978bf`: the source MAC of every frame
+    /// it sent in `bm-wire-diff/testdata/hello-pub.pcap`.
     #[test]
     fn mac_address_is_two_zero_bytes_and_the_low_half_of_the_id() {
         assert_eq!(

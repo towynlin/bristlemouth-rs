@@ -1,6 +1,6 @@
 //! Board bring-up: a node that heartbeats, answers BCMP, and logs what it
-//! hears over defmt. The manual check for card B1 is that a C node on the
-//! same bus lists it as a neighbour.
+//! hears over defmt. The manual check is that a C node on the same bus lists
+//! it as a neighbour.
 //!
 //! At start it logs each config partition's keys as loaded from flash, one
 //! `name type value` line each ([`bm_wire::configuration::Entry`]), so a key

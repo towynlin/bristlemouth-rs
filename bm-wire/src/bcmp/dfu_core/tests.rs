@@ -1,7 +1,7 @@
 //! `dfu_test.cpp`'s state sequences, as far as the core decides them.
 //!
 //! bm_core's goldens drive `bm_dfu_test_set_dfu_event_and_run_sm` through the
-//! real client and host. Those are `dfu_client`'s tests and card D4; here
+//! real client and host. Those are `dfu_client`'s and `dfu_host`'s tests; here
 //! [`StandIn`] makes the calls into the core that `dfu_client.c` and
 //! `dfu_host.c` make at the same step,
 //! so every state enum asserted below is the golden's, and each test names the

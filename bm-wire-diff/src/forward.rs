@@ -27,8 +27,7 @@
 //! that happen to use it, and it does not depend on a caller that does not
 //! exist yet.
 //!
-//! Since card M2 there *is* one caller, and [`Message::SystemTimeForAnother`]
-//! is it: [`check_relay`] then compares the whole receive path, the decision to
+//! System time is one caller, as [`Message::SystemTimeForAnother`]: [`check_relay`] then compares the whole receive path, the decision to
 //! forward included, rather than the forward alone.
 //!
 //! # Input domain

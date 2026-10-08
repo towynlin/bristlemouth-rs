@@ -34,6 +34,7 @@ pub mod crc;
 pub mod frame;
 pub mod l2;
 pub mod l2_policy;
+mod le;
 pub mod neighbor;
 pub mod pubsub;
 pub mod service;
