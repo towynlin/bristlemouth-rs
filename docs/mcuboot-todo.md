@@ -1,5 +1,13 @@
 # MCUboot todo
 
+> **Complete and closed. There is no work here.** Every card has landed, and
+> on a bench a dev kit took Rust and C images over Bristlemouth DFU in both
+> directions, unsigned and signed (`bm-devkit/README.md`, "On a bus"). Do
+> not add cards, pick work from this file, or edit it as part of a card. It
+> is kept as documentation: the sections below record what was built, the
+> API shapes, and the reasons for decisions. "Working a card" and the
+> "Order" section describe the process the plan followed and are historical.
+
 Running `bm-devkit` firmware under the MCUboot bootloader that C nodes carry,
 and updating it over Bristlemouth DFU, as dependency-ordered cards sized for
 one agent each. Same card format as `docs/services-todo.md`.
@@ -179,45 +187,15 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ## Cards
 
-### B1 — On a bus
-
-- **Bench matrix**, each from a Spotter's SD card through a Bridge:
-
-  | From | To | Expect |
-  |---|---|---|
-  | C `hello_world` | Rust `hello_world` | success reported, Rust running |
-  | Rust | Rust, new SHA | success |
-  | Rust | C `hello_world` | success, C running |
-  | Rust | Rust, same SHA | refused, `BmDfuErrSameVer` |
-  | Rust | a Rust image that never confirms (a build with the confirm removed) | previous image running after the next reset |
-  | Rust | a Rust image that hangs at start | reverted by the IWDG |
-  | power removed mid-swap | — | swap completes on the next boot |
-
-  Then on a dev kit whose bootloader is built with `SIGN_IMAGES=1` and
-  bm_protocol's development key:
-
-  | From | To | Expect |
-  |---|---|---|
-  | C, signed | Rust, signed with that key | success, Rust running |
-  | Rust, signed | Rust, unsigned | previous image running; record the error the Bridge reports |
-  | Rust, signed | C, signed | success, C running |
-
-- **Docs:** results in `bm-devkit/README.md`. Images come from
-  `bm-devkit/build.sh` (S1); the README's opening section has the commands.
-- **Blocked by:** nothing.
-- **Done:** every row run and recorded; this file marked complete.
+None remain.
 
 ## Order
 
-| Wave | Cards | Each needs |
-|---|---|---|
-| 1 | B1 | nothing |
-
-Cards within a wave can run in parallel.
+Every card has landed.
 
 ## What the landed cards left for the rest
 
-Landed: O1, N1, M1, I1, L1, S1.
+Landed: O1, N1, M1, I1, L1, S1, B1.
 
 ### O1 — `bm-mcuboot-sys`
 
@@ -378,7 +356,7 @@ Rust to Rust with a new SHA from a Spotter succeeded; the slot erase took
 |---|---|
 | `bm_devkit::slot::DevkitSlot` | `Board::slot`, the `D` of `Devkit`. `node` takes it. |
 | An image that never confirms | Make `DevkitSlot::set_confirmed` do nothing: it is the only call to `bm_mcuboot::set_confirmed`. |
-| Another git SHA | Another commit, or `BM_DEVKIT_GIT_SHA` forced in `build.rs` (L1). |
+| Another git SHA | Another commit, or `BM_DEVKIT_GIT_SHA` in the environment. |
 | Images | `cd bm-devkit && ./build.sh --release`: every binary's `.dfu.bin`; signed with `BM_IMAGE_KEY`; `.unified.bin` with `BM_BOOTLOADER`. Warns when the tree is dirty, since the image then carries HEAD's SHA. |
 | Log lines | `dfu: slot 2 erased in N ms` on the Spotter console; `slot: erased … in N ms`; `slot: N bytes written` every 64 KiB; `slot: pending (code), resetting`; after the swap `reset reason: Mcuboot`, then `slot: image confirmed`; `dfu: 0x… from …` for each DFU message except payloads. |
 
@@ -396,6 +374,5 @@ Decisions:
 | The erase time also goes to the Spotter console | A potted node has no probe; `slot::take_erase_ms` is read by `hello_world`. |
 | `build.sh` and `image.sh`, scripts beside `runner.sh` | Cargo has no post-build step, and a stale `.dfu.bin` beside a new ELF was sent once by mistake. |
 
-Not run: a C image reading the `client_update_reboot_info` a Rust image
-wrote at `0x200BFE4C` (`bm_devkit::noinit::NoInit`), or the reverse. B1's
-C-to-Rust and Rust-to-C rows are the first runs that hand it over.
+B1 ran both hand-overs of `client_update_reboot_info` at `0x200BFE4C`
+(`bm_devkit::noinit::NoInit`), C to Rust and Rust to C; both confirmed.

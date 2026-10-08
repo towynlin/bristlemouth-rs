@@ -1,7 +1,8 @@
 //! Link scripts for the binaries: `devkit.x`, which is cortex-m-rt's `link.x`
 //! with the version note and includes `memory.x`, and defmt's. `BM_DEVKIT_GIT_SHA`: the
 //! first 8 hex digits of `HEAD`, or `0` outside a git checkout, for
-//! `DevkitIdentity`.
+//! `DevkitIdentity`. The same variable in the environment replaces it, for
+//! an image that must carry another SHA without another commit.
 
 use std::process::Command;
 
@@ -14,9 +15,12 @@ fn main() {
     println!("cargo:rustc-link-arg-bins=-Tdevkit.x");
     println!("cargo:rustc-link-arg-bins=-Tdefmt.x");
 
-    let sha = git(&["rev-parse", "HEAD"])
-        .and_then(|sha| sha.get(..8).map(str::to_owned))
-        .unwrap_or_else(|| "0".to_owned());
+    println!("cargo:rerun-if-env-changed=BM_DEVKIT_GIT_SHA");
+    let sha = std::env::var("BM_DEVKIT_GIT_SHA").ok().unwrap_or_else(|| {
+        git(&["rev-parse", "HEAD"])
+            .and_then(|sha| sha.get(..8).map(str::to_owned))
+            .unwrap_or_else(|| "0".to_owned())
+    });
     println!("cargo:rustc-env=BM_DEVKIT_GIT_SHA={sha}");
     for path in ["HEAD", "packed-refs"] {
         if let Some(path) = git(&["rev-parse", "--git-path", path]) {

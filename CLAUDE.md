@@ -280,7 +280,8 @@ A cargo workspace.
   closed; no work there.** Kept as documentation of what was built and why.
 - `docs/mcuboot-todo.md` — the plan for running `bm-devkit` firmware under
   the C nodes' MCUboot bootloader and updating it over Bristlemouth DFU.
-  **Open; work comes from here.**
+  **Complete and closed; no work there.** Kept as documentation of what was
+  built and why; `bm-devkit/README.md`, "On a bus", has the bench results.
 - `docs/bcmp-port-todo.md` — the BCMP port. Complete and closed to new
   cards; its shared contract is the record of the porting rules.
 - `docs/embassy-port-tracking-prompt.md` — the brief that produced
