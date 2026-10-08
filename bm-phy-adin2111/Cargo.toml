@@ -17,8 +17,13 @@ description = "bm-stack Phy for the ADIN2111 over OPEN Alliance TC6 SPI"
 # network. Verify this crate explicitly; see CLAUDE.md.
 [workspace]
 
+[features]
+# `defmt::Format` on `PhyError`, and bm-stack's and bm-wire's types.
+defmt = ["dep:defmt", "bm-stack/defmt"]
+
 [dependencies]
 bm-stack = { path = "../bm-stack" }
+defmt = { version = "1", optional = true }
 bm-wire = { path = "../bm-wire" }
 embedded-hal = "1.0"
 embedded-hal-async = "1.0"

@@ -76,6 +76,7 @@ const SLOT: usize = MAX_CONFIG_BUFFER_SIZE_BYTES;
 
 /// `BmConfigPartition`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum Partition {
     /// `BM_CFG_PARTITION_USER`.
@@ -100,6 +101,7 @@ impl Partition {
 
 /// `ConfigDataTypes`, as stored in a key's `value_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum ValueType {
     /// `UINT32`.
@@ -121,6 +123,7 @@ pub enum ValueType {
 ///
 /// A store must use the layout of the firmware whose saved images it reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Layout {
     key_len_width: usize,
     value_type_width: usize,
@@ -198,6 +201,7 @@ impl Layout {
 /// between; [`Key::with_len`] expresses that, and the stored key then carries
 /// the value's leading bytes (divergence #45).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Key<'a> {
     text: &'a [u8],
     len: usize,
@@ -264,6 +268,7 @@ impl<'a> Key<'a> {
 
 /// One entry of `get_stored_keys`: a `ConfigKey` read out of the image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct StoredKey {
     /// `key_buf`: what `snprintf` left there, NUL and trailing bytes included.
     pub key_buf: [u8; KEY_BUF_LEN],
@@ -275,6 +280,7 @@ pub struct StoredKey {
 
 /// Why a string or byte-string get returned `false`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum CopyError {
     /// No such key, the slot does not parse, the value is another type, or the
     /// string is malformed. The C leaves `*value_len` alone; earlier chunks
@@ -288,6 +294,7 @@ pub enum CopyError {
 
 /// A CBOR item head as `preparse_value` reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Head {
     /// Major type, 0–7.
     pub major: u8,
@@ -443,6 +450,7 @@ pub fn copy_string(slot: &[u8], out: &mut [u8]) -> Result<usize, CopyError> {
 
 /// Why [`ConfigPartition::cbor_map`] wrote no map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum MapError {
     /// `services_cbor_as_map` returns `NULL`: a key got no value, so closing
     /// the map fails with `CborErrorTooFewItems`. Every `ARRAY` key does
@@ -518,6 +526,19 @@ impl core::fmt::Debug for ConfigPartition {
             .field("num_keys", &self.num_keys())
             .field("needs_commit", &self.needs_commit)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for ConfigPartition {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(
+            f,
+            "ConfigPartition {{ layout: {}, num_keys: {=u8}, needs_commit: {=bool}, .. }}",
+            self.layout,
+            self.num_keys(),
+            self.needs_commit
+        );
     }
 }
 
@@ -1052,6 +1073,7 @@ impl ConfigPartition {
 
 /// The three partitions: `CONFIGS`.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigStore {
     partitions: [ConfigPartition; 3],
 }

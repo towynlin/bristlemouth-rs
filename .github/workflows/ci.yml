@@ -76,6 +76,8 @@ jobs:
       # bare-metal is where bm-wire and bm-stack actually have to hold up.
       - name: Cortex-M33
         run: cargo clippy -p bm-wire -p bm-stack -p bm-mcuboot --features bm-stack/channel --target thumbv8m.main-none-eabihf --locked -- -D warnings
+      - name: Cortex-M33, defmt
+        run: cargo clippy -p bm-wire -p bm-stack -p bm-mcuboot --features bm-stack/channel,bm-wire/defmt,bm-stack/defmt,bm-mcuboot/defmt --target thumbv8m.main-none-eabihf --locked -- -D warnings
 
   test:
     name: test

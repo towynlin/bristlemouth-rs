@@ -108,12 +108,14 @@ pub trait Services {
 /// No application services: anything registered with
 /// [`crate::Node::register_service`] goes unanswered.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NoServices;
 
 impl Services for NoServices {}
 
 /// Which handler a listed service has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ServiceHandler {
     /// `echo_service_handler`: [`bm_wire::service::echo`].
     Echo,
@@ -134,6 +136,7 @@ pub enum ServiceHandler {
 /// Why [`crate::Node::register_service`] returned what `bm_service_register`
 /// returns false for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum RegisterError {
     /// [`SERVICES`] are listed, or the name is longer than
     /// [`SERVICE_NAME_BYTES`]. Nothing changed: the C's equivalent is a
@@ -147,6 +150,7 @@ pub enum RegisterError {
 /// Why [`crate::Node::unregister_service`] returned what
 /// `bm_service_unregister` returns false for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum UnregisterError {
     /// `<name>/req` has no service callback to remove, as
     /// [`bm_wire::pubsub::Subscriptions::unsubscribe_as`] reports. Nothing
@@ -160,6 +164,7 @@ pub enum UnregisterError {
 /// Why [`crate::Node::service_request`] returned what `bm_service_request`
 /// returns false for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ServiceRequestError {
     /// The data is longer than [`bm_wire::service::MAX_DATA_SIZE`]. Nothing
     /// changed.

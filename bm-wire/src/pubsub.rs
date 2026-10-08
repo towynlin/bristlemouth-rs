@@ -48,6 +48,7 @@ pub const MAX_MESSAGE_LEN: usize = 1452;
 
 /// A decoded publication, borrowing the datagram's payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Publication<'a> {
     /// `BmPubSubData::type`. `bm_pub_wl` writes 0; `bm_handle_msg` ignores it.
     pub header_type: u8,
@@ -118,6 +119,7 @@ pub fn decode(payload: &[u8]) -> Result<Publication<'_>, BmWireError> {
 /// Why [`Subscriptions`] refused, with the `BmErr` `bm_sub_wl` or
 /// `bm_unsub_wl` returns for the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SubscriptionError {
     /// The topic is empty: `BmEINVAL`.
     EmptyTopic,
@@ -142,6 +144,7 @@ pub enum SubscriptionError {
 /// `bm_service_request.c`'s `_service_request_cb`, which every request
 /// shares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Subscriber {
     /// The application, through `Event::Publication` in `bm-stack`.
     Application,
@@ -201,6 +204,7 @@ impl<const TOPIC: usize> Entry<TOPIC> {
 /// `N` is how many topics are held and `TOPIC` the longest; bm_core has
 /// neither ceiling, nor [`CALLBACKS`].
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Subscriptions<const N: usize, const TOPIC: usize> {
     entries: [Entry<TOPIC>; N],
     len: usize,

@@ -32,6 +32,7 @@ use crate::le;
 
 /// `BcmpDeviceInfoRequest`: ask one node, or every node, to describe itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DeviceInfoRequest {
     /// Node to answer, or zero for all of them.
     pub target_node_id: u64,
@@ -66,6 +67,7 @@ impl DeviceInfoRequest {
 
 /// `BcmpDeviceInfo`: the fixed part of a node's self-description.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DeviceInfo {
     /// Node id of the node being described.
     pub node_id: u64,
@@ -139,6 +141,7 @@ impl DeviceInfo {
 /// the wire, nor validated as UTF-8 by bm_core. They are exposed as bytes for
 /// that reason; use [`core::str::from_utf8`] if a caller needs text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DeviceInfoReply<'a> {
     /// The fixed part.
     pub info: DeviceInfo,
@@ -228,6 +231,7 @@ pub const CACHED_STRING_BYTES: usize = DeviceInfoReply::MAX_STRING_LEN;
 /// request made with a callback never updates the cache, and one made without
 /// never reaches the application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum InfoRequestKind {
     /// `cb == NULL`, which is what both of bm_core's own call sites pass
     /// (`bcmp_update_neighbor` and `bcmp_process_heartbeat`'s restart path).
@@ -254,6 +258,7 @@ pub enum InfoRequestKind {
 /// * **Thirty-two bit keys.** `LLItem::id` is a `uint32_t` while node ids are
 ///   64-bit, so the list is keyed on the low half of one. See divergence #33.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct InfoRequests<const N: usize> {
     entries: [(u32, InfoRequestKind); N],
     len: usize,
@@ -346,6 +351,7 @@ impl<const N: usize> InfoRequests<N> {
 
 /// One node's device information, borrowed out of [`InfoCache`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CachedInfo<'a> {
     /// The fixed part, as the reply carried it.
     pub info: DeviceInfo,
@@ -368,6 +374,7 @@ pub struct CachedInfo<'a> {
 /// value is a deliberate divergence for a node that cannot spare the memory:
 /// the excess is dropped, and what is kept is still the prefix that arrived.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct InfoCache<const N: usize, const STRING: usize = CACHED_STRING_BYTES> {
     entries: [CacheEntry<STRING>; N],
     len: usize,

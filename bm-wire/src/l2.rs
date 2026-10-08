@@ -49,6 +49,7 @@ pub const MIN_STAMPABLE_FRAME: usize = MIN_FRAME_WITH_ADDRESSES + 8;
 /// construction, and a caller driving a PHY wants the compiler to tell it if
 /// bm_core ever grows a fourth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TxKind {
     /// Global multicast, `FF03::1`. Sent to the whole port mask with no egress
     /// stamp and no checksum patch — to every port at once when the mask is
@@ -206,6 +207,7 @@ pub fn with_egress_port<R>(
 /// the send happens inside a closure. This is the same guarantee in a form
 /// that can be held across an `await`: stamp, transmit, and let the scope end.
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Stamped<'a> {
     frame: &'a mut [u8],
     port: u8,

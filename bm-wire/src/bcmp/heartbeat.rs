@@ -9,6 +9,7 @@ use crate::le;
 
 /// A BCMP heartbeat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Heartbeat {
     /// Microseconds since the sender last reset.
     ///

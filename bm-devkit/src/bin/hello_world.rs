@@ -96,7 +96,7 @@ fn log_to_spotter<'n>(node: &'n mut Devkit, text: &[u8]) -> Option<Outbound<'n>>
             Some(outbound)
         }
         Err(error) => {
-            warn!("spotter_log: {}", defmt::Debug2Format(&error));
+            warn!("spotter_log: {}", error);
             None
         }
     }
@@ -141,7 +141,7 @@ impl App<Devkit> for Hello {
 
     fn on_event(&mut self, event: Event<'_>) {
         if let Some(Err(error)) = self.utc_time.on_event(&event) {
-            warn!("utc-time: {}", defmt::Debug2Format(&error));
+            warn!("utc-time: {}", error);
         }
         match event {
             Event::Message {
@@ -202,7 +202,7 @@ impl App<Devkit> for Hello {
                 info!("dfu: {=u16:#x} from {=u64:016x}", message_type.0, source);
             }
             Event::DfuUpdateFinished(finished) => {
-                info!("dfu: finished {}", defmt::Debug2Format(&finished));
+                info!("dfu: finished {}", finished);
             }
             Event::Publication {
                 source,
@@ -242,11 +242,7 @@ async fn main(spawner: Spawner) {
     // `app_main.cpp:412-415`: the utc-time subscription, then the services.
     for topic in [SUBSCRIPTION, utc_time::TOPIC] {
         if let Err(error) = node.subscribe(topic) {
-            warn!(
-                "subscribe {=[u8]:a}: {}",
-                topic,
-                defmt::Debug2Format(&error)
-            );
+            warn!("subscribe {=[u8]:a}: {}", topic, error);
         }
     }
     for (name, result) in [
@@ -255,7 +251,7 @@ async fn main(spawner: Spawner) {
         ("config_map", node.register_config_map_service()),
     ] {
         if let Err(error) = result {
-            warn!("register {=str}: {}", name, defmt::Debug2Format(&error));
+            warn!("register {=str}: {}", name, error);
         }
     }
     for (name, _) in node.service_table().iter() {
@@ -273,5 +269,5 @@ async fn main(spawner: Spawner) {
         utc_time: UtcTimeSetter::new(),
     };
     let error = node.run_app(&mut board.phy, &mut app).await;
-    warn!("node stopped: {}", defmt::Debug2Format(&error));
+    warn!("node stopped: {}", error);
 }

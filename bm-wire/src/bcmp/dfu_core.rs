@@ -83,6 +83,7 @@ pub const MAX_EVENT_BODY_LEN: usize = 1514 - MIN_FRAME_WITH_ADDRESSES - BCMP_HEA
 
 /// `enum BmDfuHfsmStates`, with its C values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum State {
     /// `BmDfuStateInit`: waiting for [`EventType::InitSuccess`].
@@ -150,6 +151,7 @@ impl State {
 
 /// `enum BmDfuEvtType`, with its C values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[repr(u8)]
 pub enum EventType {
     /// `DfuEventNone`: the NOP a pending state change queues.
@@ -210,6 +212,7 @@ impl EventType {
 /// A newtype rather than an enum because the host stores a received
 /// `err_code` byte here unchecked, so every `u8` occurs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DfuErr(pub u8);
 
 impl DfuErr {
@@ -260,6 +263,7 @@ impl DfuErr {
 /// while that read blocks for a second or more, and
 /// [`Effects::host_get_chunk`] does not block. See `bcmp::dfu_host`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Timer {
     /// `CLIENT_CTX.chunk_timer`: [`EventType::ChunkTimeout`] after
     /// `bm_dfu_client_chunk_timeout_ms`.
@@ -309,6 +313,7 @@ impl Timer {
 /// a Rust image on the same part must share for an update from one to the
 /// other to complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RebootInfo {
     /// [`DFU_REBOOT_MAGIC`], or anything else.
     pub magic: u32,
@@ -360,6 +365,7 @@ impl RebootInfo {
 
 /// `DfuHostStartEvent`: what `bm_dfu_initiate_update` queues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct HostStart {
     /// The `0xD0` body the host will send, addressed from this node.
     pub start: DfuStart,
@@ -402,6 +408,17 @@ impl core::fmt::Debug for EventData {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for EventData {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        match self {
+            Self::None => defmt::write!(f, "None"),
+            Self::Message { len, bytes } => defmt::write!(f, "Message({=[u8]})", &bytes[..*len]),
+            Self::HostStart(h) => defmt::write!(f, "HostStart({})", h),
+        }
+    }
+}
+
 impl PartialEq for EventData {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -428,6 +445,7 @@ impl EventData {
 
 /// `BmDfuEvent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Event {
     /// `type`.
     pub kind: EventType,
@@ -566,6 +584,7 @@ pub trait Roles {
 /// What [`Dfu::on_message`] did with a body, in the order
 /// `bm_dfu_process_message` decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Accepted {
     /// Queued as this event.
     Queued(EventType),
@@ -587,6 +606,7 @@ pub enum Accepted {
 
 /// `dfu_event_queue`: a bounded FIFO whose sends fail when it is full.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct EventQueue {
     slots: [Event; EVENT_QUEUE_LEN],
     head: usize,
@@ -653,6 +673,7 @@ impl EventQueue {
 /// `dfu_core_ctx_t` and the queue: everything of the core's that the roles
 /// may touch.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Core {
     state: State,
     current: Event,
@@ -887,6 +908,7 @@ impl Core {
 
 /// The DFU state machine: `dfu_core.c` over a [`Roles`] implementation.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Dfu<R> {
     core: Core,
     roles: R,

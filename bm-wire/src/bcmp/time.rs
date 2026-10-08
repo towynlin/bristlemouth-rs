@@ -30,6 +30,7 @@ use crate::le;
 
 /// `BcmpSystemTimeHeader`: who a system-time message is for, and who sent it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SystemTimeHeader {
     /// Node the message is addressed to. Zero is a broadcast — but only
     /// [`SystemTimeSet`] treats it as one; see the module docs.
@@ -89,6 +90,7 @@ impl SystemTimeHeader {
 
 /// `BcmpSystemTimeRequest` (`0x10`): ask a node for its clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SystemTimeRequest {
     /// Who it is for, and who is asking.
     pub header: SystemTimeHeader,
@@ -135,6 +137,7 @@ impl SystemTimeRequest {
 /// `bcmp_time_process_time_message` only logs this, so a C node does nothing
 /// observable with one. A port that wants the time has to read it itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SystemTimeResponse {
     /// Who it is for, and who is answering.
     pub header: SystemTimeHeader,
@@ -148,6 +151,7 @@ pub struct SystemTimeResponse {
 /// because the C has two typedefs and because only this one is honoured when
 /// broadcast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SystemTimeSet {
     /// Who it is for, and who is setting it.
     pub header: SystemTimeHeader,

@@ -41,6 +41,7 @@ pub fn handle(request: &[u8], reply: &SysInfoReply<'_>, out: &mut [u8]) -> Optio
 
 /// `SysInfoReplyData`, to encode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SysInfoReply<'a> {
     /// `node_id`.
     pub node_id: u64,
@@ -89,6 +90,7 @@ impl<'a> SysInfoReply<'a> {
 
 /// `SysInfoReplyData`, as `sys_info_reply_decode` fills it.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct DecodedSysInfoReply<'a> {
     /// `node_id`.
     pub node_id: u64,

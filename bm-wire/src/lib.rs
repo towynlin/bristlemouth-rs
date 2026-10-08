@@ -15,11 +15,12 @@
 //! `no_std`, no `alloc`. Callers provide every buffer. Nothing here panics on
 //! untrusted input — parsers return [`BmWireError`] instead.
 //!
-//! One dependency, [`cbor2`], for the config chain's CBOR values; it is
+//! One dependency by default, [`cbor2`], for the config chain's CBOR values; it is
 //! `no_std` and alloc-free in the configuration used here. See
 //! `docs/c-divergences.md` for where it and bm_core's vendored tinycbor
 //! disagree, and `bm-wire-diff/src/cbor.rs` for what is proven about the
-//! bytes they both produce.
+//! bytes they both produce. The `defmt` feature adds `defmt::Format` to the
+//! public types.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
@@ -49,6 +50,7 @@ pub mod util;
 /// succeeds. Where that is true the differential harness compares against the
 /// value C produces, not against the error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum BmWireError {
     /// The buffer was too short to hold the field being read or written.

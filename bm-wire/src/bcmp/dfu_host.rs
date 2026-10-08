@@ -88,6 +88,18 @@ impl core::fmt::Debug for StreamBuffer {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for StreamBuffer {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(
+            f,
+            "StreamBuffer {{ capacity: {=usize}, count: {=usize}, .. }}",
+            self.capacity,
+            self.count
+        );
+    }
+}
+
 impl StreamBuffer {
     /// `bm_stream_buffer_create(capacity)`: `None` for zero, as the shim
     /// returns `NULL`. `s_host_req_update_entry` passes a `chunk_size`, which
@@ -147,6 +159,7 @@ impl StreamBuffer {
 
 /// `dfu_host_ctx_t`, less the queue and timers, which are the core's.
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Host {
     img_info: ImgInfo,
     client_node_id: u64,
@@ -434,6 +447,7 @@ impl Host {
 /// A node that is both client and host, dispatching on the state as
 /// `dfu_states` does.
 #[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ClientHost {
     /// `dfu_client.c`.
     pub client: Client,

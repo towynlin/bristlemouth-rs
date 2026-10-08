@@ -60,6 +60,7 @@ pub use embassy_net_adin1110::{MTU, Runner, State, Tc6};
 /// Note that SPI errors do not appear here: the driver's runner owns the bus,
 /// so a bus failure surfaces there rather than on a send or a receive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
 pub enum PhyError {
     /// A port number the device does not have. Ports are 1-based, and 0 means

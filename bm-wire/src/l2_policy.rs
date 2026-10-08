@@ -15,6 +15,7 @@ use crate::util::BmIpAddr;
 ///
 /// Field-for-field equivalent to the C `BmL2PolicyRxResult`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RxResult {
     /// Whether the frame (mutated in place) should also go up the local stack.
     pub should_submit: bool,

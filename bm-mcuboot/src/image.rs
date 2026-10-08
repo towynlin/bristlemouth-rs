@@ -11,6 +11,7 @@ pub const BM_HDR_SIZE: u16 = 0x200;
 
 /// `struct image_version`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Version {
     /// `iv_major`.
     pub major: u8,
@@ -45,6 +46,7 @@ impl Version {
 /// `struct image_header`. Every field is carried as read: `decode` checks
 /// nothing, as the C's cast of the flash bytes does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Header {
     /// `ih_magic`: [`IMAGE_MAGIC`] in an image MCUboot accepts.
     pub magic: u32,

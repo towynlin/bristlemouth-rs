@@ -38,6 +38,7 @@ pub const DATA_LEN: usize = 8;
 
 /// Why [`decode`] did not return a time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum UtcTimeError {
     /// The topic check failed. The C prints the topic and data instead.
     Topic,
@@ -102,6 +103,7 @@ fn strncmp_eq(a: &[u8], b: &[u8]) -> bool {
 /// subscription are handled, as the C handler is registered for it alone; the
 /// same publication delivered to another subscription (`spotter/*`) is not.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct UtcTimeSetter {
     pending: Option<u64>,
 }

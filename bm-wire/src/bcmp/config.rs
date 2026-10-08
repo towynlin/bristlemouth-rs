@@ -85,6 +85,7 @@ fn len_u32(len: usize) -> Result<u32, BmWireError> {
 ///
 /// Replies go to `source_node_id`, not to the frame's source address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigHeader {
     /// Node the message is addressed to. **Zero is not a broadcast**:
     /// `bcmp_process_config_message` acts only on an exact match and forwards
@@ -134,6 +135,7 @@ impl ConfigHeader {
 /// `BmConfigGet` (`0xA0`) and `BmConfigDeleteKeyRequest` (`0xA6`), which have
 /// the same layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigKeyRequest<'a> {
     /// Who it is for, and who is asking.
     pub header: ConfigHeader,
@@ -200,6 +202,7 @@ impl<'a> ConfigKeyRequest<'a> {
 
 /// `BmConfigValue` (`0xA1`): a CBOR value, in answer to a get or a set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigValue<'a> {
     /// Who it is for, and who answered.
     pub header: ConfigHeader,
@@ -264,6 +267,7 @@ impl<'a> ConfigValue<'a> {
 
 /// `BmConfigSet` (`0xA2`): store a CBOR value under a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigSet<'a> {
     /// Who it is for, and who is asking.
     pub header: ConfigHeader,
@@ -337,6 +341,7 @@ impl<'a> ConfigSet<'a> {
 /// `BmConfigCommit` (`0xA3`), `BmConfigStatusRequest` (`0xA4`) and
 /// `BmConfigClearRequest` (`0xA8`): a header and a partition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigPartitionRequest {
     /// Who it is for, and who is asking.
     pub header: ConfigHeader,
@@ -385,6 +390,7 @@ impl ConfigPartitionRequest {
 /// `BmConfigStatusResponse` (`0xA5`): the keys a partition holds, and whether
 /// it has changes not yet saved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigStatusResponse<'a> {
     /// Who it is for, and who answered.
     pub header: ConfigHeader,
@@ -443,6 +449,7 @@ impl<'a> ConfigStatusResponse<'a> {
 
 /// The keys of a [`ConfigStatusResponse`].
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct StatusKeys<'a> {
     rest: &'a [u8],
     remaining: u8,
@@ -539,6 +546,7 @@ pub fn encode_status_response(
 
 /// `BmConfigDeleteKeyResponse` (`0xA7`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigDeleteResponse<'a> {
     /// Who it is for, and who answered.
     pub header: ConfigHeader,
@@ -603,6 +611,7 @@ impl<'a> ConfigDeleteResponse<'a> {
 
 /// `BmConfigClearResponse` (`0xA9`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ConfigClearResponse {
     /// Who it is for, and who answered.
     pub header: ConfigHeader,
@@ -647,6 +656,7 @@ impl ConfigClearResponse {
 
 /// Why [`decode_value`] failed, by the `BmErr` the C returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum DecodeError {
     /// `BmEINVAL`: `data` or `buf` is empty.
     Invalid,

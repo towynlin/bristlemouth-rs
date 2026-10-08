@@ -53,6 +53,7 @@ pub fn handle(
 ///
 /// `N` requests; the C's queue is unbounded.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Callbacks<const N: usize> {
     /// The callbacks, oldest first.
     queue: [u32; N],
@@ -63,10 +64,12 @@ pub struct Callbacks<const N: usize> {
 
 /// [`Callbacks::push`] refused: `N` are queued. Nothing changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct CallbacksFull;
 
 /// What [`Callbacks::on_end`] made of a request ending.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Ended {
     /// Not a request [`Callbacks::push`] listed: its own `reply_cb` runs.
     Other,
@@ -153,6 +156,7 @@ impl<const N: usize> Callbacks<N> {
 
 /// `PowerInfoReplyData`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PowerInfoReply {
     /// `total_on_s`.
     pub total_on_s: u32,

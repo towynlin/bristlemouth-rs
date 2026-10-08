@@ -193,12 +193,23 @@ impl core::fmt::Debug for MessageType {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for MessageType {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        match self.name() {
+            Some(name) => defmt::write!(f, "{=str}", name),
+            None => defmt::write!(f, "MessageType({=u16:#06x})", self.0),
+        }
+    }
+}
+
 /// The BCMP header, decoded.
 ///
 /// `flags`, `reserved`, `frag_total`, `frag_id` and `next_header` are all
 /// documented by bm_core as unused and are written as zero by `serialize`; they
 /// are kept here so a received header round-trips byte-for-byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BcmpHeader {
     /// Message type.
     pub message_type: MessageType,

@@ -15,6 +15,7 @@ use bm_wire::util::{date_time_from_utc, utc_from_date_time};
 
 /// Where a frame should go.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Egress {
     /// Every port at once. The ADIN2111 can do this in one transfer, and
     /// bm_core uses it for global multicast.
@@ -96,6 +97,7 @@ pub trait Identity {
 /// wire carries [`bm_wire::bcmp::SystemTimeResponse::utc_time_us`], and
 /// [`Self::to_utc_micros`] and [`Self::from_utc_micros`] convert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RtcTimeAndDate {
     /// Full year, e.g. 2026.
     pub year: u16,
@@ -196,6 +198,7 @@ pub trait Rtc {
 /// error, or a board whose RTC has never been set. Such a node stays silent
 /// when asked the time, and re-floods and drops time messages as usual.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NoRtc;
 
 impl Rtc for NoRtc {
@@ -220,6 +223,7 @@ impl Rtc for NoRtc {
 /// advance, so it reports the same time until set again. A firmware wanting a
 /// clock that *runs* implements [`Rtc`] over its own peripheral.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SoftRtc {
     reading: Option<RtcTimeAndDate>,
     read_only: bool,
@@ -435,6 +439,7 @@ pub trait NoInitRam {
 /// reboot — what a C node whose `flash_area_open` fails does. Nothing
 /// survives a reset.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NoDfu;
 
 impl DfuSlot for NoDfu {
@@ -470,6 +475,7 @@ impl NoInitRam for NoDfu {
 
 /// What a [`RamDfuSlot`]'s boot hooks were asked to do. Nothing resets.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct BootRequests {
     /// [`DfuSlot::set_confirmed`] calls.
     pub confirmed: u32,

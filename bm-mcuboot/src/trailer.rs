@@ -50,6 +50,7 @@ const MAGIC_TAIL: [u8; MAGIC_SIZE - 2] = [
 
 /// A flash operation failed. `bootutil` reports every one as `BOOT_EFLASH`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct FlashError;
 
 /// One slot's flash. Offsets are from the start of the slot.
@@ -71,6 +72,7 @@ pub trait Flash {
 
 /// A non-zero return of `boot_set_pending` or `boot_set_confirmed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Error {
     /// `BOOT_EFLASH`: a read or write failed.
     Flash,
@@ -103,6 +105,7 @@ impl From<FlashError> for Error {
 /// `align` is both `BOOT_MAX_ALIGN` and `flash_area_align`, which
 /// bm_protocol sets from the one `MCUBOOT_BOOT_MAX_ALIGN`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Trailer {
     slot_size: u32,
     align: u32,
@@ -217,6 +220,7 @@ impl Trailer {
 
 /// `BOOT_MAGIC_GOOD`, `_BAD`, `_UNSET`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Magic {
     Good,
     /// Neither the magic nor erased.
@@ -227,6 +231,7 @@ pub enum Magic {
 
 /// `BOOT_FLAG_SET`, `_BAD`, `_UNSET`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Flag {
     /// `0x01`.
     Set,
@@ -238,6 +243,7 @@ pub enum Flag {
 
 /// `BOOT_SWAP_TYPE_*`, less `FAIL` and `PANIC`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SwapType {
     None = 1,
     Test = 2,
@@ -247,6 +253,7 @@ pub enum SwapType {
 
 /// `struct boot_swap_state`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct SwapState {
     pub magic: Magic,
     /// The low nibble of `swap_info`, a `BOOT_SWAP_TYPE_*` value; 1

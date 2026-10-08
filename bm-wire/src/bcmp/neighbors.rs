@@ -49,6 +49,7 @@ pub const NEIGHBOR_REQUEST_TIMEOUT_MS: u32 = 1000;
 
 /// `BcmpNeighborTableRequest`: ask one node, or every node, for its neighbours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NeighborTableRequest {
     /// Node to answer, or zero for all of them.
     pub target_node_id: u64,
@@ -83,6 +84,7 @@ impl NeighborTableRequest {
 
 /// `BcmpPortInfo`: one local port's state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct PortInfo {
     /// Link state, as the raw byte.
     ///
@@ -108,6 +110,7 @@ impl PortInfo {
 
 /// `BcmpNeighborInfo`: one neighbour, as the replying node sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NeighborInfo {
     /// The neighbour's node id.
     pub node_id: u64,
@@ -144,6 +147,7 @@ impl NeighborInfo {
 
 /// `BcmpNeighborTableReply`, borrowed from the frame it arrived in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct NeighborTableReply<'a> {
     /// Node id of the replying node.
     pub node_id: u64,
@@ -292,6 +296,7 @@ pub fn encode_neighbor_table_reply(
 /// `bcmp_request_neighbor_table`'s `request` argument, as a choice rather than
 /// a pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TableRequestKind {
     /// `request == NULL`. A matching reply is still accepted — the timer is
     /// stopped — and then dropped. What `neighbors_test.cpp` passes on its
@@ -305,6 +310,7 @@ pub enum TableRequestKind {
 
 /// What `bcmp_process_neighbor_table_reply` made of a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TableReplyOutcome {
     /// `TARGET_NODE_ID != reply->node_id`. The C returns `BmENOTINTREC` having
     /// done nothing — not even stopped the timer.
@@ -343,6 +349,7 @@ pub enum TableReplyOutcome {
 ///
 /// [`Self::on_timer`] is the timer; the caller owns the clock that drives it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TableRequests {
     target_node_id: u64,
     armed: bool,

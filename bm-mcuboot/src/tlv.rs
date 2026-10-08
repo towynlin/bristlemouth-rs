@@ -86,6 +86,7 @@ const fn put(out: &mut [u8], at: usize, bytes: &[u8]) {
 
 /// Why a TLV area could not be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum TlvError {
     /// The slice, or the area's declared length, ends before the bytes
     /// needed.
@@ -99,6 +100,7 @@ pub enum TlvError {
 
 /// One entry of the area.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Tlv<'a> {
     /// `it_type`.
     pub kind: u16,
@@ -110,6 +112,7 @@ pub struct Tlv<'a> {
 
 /// An image's TLV area, as `bootutil_tlv_iter_begin` accepts it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TlvArea<'a> {
     image: &'a [u8],
     start: usize,
@@ -189,6 +192,7 @@ impl<'a> IntoIterator for &TlvArea<'a> {
 
 /// `bootutil_tlv_iter_next` with `IMAGE_TLV_ANY`.
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TlvIter<'a> {
     area: TlvArea<'a>,
     off: usize,

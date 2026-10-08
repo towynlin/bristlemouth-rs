@@ -56,6 +56,7 @@ pub fn handle(
 /// `BmField`, with the value: the source to encode from, or the destination
 /// a decode writes to.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum Field {
     /// `BM_FIELD_UINT8`.
     U8(u8),
@@ -76,6 +77,7 @@ pub enum Field {
 
 /// `BmEncoderTableEntry` and `BmDecodeTableEntry`.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Entry<'a> {
     /// The key. As in the C, it ends at its first NUL.
     pub key: &'a str,
@@ -85,6 +87,7 @@ pub struct Entry<'a> {
 
 /// `MetricsComponent`: a component to encode.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Component<'a> {
     /// The key in `data`. As in the C, it ends at its first NUL.
     pub key: &'a str,
@@ -95,6 +98,7 @@ pub struct Component<'a> {
 /// `MetricsComponentDecode`: a component to look for, and where its fields
 /// go.
 #[derive(Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct ComponentMut<'a, 'b> {
     /// The key to find in `data`, compared up to its first NUL.
     pub key: &'a str,
@@ -104,6 +108,7 @@ pub struct ComponentMut<'a, 'b> {
 
 /// The metadata of `MetricsReplyData` and `MetricsReplyDecode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Reply {
     /// `version`.
     pub version: u8,

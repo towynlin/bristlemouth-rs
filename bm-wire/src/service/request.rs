@@ -25,6 +25,7 @@ pub const EXPIRY_PERIOD_MS: u32 = 500;
 
 /// A request waiting on its reply: a `BmServiceRequestNode`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Request<const NAME: usize> {
     service: [u8; NAME],
     len: usize,
@@ -78,10 +79,12 @@ impl<const NAME: usize> Request<NAME> {
 /// `bm_malloc` failure in `_create_node`, which returns before an id is
 /// taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct RequestsFull;
 
 /// What `_service_request_cb` makes of one publication on a reply topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum ReplyOutcome<'a, const NAME: usize> {
     /// The body is shorter than [`ReplyHeader::LEN`]. The C reads the header
     /// past the publication (divergence #92). Nothing changes.
@@ -109,6 +112,7 @@ pub enum ReplyOutcome<'a, const NAME: usize> {
 /// `N` requests of services named in up to `NAME` bytes; bm_core has neither
 /// ceiling.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Requests<const N: usize, const NAME: usize> {
     list: [Request<NAME>; N],
     len: usize,
