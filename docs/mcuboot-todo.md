@@ -181,6 +181,8 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ### B1 — On a bus
 
+**Taken:** claude/mcuboot-b1
+
 - **Bench matrix**, each from a Spotter's SD card through a Bridge:
 
   | From | To | Expect |
