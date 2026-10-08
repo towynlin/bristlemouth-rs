@@ -8,7 +8,7 @@ one agent each. Same card format as `docs/services-todo.md`.
 Why: a deployed module is potted. USB and SWD are not reachable; the only way
 in is Bristlemouth DFU of a `.dfu.bin` from a Spotter's SD card, through a
 Bridge, into MCUboot's secondary slot. `bm-devkit` links for slot 1 and
-takes updates into slot 2 (S1, bench pending).
+takes updates into slot 2.
 
 | In scope | Source |
 |---|---|
@@ -179,38 +179,6 @@ Read from bm_protocol at `62d8b5d0` (bm_core v0.13.12) and its build of
 
 ## Cards
 
-### S1 — The slot
-
-**Taken:** claude/mcuboot-s1
-
-**Bench pending:** https://github.com/towynlin/bristlemouth-rs/pull/71.
-The bench line passed: Rust to Rust with a new SHA from a Spotter, the
-Bridge reports the new SHA. Left: both measurements, by the steps in
-`bm-devkit/README.md`, "DFU slot", "On a bench".
-
-- **Rust, `bm-devkit`:** `src/slot.rs`: `bm_stack::DfuSlot` on slot 2 over
-  `embassy_stm32::flash` (blocking), per contract 10.
-
-  | Method | Behaviour |
-  |---|---|
-  | `open`, `close`, `size` | `true`, `true`, `0xF2000` |
-  | `erase` | page-aligned whole pages or `false`; verified; feeds the IWDG between pages |
-  | `write` | any offset and length a DFU chunk can have, as `flashWrite` handles a tail shorter than 16 bytes; verified |
-  | `read` | from the memory-mapped slot |
-  | `set_pending_and_reset` | `bm_mcuboot::set_pending`, then N1's reset with `RESET_REASON_MCUBOOT` |
-  | `set_confirmed` | `bm_mcuboot::set_confirmed` on slot 1 |
-  | `fail_update_and_reset` | N1's reset with `RESET_REASON_UPDATE_FAILED` |
-
-  `bm_devkit::node` builds a `Devkit` with the slot and N1's `NoInitRam` in
-  place of `NoDfu`. `hello_world` logs DFU progress over defmt.
-- **Measure:** the time to erase the slot, and that a neighbour does not
-  time the node out while it is erased; record both in the README.
-- **Bench:** a dev kit running Rust `hello_world` accepts a Rust
-  `.dfu.bin` with a different git SHA from a Bridge, reboots into it, and
-  the Bridge reports success.
-- **Blocked by:** nothing.
-- **Done:** the bench line.
-
 ### B1 — On a bus
 
 - **Bench matrix**, each from a Spotter's SD card through a Bridge:
@@ -236,21 +204,20 @@ Bridge reports the new SHA. Left: both measurements, by the steps in
 
 - **Docs:** results in `bm-devkit/README.md`. Images come from
   `bm-devkit/build.sh` (S1); the README's opening section has the commands.
-- **Blocked by:** S1.
+- **Blocked by:** nothing.
 - **Done:** every row run and recorded; this file marked complete.
 
 ## Order
 
 | Wave | Cards | Each needs |
 |---|---|---|
-| 1 | S1 | nothing |
-| 2 | B1 | S1 |
+| 1 | B1 | nothing |
 
 Cards within a wave can run in parallel.
 
 ## What the landed cards left for the rest
 
-Landed: O1, N1, M1, I1, L1.
+Landed: O1, N1, M1, I1, L1, S1.
 
 ### O1 — `bm-mcuboot-sys`
 
@@ -290,22 +257,6 @@ Left open:
 ### M1 — `bm-mcuboot`, `bm-mcuboot-diff`
 
 `bm-mcuboot` has no SHA-256 and no signing; `bm-image` has both.
-
-For S1:
-
-| `DfuSlot` method | Call |
-|---|---|
-| `set_pending_and_reset` | `bm_mcuboot::set_pending(&mut slot2, &Trailer::BM, false)` |
-| `set_confirmed` | `bm_mcuboot::set_confirmed(&mut slot1, &Trailer::BM)` |
-
-Both take a `bm_mcuboot::Flash`: `read(off, buf)`, `write(off, data)`,
-`erase(off, len)`, offsets from the start of the slot, each
-`Result<(), FlashError>`. S1 implements it once per slot.
-
-| `Flash` method | What S1's must do |
-|---|---|
-| `write` | Each call is 16 bytes at a multiple of 16: one quad-word. Verify by reading back, as `port_flash.c` does, or a failed write returns `Ok` where the C returns `BOOT_EFLASH`. |
-| `erase` | Called only by `set_pending`, with `(0, 0xF2000)`, when slot 2's magic is neither good nor erased. It must feed the IWDG (contract 5). Its result is ignored. |
 
 Limits of the slot's contents, from the start of the slot:
 
@@ -419,8 +370,9 @@ Limits:
 
 ### S1, for B1
 
-Bench pending; the code is in. `bm-devkit/README.md`, "DFU slot", is the
-record.
+`bm-devkit/README.md`, "DFU slot", is the record, bench results included:
+Rust to Rust with a new SHA from a Spotter succeeded; the slot erase took
+240 ms; the Bridge logged no `Neighbor <node id> lost` during it.
 
 | Item | Use |
 |---|---|
@@ -444,54 +396,6 @@ Decisions:
 | The erase time also goes to the Spotter console | A potted node has no probe; `slot::take_erase_ms` is read by `hello_world`. |
 | `build.sh` and `image.sh`, scripts beside `runner.sh` | Cargo has no post-build step, and a stale `.dfu.bin` beside a new ELF was sent once by mistake. |
 
-Not measured: the erase time; a neighbour timing the node out during it.
-
-### L1, for S1
-
-`bm-devkit/README.md`, "Flash layout, bootloader, no-init RAM", is the
-record, bench results included.
-
-| Item | Use |
-|---|---|
-| `bm_devkit::watchdog::feed()` | Call between page erases. `watchdog::task` cannot run while `erase` holds the executor. |
-| `bm_devkit::start(spawner)` | Takes the `Spawner` and spawns `watchdog::task`. |
-| `bm_devkit::version` | `GIT_SHA`, `MAJOR`, `MINOR`, `REVISION`: what `DevkitIdentity` reports and what the note carries. A build with another SHA is another commit, or `BM_DEVKIT_GIT_SHA` forced in `build.rs`. |
-| `cargo run` | `runner.sh`: writes slot 1 only. A pending image in slot 2 is swapped in by the bootloader on the reset that follows. |
-| `embassy_stm32::init` | Drops `p.FLASH` unless `start` keeps it; `Board` needs a field for S1's slot. |
-
-Decisions:
-
-| Decision | Reason |
-|---|---|
-| `devkit.x`, a copy of cortex-m-rt 0.7.7's `link.x`, with the crate pinned | Its vector table assertion wants `0x400` alignment for a `0x238`-byte table and cannot be overridden from `memory.x`. ARMv8-M needs 128. |
-| The IWDG is fed, not reconfigured | The bootloader's 4.1 s stands, as in the C. `feed` writes `IWDG_KR` through the PAC, so S1's `erase` needs no handle. |
-| `config()` unchanged | `embassy_stm32::init` moves SYSCLK to HSI first. Registers read on a bench match. |
-| The dirty flag is not in the note | `build.rs` reruns when `HEAD` moves, not when the tree changes. |
-| The runner resets and attaches rather than `probe-rs run` | `run` programs the ELF, which has no MCUboot header. Logs between reset and attach wait in the RTT buffer. |
-
-### N1, for S1
-
-`bm_devkit::noinit`:
-
-| Item | Use |
-|---|---|
-| `NoInit` | A unit struct implementing `bm_stack::NoInitRam` at `0x200BFE4C`. |
-| `reset(ResetReason) -> !` | `set_pending_and_reset` passes `ResetReason::Mcuboot`, `fail_update_and_reset` `ResetReason::UpdateFailed`. |
-| `take_reset_reason()` | Called once by `start`; read `Board::reset_reason` instead. A second call returns `Invalid`. |
-
-- `Node` takes one type `D: DfuSlot + NoInitRam`, so `node` still passes
-  `NoDfu`. S1's slot type implements both traits and delegates `load` and
-  `store` to `NoInit`.
-- `FlashConfigStorage::reset` now resets with `ResetReason::Config`.
-- Contract 9's addresses are the same in the Bridge's link map, which adds
-  `_reboot_info` (8 bytes, `ncp_dfu.cpp`) at `0x200BFE60`.
-  `client_update_reboot_info` is the first object in plain `.noinit`; its
-  address depends on memfault's U5 core being linked ahead of it
-  (`bm-devkit/README.md`, "No-init RAM").
-- On a bench: `Invalid` after flashing and after the reset button;
-  `Config` after `bm cfg commit` from a C node; a `RebootInfo` stored
-  before `reset(ResetReason::Mcuboot)` read back unchanged with reason
-  `Mcuboot`. Not run: a C image reading what a Rust image wrote, or the
-  reverse.
-- After power-on `NoInit::load` returns whatever RAM holds. The DFU client
-  acts only on `DFU_REBOOT_MAGIC`.
+Not run: a C image reading the `client_update_reboot_info` a Rust image
+wrote at `0x200BFE4C` (`bm_devkit::noinit::NoInit`), or the reverse. B1's
+C-to-Rust and Rust-to-C rows are the first runs that hand it over.
