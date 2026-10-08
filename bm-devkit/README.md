@@ -417,10 +417,10 @@ ports as `Neighbor <node id> added` or `Neighbor <node id> lost`
 | Step | Result |
 |---|---|
 | Rust `hello_world` to Rust `hello_world` with another git SHA, from a Spotter's SD card through a Bridge | success; the Bridge reports the new SHA |
-| Slot erase time | not measured |
-| A neighbour timing the node out during the erase | not measured |
+| Slot erase time | 240 ms, from `dfu: slot 2 erased in 240 ms` |
+| A neighbour timing the node out during the erase | none: no `Neighbor <node id> lost` from the Bridge |
 
-Measuring the last two. The node must be cabled to the Bridge itself, and
+Measuring the last two again. The node must be cabled to the Bridge itself, and
 the image it runs **before** the update must already contain the erase
 report, since the old image is the one that erases:
 
