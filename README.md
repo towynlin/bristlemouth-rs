@@ -63,4 +63,9 @@ DFU over the bus.
 ## Contributing
 
 [CLAUDE.md](CLAUDE.md) is the contributor guide for people as well as agents:
-the per-file layout, the porting procedure, and every command CI runs.
+the rules each crate keeps, the porting procedure, and every command CI runs.
+Closed plans are in [docs/history](docs/history).
+
+## License
+
+[Apache-2.0](LICENSE).

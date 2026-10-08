@@ -47,246 +47,103 @@ output.
 
 ## Layout
 
-A cargo workspace.
+Four cargo workspaces: the root, `bm-wire/fuzz`, `bm-phy-adin2111` and
+`bm-devkit`. The last two pin embassy to git, and `embassy-time-driver`
+carries `links = "embassy-time"`, so a git embassy and a crates.io embassy
+cannot share a dependency graph. The root `cargo test` builds neither.
 
-- `bm-wire/` — the port. `no_std`, no `alloc`, `forbid(unsafe_code)`, and one
-  dependency: `cbor2`, at `default-features = false`, for the config chain's
-  CBOR values. **Must never depend on `bm-wire-sys`**, in any configuration:
-  that keeps the host-only oracle out of firmware builds. The `std` feature is
-  for tests and fuzzing only, and must not forward to `cbor2`.
-  - `src/cbor/parser.rs` — tinycbor's parser, ported: `Value` is
-    `CborValue`. For decoders whose outcomes are tinycbor's error codes and
-    item counting rather than CBOR's.
-  - `src/service/` — the services' bodies: `sys_info`, `config_map`,
-    `power_info`, `metrics`, each encode and decode, and each built-in's
-    handler; `power_info.rs` also holds `power_info_service.c`'s callback
-    queue (`Callbacks`); `table.rs` is
-    `bm_service.c`'s list and request walk (`ServiceTable`), the request and
-    reply headers, and echo's handler; `request.rs` is
-    `bm_service_request.c`'s list, id counter and 500 ms sweep (`Requests`).
-  - `fuzz/` — a `cargo fuzz` crate, its own workspace. Targets are ~6 lines
-    each; the work is in `bm-wire-diff`.
-  - `fuzz/seeds/` — committed seed corpora, one directory per target, replayed
-    by `cargo test`. `fuzz/corpus/` is gitignored.
-- `bm-stack/` — the node. `no_std`, no `alloc` (except behind the test-only
-  `mock` feature), and the only crate that knows about time or I/O.
-  - `src/port.rs` — the seams bm_core leaves to the integrator, as traits
-    rather than link-time symbols, including the DFU update slot and the
-    no-init RAM that carries an update across a reset.
-  - `src/dfu.rs` — DFU on a node, client and host: the machine, its outbox,
-    the resets it asks for and the finish callbacks it reports.
-  - `src/config.rs` — `config_init` and `save_config`, the two functions of
-    `bcmp/configuration.c` that touch storage; the store itself is
-    `bm_wire::configuration`.
-  - `src/node.rs` — `Node::on_frame`, `on_tick` and `on_expiry` are
-    synchronous and take the current time; `Node::run` is the only async code.
-    Each has a `_with` twin that reports `Event`s. The three timers are
-    bm_core's: the 10 s heartbeat, `packet.c`'s 150 ms expiry sweep and
-    `bm_service_request.c`'s 500 ms sweep (`on_service_expiry`), which must
-    not be put on a grid of the port's own (divergence #22). DFU runs
-    from `next_dfu_transmission`, as bm_core's runs on its own task.
-    Pub/sub (`subscribe`, `unsubscribe`, `publish`, `Event::Publication`)
-    holds UDP port 4321; the subscription table is `bm_wire::pubsub::Subscriptions`.
-    `spotter_log` and `spotter_tx_data` wrap `publish`; their bodies are
-    `bm_wire::spotter`.
-  - `src/service.rs` — `Services`, the application's service handlers, a
-    `Node`'s `S`. `Node::register_service`, `register_echo_service` and
-    `unregister_service` list them; `on_frame` answers a request in
-    `Owed::reply`. `Node::service_request` asks another node's service;
-    the answer is `Event::ServiceReply` or `Event::ServiceTimeout`, or for
-    `Node::power_info_request`, `Event::PowerInfoReply` (divergence #96).
-    A node lists the metrics service at construction unless
-    `Services::METRICS` is false, as `bristlemouth_init` does.
-  - `src/utc_time.rs` — the Spotter's `spotter/utc-time`, which C nodes set
-    their RTC from (bm_protocol app code, not bm_core): `decode` and
-    `UtcTimeSetter`, for an `App`.
-  - `src/app.rs` — `App`, application code `Node::run_app` runs in the
-    node's loop: a cancel-safe `ready` arm, then `act` with `&mut Node`.
-  - `src/channel.rs` — behind the `channel` feature: `Channels`, an
-    `embassy-sync` `NodeHandle` for an application in a task of its own:
-    owned `Command`s in, owned `Notification`s out, run by `ChannelApp`, an
-    `App`. A service request command reports
-    `Notification::ServiceRequested` with its id, then the reply, timeout or
-    power_info notification. Off by default, so a single-task firmware
-    carries neither `embassy-sync` nor `heapless`.
-  - `src/mock.rs` — a scripted PHY that also drives embassy's mock clock.
-    `src/mock/frames.rs` builds the peer frames a script feeds it; use it
-    rather than a local builder.
-  - `examples/hello_node.rs` — a node on the mock PHY through the public API
-    only: a scripted neighbour, an `App` that pings it, publishes, logs to
-    the Spotter and asks for its sys_info. Panics on a wrong
-    outcome, so CI runs it.
-- `bm-phy-adin2111/` — `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6
-  SPI, on the per-port frame I/O of
+Each crate's `lib.rs` module doc, and each `tests/` file's, says what it
+holds; `cargo doc --open` is the per-file index. The `README.md` in
+`bm-wire-sys`, `bm-mcuboot-sys`, `bm-image` and `bm-devkit` is that crate's
+contract.
+
+| Crate | What it is |
+| --- | --- |
+| `bm-wire/` | The port: codecs and sans-io state machines. |
+| `bm-wire/fuzz/` | `cargo fuzz` targets, ~6 lines each; the work is in `bm-wire-diff`. |
+| `bm-stack/` | The node on embassy: `Node`, the `port` traits, `App`, `Services`, DFU, the `channel` feature, the `mock` PHY. |
+| `bm-phy-adin2111/` | `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6 SPI. |
+| `bm-devkit/` | Board support and firmware (`bringup`, `hello_world`) for the dev kit's mote: STM32U575CI, ADIN2111, W25Q64JV. |
+| `bm-wire-diff/` | The differential harness: one comparator per surface, shared by fuzz targets and `#[test]`s. |
+| `bm-wire-sys/` | The oracle: FFI bindings to the real bm_core C. |
+| `bm-mcuboot/` | MCUboot's image header, TLV area and slot trailer. |
+| `bm-mcuboot-sys/` | The oracle for slot contents and images: MCUboot v1.9.0's `bootutil` with bm_protocol's configuration, over RAM flash. |
+| `bm-mcuboot-diff/` | `bm-mcuboot` against `bm-mcuboot-sys`. |
+| `bm-image/` | Builds and reads `.dfu.bin` and `.unified.bin`; library and CLI. |
+| `docs/c-divergences.md` | The upstream defect list. |
+| `docs/history/` | Closed plans and briefs. **No work there.** `bcmp-port-todo.md`'s shared contract is the record of the porting rules. |
+
+### Rules
+
+Dependencies:
+
+- `bm-wire`: `no_std`, no `alloc`, `forbid(unsafe_code)`, and one dependency:
+  `cbor2` at `default-features = false`. **Must never depend on
+  `bm-wire-sys`**, in any configuration. The `std` feature is for tests and
+  fuzzing only, and must not forward to `cbor2`.
+- `bm-stack`: `no_std`, no `alloc` except behind the test-only `mock` feature.
+  The only crate that knows about time or I/O. `channel` is off by default,
+  so a single-task firmware carries neither `embassy-sync` nor `heapless`.
+- `bm-mcuboot`: `no_std`, no `alloc`, no dependencies, `forbid(unsafe_code)`.
+  **Must never depend on `bm-mcuboot-sys`.** SHA-256 and ed25519 live in
+  `bm-image`.
+- `bm-wire-sys`, `bm-mcuboot-sys`, `bm-wire-diff`, `bm-mcuboot-diff` and
+  `bm-image` are host-only. `bm-wire` and `bm-stack` must never depend on
+  them. `bm-mcuboot-diff` is separate from `bm-wire-diff` so that the fuzz
+  workspace does not build MCUboot.
+
+Vendored C:
+
+- `bm-wire-sys/vendor/bm_core/` and `bm-mcuboot-sys/vendor/mcuboot/` are
+  submodules. **Never edit them.** Fixes go upstream to `bristlemouth/bm_core`.
+  Check `mcuboot` out without `--recursive`: its own submodules are not used.
+- `csrc/` in both `-sys` crates is ours: the platform layer, deterministic.
+- `bm-wire-sys/build.rs` holds the tiered source lists. `T2_RELEASE` compiles
+  `cbor_service_helper.c` and four message codecs with `NDEBUG`, as a release
+  build does (divergences #82, #88).
+- `bm-wire-sys/scripts/check_symbols.sh --check`, from the workspace root,
+  fails on any unresolved symbol outside its libc allowlist. The allowlist
+  omits `rand` and `time`, so a non-deterministic reach from `csrc/` trips it.
+
+`bm-stack`:
+
+- `Node::on_frame`, `on_tick` and `on_expiry` are synchronous and take the
+  current time; `Node::run` and `run_app` are the only async code. Each entry
+  point has a `_with` twin that reports `Event`s.
+- The three timers are bm_core's: the 10 s heartbeat, `packet.c`'s 150 ms
+  expiry sweep and `bm_service_request.c`'s 500 ms sweep
+  (`on_service_expiry`), which must not be put on a grid of the port's own
+  (divergence #22).
+- `examples/hello_node.rs` uses the public API only and panics on a wrong
+  outcome, so CI runs it.
+
+Tests:
+
+- Build peer frames with `bm-stack/src/mock/frames.rs` or
+  `bm-wire-diff/src/frames.rs`, not a local builder.
+- `bm-wire/fuzz/seeds/<target>/` is committed and replayed by `cargo test`;
+  `fuzz/corpus/` is gitignored.
+- `bm-wire-diff/testdata/` holds pcaps from C dev kits;
+  `tests/capture_hello_pub.rs` documents `hello-pub.pcap`.
+
+Firmware:
+
+- `bm-phy-adin2111`'s `Runner` owns the SPI bus and must be spawned by the
+  firmware; until it runs no frame moves. It is on the per-port frame I/O of
   [embassy-rs/embassy#7024](https://github.com/embassy-rs/embassy/pull/7024),
   merged to embassy `main` and awaiting an `embassy-net-adin1110` release.
-  Each frame's port rides in `PacketMeta::id`. **Its own workspace**, because
-  it pins embassy to git and `embassy-time-driver` carries
-  `links = "embassy-time"`, so a git embassy and a crates.io embassy cannot
-  share a dependency graph. Not built by the root `cargo test`. Its `Runner`
-  must be spawned by the firmware — it owns the SPI bus, and until it runs no
-  frame moves.
-- `bm-devkit/` — board support for the dev kit's mote (STM32U575CI,
-  ADIN2111 on SPI3, W25Q64JV NOR flash on SPI2): `start` spawns the watchdog task, powers and
-  brings up the ADIN2111, sets up the flash and starts the RTC, `node` builds a
-  `Devkit` node with the chip's node id, the binary's name as `app_name`, the
-  RTC, its config partitions in flash and its DFU slot; `src/bin/bringup.rs`
-  runs one and logs the config keys it loaded, each as a
-  `bm_wire::configuration::Entry`; `src/bin/hello_world.rs` is
-  the hello-world app: subscribes to `spotter/*`, sends `hello world` with
-  `spotter_log` every 10 s, sets the RTC from `spotter/utc-time`,
-  lists echo, sys_info and config_map after metrics, as a C dev kit does,
-  logs DFU progress, and sends the slot's erase time to the Spotter console.
-  **Its own workspace**, for
-  bm-phy-adin2111's reason, with `Cargo.lock` on the same embassy commit;
-  `.cargo/config.toml` sets the thumb target and `runner.sh` as the runner.
-  Images link for MCUboot slot 1 and run behind bm_protocol's bootloader:
-  `memory.x` starts `FLASH` at `0x0800C200`, and `devkit.x` is cortex-m-rt
-  0.7.7's `link.x` (pinned in `Cargo.toml`) with the version note's section
-  and a 128-byte vector table alignment check.
-  `image.sh <elf>` builds `<elf>.dfu.bin` with `bm-image` (signed when
-  `BM_IMAGE_KEY` is set) and `<elf>.unified.bin` when `BM_BOOTLOADER` is;
-  `build.sh [cargo args]` runs `cargo build` then `image.sh` on every binary
-  it built; `runner.sh` runs `image.sh`, programs the `.dfu.bin` at
-  `0x0800C000` and attaches.
-  `README.md` is the record of bm_protocol's BSP (pins, clocks, ADIN2111
-  sequence, node id, config flash layout), with file and line references —
-  bm_protocol is not vendored, so read it there rather than re-deriving it.
-  - `src/w25.rs` — the flash driver, bm_protocol's `spiflash::W25`, over
-    `embedded-hal` traits only.
-  - `src/rtc.rs` — `DevkitRtc`, `bm_stack::Rtc` over the STM32 RTC on LSE,
-    as bm_protocol's `stm32_rtc.c`.
-  - `src/version.rs` — the git SHA and version `DevkitIdentity` reports, and
-    `NOTE`, bm_protocol's `versionNote`, which `bm-image` reads them from.
-  - `src/watchdog.rs` — `feed` and the task `start` spawns: the bootloader
-    starts the IWDG and it cannot be stopped.
-  - `src/noinit.rs` — the no-init RAM C images and the bootloader share, at
-    fixed addresses: `NoInit`, `bm_stack::NoInitRam`; `reset` and
-    `take_reset_reason`, bm_protocol's `reset_reason.c`.
-  - `src/storage.rs` — `FlashConfigStorage`, `bm_stack::ConfigStorage` at
-    bm_protocol's partition offsets.
-  - `src/slot.rs` — `DevkitSlot`, `bm_stack::DfuSlot` on MCUboot's slot 2
-    over `embassy_stm32::flash`, with `bm_mcuboot`'s pending and confirm
-    marks; `NoInitRam` through `noinit::NoInit`; `take_erase_ms`.
-- `bm-wire-diff/` — the differential harness. Host-only. One comparator per
-  surface, shared by the fuzz targets and by ordinary `#[test]`s.
-  - `src/frames.rs` — BCMP, UDP and publication frames a peer sends, for
-    comparators to inject; `bm_wire::bcmp::tx::build` into a `Vec`. Use it rather than a local
-    builder.
-  - `tests/node_frames.rs` — compares whole frames `bm-stack` builds against
-    the ones bm_core emits for the same question from the same identity.
-  - `src/node_udp.rs`, `tests/node_udp.rs` — UDP through `bm_stack::Node`
-    against the oracle's whole stack: sends, relays, and delivery to bound
-    ports and to `bm_middleware_rx`; `bm_pub_wl` against `Node::publish`.
-  - `src/spotter.rs`, `tests/spotter.rs` — `spotter_log` and
-    `spotter_tx_data` against `Node::spotter_log` and `Node::spotter_tx_data`.
-  - `src/pubsub.rs`, `tests/pubsub.rs` — `bm_sub_wl`, `bm_unsub_wl`,
-    `bm_pub_wl` and `bm_handle_msg` against `Node`'s pub/sub, with one Rust
-    node mirroring the oracle's subscription and resource lists for the life
-    of the process.
-  - `src/services.rs`, `tests/services.rs` — `bm_service.c`, echo,
-    sys_info, config_map, power_info, metrics and `bm_service_request.c`
-    against `Node`'s services and requests, with one Rust node mirroring the
-    oracle's service list, request list, subscriptions and resources for the
-    life of the process, and a config store and metrics components both
-    sides empty at each input.
-  - `tests/service_request_failures.rs` — `bm_service_request`'s failure
-    paths on the oracle alone (divergence #91), which the Rust node's
-    ceilings refuse earlier.
-  - `src/service_codecs.rs` — the service bodies against
-    `bm_common_messages`, in-process; what it skips is listed at the top.
-  - `src/metrics_codec.rs` — the metrics body against `metrics_reply_msg.c`,
-    in-process; destinations are compared after every decode, failed or not.
-  - `testdata/` — pcaps from C dev kits. `hello-pub-card-h0.pcap` is card
-    H0's; `tests/capture_h0.rs` documents it and asserts the header fields
-    where deployed nodes differ from `bm_linux.c` (divergence #70).
-    `src/pcap.rs` reads them.
-- `bm-wire-sys/` — raw FFI bindings to the real bm_core C. The oracle.
-  - `vendor/bm_core/` — the C submodule. **Never edit it from here.** Fixes go
-    upstream to `bristlemouth/bm_core`.
-  - `csrc/` — the platform layer bm_core leaves to the integrator, implemented
-    deterministically. This is ours.
-  - `build.rs` — tiered source lists, the generated guarded header tree,
-    bindgen. `T2_RELEASE` compiles `cbor_service_helper.c` and four message
-    codecs with `NDEBUG`, as a release build does (divergences #82, #88).
-  - `scripts/check_symbols.sh` — what `libbm_core.a` and
-    `libbm_core_release.a` reference but nothing defines; everything left
-    should be libc. Run from the workspace root. `--check` fails on anything
-    outside its libc allowlist, which deliberately omits `rand` and `time`, so
-    a non-deterministic reach from `csrc/` trips it.
-- `bm-mcuboot-sys/` — MCUboot v1.9.0's `bootutil` with bm_protocol's
-  configuration, over RAM flash. The oracle for slot contents and images.
-  Host-only; `bm-wire` and `bm-stack` must never depend on it. `README.md`
-  is its contract.
-  - `vendor/mcuboot/` — the C submodule. **Never edit it.** Check it out
-    without `--recursive`: its own submodules are not used.
-  - `csrc/` — `mcuboot_config.h` and the port headers, citing the bm_protocol
-    lines they mirror; `bm_mcuboot.c`, the flash map over RAM and the entry
-    points. Deterministic, as `bm-wire-sys/csrc/`.
-  - `build.rs` — compiles everything twice: `libbm_mcuboot.a` with no
-    signature type and `libbm_mcuboot_ed25519.a` with `MCUBOOT_SIGN_ED25519`,
-    every symbol of the second prefixed `ed25519_`.
-  - `src/lib.rs` — `lock(Build)` returns an `Oracle`: `reset`, `read`,
-    `write`, `set_pending`, `set_confirmed`, `swap_type`, `boot_go`.
-  - `testdata/` — `test_ed25519_key.pem`, a test-only private key whose
-    public half the signing build trusts, and an image `imgtool` signed
-    with it.
-- `bm-mcuboot/` — MCUboot's image header, TLV area and slot trailer.
-  `no_std`, no `alloc`, no dependencies, `forbid(unsafe_code)`; no SHA-256
-  and no signing. **Must never depend on `bm-mcuboot-sys`.**
-  - `src/image.rs` — `Header` and `Version`: `struct image_header`,
-    `struct image_version`.
-  - `src/tlv.rs` — `encode_unsigned` and `encode_ed25519`, the two TLV areas
-    bm_protocol's build makes; `TlvArea`, `tlv.c`'s walk over a byte slice.
-  - `src/trailer.rs` — `Trailer` (the offsets), the `Flash` trait,
-    `set_pending`, `set_confirmed`, `read_swap_state` and `swap_type`:
-    `bootutil_public.c`. Its module doc lists what the C does that its
-    comments do not say.
-- `bm-mcuboot-diff/` — `bm-mcuboot` against `bm-mcuboot-sys`. Host-only.
-  Separate from `bm-wire-diff` so that the fuzz workspace does not build
-  MCUboot.
-  - `src/lib.rs` — `RamSlot`, a copy of an oracle slot with the oracle's
-    flash rules; `image`, an unsigned image from `bm-mcuboot`'s encoders.
-  - `tests/trailer.rs` — every marking function on both sides from the same
-    flash: results, slot bytes and swap type must agree, over named cases
-    and 5000 random trailers; `boot_go` on Rust's marks against its own.
-  - `tests/image.rs` — the codecs on `imgtool`'s signed image and on images
-    `boot_go` boots.
-- `bm-image/` — builds and reads `.dfu.bin` and `.unified.bin`, as
-  bm_protocol's `imgtool` and `objcopy` steps make them. Host-only; a
-  library over bytes and a CLI (`dfu`, `unified`, `info`). The SHA-256 and
-  ed25519 dependencies live here, not in `bm-mcuboot`. `README.md` is its
-  contract.
-  - `src/elf.rs` — `flat`: an ELF32's loaded sections at their load
-    addresses, as `objcopy --gap-fill 0xFF -O binary`.
-  - `src/version.rs` — `VersionInfo`, bm_protocol's `versionInfo_t`, found
-    by its magic; the image's `ih_ver` comes from it.
-  - `src/image.rs` — `build`, `from_body`, `dfu`, `unified`, and
-    `MAX_IMAGE_LEN`, `imgtool`'s limit.
-  - `src/key.rs` — `Key`: a PKCS#8 PEM ed25519 key, its `KEYHASH` and
-    signature.
-  - `src/info.rs` — `Info`: header, TLVs, version note, and
-    `BmDfuImgInfo`'s size and CRC.
-  - `testdata/` — a small ELF, its `objcopy` binary and `imgtool`'s
-    unsigned and signed images of it.
-  - `tests/gold.rs` — byte-identical to `testdata/`; `tests/oracle.rs` —
-    what `bm-mcuboot-sys`'s `boot_go` boots and refuses.
-- `docs/c-divergences.md` — the upstream defect list.
-- `docs/hello-world-todo.md` — the plan for a Rust hello-world app on a dev
-  kit (UDP, pub/sub, `spotter_log`, board support). **Complete and closed; no
-  work there.** Kept as documentation of what was built and why.
-- `docs/services-todo.md` — the plan for `bm_service*.c` and the built-in
-  services (echo, sys_info, config_map, power_info, metrics). **Complete and
-  closed; no work there.** Kept as documentation of what was built and why.
-- `docs/mcuboot-todo.md` — the plan for running `bm-devkit` firmware under
-  the C nodes' MCUboot bootloader and updating it over Bristlemouth DFU.
-  **Complete and closed; no work there.** Kept as documentation of what was
-  built and why; `bm-devkit/README.md`, "On a bus", has the bench results.
-- `docs/bcmp-port-todo.md` — the BCMP port. Complete and closed to new
-  cards; its shared contract is the record of the porting rules.
-- `docs/embassy-port-tracking-prompt.md` — the brief that produced
-  embassy#7024, which made `embassy-net-adin1110` report the ingress port and
-  take an egress port per frame. Merged; kept as the record of the design.
+- `bm-devkit` images link for MCUboot slot 1 and run behind bm_protocol's
+  bootloader: `memory.x` starts `FLASH` at `0x0800C200`, and `devkit.x` is
+  cortex-m-rt 0.7.7's `link.x`, pinned in `Cargo.toml`.
+- `bm-devkit/build.sh [cargo args]` builds and then runs `image.sh` on each
+  binary, making `<elf>.dfu.bin` (signed when `BM_IMAGE_KEY` is set) and
+  `<elf>.unified.bin` (when `BM_BOOTLOADER` is). `cargo run` goes through
+  `runner.sh`, which programs the `.dfu.bin` at `0x0800C000` and attaches.
+- The bootloader starts the IWDG and it cannot be stopped; `bm_devkit::start`
+  spawns the task that feeds it.
+- bm_protocol is not vendored. `bm-devkit/README.md` records its BSP (pins,
+  clocks, ADIN2111 sequence, node id, flash layout) with file and line
+  references; read it there rather than re-deriving it.
 
 ## Porting a function to bm-wire
 
