@@ -28,6 +28,11 @@ name = "hello_world"
 test = false
 bench = false
 
+[[bin]]
+name = "bm_soft_module"
+test = false
+bench = false
+
 [dependencies]
 # `defmt` for `defmt::Format` on their errors and events.
 bm-stack = { path = "../bm-stack", features = ["defmt"] }
