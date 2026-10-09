@@ -9,7 +9,8 @@ use bm_stack::service::{
     RegisterError, SERVICE_REQUESTS, ServiceHandler, ServiceRequestError, UnregisterError,
 };
 use bm_stack::{
-    Event, Identity, NoConfig, NoDfu, NoServices, Node, RamConfigStorage, Services, SoftRtc,
+    Event, Identity, NoConfig, NoDfu, Node, NodeResources, Parts, RamConfigStorage, Services,
+    SoftRtc,
 };
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::bcmp::resource::ResourceType;
@@ -78,16 +79,21 @@ impl Services for Reverser {
     const METRICS: bool = false;
 }
 
-type TestNode =
-    Node<TestIdentity, SoftRtc, 4, 4, 64, 8, 64, 16, 64, 4, 8, NoConfig, NoDfu, Reverser>;
+/// The memory every node here runs in: room for 16 resources and 8
+/// subscriptions.
+type Resources = NodeResources<16, 8>;
+
+/// Memory that lives as long as the test process, for a node to borrow.
+fn leaked<T: Default>() -> &'static mut T {
+    Box::leak(Box::default())
+}
+
+type TestNode = Node<'static, TestIdentity, SoftRtc, NoConfig, NoDfu, Reverser>;
 
 fn node() -> TestNode {
-    let mut node = Node::with_services(
-        TestIdentity,
-        SoftRtc::new(),
-        NoConfig,
-        NoDfu,
-        Reverser::default(),
+    let mut node = Node::new(
+        leaked::<Resources>(),
+        Parts::new(TestIdentity, SoftRtc::new()).with_services(Reverser::default()),
         2,
     );
     node.set_link_up(1, true);
@@ -636,22 +642,7 @@ impl Identity for NamedIdentity {
     }
 }
 
-type ConfigNode = Node<
-    NamedIdentity,
-    SoftRtc,
-    4,
-    4,
-    64,
-    8,
-    64,
-    16,
-    64,
-    4,
-    8,
-    Config<RamConfigStorage>,
-    NoDfu,
-    NoServices,
->;
+type ConfigNode = Node<'static, NamedIdentity, SoftRtc, Config<RamConfigStorage>>;
 
 fn decoded(body: &[u8]) -> (u64, u32, u32, u32, Vec<u8>) {
     let header = ReplyHeader::decode(body).unwrap();
@@ -680,8 +671,11 @@ fn sys_info_answers_with_the_identity_and_the_system_partitions_crc() {
         .set_uint(Key::new(b"sampleIntervalMs"), 60_000);
     let crc = config.store.partition(Partition::System).cbor_map_crc32();
     assert_ne!(crc, crc32_ieee(&[0xa0]), "not the empty partition's");
-    let mut node: ConfigNode =
-        Node::with_services(NamedIdentity, SoftRtc::new(), config, NoDfu, NoServices, 2);
+    let mut node: ConfigNode = Node::new(
+        leaked::<Resources>(),
+        Parts::new(NamedIdentity, SoftRtc::new()).with_config(config),
+        2,
+    );
     node.register_sys_info_service().unwrap();
     assert!(
         node.service_table().iter().eq([
@@ -811,8 +805,11 @@ fn config_map_answers_with_the_partition_named() {
         .cbor_map(&mut user)
         .unwrap();
     let user = user[..len].to_vec();
-    let mut node: ConfigNode =
-        Node::with_services(NamedIdentity, SoftRtc::new(), config, NoDfu, NoServices, 2);
+    let mut node: ConfigNode = Node::new(
+        leaked::<Resources>(),
+        Parts::new(NamedIdentity, SoftRtc::new()).with_config(config),
+        2,
+    );
     node.register_config_map_service().unwrap();
     assert!(
         node.service_table().iter().eq([
@@ -868,8 +865,11 @@ fn config_map_sends_nothing_for_a_map_past_its_buffer() {
         matches!(map, Err(MapError::TooSmall(n)) if n > REPLY_DATA_LEN),
         "{map:?}"
     );
-    let mut node: ConfigNode =
-        Node::with_services(NamedIdentity, SoftRtc::new(), config, NoDfu, NoServices, 2);
+    let mut node: ConfigNode = Node::new(
+        leaked::<Resources>(),
+        Parts::new(NamedIdentity, SoftRtc::new()).with_config(config),
+        2,
+    );
     node.register_config_map_service().unwrap();
     let mut frame = frames::service_request(
         PEER_ID,
@@ -1127,18 +1127,15 @@ impl Services for Meter {
     }
 }
 
-type MeterNode = Node<TestIdentity, SoftRtc, 4, 4, 64, 8, 64, 16, 64, 4, 8, NoConfig, NoDfu, Meter>;
+type MeterNode = Node<'static, TestIdentity, SoftRtc, NoConfig, NoDfu, Meter>;
 
 fn meter_node() -> MeterNode {
-    let mut node = Node::with_services(
-        TestIdentity,
-        SoftRtc::new(),
-        NoConfig,
-        NoDfu,
-        Meter {
+    let mut node = Node::new(
+        leaked::<Resources>(),
+        Parts::new(TestIdentity, SoftRtc::new()).with_services(Meter {
             free: 4096,
             ..Meter::default()
-        },
+        }),
         2,
     );
     node.set_link_up(1, true);
@@ -1242,7 +1239,11 @@ fn metrics_sends_nothing_for_a_string_field() {
 
 #[test]
 fn no_services_answers_metrics_with_no_components() {
-    let mut node: Node<TestIdentity, SoftRtc, 4> = Node::new(TestIdentity, SoftRtc::new(), 2);
+    let mut node: Node<'static, TestIdentity, SoftRtc> = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::new()),
+        2,
+    );
     node.set_link_up(1, true);
     let mut frame = frames::service_request(PEER_ID, METRICS, 1, b"");
     let owed = node.on_frame(0, 1, &mut frame);

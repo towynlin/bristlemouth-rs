@@ -20,7 +20,7 @@ use std::sync::Once;
 
 use arbitrary::Arbitrary;
 
-use bm_stack::{Node, SoftRtc, SpotterError};
+use bm_stack::{Node, NodeResources, SoftRtc, SpotterError};
 use bm_wire::spotter::{self, NetworkType};
 use bm_wire::util::BmIpAddr;
 use bm_wire::{pubsub, udp};
@@ -258,8 +258,8 @@ fn compare(
 }
 
 /// A node subscribed to `*`, as the oracle is.
-fn node() -> Node<stack::OracleIdentity, SoftRtc, 4> {
-    let mut node = stack::node();
+fn node(resources: &mut NodeResources) -> Node<'_, stack::OracleIdentity, SoftRtc> {
+    let mut node = stack::node(resources);
     node.subscribe(b"*").expect("an empty table");
     node
 }
@@ -287,7 +287,8 @@ pub fn check_log(log: &Log) {
         )
     });
 
-    let mut node = node();
+    let mut resources = NodeResources::new();
+    let mut node = node(&mut resources);
     let mut rs_published = Vec::new();
     let rs = node
         .spotter_log_with(log.target_node_id, file_name, log.print_time, &text, |e| {
@@ -324,7 +325,8 @@ pub fn check_tx_data(tx: &TxData) {
         bm_wire_sys::spotter_tx_data(data.as_ptr().cast(), data.len() as u16, tx.network)
     });
 
-    let mut node = node();
+    let mut resources = NodeResources::new();
+    let mut node = node(&mut resources);
     let mut rs_published = Vec::new();
     let rs = node
         .spotter_tx_data_with(&data, network, |e| {

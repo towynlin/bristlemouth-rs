@@ -303,7 +303,8 @@ fn a_reply_whose_stamped_checksum_double_carries_is_wrong_on_both_sides() {
     check_reply(&i);
 
     // And the frame they agree on is one no node will accept.
-    let mut node = bm_wire_diff::stack::node();
+    let mut resources = bm_stack::NodeResources::new();
+    let mut node = bm_wire_diff::stack::node(&mut resources);
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }

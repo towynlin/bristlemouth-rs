@@ -1242,8 +1242,9 @@ so `bm-wire-diff/src/ping.rs` compares the two frames on the wire and
 `bm_wire::bcmp::ping`'s unit tests assert the rule from the reading.
 
 The allocation is the one place `bm-stack` diverges deliberately: it keeps a
-fixed slot, `Node`'s `PING_PAYLOAD`, and `Node::ping` refuses a payload that
-will not fit rather than sending a ping whose reply it could not check.
+fixed slot, `NodeResources`' `PING_PAYLOAD`, and `Node::ping` refuses a
+payload that will not fit rather than sending a ping whose reply it could not
+check.
 
 Fix with a callback argument on `bcmp_send_ping_request`, a null check, and a
 real timeout.

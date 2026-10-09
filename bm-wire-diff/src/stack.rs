@@ -25,7 +25,7 @@
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use bm_stack::port::{Egress, Identity, Phy, RtcTimeAndDate, SoftRtc};
-use bm_stack::{Node, Outbound, Reflood};
+use bm_stack::{Node, NodeResources, Outbound, Parts, Reflood};
 use bm_wire::addr;
 use bm_wire::bcmp::{BCMP_HEADER_OFFSET, BcmpHeader, DeviceInfo, MessageType};
 use bm_wire::frame::{
@@ -382,40 +382,26 @@ impl Identity for OracleIdentity {
 /// answers no system-time request. A comparator that wants the two clocks to
 /// agree calls [`set_both_clocks`].
 #[must_use]
-pub fn node() -> Node<OracleIdentity, SoftRtc, 4> {
-    node_with_clock(SoftRtc::new())
+pub fn node(resources: &mut NodeResources) -> Node<'_, OracleIdentity, SoftRtc> {
+    node_with_clock(resources, SoftRtc::new())
 }
 
 /// The same, with a clock of the caller's choosing.
 #[must_use]
-pub fn node_with_clock(rtc: SoftRtc) -> Node<OracleIdentity, SoftRtc, 4> {
-    let mut node = Node::new(OracleIdentity, rtc, NUM_PORTS);
+pub fn node_with_clock(
+    resources: &mut NodeResources,
+    rtc: SoftRtc,
+) -> Node<'_, OracleIdentity, SoftRtc> {
+    let mut node = Node::new(resources, Parts::new(OracleIdentity, rtc), NUM_PORTS);
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }
     node
 }
 
-/// A `bm-stack` node with the oracle's identity and a config store, for
-/// comparing the config exchange.
-///
-/// The type [`node_with_config`] returns: a node whose const parameters are
-/// [`Node`]'s defaults, made explicit because naming the config parameter
-/// requires naming every parameter before it.
-pub type ConfigNode = Node<
-    OracleIdentity,
-    SoftRtc,
-    4,
-    4,
-    { bm_stack::node::PING_PAYLOAD_BYTES },
-    { bm_stack::node::INFO_REQUESTS_DEFAULT },
-    { bm_wire::bcmp::info::CACHED_STRING_BYTES },
-    { bm_stack::node::RESOURCES_DEFAULT },
-    { bm_wire::bcmp::resource::RESOURCE_NAME_BYTES },
-    { bm_stack::node::RESOURCE_REQUESTS_DEFAULT },
-    { bm_stack::node::SUBSCRIPTIONS_DEFAULT },
-    bm_stack::Config<bm_stack::RamConfigStorage>,
->;
+/// The type [`node_with_config`] returns.
+pub type ConfigNode<'r> =
+    Node<'r, OracleIdentity, SoftRtc, bm_stack::Config<bm_stack::RamConfigStorage>>;
 
 /// A `bm-stack` node with the oracle's identity and a config store, for
 /// comparing the config exchange.
@@ -424,8 +410,15 @@ pub type ConfigNode = Node<
 /// `CONFIGS` before the comparison. The oracle brings its store up empty, so a
 /// comparator seeds both the same way; [`crate::config`] is the caller.
 #[must_use]
-pub fn node_with_config(config: bm_stack::Config<bm_stack::RamConfigStorage>) -> ConfigNode {
-    let mut node = Node::with_config(OracleIdentity, SoftRtc::new(), config, NUM_PORTS);
+pub fn node_with_config(
+    resources: &mut NodeResources,
+    config: bm_stack::Config<bm_stack::RamConfigStorage>,
+) -> ConfigNode<'_> {
+    let mut node = Node::new(
+        resources,
+        Parts::new(OracleIdentity, SoftRtc::new()).with_config(config),
+        NUM_PORTS,
+    );
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }
@@ -555,7 +548,7 @@ pub fn capture(outbound: Outbound<'_>) -> Vec<(u8, Vec<u8>)> {
 /// Never: [`CapturePhy`] cannot fail.
 #[must_use]
 pub fn capture_reflood<R: bm_stack::Rtc>(
-    node: &mut Node<OracleIdentity, R, 4>,
+    node: &mut Node<'_, OracleIdentity, R>,
     reflood: Reflood,
     frame: &[u8],
 ) -> Vec<(u8, Vec<u8>)> {

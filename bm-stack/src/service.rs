@@ -12,7 +12,7 @@
 //! | `sys_info_service_init` | [`crate::Node::register_sys_info_service`] |
 //! | `config_cbor_map_service_init` | [`crate::Node::register_config_map_service`] |
 //! | `power_info_service_init` | [`crate::Node::register_power_info_service`] |
-//! | `metrics_service_init` | [`crate::Node::with_services`], if [`Services::METRICS`] |
+//! | `metrics_service_init` | [`crate::Node::new`], if [`Services::METRICS`] |
 //! | `_service_request_received_cb` | [`crate::Node::on_frame`], for each service callback a publication reaches |
 //! | a `BmServiceHandler` | [`Services::handle`], or a built-in [`ServiceHandler`] |
 //! | a `BmPowerInfoStatsCb` | [`Services::power_info`] |
@@ -83,7 +83,7 @@ pub trait Services {
         None
     }
 
-    /// `bm_metrics_enabled`: whether [`crate::Node::with_services`] lists
+    /// `bm_metrics_enabled`: whether [`crate::Node::new`] lists
     /// the metrics service, `<node id>/metrics`, before anything else, as
     /// `bristlemouth_init` does. bm_protocol's `bm_config.h` sets it, so a
     /// C node lists it; so does the default.

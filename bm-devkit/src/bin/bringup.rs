@@ -13,7 +13,7 @@
 #![no_std]
 #![no_main]
 
-use bm_devkit::{AdinRunner, Devkit};
+use bm_devkit::{AdinRunner, Devkit, DevkitResources};
 use bm_stack::{App, Event, Outbound};
 use bm_wire::bcmp::MessageType;
 use bm_wire::configuration::{ConfigStore, Partition};
@@ -81,9 +81,12 @@ async fn main(spawner: Spawner) {
     info!("reset reason: {}", board.reset_reason);
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));
 
+    static MEMORY: StaticCell<DevkitResources> = StaticCell::new();
     static NODE: StaticCell<Devkit> = StaticCell::new();
+    let memory = MEMORY.init_with(DevkitResources::new);
     let node = NODE.init_with(|| {
         bm_devkit::node(
+            memory,
             env!("CARGO_BIN_NAME"),
             board.node_id,
             board.flash,

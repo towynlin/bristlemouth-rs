@@ -266,6 +266,20 @@ pub fn encode_neighbor_table_reply(
     ports: &[PortInfo],
     neighbors: &[NeighborInfo],
 ) -> Result<usize, BmWireError> {
+    encode_neighbor_table_reply_from(buf, node_id, ports, neighbors.iter().copied())
+}
+
+/// [`encode_neighbor_table_reply`], taking the neighbours from an iterator.
+///
+/// # Errors
+///
+/// As [`encode_neighbor_table_reply`].
+pub fn encode_neighbor_table_reply_from(
+    buf: &mut [u8],
+    node_id: u64,
+    ports: &[PortInfo],
+    neighbors: impl ExactSizeIterator<Item = NeighborInfo>,
+) -> Result<usize, BmWireError> {
     if ports.len() > usize::from(u8::MAX) || neighbors.len() > usize::from(u16::MAX) {
         return Err(BmWireError::Invalid);
     }

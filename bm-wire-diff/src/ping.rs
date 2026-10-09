@@ -54,7 +54,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 
-use bm_stack::{Node, SoftRtc};
+use bm_stack::node::{RESOURCES_DEFAULT, SUBSCRIPTIONS_DEFAULT};
+use bm_stack::{Node, NodeResources, Parts, SoftRtc};
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::{BCMP_HEADER_OFFSET, BcmpHeader, MessageType};
 use bm_wire::l2;
@@ -70,8 +71,8 @@ pub const PEER_NODE_ID: u64 = 0x0000_0000_55AA_0011;
 /// Longest ping payload the comparator will use.
 ///
 /// bm_core's own ceiling is `bcmp_tx`'s `max_payload_len` (1460). This is well
-/// inside it, keeps fuzz inputs small, and is what [`PingNode`]'s expectation
-/// slot is sized for.
+/// inside it, keeps fuzz inputs small, and is what [`PingResources`]'
+/// expectation slot is sized for.
 pub const MAX_PING_PAYLOAD: usize = 256;
 
 /// Longest prefix of [`PingInput::decode_probe`] injected into the C as an
@@ -79,8 +80,13 @@ pub const MAX_PING_PAYLOAD: usize = 256;
 /// otherwise uses.
 pub const MAX_PROBE_BODY: usize = bm_wire::bcmp::ping::ECHO_HEADER_LEN + MAX_PING_PAYLOAD;
 
-/// A `bm-stack` node whose ping slot is as large as this comparator's domain.
-pub type PingNode = Node<OracleIdentity, SoftRtc, 4, 4, MAX_PING_PAYLOAD>;
+/// Memory for a `bm-stack` node whose ping slot is as large as this
+/// comparator's domain.
+pub type PingResources =
+    NodeResources<RESOURCES_DEFAULT, SUBSCRIPTIONS_DEFAULT, 4, 4, MAX_PING_PAYLOAD>;
+
+/// The `bm-stack` node, in a [`PingResources`] that lives as long as it does.
+pub type PingNode = Node<'static, OracleIdentity, SoftRtc>;
 
 /// The Rust node, kept for the life of the process alongside the C stack.
 ///
@@ -96,7 +102,12 @@ fn pair() -> (MutexGuard<'static, ()>, MutexGuard<'static, PingNode>) {
     let guard = oracle();
     let node = NODE
         .get_or_init(|| {
-            let mut node = PingNode::new(OracleIdentity, SoftRtc::new(), NUM_PORTS);
+            let resources: &'static mut PingResources = Box::leak(Box::default());
+            let mut node = Node::new(
+                resources,
+                Parts::new(OracleIdentity, SoftRtc::new()),
+                NUM_PORTS,
+            );
             // `stack::oracle` brings both of the capture device's ports up
             // before any comparison; a node that disagreed about that would
             // disagree about more than ping.

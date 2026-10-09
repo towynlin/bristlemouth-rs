@@ -953,7 +953,8 @@ impl Model {
 
 /// The frames a `bm-stack` node puts on the wire for `sent`, in order.
 fn rust_frames(sent: &[(MessageType, Vec<u8>)]) -> Vec<(u8, Vec<u8>)> {
-    let mut node = stack::node();
+    let mut resources = bm_stack::NodeResources::new();
+    let mut node = stack::node(&mut resources);
     let mut frames = Vec::new();
     for (message_type, body) in sent {
         let outbound = node

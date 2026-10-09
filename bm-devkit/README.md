@@ -143,7 +143,7 @@ each binary passes `env!("CARGO_BIN_NAME")`.
 
 | Order | C | Here |
 |---|---|---|
-| 1 | `metrics_service_init`, from `bristlemouth_init` (`bm_metrics_enabled`), in `bcl_init` | `Node::with_config`, as `Services::METRICS` defaults to true |
+| 1 | `metrics_service_init`, from `bristlemouth_init` (`bm_metrics_enabled`), in `bcl_init` | `Node::new`, as `Services::METRICS` defaults to true |
 | 2 | `echo_service_init()`, `app_main.cpp:413` | `hello_world`: `Node::register_echo_service` |
 | 3 | `sys_info_service_init()`, `app_main.cpp:414` | `Node::register_sys_info_service` |
 | 4 | `config_cbor_map_service_init()`, `app_main.cpp:415` | `Node::register_config_map_service` |
@@ -366,14 +366,14 @@ memfault's U5 core, or with another `.noinit` object linked ahead of
 | `checkResetReason()` (`reset_reason.c:32-54`): the stored reason if the magic is set, else `RESET_REASON_INVALID`; zeroes the magic and sets the stored reason to `RESET_REASON_INVALID`; later calls return a cached value | `noinit::take_reset_reason()`: the same reads and writes, no cache. `start` calls it once; the result is `Board::reset_reason`, which both binaries log |
 | reasons written on the DFU path: `RESET_REASON_MCUBOOT` (4) and `RESET_REASON_UPDATE_FAILED` (6), `src/lib/drivers/bm_dfu_wrapper.cpp:26`, `:31` | `ResetReason::Mcuboot`, `ResetReason::UpdateFailed`; not written until the node has a `DfuSlot` |
 
-`bm_devkit::node` still builds its node with `NoDfu`: `Node` takes one type
-for `DfuSlot` and `NoInitRam`, so `NoInit` goes in with the slot.
+`bm_devkit::node` passes `DevkitSlot` as both: `Node` takes one type for
+`DfuSlot` and `NoInitRam`, so `NoInit` goes in with the slot.
 
 ### DFU slot
 
 `src/slot.rs` `DevkitSlot` is `bm_stack::DfuSlot` on slot 2 and
 `bm_stack::NoInitRam` through `noinit::NoInit`. `start` builds it from
-`p.FLASH`; `node` passes it to `Node::with_dfu`.
+`p.FLASH`; `node` passes it to `Parts::with_dfu`.
 
 | Hook | C | Here |
 |---|---|---|

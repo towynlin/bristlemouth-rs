@@ -23,13 +23,8 @@ pub mod w25;
 pub mod watchdog;
 
 use bm_phy_adin2111::{Adin2111Phy, Runner, State, Tc6};
-use bm_stack::node::{
-    INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, RESOURCE_REQUESTS_DEFAULT, SUBSCRIPTIONS_DEFAULT,
-};
-use bm_stack::{Config, Identity, Node};
+use bm_stack::{Config, Identity, Node, NodeResources, Parts};
 use bm_wire::bcmp::DeviceInfo;
-use bm_wire::bcmp::info::CACHED_STRING_BYTES;
-use bm_wire::bcmp::resource::RESOURCE_NAME_BYTES;
 use bm_wire::configuration::Layout;
 use embassy_executor::Spawner;
 use embassy_stm32::exti::{self, ExtiInput};
@@ -99,23 +94,13 @@ pub type DevkitConfigStorage = FlashConfigStorage<FlashSpi, Delay>;
 /// is not advertised, where a C node's `PUB_LIST` would list it.
 pub const RESOURCES: usize = 16;
 
+/// The memory a [`Devkit`] runs in: [`NodeResources`] with room for
+/// [`RESOURCES`] topics.
+pub type DevkitResources = NodeResources<RESOURCES>;
+
 /// A node on this board: [`DevkitIdentity`], the RTC, the config
 /// partitions in NOR flash, and MCUboot's slot 2 for DFU.
-pub type Devkit = Node<
-    DevkitIdentity,
-    DevkitRtc,
-    4,
-    4,
-    PING_PAYLOAD_BYTES,
-    INFO_REQUESTS_DEFAULT,
-    CACHED_STRING_BYTES,
-    RESOURCES,
-    RESOURCE_NAME_BYTES,
-    RESOURCE_REQUESTS_DEFAULT,
-    SUBSCRIPTIONS_DEFAULT,
-    Config<DevkitConfigStorage>,
-    DevkitSlot,
->;
+pub type Devkit = Node<'static, DevkitIdentity, DevkitRtc, Config<DevkitConfigStorage>, DevkitSlot>;
 
 /// The brought-up board.
 pub struct Board {
@@ -244,7 +229,7 @@ pub async fn start(spawner: Spawner) -> Board {
 /// A [`Devkit`] node with id `node_id`, this chip's UID as its name and
 /// `app_name` as its `bm_app_name`, its config partitions loaded from `flash`
 /// in the layout `arm-none-eabi-gcc` gives bm_protocol's, and DFU into
-/// `slot`.
+/// `slot`, running in `resources`.
 ///
 /// bm_protocol's `bm_app_name` is the app directory's name
 /// (`src/CMakeLists.txt`, `get_filename_component(APP_NAME ${APP} NAME)`);
@@ -252,17 +237,18 @@ pub async fn start(spawner: Spawner) -> Board {
 /// `hello_world`.
 #[must_use]
 pub fn node(
+    resources: &'static mut DevkitResources,
     app_name: &'static str,
     node_id: u64,
     flash: Flash,
     rtc: DevkitRtc,
     slot: DevkitSlot,
 ) -> Devkit {
-    Node::with_dfu(
-        DevkitIdentity::new(node_id, embassy_stm32::uid::uid(), app_name),
-        rtc,
-        Config::load(Layout::ARM_EABI_GCC, FlashConfigStorage::new(flash)),
-        slot,
+    let identity = DevkitIdentity::new(node_id, embassy_stm32::uid::uid(), app_name);
+    let config = Config::load(Layout::ARM_EABI_GCC, FlashConfigStorage::new(flash));
+    Node::new(
+        resources,
+        Parts::new(identity, rtc).with_config(config).with_dfu(slot),
         PORTS,
     )
 }

@@ -4,7 +4,9 @@
 
 use bm_stack::dfu::DfuFinished;
 use bm_stack::mock::frames;
-use bm_stack::{Event, Identity, NoConfig, NoDfu, Node, Outbound, RamDfuSlot, SoftRtc};
+use bm_stack::{
+    Event, Identity, NoConfig, NoDfu, Node, NodeResources, Outbound, Parts, RamDfuSlot, SoftRtc,
+};
 use bm_wire::bcmp::dfu::{
     DfuAddress, DfuChunk, DfuMessage, DfuResult, DfuStart, IMG_INFO_FORCE_UPDATE, ImgInfo,
 };
@@ -49,24 +51,19 @@ impl Identity for HostIdentity {
     }
 }
 
-type DfuNode<'a, I = TestIdentity> = Node<
-    I,
-    SoftRtc,
-    4,
-    4,
-    { bm_stack::node::PING_PAYLOAD_BYTES },
-    { bm_stack::node::INFO_REQUESTS_DEFAULT },
-    { bm_wire::bcmp::info::CACHED_STRING_BYTES },
-    { bm_stack::node::RESOURCES_DEFAULT },
-    { bm_wire::bcmp::resource::RESOURCE_NAME_BYTES },
-    { bm_stack::node::RESOURCE_REQUESTS_DEFAULT },
-    { bm_stack::node::SUBSCRIPTIONS_DEFAULT },
-    NoConfig,
-    &'a mut RamDfuSlot<SLOT>,
->;
+type DfuNode<'a, I = TestIdentity> = Node<'static, I, SoftRtc, NoConfig, &'a mut RamDfuSlot<SLOT>>;
+
+/// Memory that lives as long as the test process, for a node to borrow.
+fn leaked<T: Default>() -> &'static mut T {
+    Box::leak(Box::default())
+}
 
 fn node(slot: &mut RamDfuSlot<SLOT>) -> DfuNode<'_> {
-    Node::with_dfu(TestIdentity, SoftRtc::new(), NoConfig, slot, PORTS)
+    Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::new()).with_dfu(slot),
+        PORTS,
+    )
 }
 
 fn frame_to(dst: BmIpAddr, message: &DfuMessage<'_>) -> Vec<u8> {
@@ -297,7 +294,11 @@ fn a_dfu_message_for_another_node_is_re_flooded_only_if_link_local() {
 /// `flash_area_open` fails, and stays in Error until reboot.
 #[test]
 fn a_node_without_a_slot_nacks_with_a_flash_error() {
-    let mut node: Node<TestIdentity, SoftRtc, 4> = Node::new(TestIdentity, SoftRtc::new(), PORTS);
+    let mut node: Node<'static, TestIdentity, SoftRtc> = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::new()),
+        PORTS,
+    );
     while node.next_dfu_transmission(0).is_some() {}
     let mut frame = from_host(&offer(&image()));
     let _ = node.on_frame(0, 1, &mut frame);
@@ -349,11 +350,9 @@ fn a_node_hosts_an_update_to_another_node() {
     let mut host_slot = RamDfuSlot::<SLOT>::new();
     host_slot.flash[ImgInfo::LEN..ImgInfo::LEN + image.len()].copy_from_slice(&image);
     let mut client_slot = RamDfuSlot::<SLOT>::new();
-    let mut host: DfuNode<'_, HostIdentity> = Node::with_dfu(
-        HostIdentity,
-        SoftRtc::new(),
-        NoConfig,
-        &mut host_slot,
+    let mut host: DfuNode<'_, HostIdentity> = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(HostIdentity, SoftRtc::new()).with_dfu(&mut host_slot),
         PORTS,
     );
     let info = ImgInfo {

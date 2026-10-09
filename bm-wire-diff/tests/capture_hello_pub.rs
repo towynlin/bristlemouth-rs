@@ -292,11 +292,12 @@ fn own_publications_go_out_once_and_a_neighbours_are_relayed_unchanged() {
 /// of each body.
 #[test]
 fn node_spotter_calls_rebuild_the_dev_kits_frames() {
-    use bm_stack::{NoRtc, Node};
+    use bm_stack::{NoRtc, Node, NodeResources, Parts};
     use bm_wire::spotter::{self, NetworkType};
     use bm_wire_diff::node_udp::Peer;
 
-    let mut node: Node<Peer, NoRtc, 4> = Node::new(Peer(DEV_KIT), NoRtc, 2);
+    let mut resources: NodeResources = NodeResources::new();
+    let mut node = Node::new(&mut resources, Parts::new(Peer(DEV_KIT), NoRtc), 2);
     let mut counts = [0; 3];
     for r in frames()
         .iter()

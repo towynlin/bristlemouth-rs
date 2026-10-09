@@ -22,7 +22,7 @@
 
 use core::fmt::{self, Write};
 
-use bm_devkit::{AdinRunner, Devkit, slot};
+use bm_devkit::{AdinRunner, Devkit, DevkitResources, slot};
 use bm_stack::utc_time::{self, UtcTimeSetter};
 use bm_stack::{App, Event, Outbound, Rtc};
 use bm_wire::bcmp::MessageType;
@@ -229,9 +229,12 @@ async fn main(spawner: Spawner) {
     info!("reset reason: {}", board.reset_reason);
     spawner.spawn(adin(board.adin_runner).expect("one adin task"));
 
+    static MEMORY: StaticCell<DevkitResources> = StaticCell::new();
     static NODE: StaticCell<Devkit> = StaticCell::new();
+    let memory = MEMORY.init_with(DevkitResources::new);
     let node = NODE.init_with(|| {
         bm_devkit::node(
+            memory,
             env!("CARGO_BIN_NAME"),
             board.node_id,
             board.flash,
