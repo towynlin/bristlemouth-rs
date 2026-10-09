@@ -117,7 +117,7 @@ dependencies = [
 [[package]]
 name = "embassy-executor-timer-queue"
 version = "0.1.1"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#b12a6d9efcd2711037abca1b63a661a9ef726444"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#edb49c04f994974a7c52d9153356eef6cc9bbaf6"
 dependencies = [
  "unitrait",
 ]
@@ -125,12 +125,12 @@ dependencies = [
 [[package]]
 name = "embassy-futures"
 version = "0.1.2"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#b12a6d9efcd2711037abca1b63a661a9ef726444"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#edb49c04f994974a7c52d9153356eef6cc9bbaf6"
 
 [[package]]
 name = "embassy-net-adin1110"
 version = "0.4.0"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#b12a6d9efcd2711037abca1b63a661a9ef726444"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#edb49c04f994974a7c52d9153356eef6cc9bbaf6"
 dependencies = [
  "bitfield",
  "embassy-futures",
@@ -146,7 +146,7 @@ dependencies = [
 [[package]]
 name = "embassy-net-driver-channel"
 version = "0.4.0"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#b12a6d9efcd2711037abca1b63a661a9ef726444"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#edb49c04f994974a7c52d9153356eef6cc9bbaf6"
 dependencies = [
  "embassy-futures",
  "embassy-sync",
@@ -156,7 +156,7 @@ dependencies = [
 [[package]]
 name = "embassy-sync"
 version = "0.8.0"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#b12a6d9efcd2711037abca1b63a661a9ef726444"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#edb49c04f994974a7c52d9153356eef6cc9bbaf6"
 dependencies = [
  "cfg-if",
  "critical-section",
@@ -169,7 +169,7 @@ dependencies = [
 [[package]]
 name = "embassy-time"
 version = "0.5.1"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#b12a6d9efcd2711037abca1b63a661a9ef726444"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#edb49c04f994974a7c52d9153356eef6cc9bbaf6"
 dependencies = [
  "cfg-if",
  "critical-section",
@@ -185,7 +185,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-driver"
 version = "0.2.2"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#b12a6d9efcd2711037abca1b63a661a9ef726444"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#edb49c04f994974a7c52d9153356eef6cc9bbaf6"
 dependencies = [
  "document-features",
 ]
@@ -193,7 +193,7 @@ dependencies = [
 [[package]]
 name = "embassy-time-queue-utils"
 version = "0.3.2"
-source = "git+https://github.com/embassy-rs/embassy?branch=main#b12a6d9efcd2711037abca1b63a661a9ef726444"
+source = "git+https://github.com/embassy-rs/embassy?branch=main#edb49c04f994974a7c52d9153356eef6cc9bbaf6"
 dependencies = [
  "embassy-executor-timer-queue",
  "heapless",
@@ -430,8 +430,7 @@ checksum = "6a02e4885ed3bc0f2de90ea6dd45ebcbb66dacffe03547fadbb0eeae2770887d"
 [[package]]
 name = "xarxa-driver"
 version = "0.1.0"
-source = "git+https://github.com/embassy-rs/xarxa?rev=af7342391a78692312cff94a826e9ea52dfea72f#af7342391a78692312cff94a826e9ea52dfea72f"
+source = "git+https://github.com/embassy-rs/xarxa?rev=93228f1ec64720122016be52be4671e413fa92a9#93228f1ec64720122016be52be4671e413fa92a9"
 dependencies = [
- "critical-section",
  "document-features",
 ]
