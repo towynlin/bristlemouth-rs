@@ -45,15 +45,19 @@ use embassy_net_adin1110::{
     Device, PACKET_ID_ALL_PORTS, PACKET_ID_PORT_MASK, PACKET_ID_PORT1, PACKET_ID_PORT2, PortLinks,
     TxPort, new_tc6,
 };
-use embassy_net_driver_channel::driver::{Driver, PacketBuf};
+use embassy_net_driver_channel::driver::Driver;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::digital::Wait;
 use embedded_hal_async::spi::SpiDevice;
+use xarxa::Pool;
 
 /// Re-exported from the driver: a caller needs `State` to declare the storage
 /// [`new`] borrows, and `Runner` and `Tc6` to name the type of the task it has
 /// to spawn.
 pub use embassy_net_adin1110::{MTU, Runner, State, Tc6};
+/// Re-exported so a board can declare the pool [`new`] takes without a
+/// dependency of its own on `xarxa`.
+pub use xarxa::StaticPool;
 
 /// Why a transfer failed.
 ///
@@ -74,8 +78,8 @@ pub enum PhyError {
         /// What a buffer holds.
         capacity: usize,
     },
-    /// The packet pool is empty. Size it with `XARXA_PACKET_BUF_COUNT` or the
-    /// `packet-buf-count-*` features of `xarxa-driver`.
+    /// The packet pool is empty. Size the `COUNT` of the `xarxa::StaticPool`
+    /// passed to [`new`].
     OutOfBuffers,
 }
 
@@ -83,6 +87,7 @@ pub enum PhyError {
 pub struct Adin2111Phy<'d> {
     device: Device<'d>,
     links: PortLinks<'d>,
+    pool: &'static dyn Pool,
 }
 
 /// Bring the device up, returning it as a [`Phy`] and the runner that drives it.
@@ -90,11 +95,17 @@ pub struct Adin2111Phy<'d> {
 /// **The runner must be spawned.** It owns the SPI bus and the interrupt line;
 /// until it runs, no frame is transmitted or received.
 ///
+/// `pool` supplies the buffers frames are sent from and received into; it
+/// is the packet pool the driver expects the network stack to own, and here
+/// this crate is that stack. A `xarxa::StaticPool` in a `static` is the usual
+/// choice.
+///
 /// `append_fcs_on_tx` has the host compute the Ethernet FCS rather than the
 /// MAC; pass `false` unless the board needs otherwise.
 pub async fn new<'d, const N_RX: usize, const N_TX: usize, SPI, INT, RST>(
     mac_addr: [u8; 6],
     state: &'d mut State<N_RX, N_TX>,
+    pool: &'static dyn Pool,
     spi: SPI,
     int: INT,
     reset: RST,
@@ -119,7 +130,14 @@ where
     )
     .await;
     let links = runner.port_links();
-    (Adin2111Phy { device, links }, runner)
+    (
+        Adin2111Phy {
+            device,
+            links,
+            pool,
+        },
+        runner,
+    )
 }
 
 /// The same, with the MAC a deployed node derives from its node id,
@@ -130,6 +148,7 @@ where
 pub async fn for_node<'d, const N_RX: usize, const N_TX: usize, SPI, INT, RST>(
     node_id: u64,
     state: &'d mut State<N_RX, N_TX>,
+    pool: &'static dyn Pool,
     spi: SPI,
     int: INT,
     reset: RST,
@@ -143,6 +162,7 @@ where
     new(
         bm_wire::addr::mac_address(node_id),
         state,
+        pool,
         spi,
         int,
         reset,
@@ -180,6 +200,17 @@ pub fn ingress_port(id: u32, port_count: u8) -> u8 {
     }
 }
 
+impl Adin2111Phy<'_> {
+    /// Hand the driver empty buffers until it has all it asks for. It cannot
+    /// receive a frame it has no buffer for.
+    fn refill_rx(&mut self) {
+        while self.device.rx_wanted() > 0 {
+            let Some(buf) = self.pool.alloc() else { break };
+            self.device.rx_give(buf);
+        }
+    }
+}
+
 impl Phy for Adin2111Phy<'_> {
     type Error = PhyError;
 
@@ -203,7 +234,7 @@ impl Phy for Adin2111Phy<'_> {
             Egress::AllPorts => PhyError::NoSuchPort(0),
         })?;
 
-        let mut buf = PacketBuf::try_new().ok_or(PhyError::OutOfBuffers)?;
+        let mut buf = self.pool.alloc().ok_or(PhyError::OutOfBuffers)?;
         if frame.len() > buf.capacity() {
             return Err(PhyError::FrameTooLarge {
                 len: frame.len(),
@@ -239,6 +270,7 @@ impl Phy for Adin2111Phy<'_> {
     }
 
     async fn receive(&mut self, out: &mut [u8]) -> Result<(u8, usize), Self::Error> {
+        self.refill_rx();
         let packet = poll_fn(|cx| {
             if let Some(packet) = self.device.receive() {
                 return Poll::Ready(packet);

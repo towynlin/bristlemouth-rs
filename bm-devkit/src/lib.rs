@@ -22,7 +22,7 @@ pub mod version;
 pub mod w25;
 pub mod watchdog;
 
-use bm_phy_adin2111::{Adin2111Phy, Runner, State, Tc6};
+use bm_phy_adin2111::{Adin2111Phy, Runner, State, StaticPool, Tc6};
 use bm_stack::{Config, Identity, Node, NodeResources, Parts};
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::configuration::Layout;
@@ -174,6 +174,8 @@ pub fn config() -> embassy_stm32::Config {
 /// answers or never completes reset.
 pub async fn start(spawner: Spawner) -> Board {
     static STATE: StaticCell<State<8, 8>> = StaticCell::new();
+    // Frames in flight: up to 8 queued each way, plus one being sent.
+    static POOL: StaticPool<1514, 20> = StaticPool::new();
 
     watchdog::feed();
     let p = embassy_stm32::init(config());
@@ -205,8 +207,16 @@ pub async fn start(spawner: Spawner) -> Board {
     );
     let spi = ExclusiveDevice::new(spi, cs, Delay);
 
-    let (phy, adin_runner) =
-        bm_phy_adin2111::for_node(node_id, STATE.init(State::new()), spi, int, reset, false).await;
+    let (phy, adin_runner) = bm_phy_adin2111::for_node(
+        node_id,
+        STATE.init(State::new()),
+        &POOL,
+        spi,
+        int,
+        reset,
+        false,
+    )
+    .await;
 
     let flash_cs = Output::new(p.PA8, Level::High, Speed::High);
     let mut flash_config = spi::Config::default();
