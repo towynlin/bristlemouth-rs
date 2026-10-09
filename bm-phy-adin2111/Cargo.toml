@@ -47,6 +47,15 @@ features = ["tc6", "packetmeta-id"]
 git = "https://github.com/embassy-rs/embassy"
 branch = "main"
 
+# The packet pool trait and `StaticPool`. `rev` must equal the one embassy main
+# pins in embassy-net-driver-channel, or two `PacketBuf` types coexist; bump it
+# with `cargo update -p embassy-net-adin1110`.
+[dependencies.xarxa]
+git = "https://github.com/embassy-rs/xarxa"
+rev = "93228f1ec64720122016be52be4671e413fa92a9"
+default-features = false
+features = ["medium-ethernet", "ipv6"]
+
 # bm-stack depends on released embassy-time, embassy-futures and, with its
 # `channel` feature, embassy-sync; the driver above brings the git ones. Only one crate may claim
 # `links = "embassy-time"`, so point everything at the git tree. embassy-sync
