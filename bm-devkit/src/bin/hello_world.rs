@@ -248,15 +248,7 @@ async fn main(spawner: Spawner) {
             warn!("subscribe {=[u8]:a}: {}", topic, error);
         }
     }
-    for (name, result) in [
-        ("echo", node.register_echo_service()),
-        ("sys_info", node.register_sys_info_service()),
-        ("config_map", node.register_config_map_service()),
-    ] {
-        if let Err(error) = result {
-            warn!("register {=str}: {}", name, error);
-        }
-    }
+    bm_devkit::register_services(node);
     for (name, _) in node.service_table().iter() {
         info!("service {=[u8]:a}", name);
     }
