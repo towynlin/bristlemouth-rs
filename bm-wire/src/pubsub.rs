@@ -159,15 +159,18 @@ pub enum Subscriber {
 /// Divergence #79 is what fills a list past two.
 pub const CALLBACKS: usize = 4;
 
+/// One slot of a [`SubscriptionsInner`]. Opaque: read topics through
+/// [`SubscriptionsInner::iter`] and [`SubscriptionsInner::callbacks`].
 #[derive(Debug, Clone, Copy)]
-struct Entry<const TOPIC: usize> {
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct SubscriptionSlot<const TOPIC: usize> {
     topic: [u8; TOPIC],
     len: usize,
     callbacks: [Subscriber; CALLBACKS],
     callbacks_len: usize,
 }
 
-impl<const TOPIC: usize> Entry<TOPIC> {
+impl<const TOPIC: usize> SubscriptionSlot<TOPIC> {
     const EMPTY: Self = Self {
         topic: [0; TOPIC],
         len: 0,
@@ -203,11 +206,36 @@ impl<const TOPIC: usize> Entry<TOPIC> {
 ///
 /// `N` is how many topics are held and `TOPIC` the longest; bm_core has
 /// neither ceiling, nor [`CALLBACKS`].
+///
+/// [`Subscriptions<N, TOPIC>`] owns an array of `N`; [`SubscriptionsView`] is
+/// the same list with `N` erased, which it derefs to. The methods are on the
+/// view.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Subscriptions<const N: usize, const TOPIC: usize> {
-    entries: [Entry<TOPIC>; N],
+pub struct SubscriptionsInner<const TOPIC: usize, S: ?Sized> {
     len: usize,
+    entries: S,
+}
+
+/// A [`SubscriptionsInner`] holding up to `N` topics.
+pub type Subscriptions<const N: usize, const TOPIC: usize> =
+    SubscriptionsInner<TOPIC, [SubscriptionSlot<TOPIC>; N]>;
+
+/// A [`SubscriptionsInner`] of any capacity.
+pub type SubscriptionsView<const TOPIC: usize> =
+    SubscriptionsInner<TOPIC, [SubscriptionSlot<TOPIC>]>;
+
+impl<const N: usize, const TOPIC: usize> core::ops::Deref for Subscriptions<N, TOPIC> {
+    type Target = SubscriptionsView<TOPIC>;
+    fn deref(&self) -> &SubscriptionsView<TOPIC> {
+        self
+    }
+}
+
+impl<const N: usize, const TOPIC: usize> core::ops::DerefMut for Subscriptions<N, TOPIC> {
+    fn deref_mut(&mut self) -> &mut SubscriptionsView<TOPIC> {
+        self
+    }
 }
 
 impl<const N: usize, const TOPIC: usize> Default for Subscriptions<N, TOPIC> {
@@ -221,11 +249,13 @@ impl<const N: usize, const TOPIC: usize> Subscriptions<N, TOPIC> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            entries: [Entry::EMPTY; N],
+            entries: [SubscriptionSlot::EMPTY; N],
             len: 0,
         }
     }
+}
 
+impl<const TOPIC: usize> SubscriptionsView<TOPIC> {
     /// How many topics are subscribed.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -240,7 +270,7 @@ impl<const N: usize, const TOPIC: usize> Subscriptions<N, TOPIC> {
 
     /// The subscribed topics, in list order.
     pub fn iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
-        self.entries[..self.len].iter().map(Entry::topic)
+        self.entries[..self.len].iter().map(SubscriptionSlot::topic)
     }
 
     /// Whether `topic` itself is subscribed: `get_sub(topic, len, false)`.
@@ -296,7 +326,7 @@ impl<const N: usize, const TOPIC: usize> Subscriptions<N, TOPIC> {
             entry.callbacks_len += 1;
             return Ok(());
         }
-        if self.len == N || topic.len() > TOPIC {
+        if self.len == self.entries.len() || topic.len() > TOPIC {
             return Err(SubscriptionError::Full);
         }
         let entry = &mut self.entries[self.len];

@@ -28,8 +28,8 @@ use crate::node::{Event, Node, Outbound, PING_PAYLOAD_BYTES};
 use crate::port::{DfuSlot, Identity, NoInitRam, Rtc};
 use crate::service::{SERVICE_NAME_BYTES, ServiceRequestError, Services};
 
-/// Longest topic a [`Command`] or [`Notification`] carries: the default
-/// `RESOURCE_NAME`, which bounds a [`Node`] subscription's topic.
+/// Longest topic a [`Command`] or [`Notification`] carries:
+/// [`RESOURCE_NAME_BYTES`], which bounds a [`Node`] subscription's topic.
 pub const TOPIC_BYTES: usize = RESOURCE_NAME_BYTES;
 
 /// Most data a [`Command::Publish`] or [`Notification::Publication`] carries.
@@ -573,41 +573,15 @@ fn built_in(target_node_id: u64, suffix: &[u8]) -> Vec<u8, SERVICE_NAME_BYTES> {
 }
 
 impl<
+    'r,
     M: RawMutex,
     const DEPTH: usize,
     I: Identity,
     R: Rtc,
-    const NEIGHBORS: usize,
-    const PENDING: usize,
-    const PING_PAYLOAD: usize,
-    const INFO_REQUESTS: usize,
-    const INFO_STRINGS: usize,
-    const RESOURCES: usize,
-    const RESOURCE_NAME: usize,
-    const RESOURCE_REQUESTS: usize,
-    const SUBSCRIPTIONS: usize,
     C: Configuration,
     D: DfuSlot + NoInitRam,
     S: Services,
->
-    App<
-        Node<
-            I,
-            R,
-            NEIGHBORS,
-            PENDING,
-            PING_PAYLOAD,
-            INFO_REQUESTS,
-            INFO_STRINGS,
-            RESOURCES,
-            RESOURCE_NAME,
-            RESOURCE_REQUESTS,
-            SUBSCRIPTIONS,
-            C,
-            D,
-            S,
-        >,
-    > for ChannelApp<'_, M, DEPTH>
+> App<Node<'r, I, R, C, D, S>> for ChannelApp<'_, M, DEPTH>
 {
     async fn ready(&mut self) {
         // Cancel-safe: `receive` takes nothing from the queue until it
@@ -619,22 +593,7 @@ impl<
 
     fn act<'n>(
         &mut self,
-        node: &'n mut Node<
-            I,
-            R,
-            NEIGHBORS,
-            PENDING,
-            PING_PAYLOAD,
-            INFO_REQUESTS,
-            INFO_STRINGS,
-            RESOURCES,
-            RESOURCE_NAME,
-            RESOURCE_REQUESTS,
-            SUBSCRIPTIONS,
-            C,
-            D,
-            S,
-        >,
+        node: &'n mut Node<'r, I, R, C, D, S>,
         now_ms: u32,
     ) -> Option<Outbound<'n>> {
         match self.next.take()? {

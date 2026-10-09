@@ -80,10 +80,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 
-use bm_stack::node::{INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES};
-use bm_stack::{Event, Node, SoftRtc};
+use bm_stack::node::{INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, SUBSCRIPTIONS_DEFAULT};
+use bm_stack::{Event, Node, NodeResources, Parts, SoftRtc};
 use bm_wire::bcmp::MessageType;
-use bm_wire::bcmp::info::CACHED_STRING_BYTES;
 use bm_wire::bcmp::resource::{
     ResourceAddError, ResourceRequestKind, ResourceTableRequest, ResourceType,
     encode_resource_table_reply,
@@ -183,12 +182,6 @@ pub const MAX_STEPS: usize = 24;
 /// bm_core `bm_malloc`s each resource and has no ceiling at all.
 pub const RESOURCES: usize = 10;
 
-/// Longest name the port's table keeps.
-///
-/// `<node id>/metrics/req` is 28 bytes, so [`RESOURCE_LEN`] is not the
-/// ceiling: this is sized for what the stack's own subscriptions bring.
-pub const RESOURCE_NAME: usize = 48;
-
 /// How many unanswered resource-table requests the port's node remembers.
 ///
 /// `RESOURCE_REQUEST_LIST` is unbounded and never expires an entry, so a
@@ -197,19 +190,19 @@ pub const RESOURCE_NAME: usize = 48;
 /// puts the port's ceiling out of reach of any seed.
 pub const REQUEST_CAPACITY: usize = MAX_STEPS + 1;
 
-/// The port's node, sized as above.
-type ResourceNode = Node<
-    OracleIdentity,
-    SoftRtc,
+/// The port's node's memory, sized as above.
+type ResourceResources = NodeResources<
+    RESOURCES,
+    SUBSCRIPTIONS_DEFAULT,
     4,
     4,
     PING_PAYLOAD_BYTES,
     INFO_REQUESTS_DEFAULT,
-    CACHED_STRING_BYTES,
-    RESOURCES,
-    RESOURCE_NAME,
     REQUEST_CAPACITY,
 >;
+
+/// The port's node.
+type ResourceNode<'r> = Node<'r, OracleIdentity, SoftRtc>;
 
 /// The record lists a `0x0B` arriving from a peer may carry, as
 /// `(publisher indices, subscriber indices)` into [`NAMES`].
@@ -761,8 +754,12 @@ fn compare_frames(what: &str, c_copies: &[Captured], ours: &[u8]) {
 ///
 /// The lists are process-global and monotone, so a node that started empty
 /// would answer a `0x0A` with a shorter table than the C after the first seed.
-fn resource_node(model: &Model) -> ResourceNode {
-    let mut node = Node::new(OracleIdentity, SoftRtc::new(), NUM_PORTS);
+fn resource_node<'r>(resources: &'r mut ResourceResources, model: &Model) -> ResourceNode<'r> {
+    let mut node = Node::new(
+        resources,
+        Parts::new(OracleIdentity, SoftRtc::new()),
+        NUM_PORTS,
+    );
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }
@@ -835,7 +832,8 @@ pub fn check(input: &ResourceInput) {
         model.subscribers
     );
 
-    let mut node = resource_node(&model);
+    let mut resources = ResourceResources::new();
+    let mut node = resource_node(&mut resources, &model);
     drain();
     take_reported();
     assert_lists("before the first step", &model, &node);
@@ -1013,7 +1011,7 @@ pub fn is_ours(frame: &[u8]) -> bool {
 /// Run the same frame through our node, returning the reply it wants sent and
 /// recording every [`Event::ResourceTable`] on the way.
 fn our_reply(
-    node: &mut ResourceNode,
+    node: &mut ResourceNode<'_>,
     now: u32,
     port: u8,
     frame: &[u8],
@@ -1034,7 +1032,7 @@ fn our_reply(
 
 /// Assert both lists are what [`Model`] says, on the port's side and through
 /// the oracle's two accessors.
-fn assert_lists(what: &str, model: &Model, node: &ResourceNode) {
+fn assert_lists(what: &str, model: &Model, node: &ResourceNode<'_>) {
     // The port has ceilings bm_core does not. Both are sized out of reach; a
     // full one would mean the comparison had stopped being meaningful.
     assert!(

@@ -287,7 +287,8 @@ fn a_response_whose_stamped_checksum_carries_twice_is_unverifiable() {
 #[test]
 fn a_node_whose_clock_is_unset_answers_no_request() {
     let frame = build_frame(&input(TimeMessage::Request, Target::ThisNode, 1));
-    let mut node = bm_wire_diff::stack::node(); // clock unset
+    let mut resources = bm_stack::NodeResources::new();
+    let mut node = bm_wire_diff::stack::node(&mut resources); // clock unset
     let mut ours = frame.clone();
     let owed = node.on_frame(0, 1, &mut ours);
     assert!(owed.reply.is_none(), "no clock, no answer");
@@ -364,7 +365,9 @@ fn the_requests_we_issue_are_byte_identical_to_the_c() {
             stack::pump_until_quiet();
             let captured = drain();
 
-            let mut node = bm_wire_diff::stack::node();
+            let mut resources = bm_stack::NodeResources::new();
+
+            let mut node = bm_wire_diff::stack::node(&mut resources);
             let ours = node
                 .request_system_time(now_ms, target)
                 .expect("a registered type is sent")

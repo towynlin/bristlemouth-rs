@@ -170,21 +170,22 @@ use bm_wire::bcmp::config::{
 };
 use bm_wire::bcmp::dfu::{DfuAddress, ImgInfo};
 use bm_wire::bcmp::info::{
-    CACHED_STRING_BYTES, CachedInfo, DeviceInfoReply, DeviceInfoRequest, InfoCache,
-    InfoRequestKind, InfoRequests,
+    CachedInfo, DeviceInfoReply, DeviceInfoRequest, InfoCache, InfoCacheView, InfoRequestKind,
+    InfoRequests, InfoRequestsView,
 };
 use bm_wire::bcmp::neighbors::{
     NEIGHBOR_TABLE_MAX_LEN, NeighborTableReply, NeighborTableRequest, PortInfo, TableReplyOutcome,
-    TableRequestKind, TableRequests, encode_neighbor_table_reply, neighbor_table_reply_len,
+    TableRequestKind, TableRequests, encode_neighbor_table_reply_from, neighbor_table_reply_len,
 };
 use bm_wire::bcmp::ping::{EchoReply, EchoRequest};
 use bm_wire::bcmp::registry::{
     Delivery, Expiry, MESSAGE_TIMER_EXPIRY_PERIOD_MS, PacketCfg, PendingRequest, Registry,
-    RegistryError,
+    RegistryError, RegistryView,
 };
 use bm_wire::bcmp::resource::{
     RESOURCE_NAME_BYTES, ResourceAddError, ResourceReplyOutcome, ResourceRequestKind,
-    ResourceRequests, ResourceTable, ResourceTableReply, ResourceTableRequest, ResourceType,
+    ResourceRequests, ResourceRequestsView, ResourceTable, ResourceTableReply,
+    ResourceTableRequest, ResourceTableView, ResourceType,
 };
 use bm_wire::bcmp::time::{SystemTimeHeader, SystemTimeRequest, SystemTimeResponse, SystemTimeSet};
 use bm_wire::bcmp::{BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, Heartbeat, MessageType, forward, rx, tx};
@@ -195,8 +196,8 @@ use bm_wire::frame::{
 };
 use bm_wire::l2::{self, TxKind};
 use bm_wire::l2_policy;
-use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, heartbeat_for};
-use bm_wire::pubsub::{self, Subscriber, SubscriptionError, Subscriptions};
+use bm_wire::neighbor::{HEARTBEAT_PERIOD_S, NeighborTable, NeighborTableView, heartbeat_for};
+use bm_wire::pubsub::{self, Subscriber, SubscriptionError, Subscriptions, SubscriptionsView};
 use bm_wire::service::config_map::{self, ConfigMapRequest};
 use bm_wire::service::metrics;
 use bm_wire::service::power_info::{self, Ended, PowerInfoReply};
@@ -862,7 +863,7 @@ impl Snapshot {
 }
 
 /// Default number of unanswered device-info requests a node remembers,
-/// [`Node`]'s `INFO_REQUESTS`.
+/// [`NodeResources`]' `INFO_REQUESTS`.
 ///
 /// bm_core's `INFO_REQUEST_LIST` is unbounded and never expires an entry
 /// (divergence #19), so there is no C number to match. This is a ceiling the
@@ -871,7 +872,7 @@ impl Snapshot {
 pub const INFO_REQUESTS_DEFAULT: usize = 8;
 
 /// Default number of resources a node's [`ResourceTable`] holds across both
-/// of its lists, [`Node`]'s `RESOURCES`.
+/// of its lists, [`NodeResources`]' `RESOURCES`.
 ///
 /// bm_core's `PUB_LIST` and `SUB_LIST` are `bm_malloc`'d and have no ceiling.
 /// A node advertising more topics than this raises the parameter;
@@ -881,22 +882,22 @@ pub const INFO_REQUESTS_DEFAULT: usize = 8;
 pub const RESOURCES_DEFAULT: usize = 9;
 
 /// Default number of unanswered resource-table requests a node remembers,
-/// [`Node`]'s `RESOURCE_REQUESTS`.
+/// [`NodeResources`]' `RESOURCE_REQUESTS`.
 ///
 /// `RESOURCE_REQUEST_LIST` is unbounded and never expires an entry, as
 /// `INFO_REQUEST_LIST` is (divergence #19), so there is no C number to match.
 pub const RESOURCE_REQUESTS_DEFAULT: usize = 4;
 
-/// Default number of topics a node can subscribe to at once, [`Node`]'s
-/// `SUBSCRIPTIONS`.
+/// Default number of topics a node can subscribe to at once,
+/// [`NodeResources`]' `SUBSCRIPTIONS`.
 ///
 /// bm_core's `CTX.subscription_list` is `bm_malloc`'d and unbounded.
 /// [`Node::subscribe`] reports [`SubscriptionError::Full`] past it. One is
 /// the metrics service's ([`Services::METRICS`]).
 pub const SUBSCRIPTIONS_DEFAULT: usize = 9;
 
-/// Default size of a node's expected-ping-payload buffer, [`Node`]'s
-/// `PING_PAYLOAD`.
+/// Default size of a node's expected-ping-payload buffer,
+/// [`NodeResources`]' `PING_PAYLOAD`.
 ///
 /// bm_core keeps this on the heap, reallocated per request, so it has no
 /// ceiling but `bcmp_tx`'s. A node that wants to ping with more than this
@@ -911,7 +912,7 @@ pub const PING_PAYLOAD_BYTES: usize = 64;
 /// `EXPECTED_PAYLOAD`. Nothing else ever clears them, so the last ping's
 /// payload keeps answering for as long as the node runs.
 #[derive(Debug)]
-struct PingState<const PAYLOAD: usize> {
+struct PingState<'r> {
     /// `BCMP_SEQ`. A `uint32_t` counter whose low sixteen bits are what
     /// reaches the wire, and a sequence space entirely separate from
     /// `packet.c`'s `message_count`.
@@ -925,21 +926,19 @@ struct PingState<const PAYLOAD: usize> {
     /// statics are only ever set and cleared together, so one field holds both.
     expected_len: Option<u16>,
     /// `EXPECTED_PAYLOAD`'s bytes, as much of them as is worth keeping.
-    expected: [u8; PAYLOAD],
+    expected: &'r mut [u8],
 }
 
-impl<const PAYLOAD: usize> Default for PingState<PAYLOAD> {
-    fn default() -> Self {
+impl<'r> PingState<'r> {
+    fn new(expected: &'r mut [u8]) -> Self {
         Self {
             seq: 0,
             sent_at_ms: 0,
             expected_len: None,
-            expected: [0u8; PAYLOAD],
+            expected,
         }
     }
-}
 
-impl<const PAYLOAD: usize> PingState<PAYLOAD> {
     /// What `bcmp_process_ping_reply` compares against, or `None` for the C's
     /// null pointer.
     fn expected_payload(&self) -> Option<&[u8]> {
@@ -968,6 +967,14 @@ struct HeldRequest {
     frame: [u8; MTU],
 }
 
+impl HeldRequest {
+    const EMPTY: Self = Self {
+        seq_num: 0,
+        len: 0,
+        frame: [0; MTU],
+    };
+}
+
 /// The frames of tracked requests, kept for re-sending.
 ///
 /// `serialize` records each sequenced request's buffer in its
@@ -983,22 +990,19 @@ struct HeldRequest {
 /// One slot per entry the registry can hold, so a tracked request always has
 /// somewhere to go.
 #[derive(Debug)]
-struct HeldRequests<const N: usize> {
-    slots: [HeldRequest; N],
+struct HeldRequests<'r> {
+    slots: &'r mut [HeldRequest],
     /// Sequence numbers owed a re-send, in the order the sweep retried them.
-    due: [u32; N],
+    /// As long as `slots`.
+    due: &'r mut [u32],
     due_len: usize,
 }
 
-impl<const N: usize> HeldRequests<N> {
-    fn new() -> Self {
+impl<'r> HeldRequests<'r> {
+    fn new(slots: &'r mut [HeldRequest], due: &'r mut [u32]) -> Self {
         Self {
-            slots: core::array::from_fn(|_| HeldRequest {
-                seq_num: 0,
-                len: 0,
-                frame: [0; MTU],
-            }),
-            due: [0; N],
+            slots,
+            due,
             due_len: 0,
         }
     }
@@ -1040,7 +1044,7 @@ impl<const N: usize> HeldRequests<N> {
     fn mark_due(&mut self, seq_num: u32) {
         if self.slot(seq_num).is_some()
             && !self.due[..self.due_len].contains(&seq_num)
-            && self.due_len < N
+            && self.due_len < self.due.len()
         {
             self.due[self.due_len] = seq_num;
             self.due_len += 1;
@@ -1069,76 +1073,265 @@ struct Stamp {
     tracked: bool,
 }
 
-/// A Bristlemouth node.
+/// The memory a [`Node`] runs in: its tables and its frame buffers.
 ///
-/// `NEIGHBORS` is the neighbour-table capacity, and must be at least the PHY's
-/// port count, since bm_core keeps one neighbour per port.
+/// The firmware owns it, usually in a `static_cell::StaticCell`, and lends it
+/// to [`Node::new`] for as long as the node runs. Every ceiling is set here,
+/// where the memory is declared, and nowhere else:
 ///
-/// `PENDING` is how many requests may await a reply at once. bm_core's list is
-/// unbounded and discards a `bm_malloc` failure, so a full list here does the
-/// same: the request goes out untracked and its reply arrives as ordinary
-/// traffic. See
+/// | Parameter | Default | What it bounds |
+/// |---|---|---|
+/// | `RESOURCES` | [`RESOURCES_DEFAULT`] | resources advertised across both of `bcmp/resource_discovery.c`'s lists |
+/// | `SUBSCRIPTIONS` | [`SUBSCRIPTIONS_DEFAULT`] | topics [`Node::subscribe`] holds at once |
+/// | `NEIGHBORS` | 4 | the neighbour table and the device-info cache |
+/// | `PENDING` | 4 | requests awaiting a reply |
+/// | `PING_PAYLOAD` | [`PING_PAYLOAD_BYTES`] | the longest payload [`Node::ping`] sends |
+/// | `INFO_REQUESTS` | [`INFO_REQUESTS_DEFAULT`] | unanswered device-info requests |
+/// | `RESOURCE_REQUESTS` | [`RESOURCE_REQUESTS_DEFAULT`] | unanswered resource-table requests |
+///
+/// The parameters are ordered by how often a node changes them, so a board
+/// that changes only `RESOURCES` writes `NodeResources<16>`.
+///
+/// `NEIGHBORS` must be at least the PHY's port count, since bm_core keeps one
+/// neighbour per port.
+///
+/// `PENDING`: bm_core's list is unbounded and discards a `bm_malloc` failure,
+/// so a full list here does the same: the request goes out untracked and its
+/// reply arrives as ordinary traffic. See
 /// [`Outgoing::tracked`][bm_wire::bcmp::registry::Outgoing::tracked]. Each
 /// outstanding request's frame is kept for re-sending, so this costs
 /// `PENDING` times [`MTU`] bytes.
 ///
 /// `PING_PAYLOAD` is the longest ping payload the node can remember well
-/// enough to check a reply against, and so the longest [`Node::ping`] will
-/// send. bm_core has no equivalent limit, only an unchecked `bm_malloc` whose
-/// failure it dereferences. This is the one place ping's behaviour here is a
-/// choice rather than a port.
+/// enough to check a reply against. bm_core has no equivalent limit, only an
+/// unchecked `bm_malloc` whose failure it dereferences. This is the one place
+/// ping's behaviour here is a choice rather than a port.
 ///
-/// `INFO_REQUESTS` is how many unanswered device-info requests are remembered,
-/// and `INFO_STRINGS` how many bytes of each cached string are kept. Both are
-/// ceilings bm_core does not have; the defaults keep every string whole, so
-/// only the first is reachable in ordinary operation.
-///
-/// `RESOURCES` is how many resources the node advertises across both of
-/// `bcmp/resource_discovery.c`'s lists, `RESOURCE_NAME` the longest name one
-/// may have, and `RESOURCE_REQUESTS` how many unanswered resource-table
-/// requests are remembered. All three are ceilings bm_core does not have.
-///
-/// `SUBSCRIPTIONS` is how many topics [`Node::subscribe`] holds at once. A
-/// topic is at most `RESOURCE_NAME` bytes, since each is also advertised as a
-/// resource.
-pub struct Node<
-    I,
-    R = NoRtc,
+/// The others are ceilings bm_core does not have. Device-info strings are kept
+/// to [`CACHED_STRING_BYTES`](bm_wire::bcmp::info::CACHED_STRING_BYTES), which keeps every string whole, and resource
+/// names and topics to [`RESOURCE_NAME_BYTES`].
+pub struct NodeResources<
+    const RESOURCES: usize = RESOURCES_DEFAULT,
+    const SUBSCRIPTIONS: usize = SUBSCRIPTIONS_DEFAULT,
     const NEIGHBORS: usize = 4,
     const PENDING: usize = 4,
     const PING_PAYLOAD: usize = PING_PAYLOAD_BYTES,
     const INFO_REQUESTS: usize = INFO_REQUESTS_DEFAULT,
-    const INFO_STRINGS: usize = CACHED_STRING_BYTES,
-    const RESOURCES: usize = RESOURCES_DEFAULT,
-    const RESOURCE_NAME: usize = RESOURCE_NAME_BYTES,
     const RESOURCE_REQUESTS: usize = RESOURCE_REQUESTS_DEFAULT,
-    const SUBSCRIPTIONS: usize = SUBSCRIPTIONS_DEFAULT,
-    C = NoConfig,
-    D = NoDfu,
-    S = NoServices,
 > {
-    identity: I,
-    rtc: R,
     neighbors: NeighborTable<NEIGHBORS>,
     registry: Registry<MESSAGE_TYPES, PENDING>,
+    held: [HeldRequest; PENDING],
+    due: [u32; PENDING],
+    ping: [u8; PING_PAYLOAD],
+    info_requests: InfoRequests<INFO_REQUESTS>,
+    info: InfoCache<NEIGHBORS>,
+    resources: ResourceTable<RESOURCES>,
+    resource_requests: ResourceRequests<RESOURCE_REQUESTS>,
+    subscriptions: Subscriptions<SUBSCRIPTIONS, RESOURCE_NAME_BYTES>,
+    tx: [u8; MTU],
+}
+
+impl<
+    const RESOURCES: usize,
+    const SUBSCRIPTIONS: usize,
+    const NEIGHBORS: usize,
+    const PENDING: usize,
+    const PING_PAYLOAD: usize,
+    const INFO_REQUESTS: usize,
+    const RESOURCE_REQUESTS: usize,
+>
+    NodeResources<
+        RESOURCES,
+        SUBSCRIPTIONS,
+        NEIGHBORS,
+        PENDING,
+        PING_PAYLOAD,
+        INFO_REQUESTS,
+        RESOURCE_REQUESTS,
+    >
+{
+    /// Empty tables and zeroed buffers.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            neighbors: NeighborTable::new(),
+            registry: Registry::new(),
+            held: [HeldRequest::EMPTY; PENDING],
+            due: [0; PENDING],
+            ping: [0; PING_PAYLOAD],
+            info_requests: InfoRequests::new(),
+            info: InfoCache::new(),
+            resources: ResourceTable::new(),
+            resource_requests: ResourceRequests::new(),
+            subscriptions: Subscriptions::new(),
+            tx: [0; MTU],
+        }
+    }
+
+    /// Return every table to [`Self::new`]'s state, in place.
+    fn clear(&mut self) {
+        self.neighbors = NeighborTable::new();
+        self.registry = Registry::new();
+        for held in &mut self.held {
+            held.len = 0;
+        }
+        self.due = [0; PENDING];
+        self.ping = [0; PING_PAYLOAD];
+        self.info_requests = InfoRequests::new();
+        self.info = InfoCache::new();
+        self.resources = ResourceTable::new();
+        self.resource_requests = ResourceRequests::new();
+        self.subscriptions = Subscriptions::new();
+        self.tx = [0; MTU];
+    }
+}
+
+impl<
+    const RESOURCES: usize,
+    const SUBSCRIPTIONS: usize,
+    const NEIGHBORS: usize,
+    const PENDING: usize,
+    const PING_PAYLOAD: usize,
+    const INFO_REQUESTS: usize,
+    const RESOURCE_REQUESTS: usize,
+> Default
+    for NodeResources<
+        RESOURCES,
+        SUBSCRIPTIONS,
+        NEIGHBORS,
+        PENDING,
+        PING_PAYLOAD,
+        INFO_REQUESTS,
+        RESOURCE_REQUESTS,
+    >
+{
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What a [`Node`] is built from besides its memory: its identity, its clock,
+/// and, optionally, a config store, a DFU slot and application services.
+///
+/// [`Parts::new`] starts with [`NoConfig`], [`NoDfu`] and [`NoServices`]; the
+/// `with_` methods replace one each.
+#[derive(Debug)]
+pub struct Parts<I, R = NoRtc, C = NoConfig, D = NoDfu, S = NoServices> {
+    /// Who the node is.
+    pub identity: I,
+    /// Its real-time clock.
+    pub rtc: R,
+    /// `CONFIGS` and its flash, which `0xA0`–`0xA9` read and write. With
+    /// [`NoConfig`], config messages for other nodes are still forwarded, and
+    /// none addressed to this one is answered.
+    pub config: C,
+    /// The update slot and no-init RAM. With [`NoDfu`], DFU messages for other
+    /// nodes are forwarded, and an update request is refused with
+    /// `BmDfuErrFlashAccess`.
+    pub dfu: D,
+    /// The application's service handlers. With [`NoServices`], a service
+    /// [`Node::register_service`] lists goes unanswered.
+    pub services: S,
+}
+
+impl<I, R> Parts<I, R> {
+    /// `identity` and `rtc`, with no config store, no DFU slot and no
+    /// services.
+    pub fn new(identity: I, rtc: R) -> Self {
+        Self {
+            identity,
+            rtc,
+            config: NoConfig,
+            dfu: NoDfu,
+            services: NoServices,
+        }
+    }
+}
+
+impl<I, R, C, D, S> Parts<I, R, C, D, S> {
+    /// The same parts, answering config messages from `config`.
+    pub fn with_config<C2>(self, config: C2) -> Parts<I, R, C2, D, S> {
+        let Self {
+            identity,
+            rtc,
+            dfu,
+            services,
+            ..
+        } = self;
+        Parts {
+            identity,
+            rtc,
+            config,
+            dfu,
+            services,
+        }
+    }
+
+    /// The same parts, taking DFU updates into `dfu`.
+    pub fn with_dfu<D2>(self, dfu: D2) -> Parts<I, R, C, D2, S> {
+        let Self {
+            identity,
+            rtc,
+            config,
+            services,
+            ..
+        } = self;
+        Parts {
+            identity,
+            rtc,
+            config,
+            dfu,
+            services,
+        }
+    }
+
+    /// The same parts, answering application services from `services`.
+    pub fn with_services<S2>(self, services: S2) -> Parts<I, R, C, D, S2> {
+        let Self {
+            identity,
+            rtc,
+            config,
+            dfu,
+            ..
+        } = self;
+        Parts {
+            identity,
+            rtc,
+            config,
+            dfu,
+            services,
+        }
+    }
+}
+
+/// A Bristlemouth node.
+///
+/// Built by [`Node::new`] from a [`NodeResources`], which sets every ceiling,
+/// and a [`Parts`].
+pub struct Node<'r, I, R = NoRtc, C = NoConfig, D = NoDfu, S = NoServices> {
+    identity: I,
+    rtc: R,
+    neighbors: &'r mut NeighborTableView,
+    registry: &'r mut RegistryView<MESSAGE_TYPES>,
     /// The frames the registry's outstanding requests were sent in.
-    held: HeldRequests<PENDING>,
-    ping: PingState<PING_PAYLOAD>,
+    held: HeldRequests<'r>,
+    ping: PingState<'r>,
     /// `INFO_REQUEST_LIST`, and the device information the replies to it
     /// carried. bm_core hangs the second off its neighbour table entries and
     /// frees it with them, which is what [`NeighborTable`] evictions do here.
-    info_requests: InfoRequests<INFO_REQUESTS>,
-    info: InfoCache<NEIGHBORS, INFO_STRINGS>,
+    info_requests: &'r mut InfoRequestsView,
+    info: &'r mut InfoCacheView,
     /// `bcmp/neighbors.c`'s `TARGET_NODE_ID`, `NEIGHBOR_REQUEST_CB` and
     /// `NEIGHBOR_TIMER` — one outstanding neighbour-table request, however
     /// many have been sent.
     table_requests: TableRequests,
     /// `PUB_LIST` and `SUB_LIST`, which a `0x0A` is answered with, and
     /// `RESOURCE_REQUEST_LIST`, which correlates the `0x0B`s that come back.
-    resources: ResourceTable<RESOURCES, RESOURCE_NAME>,
-    resource_requests: ResourceRequests<RESOURCE_REQUESTS>,
+    resources: &'r mut ResourceTableView,
+    resource_requests: &'r mut ResourceRequestsView,
     /// `middleware/pubsub.c`'s `CTX.subscription_list`.
-    subscriptions: Subscriptions<SUBSCRIPTIONS, RESOURCE_NAME>,
+    subscriptions: &'r mut SubscriptionsView<RESOURCE_NAME_BYTES>,
     /// `CONFIGS` and its flash, which `0xA0`–`0xA9` read and write.
     config: C,
     /// `dfu_core.c` and `dfu_client.c`, their update slot and no-init RAM.
@@ -1159,165 +1352,17 @@ pub struct Node<
     link_mask: u16,
     /// Ports [`Node::bind_udp`] bound, `CTX.udp_list`.
     udp_ports: [Option<u16>; UDP_PORTS],
-    tx: [u8; MTU],
+    tx: &'r mut [u8; MTU],
 }
 
-impl<
-    I: Identity,
-    R: Rtc,
-    const NEIGHBORS: usize,
-    const PENDING: usize,
-    const PING_PAYLOAD: usize,
-    const INFO_REQUESTS: usize,
-    const INFO_STRINGS: usize,
-    const RESOURCES: usize,
-    const RESOURCE_NAME: usize,
-    const RESOURCE_REQUESTS: usize,
-    const SUBSCRIPTIONS: usize,
->
-    Node<
-        I,
-        R,
-        NEIGHBORS,
-        PENDING,
-        PING_PAYLOAD,
-        INFO_REQUESTS,
-        INFO_STRINGS,
-        RESOURCES,
-        RESOURCE_NAME,
-        RESOURCE_REQUESTS,
-        SUBSCRIPTIONS,
-        NoConfig,
-        NoDfu,
-    >
+impl<'r, I: Identity, R: Rtc, C: Configuration, D: DfuSlot + NoInitRam, S: Services>
+    Node<'r, I, R, C, D, S>
 {
-    /// A node with no config store, an empty neighbour table, at time zero.
+    /// A node built from `parts` in `resources`, with an empty neighbour
+    /// table, at time zero.
     ///
-    /// [`Node::with_config`] with [`NoConfig`]: config messages for other
-    /// nodes are still forwarded, and none addressed to this one is answered.
-    pub fn new(identity: I, rtc: R, port_count: u8) -> Self {
-        Self::with_config(identity, rtc, NoConfig, port_count)
-    }
-}
-
-impl<
-    I: Identity,
-    R: Rtc,
-    const NEIGHBORS: usize,
-    const PENDING: usize,
-    const PING_PAYLOAD: usize,
-    const INFO_REQUESTS: usize,
-    const INFO_STRINGS: usize,
-    const RESOURCES: usize,
-    const RESOURCE_NAME: usize,
-    const RESOURCE_REQUESTS: usize,
-    const SUBSCRIPTIONS: usize,
-    C: Configuration,
->
-    Node<
-        I,
-        R,
-        NEIGHBORS,
-        PENDING,
-        PING_PAYLOAD,
-        INFO_REQUESTS,
-        INFO_STRINGS,
-        RESOURCES,
-        RESOURCE_NAME,
-        RESOURCE_REQUESTS,
-        SUBSCRIPTIONS,
-        C,
-        NoDfu,
-    >
-{
-    /// A node answering config messages from `config`, with an empty
-    /// neighbour table, at time zero.
-    ///
-    /// [`Node::with_dfu`] with [`NoDfu`]: DFU messages for other nodes are
-    /// forwarded, and an update request is refused with
-    /// `BmDfuErrFlashAccess`.
-    pub fn with_config(identity: I, rtc: R, config: C, port_count: u8) -> Self {
-        Self::with_dfu(identity, rtc, config, NoDfu, port_count)
-    }
-}
-
-impl<
-    I: Identity,
-    R: Rtc,
-    const NEIGHBORS: usize,
-    const PENDING: usize,
-    const PING_PAYLOAD: usize,
-    const INFO_REQUESTS: usize,
-    const INFO_STRINGS: usize,
-    const RESOURCES: usize,
-    const RESOURCE_NAME: usize,
-    const RESOURCE_REQUESTS: usize,
-    const SUBSCRIPTIONS: usize,
-    C: Configuration,
-    D: DfuSlot + NoInitRam,
->
-    Node<
-        I,
-        R,
-        NEIGHBORS,
-        PENDING,
-        PING_PAYLOAD,
-        INFO_REQUESTS,
-        INFO_STRINGS,
-        RESOURCES,
-        RESOURCE_NAME,
-        RESOURCE_REQUESTS,
-        SUBSCRIPTIONS,
-        C,
-        D,
-    >
-{
-    /// A node answering config messages from `config` and DFU requests
-    /// into `dfu`, with an empty neighbour table, at time zero.
-    ///
-    /// [`Node::with_services`] with [`NoServices`]: a service
-    /// [`Node::register_service`] lists goes unanswered.
-    pub fn with_dfu(identity: I, rtc: R, config: C, dfu: D, port_count: u8) -> Self {
-        Self::with_services(identity, rtc, config, dfu, NoServices, port_count)
-    }
-}
-
-impl<
-    I: Identity,
-    R: Rtc,
-    const NEIGHBORS: usize,
-    const PENDING: usize,
-    const PING_PAYLOAD: usize,
-    const INFO_REQUESTS: usize,
-    const INFO_STRINGS: usize,
-    const RESOURCES: usize,
-    const RESOURCE_NAME: usize,
-    const RESOURCE_REQUESTS: usize,
-    const SUBSCRIPTIONS: usize,
-    C: Configuration,
-    D: DfuSlot + NoInitRam,
-    S: Services,
->
-    Node<
-        I,
-        R,
-        NEIGHBORS,
-        PENDING,
-        PING_PAYLOAD,
-        INFO_REQUESTS,
-        INFO_STRINGS,
-        RESOURCES,
-        RESOURCE_NAME,
-        RESOURCE_REQUESTS,
-        SUBSCRIPTIONS,
-        C,
-        D,
-        S,
-    >
-{
-    /// A node answering config messages from `config`, DFU requests into
-    /// `dfu` and application services from `services`, with an empty
-    /// neighbour table, at time zero.
+    /// `resources` is cleared first, so the node starts the same whatever it
+    /// last held.
     ///
     /// The registry comes up holding what `bcmp_init` registers for the ported
     /// modules, with the expiry sweep phased from zero — where
@@ -1332,19 +1377,28 @@ impl<
     /// anything (contract 4 of `docs/history/services-todo.md`). A request is
     /// answered with [`Services::metrics`]; see
     /// [`bm_wire::service::metrics::handle`]. Otherwise no service is listed.
-    pub fn with_services(
-        identity: I,
-        rtc: R,
-        config: C,
-        dfu: D,
-        services: S,
+    pub fn new<
+        const RESOURCES: usize,
+        const SUBSCRIPTIONS: usize,
+        const NEIGHBORS: usize,
+        const PENDING: usize,
+        const PING_PAYLOAD: usize,
+        const INFO_REQUESTS: usize,
+        const RESOURCE_REQUESTS: usize,
+    >(
+        resources: &'r mut NodeResources<
+            RESOURCES,
+            SUBSCRIPTIONS,
+            NEIGHBORS,
+            PENDING,
+            PING_PAYLOAD,
+            INFO_REQUESTS,
+            RESOURCE_REQUESTS,
+        >,
+        parts: Parts<I, R, C, D, S>,
         port_count: u8,
     ) -> Self {
-        let mut registry = Registry::new();
-        // heartbeat.c, ping.c, time.c, dfu_core.c, config.c, neighbors.c,
-        // info.c and resource_discovery.c, in the order `bcmp_init` calls
-        // their inits. Only config.c's are sequenced: everything else rides on
-        // the wire with a sequence number of zero.
+        resources.clear();
         for (message_type, cfg) in [
             (MessageType::HEARTBEAT, PacketCfg::UNSEQUENCED),
             (MessageType::ECHO_REQUEST, PacketCfg::UNSEQUENCED),
@@ -1384,22 +1438,42 @@ impl<
             (MessageType::RESOURCE_TABLE_REPLY, PacketCfg::UNSEQUENCED),
         ] {
             // Cannot fail: MESSAGE_TYPES is larger than this list.
-            let _ = registry.add(message_type, cfg);
+            let _ = resources.registry.add(message_type, cfg);
         }
+        let Parts {
+            identity,
+            rtc,
+            config,
+            dfu,
+            services,
+        } = parts;
+        let NodeResources {
+            neighbors,
+            registry,
+            held,
+            due,
+            ping,
+            info_requests,
+            info,
+            resources,
+            resource_requests,
+            subscriptions,
+            tx,
+        } = resources;
         let dfu = NodeDfu::new(identity.node_id(), dfu);
         let mut node = Self {
             identity,
             rtc,
-            neighbors: NeighborTable::new(),
+            neighbors,
             registry,
-            held: HeldRequests::new(),
-            ping: PingState::default(),
-            info_requests: InfoRequests::new(),
-            info: InfoCache::new(),
+            held: HeldRequests::new(held, due),
+            ping: PingState::new(ping),
+            info_requests,
+            info,
             table_requests: TableRequests::new(),
-            resources: ResourceTable::new(),
-            resource_requests: ResourceRequests::new(),
-            subscriptions: Subscriptions::new(),
+            resources,
+            resource_requests,
+            subscriptions,
             config,
             dfu,
             service_table: ServiceTable::new(),
@@ -1409,7 +1483,7 @@ impl<
             port_count,
             link_mask: 0,
             udp_ports: [None; UDP_PORTS],
-            tx: [0u8; MTU],
+            tx,
         };
         if S::METRICS {
             // Fails only for ceilings of zero, as `metrics_service_init`'s
@@ -1447,8 +1521,8 @@ impl<
 
     /// The packet registry: what is registered, and what is still waiting for
     /// a reply.
-    pub fn registry(&self) -> &Registry<MESSAGE_TYPES, PENDING> {
-        &self.registry
+    pub fn registry(&self) -> &RegistryView<MESSAGE_TYPES> {
+        self.registry
     }
 
     /// Record that `port` came up or went down. Ports are 1-based.
@@ -1499,8 +1573,8 @@ impl<
     }
 
     /// The neighbours seen so far.
-    pub fn neighbors(&self) -> &NeighborTable<NEIGHBORS> {
-        &self.neighbors
+    pub fn neighbors(&self) -> &NeighborTableView {
+        self.neighbors
     }
 
     /// This node's link-local address, the source of every BCMP frame it
@@ -2367,7 +2441,7 @@ impl<
             ..
         } = self;
         build_outbound(
-            tx,
+            &mut tx[..],
             held,
             identity.node_id(),
             dst,
@@ -2432,7 +2506,7 @@ impl<
     /// takes the address as an argument, so this does too.
     ///
     /// Returns `None` without sending, and **without disturbing the ping
-    /// state**, when `payload` is longer than `PING_PAYLOAD` or than the `u16`
+    /// state**, when `payload` is longer than [`NodeResources`]' `PING_PAYLOAD` or than the `u16`
     /// length field: there would be nowhere to remember it. That is the one
     /// thing here with no C counterpart — bm_core `bm_malloc`s the copy and
     /// dereferences the result unchecked.
@@ -2448,7 +2522,8 @@ impl<
         target_node_id: u64,
         payload: &[u8],
     ) -> Option<Outbound<'_>> {
-        if payload.len() > PING_PAYLOAD || payload.len() > EchoRequest::MAX_PAYLOAD_LEN {
+        if payload.len() > self.ping.expected.len() || payload.len() > EchoRequest::MAX_PAYLOAD_LEN
+        {
             return None;
         }
 
@@ -2475,7 +2550,7 @@ impl<
             identity, tx, held, ..
         } = self;
         build_outbound(
-            tx,
+            &mut tx[..],
             held,
             identity.node_id(),
             dst,
@@ -2824,7 +2899,7 @@ impl<
         payload: &[u8],
     ) -> Option<Outbound<'_>> {
         let src = udp::source_address(self.identity.node_id(), dst);
-        let end = udp::build(&mut self.tx, &src, dst, src_port, dst_port, payload).ok()?;
+        let end = udp::build(&mut self.tx[..], &src, dst, src_port, dst_port, payload).ok()?;
         let frame = &mut self.tx[..end];
         let mask = l2::take_requested_egress_port(frame, self.port_count).ok()?;
         Some(Outbound { frame, mask })
@@ -2844,7 +2919,7 @@ impl<
     ///
     /// [`SubscribeError::Refused`] with nothing changed, for an empty topic,
     /// one of [`pubsub::TOPIC_MAX_LEN`] bytes or more, one longer than
-    /// `RESOURCE_NAME`, `SUBSCRIPTIONS` already held, or
+    /// [`RESOURCE_NAME_BYTES`], [`NodeResources`]' `SUBSCRIPTIONS` already held, or
     /// [`pubsub::CALLBACKS`] on the topic.
     /// [`SubscribeError::NotAdvertised`] when subscribed but the resource
     /// table is full.
@@ -2875,8 +2950,8 @@ impl<
     }
 
     /// The topics subscribed, in the order publications reach them.
-    pub fn subscriptions(&self) -> &Subscriptions<SUBSCRIPTIONS, RESOURCE_NAME> {
-        &self.subscriptions
+    pub fn subscriptions(&self) -> &SubscriptionsView<RESOURCE_NAME_BYTES> {
+        self.subscriptions
     }
 
     /// [`Node::publish_with`], discarding local deliveries.
@@ -2930,7 +3005,7 @@ impl<
         })?;
         let node_id = self.identity.node_id();
         Self::deliver_locally(
-            &self.subscriptions,
+            self.subscriptions,
             &mut self.service_requests,
             &mut self.power_info,
             node_id,
@@ -2947,7 +3022,7 @@ impl<
         let src = udp::source_address(node_id, &dst);
         // Cannot fail: MAX_MESSAGE_LEN is what fits in MTU after the headers.
         let end = udp::build_with(
-            &mut self.tx,
+            &mut self.tx[..],
             &src,
             &dst,
             pubsub::PORT,
@@ -3095,7 +3170,7 @@ impl<
                             &mut self.services,
                             &self.identity,
                             &self.config,
-                            &mut self.tx,
+                            self.tx,
                             now_ms,
                             node_id,
                             source,
@@ -3123,7 +3198,7 @@ impl<
         let payload = &self.tx[udp::PAYLOAD_OFFSET..end];
         let reply = pubsub::decode(payload).ok()?;
         Self::deliver_locally(
-            &self.subscriptions,
+            self.subscriptions,
             &mut self.service_requests,
             &mut self.power_info,
             node_id,
@@ -3234,7 +3309,7 @@ impl<
     /// the reply callback once. Service callbacks are not called.
     #[allow(clippy::too_many_arguments)]
     fn deliver_locally(
-        subscriptions: &Subscriptions<SUBSCRIPTIONS, RESOURCE_NAME>,
+        subscriptions: &SubscriptionsView<RESOURCE_NAME_BYTES>,
         requests: &mut ServiceRequests,
         power_info: &mut PowerInfoCallbacks,
         node_id: u64,
@@ -3493,7 +3568,7 @@ impl<
     }
 
     /// List the metrics service, `<node id>/metrics` — `metrics_service_init`,
-    /// which [`Node::with_services`] calls if [`Services::METRICS`].
+    /// which [`Node::new`] calls if [`Services::METRICS`].
     fn register_metrics_service(&mut self) -> Result<(), RegisterError> {
         let mut name = [0u8; SERVICE_NAME_BYTES];
         // Cannot fail: 24 bytes.
@@ -3682,7 +3757,7 @@ impl<
         // At most 52 bytes of topic and 1032 of body: within
         // `MAX_MESSAGE_LEN`, so the C's `bm_middleware_net_tx` sends it too.
         let end = udp::build_with(
-            &mut self.tx,
+            &mut self.tx[..],
             &src,
             &dst,
             pubsub::PORT,
@@ -3702,7 +3777,7 @@ impl<
         let payload = &self.tx[udp::PAYLOAD_OFFSET..end];
         let request = pubsub::decode(payload).map_err(|_| ServiceRequestError::NotSent { id })?;
         Self::deliver_locally(
-            &self.subscriptions,
+            self.subscriptions,
             &mut self.service_requests,
             &mut self.power_info,
             node_id,
@@ -3778,8 +3853,8 @@ impl<
     /// [`ResourceAddError::AlreadyPresent`] if the list already covers `name`
     /// — which, the C's de-duplication being a prefix match, includes names
     /// that are not in it (divergence #38). [`ResourceAddError::Full`] once
-    /// `RESOURCES` resources are held or for a name longer than
-    /// `RESOURCE_NAME`, neither of which bm_core has.
+    /// [`NodeResources`]' `RESOURCES` resources are held or for a name longer
+    /// than [`RESOURCE_NAME_BYTES`], neither of which bm_core has.
     pub fn add_resource(
         &mut self,
         name: &[u8],
@@ -3789,14 +3864,14 @@ impl<
     }
 
     /// `PUB_LIST` and `SUB_LIST`: the resources this node advertises.
-    pub fn resources(&self) -> &ResourceTable<RESOURCES, RESOURCE_NAME> {
-        &self.resources
+    pub fn resources(&self) -> &ResourceTableView {
+        self.resources
     }
 
     /// `RESOURCE_REQUEST_LIST`: which nodes have been asked for their resource
     /// table and have not answered.
-    pub fn resource_requests(&self) -> &ResourceRequests<RESOURCE_REQUESTS> {
-        &self.resource_requests
+    pub fn resource_requests(&self) -> &ResourceRequestsView {
+        self.resource_requests
     }
 
     /// Ask `target_node_id` for its resource table —
@@ -4040,14 +4115,14 @@ impl<
 
     /// Everything known about every node — what `populate_neighbor_info`
     /// writes onto bm_core's neighbour table entries.
-    pub fn device_info_cache(&self) -> &InfoCache<NEIGHBORS, INFO_STRINGS> {
-        &self.info
+    pub fn device_info_cache(&self) -> &InfoCacheView {
+        self.info
     }
 
     /// `INFO_REQUEST_LIST`: which nodes have been asked to describe themselves
     /// and have not answered.
-    pub fn info_requests(&self) -> &InfoRequests<INFO_REQUESTS> {
-        &self.info_requests
+    pub fn info_requests(&self) -> &InfoRequestsView {
+        self.info_requests
     }
 
     fn addressed_to_us(&self, target_node_id: u64) -> bool {
@@ -4084,7 +4159,7 @@ impl<
         } = self;
         let heartbeat = heartbeat_for(uptime_ms, HEARTBEAT_PERIOD_S);
         build_outbound(
-            tx,
+            &mut tx[..],
             held,
             identity.node_id(),
             &BmIpAddr::LINK_LOCAL_MULTICAST,
@@ -4122,7 +4197,7 @@ impl<
             device_name: &name[..name.len().min(DeviceInfoReply::MAX_STRING_LEN)],
         };
         build_outbound(
-            tx,
+            &mut tx[..],
             held,
             node_id,
             dst,
@@ -4149,7 +4224,7 @@ impl<
             identity, tx, held, ..
         } = self;
         build_outbound(
-            tx,
+            &mut tx[..],
             held,
             identity.node_id(),
             dst,
@@ -4180,7 +4255,7 @@ impl<
             utc_time_us,
         };
         build_outbound(
-            tx,
+            &mut tx[..],
             held,
             node_id,
             &BmIpAddr::LINK_LOCAL_MULTICAST,
@@ -4215,7 +4290,7 @@ impl<
         } = self;
         let node_id = identity.node_id();
         build_outbound(
-            tx,
+            &mut tx[..],
             held,
             node_id,
             dst,
@@ -4234,7 +4309,7 @@ impl<
         // `bcmp_send_neighbor_table`'s first act: a table that would not fit
         // `bcmp_table_max_len` is answered with nothing at all. Checked before
         // the registry is asked, as the C checks it before `bcmp_tx`. Out of
-        // reach at any plausible `NEIGHBORS` -- 101 neighbours on a two-port
+        // reach at any plausible neighbour count -- 101 neighbours on a two-port
         // node -- so nothing differential covers it.
         if neighbor_table_reply_len(usize::from(self.port_count), self.neighbors.len())
             > NEIGHBOR_TABLE_MAX_LEN
@@ -4261,25 +4336,22 @@ impl<
             port.state = u8::from(*link_mask & (1 << index) != 0);
         }
 
-        let mut table = [bm_wire::bcmp::NeighborInfo::default(); NEIGHBORS];
-        let mut count = 0;
-        for (slot, neighbor) in table.iter_mut().zip(neighbors.neighbors()) {
-            *slot = bm_wire::bcmp::NeighborInfo {
+        let table = neighbors
+            .neighbors()
+            .map(|neighbor| bm_wire::bcmp::NeighborInfo {
                 node_id: neighbor.node_id,
                 port: neighbor.port,
                 online: u8::from(neighbor.online),
-            };
-            count += 1;
-        }
+            });
 
         build_outbound(
-            tx,
+            &mut tx[..],
             held,
             node_id,
             dst,
             MessageType::NEIGHBOR_TABLE_REPLY,
             stamp,
-            |body| encode_neighbor_table_reply(body, node_id, ports, &table[..count]),
+            |body| encode_neighbor_table_reply_from(body, node_id, ports, table),
         )
     }
 }
@@ -4300,9 +4372,9 @@ fn port_mask(port: u8) -> u16 {
 /// [`tx::build`], handed back as the [`Outbound`] every `build_*` returns.
 ///
 /// A tracked request's frame is also kept in `held`, for re-sending.
-fn build_outbound<'a, F, const PENDING: usize>(
+fn build_outbound<'a, F>(
     tx: &'a mut [u8],
-    held: &mut HeldRequests<PENDING>,
+    held: &mut HeldRequests<'_>,
     node_id: u64,
     dst: &BmIpAddr,
     message_type: MessageType,
@@ -4400,38 +4472,8 @@ pub async fn deliver<P: Phy>(
 // The async loop
 // ---------------------------------------------------------------------------
 
-impl<
-    I: Identity,
-    R: Rtc,
-    const NEIGHBORS: usize,
-    const PENDING: usize,
-    const PING_PAYLOAD: usize,
-    const INFO_REQUESTS: usize,
-    const INFO_STRINGS: usize,
-    const RESOURCES: usize,
-    const RESOURCE_NAME: usize,
-    const RESOURCE_REQUESTS: usize,
-    const SUBSCRIPTIONS: usize,
-    C: Configuration,
-    D: DfuSlot + NoInitRam,
-    S: Services,
->
-    Node<
-        I,
-        R,
-        NEIGHBORS,
-        PENDING,
-        PING_PAYLOAD,
-        INFO_REQUESTS,
-        INFO_STRINGS,
-        RESOURCES,
-        RESOURCE_NAME,
-        RESOURCE_REQUESTS,
-        SUBSCRIPTIONS,
-        C,
-        D,
-        S,
-    >
+impl<I: Identity, R: Rtc, C: Configuration, D: DfuSlot + NoInitRam, S: Services>
+    Node<'_, I, R, C, D, S>
 {
     /// Run the node until the PHY fails, discarding every [`Event`].
     ///

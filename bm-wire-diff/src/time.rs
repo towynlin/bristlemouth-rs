@@ -424,7 +424,9 @@ pub fn check(input: &TimeInput) {
     inject(input.ingress_port, &frame);
     let c = drain();
 
-    let mut node = node_with_clock(rtc);
+    let mut resources = bm_stack::NodeResources::new();
+
+    let mut node = node_with_clock(&mut resources, rtc);
     let mut ours = frame.clone();
     let owed = node.on_frame(0, input.ingress_port, &mut ours);
     let forward = owed.forward;

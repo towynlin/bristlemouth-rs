@@ -386,11 +386,36 @@ pub struct FindReadsOutOfBounds {
 /// bytes of each name are kept. Both are ceilings bm_core does not have; past
 /// either, [`Self::add`] reports [`ResourceAddError::Full`] rather than
 /// truncating, because a truncated name is a different name on the wire.
+///
+/// [`ResourceTable<N, NAME>`] owns an array of `N`; [`ResourceTableView`] is
+/// the same table with `N` erased, which it derefs to. The methods are on the
+/// view.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct ResourceTable<const N: usize, const NAME: usize = RESOURCE_NAME_BYTES> {
-    entries: [Entry<NAME>; N],
+pub struct ResourceTableInner<const NAME: usize, S: ?Sized> {
     len: usize,
+    entries: S,
+}
+
+/// A [`ResourceTableInner`] holding up to `N` resources.
+pub type ResourceTable<const N: usize, const NAME: usize = RESOURCE_NAME_BYTES> =
+    ResourceTableInner<NAME, [ResourceSlot<NAME>; N]>;
+
+/// A [`ResourceTableInner`] of any capacity.
+pub type ResourceTableView<const NAME: usize = RESOURCE_NAME_BYTES> =
+    ResourceTableInner<NAME, [ResourceSlot<NAME>]>;
+
+impl<const N: usize, const NAME: usize> core::ops::Deref for ResourceTable<N, NAME> {
+    type Target = ResourceTableView<NAME>;
+    fn deref(&self) -> &ResourceTableView<NAME> {
+        self
+    }
+}
+
+impl<const N: usize, const NAME: usize> core::ops::DerefMut for ResourceTable<N, NAME> {
+    fn deref_mut(&mut self) -> &mut ResourceTableView<NAME> {
+        self
+    }
 }
 
 /// Default longest resource name [`ResourceTable`] keeps.
@@ -401,14 +426,17 @@ pub struct ResourceTable<const N: usize, const NAME: usize = RESOURCE_NAME_BYTES
 /// the parameter.
 pub const RESOURCE_NAME_BYTES: usize = 64;
 
+/// One slot of a [`ResourceTableInner`]. Opaque: read resources through
+/// [`ResourceTableInner::iter`].
 #[derive(Debug, Clone, Copy)]
-struct Entry<const NAME: usize> {
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct ResourceSlot<const NAME: usize> {
     kind: ResourceType,
     len: usize,
     name: [u8; NAME],
 }
 
-impl<const NAME: usize> Entry<NAME> {
+impl<const NAME: usize> ResourceSlot<NAME> {
     const EMPTY: Self = Self {
         kind: ResourceType::Publisher,
         len: 0,
@@ -431,11 +459,13 @@ impl<const N: usize, const NAME: usize> ResourceTable<N, NAME> {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            entries: [Entry::EMPTY; N],
+            entries: [ResourceSlot::EMPTY; N],
             len: 0,
         }
     }
+}
 
+impl<const NAME: usize> ResourceTableView<NAME> {
     /// How many resources both lists hold between them.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -451,7 +481,7 @@ impl<const N: usize, const NAME: usize> ResourceTable<N, NAME> {
     /// Most resources the two lists hold between them.
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        N
+        self.entries.len()
     }
 
     /// Longest name a resource may have.
@@ -474,7 +504,7 @@ impl<const N: usize, const NAME: usize> ResourceTable<N, NAME> {
         self.entries[..self.len]
             .iter()
             .filter(move |entry| entry.kind == kind)
-            .map(Entry::name)
+            .map(ResourceSlot::name)
     }
 
     /// `bcmp_resource_discovery_find_resource`, quirk included.
@@ -538,7 +568,7 @@ impl<const N: usize, const NAME: usize> ResourceTable<N, NAME> {
         if self.find(name, kind) {
             return Err(ResourceAddError::AlreadyPresent);
         }
-        if self.len == N || name.len() > NAME {
+        if self.len == self.entries.len() || name.len() > NAME {
             return Err(ResourceAddError::Full);
         }
         let entry = &mut self.entries[self.len];
@@ -628,11 +658,34 @@ pub enum ResourceReplyOutcome {
 ///   bm_core does not have. See divergence #19.
 /// * **Thirty-two bit keys.** `LLItem::id` is a `uint32_t`, so the list is
 ///   keyed on the low half of a 64-bit node id. See divergence #33.
+///
+/// [`ResourceRequests<N>`] owns an array of `N`; [`ResourceRequestsView`] is
+/// the same list with its capacity erased, which it derefs to. The methods are
+/// on the view.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct ResourceRequests<const N: usize> {
-    entries: [(u32, ResourceRequestKind); N],
+pub struct ResourceRequestsInner<S: ?Sized> {
     len: usize,
+    entries: S,
+}
+
+/// A [`ResourceRequestsInner`] holding up to `N` requests.
+pub type ResourceRequests<const N: usize> = ResourceRequestsInner<[(u32, ResourceRequestKind); N]>;
+
+/// A [`ResourceRequestsInner`] of any capacity.
+pub type ResourceRequestsView = ResourceRequestsInner<[(u32, ResourceRequestKind)]>;
+
+impl<const N: usize> core::ops::Deref for ResourceRequests<N> {
+    type Target = ResourceRequestsView;
+    fn deref(&self) -> &ResourceRequestsView {
+        self
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for ResourceRequests<N> {
+    fn deref_mut(&mut self) -> &mut ResourceRequestsView {
+        self
+    }
 }
 
 impl<const N: usize> Default for ResourceRequests<N> {
@@ -650,7 +703,9 @@ impl<const N: usize> ResourceRequests<N> {
             len: 0,
         }
     }
+}
 
+impl ResourceRequestsView {
     /// The key `ll_create_item` is given: the low 32 bits of the node id.
     #[must_use]
     pub const fn key(node_id: u64) -> u32 {
@@ -672,7 +727,7 @@ impl<const N: usize> ResourceRequests<N> {
     /// Most entries the list can hold.
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        N
+        self.entries.len()
     }
 
     /// The outstanding requests, in the order they were made.
@@ -694,7 +749,7 @@ impl<const N: usize> ResourceRequests<N> {
     /// reaches the same place only on a `bm_malloc` failure, which it reports
     /// as `BmENOMEM` **after** the request has gone out.
     pub fn record(&mut self, target_node_id: u64, kind: ResourceRequestKind) -> bool {
-        if self.len == N {
+        if self.len == self.entries.len() {
             return false;
         }
         self.entries[self.len] = (Self::key(target_node_id), kind);
@@ -1139,7 +1194,7 @@ mod tests {
     #[test]
     fn the_request_list_is_keyed_on_half_an_id() {
         assert_eq!(
-            ResourceRequests::<4>::key(0xDEAD_BEEF_1234_5678),
+            ResourceRequestsView::key(0xDEAD_BEEF_1234_5678),
             0x1234_5678
         );
         let mut list = ResourceRequests::<4>::new();

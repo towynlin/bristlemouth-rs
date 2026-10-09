@@ -4,7 +4,7 @@
 //! Written *sans-io*: no clock, no timers, no transmission. Every entry point
 //! takes the current time and returns what the caller should do about it, so
 //! the module is testable without an executor and `bm-wire` stays free of
-//! dependencies. The timer driving [`NeighborTable::check`] and the
+//! dependencies. The timer driving [`NeighborTableView::check`] and the
 //! transmission answering [`HeartbeatOutcome::request_info`] belong to the
 //! runtime above.
 //!
@@ -18,7 +18,7 @@
 //! # Capacity
 //!
 //! bm_core keeps a `bm_malloc`'d linked list; this is a fixed-capacity array,
-//! because `bm-wire` has no allocator. [`NeighborTable::on_heartbeat`] evicts
+//! because `bm-wire` has no allocator. [`NeighborTableView::on_heartbeat`] evicts
 //! whatever was on the ingress port before adding, as the C does, so the table
 //! never holds more than one entry per port.
 
@@ -95,19 +95,42 @@ pub struct HeartbeatOutcome {
     pub table_full: bool,
 }
 
-/// A fixed-capacity neighbour table.
+/// A fixed-capacity neighbour table, over whatever holds its entries.
 ///
-/// `N` should be at least the number of ports the device has.
+/// [`NeighborTable<N>`] owns an array of `N`; [`NeighborTableView`] is the
+/// same table with its capacity erased, which `&mut NeighborTable<N>` coerces
+/// to and derefs to. The methods are on the view.
+///
+/// The capacity should be at least the number of ports the device has.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct NeighborTable<const N: usize> {
-    entries: [Neighbor; N],
+pub struct NeighborTableInner<S: ?Sized> {
     len: usize,
+    entries: S,
 }
+
+/// A [`NeighborTableInner`] holding up to `N` neighbours.
+pub type NeighborTable<const N: usize> = NeighborTableInner<[Neighbor; N]>;
+
+/// A [`NeighborTableInner`] of any capacity.
+pub type NeighborTableView = NeighborTableInner<[Neighbor]>;
 
 impl<const N: usize> Default for NeighborTable<N> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<const N: usize> core::ops::Deref for NeighborTable<N> {
+    type Target = NeighborTableView;
+    fn deref(&self) -> &NeighborTableView {
+        self
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for NeighborTable<N> {
+    fn deref_mut(&mut self) -> &mut NeighborTableView {
+        self
     }
 }
 
@@ -127,7 +150,9 @@ impl<const N: usize> NeighborTable<N> {
             len: 0,
         }
     }
+}
 
+impl NeighborTableView {
     /// How many neighbours are recorded, online or not.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -142,7 +167,7 @@ impl<const N: usize> NeighborTable<N> {
 
     /// The neighbours, in the order bm_core's linked list holds them: insertion
     /// order, with removals closing the gap.
-    pub fn neighbors(&self) -> impl Iterator<Item = &Neighbor> + '_ {
+    pub fn neighbors(&self) -> impl ExactSizeIterator<Item = &Neighbor> + '_ {
         self.entries[..self.len].iter()
     }
 
@@ -201,7 +226,7 @@ impl<const N: usize> NeighborTable<N> {
                     outcome.evicted = Some(self.entries[occupant].node_id);
                     self.remove(occupant);
                 }
-                if self.len == N {
+                if self.len == self.entries.len() {
                     outcome.table_full = true;
                     return outcome;
                 }

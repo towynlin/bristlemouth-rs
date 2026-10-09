@@ -244,15 +244,39 @@ pub enum Delivery {
 /// requests may be outstanding at once. bm_core keeps both in `bm_malloc`'d
 /// linked lists; these are fixed-capacity arrays, because `bm-wire` has no
 /// allocator.
+///
+/// [`Registry<TYPES, PENDING>`] owns both arrays; [`RegistryView<TYPES>`] is
+/// the same registry with `PENDING` erased, which it derefs to. The methods
+/// are on the view.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Registry<const TYPES: usize, const PENDING: usize> {
+pub struct RegistryInner<const TYPES: usize, S: ?Sized> {
     types: [(MessageType, PacketCfg); TYPES],
     types_len: usize,
-    pending: [PendingRequest; PENDING],
     pending_len: usize,
     message_count: u32,
     next_sweep_ms: u32,
+    pending: S,
+}
+
+/// A [`RegistryInner`] with room for `PENDING` outstanding requests.
+pub type Registry<const TYPES: usize, const PENDING: usize> =
+    RegistryInner<TYPES, [PendingRequest; PENDING]>;
+
+/// A [`RegistryInner`] with room for any number of outstanding requests.
+pub type RegistryView<const TYPES: usize> = RegistryInner<TYPES, [PendingRequest]>;
+
+impl<const TYPES: usize, const PENDING: usize> core::ops::Deref for Registry<TYPES, PENDING> {
+    type Target = RegistryView<TYPES>;
+    fn deref(&self) -> &RegistryView<TYPES> {
+        self
+    }
+}
+
+impl<const TYPES: usize, const PENDING: usize> core::ops::DerefMut for Registry<TYPES, PENDING> {
+    fn deref_mut(&mut self) -> &mut RegistryView<TYPES> {
+        self
+    }
 }
 
 impl<const TYPES: usize, const PENDING: usize> Default for Registry<TYPES, PENDING> {
@@ -307,7 +331,9 @@ impl<const TYPES: usize, const PENDING: usize> Registry<TYPES, PENDING> {
             next_sweep_ms,
         }
     }
+}
 
+impl<const TYPES: usize> RegistryView<TYPES> {
     /// Register a configuration for `message_type`, as `packet_add` does.
     ///
     /// **Duplicates are allowed**, because `ll_item_add` appends without
@@ -411,7 +437,7 @@ impl<const TYPES: usize, const PENDING: usize> Registry<TYPES, PENDING> {
         // increments it in the header assignment, before it tries to allocate.
         self.message_count = self.message_count.wrapping_add(1);
 
-        let tracked = self.pending_len < PENDING;
+        let tracked = self.pending_len < self.pending.len();
         if tracked {
             self.pending[self.pending_len] = PendingRequest {
                 message_type,

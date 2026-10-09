@@ -56,7 +56,9 @@ fn a_frame_on_port_one_leaves_port_two_byte_for_byte() {
     assert_eq!(c.len(), 1, "one copy, on the one other port");
     assert_eq!(c[0].0, 2, "port 2");
 
-    let mut node = node();
+    let mut resources = bm_stack::NodeResources::new();
+
+    let mut node = node(&mut resources);
     let mut ours = frame.clone();
     let owed = node.on_frame(0, 1, &mut ours);
     assert!(owed.reply.is_none(), "nothing registers this message type");
@@ -212,7 +214,9 @@ fn a_forwarded_message_that_fails_its_checksum_is_relayed_and_not_re_flooded() {
     assert_eq!(c.len(), 1, "relayed only -- no re-flood behind it");
     assert_eq!(c[0].0, 1, "onto the other port");
 
-    let mut node = node();
+    let mut resources = bm_stack::NodeResources::new();
+
+    let mut node = node(&mut resources);
     let mut ours = frame.clone();
     let owed = node.on_frame(0, 2, &mut ours);
     assert!(
@@ -263,7 +267,9 @@ fn legacy_port_bytes_of_all_ones_leave_the_checksum_valid() {
     );
     assert_eq!(c[0].0, 1);
 
-    let mut node = node();
+    let mut resources = bm_stack::NodeResources::new();
+
+    let mut node = node(&mut resources);
     let mut ours = frame.clone();
     assert!(
         node.on_frame(0, 2, &mut ours).forward.is_some(),
@@ -293,7 +299,8 @@ fn the_c_puts_its_own_address_on_a_forwarded_message() {
 
     let frame = build_frame(&input);
     let bcmp = frame[BCMP_HEADER_OFFSET..].to_vec();
-    let mut node = node();
+    let mut resources = bm_stack::NodeResources::new();
+    let mut node = node(&mut resources);
     let forwarded = capture(
         node.forward_link_local(2, &bcmp)
             .expect("a forward fits the buffer"),
@@ -328,7 +335,8 @@ fn the_egress_port_survives_in_the_multicast_mac() {
 
     let frame = build_frame(&input);
     let bcmp = frame[BCMP_HEADER_OFFSET..].to_vec();
-    let mut node = node();
+    let mut resources = bm_stack::NodeResources::new();
+    let mut node = node(&mut resources);
     let forwarded = capture(node.forward_link_local(2, &bcmp).expect("fits"));
     let sent = &forwarded[0].1;
 

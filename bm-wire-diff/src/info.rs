@@ -42,8 +42,8 @@ use std::sync::Mutex;
 
 use arbitrary::{Arbitrary, Result, Unstructured};
 
-use bm_stack::node::PING_PAYLOAD_BYTES;
-use bm_stack::{Event, Node, SoftRtc};
+use bm_stack::node::{PING_PAYLOAD_BYTES, RESOURCES_DEFAULT, SUBSCRIPTIONS_DEFAULT};
+use bm_stack::{Event, Node, NodeResources, Parts, SoftRtc};
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest};
 use bm_wire::bcmp::{
     BCMP_HEADER_LEN, BCMP_HEADER_OFFSET, DeviceInfo, Heartbeat, InfoRequestKind, MessageType,
@@ -117,13 +117,27 @@ pub const NEIGHBORS: usize = 4;
 /// requests landing on it.
 pub const REQUEST_CAPACITY: usize = MAX_STEPS + 1;
 
-/// The port's node, sized as above.
-type InfoNode = Node<OracleIdentity, SoftRtc, NEIGHBORS, 4, PING_PAYLOAD_BYTES, REQUEST_CAPACITY>;
+/// The port's node's memory, sized as above.
+type InfoResources = NodeResources<
+    RESOURCES_DEFAULT,
+    SUBSCRIPTIONS_DEFAULT,
+    NEIGHBORS,
+    4,
+    PING_PAYLOAD_BYTES,
+    REQUEST_CAPACITY,
+>;
+
+/// The port's node.
+type InfoNode<'r> = Node<'r, OracleIdentity, SoftRtc>;
 
 /// A node with the oracle's identity, port count and link state, and a request
 /// list no seed can fill.
-fn info_node() -> InfoNode {
-    let mut node = Node::new(OracleIdentity, SoftRtc::new(), NUM_PORTS);
+fn info_node(resources: &mut InfoResources) -> InfoNode<'_> {
+    let mut node = Node::new(
+        resources,
+        Parts::new(OracleIdentity, SoftRtc::new()),
+        NUM_PORTS,
+    );
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }
@@ -546,7 +560,8 @@ pub fn check(input: &InfoInput) {
     // Both sides start with nothing. Clearing the table frees the strings the
     // last seed left on it, which is the only reset the oracle has.
     clear_neighbor_table();
-    let mut node = info_node();
+    let mut resources = InfoResources::new();
+    let mut node = info_node(&mut resources);
     drain();
     take_reported();
 
@@ -663,7 +678,7 @@ pub fn check(input: &InfoInput) {
 /// Run the same frame through our node, returning the request it wants sent
 /// and recording every [`Event::DeviceInfo`] on the way.
 fn our_reply(
-    node: &mut InfoNode,
+    node: &mut InfoNode<'_>,
     now: u32,
     port: u8,
     frame: &[u8],
@@ -684,7 +699,7 @@ fn our_reply(
 
 /// Compare what each side knows about every node the oracle has a neighbour
 /// entry for, and assert we know nothing about anything else.
-fn compare_caches(index: usize, step: &Step, node: &InfoNode) {
+fn compare_caches(index: usize, step: &Step, node: &InfoNode<'_>) {
     // The port has ceilings bm_core does not. Both are sized out of reach; a
     // full one would mean the comparison had stopped being meaningful.
     assert!(

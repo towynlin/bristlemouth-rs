@@ -28,7 +28,7 @@ use std::sync::{Mutex, Once};
 
 use arbitrary::Arbitrary;
 
-use bm_stack::{Event, Identity, NoRtc, Node, PublishError};
+use bm_stack::{Event, Identity, NoRtc, Node, NodeResources, Parts, PublishError};
 use bm_wire::bcmp::DeviceInfo;
 use bm_wire::bcmp::resource::{RESOURCE_NAME_BYTES, ResourceType};
 use bm_wire::util::BmIpAddr;
@@ -83,8 +83,8 @@ impl Identity for Peer {
 ///
 /// Never: the ports are distinct and fit.
 #[must_use]
-pub fn receiver(id: u64) -> Node<Peer, NoRtc, 4> {
-    let mut node = Node::new(Peer(id), NoRtc, NUM_PORTS);
+pub fn receiver(resources: &mut NodeResources, id: u64) -> Node<'_, Peer, NoRtc> {
+    let mut node = Node::new(resources, Parts::new(Peer(id), NoRtc), NUM_PORTS);
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }
@@ -191,7 +191,8 @@ impl Arrival {
     /// if it sends nothing to `dst`, or nothing to that port.
     fn frame(&self) -> Option<Vec<u8>> {
         let (src_port, dst_port) = self.ports();
-        let mut peer: Node<Peer, NoRtc, 4> = Node::new(Peer(self.src), NoRtc, NUM_PORTS);
+        let mut resources: NodeResources = NodeResources::new();
+        let mut peer = Node::new(&mut resources, Parts::new(Peer(self.src), NoRtc), NUM_PORTS);
         let outbound = peer.send_udp(src_port, &self.dst.addr(), dst_port, &self.payload())?;
         capture(outbound)
             .into_iter()
@@ -449,7 +450,7 @@ pub fn read_in_bounds(published: &[Published]) -> Vec<Published> {
 /// Hand `frame` to `node` on `ingress`, returning its UDP events, its
 /// publications and what it relayed.
 pub fn receive(
-    node: &mut Node<Peer, NoRtc, 4>,
+    node: &mut Node<'_, Peer, NoRtc>,
     ingress: u8,
     frame: &mut [u8],
 ) -> (Vec<Reported>, Vec<Published>, Vec<Captured>) {
@@ -485,7 +486,9 @@ pub fn check_send(send: &Send) {
     let dst = send.dst_addr();
     let payload = send.payload();
 
-    let mut node = stack::node();
+    let mut resources = NodeResources::new();
+
+    let mut node = stack::node(&mut resources);
     let rs = node
         .send_udp(src_port, &dst, send.dst_port, payload)
         .map(capture)
@@ -518,7 +521,8 @@ pub fn check_send(send: &Send) {
     };
     for (port, frame) in c {
         let mut frame = frame;
-        let mut receiver = receiver(!stack::NODE_ID);
+        let mut resources = NodeResources::new();
+        let mut receiver = receiver(&mut resources, !stack::NODE_ID);
         let (reported, published, _) = receive(&mut receiver, port.max(1), &mut frame);
         let expected: Vec<Reported> = rust_bound_ports()
             .contains(&send.dst_port)
@@ -564,7 +568,8 @@ pub fn check_receive(arrival: &Arrival) {
     drop(guard);
 
     let mut rs_frame = frame.clone();
-    let mut node = receiver(!arrival.src);
+    let mut resources = NodeResources::new();
+    let mut node = receiver(&mut resources, !arrival.src);
     let (reported, rs_published, rs_relayed) = receive(&mut node, ingress, &mut rs_frame);
 
     assert_eq!(c_relayed, rs_relayed, "relay ({arrival:?})");
@@ -769,7 +774,9 @@ pub fn check_publish(publish: &Publish) {
     let published = take_published();
     drop(guard);
 
-    let mut node = stack::node();
+    let mut resources = NodeResources::new();
+
+    let mut node = stack::node(&mut resources);
     node.subscribe(b"*").expect("an empty table");
     let mut rs_published = Vec::new();
     let rs = node

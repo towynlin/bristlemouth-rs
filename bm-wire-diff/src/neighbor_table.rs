@@ -111,7 +111,7 @@ pub const MAX_STEPS: usize = 24;
 
 /// The port's node. Four neighbours, as everywhere else here; the requester
 /// does not use the table.
-type TableNode = Node<OracleIdentity, SoftRtc, 4>;
+type TableNode<'r> = Node<'r, OracleIdentity, SoftRtc>;
 
 /// One thing that happens to the node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -544,7 +544,8 @@ pub fn check(input: &NeighborTableInput) {
 
     let _guard = oracle();
     reset_requester();
-    let mut node = crate::stack::node();
+    let mut resources = bm_stack::NodeResources::new();
+    let mut node = crate::stack::node(&mut resources);
     let mut model = Model::default();
     drain();
 
@@ -689,7 +690,7 @@ pub fn check(input: &NeighborTableInput) {
 /// The C has no accessor for any of the three, so this is the port being held
 /// to the belief rather than to the C directly. The callback comparisons above
 /// are what hold the belief to the C.
-fn assert_state(index: usize, step: &Step, model: &Model, node: &TableNode) {
+fn assert_state(index: usize, step: &Step, model: &Model, node: &TableNode<'_>) {
     let ours = node.table_requests();
     assert_eq!(
         (

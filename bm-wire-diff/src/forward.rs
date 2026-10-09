@@ -383,7 +383,9 @@ pub fn check_relay(input: &ForwardInput) {
     inject(input.ingress_port, &frame);
     let c = drain();
 
-    let mut node = node();
+    let mut resources = bm_stack::NodeResources::new();
+
+    let mut node = node(&mut resources);
     let mut ours = frame.clone();
     let owed = node.on_frame(0, input.ingress_port, &mut ours);
     // Read out before `owed` is consumed: a re-flood needs the frame back.
@@ -465,7 +467,9 @@ pub fn check_ll_forward(input: &ForwardInput) {
         "bcmp_ll_forward should have emitted one frame per other port ({input:?})"
     );
 
-    let mut node = node();
+    let mut resources = bm_stack::NodeResources::new();
+
+    let mut node = node(&mut resources);
     let mut rs = Vec::new();
     for port in forward::egress_ports(NUM_PORTS, input.ingress_port) {
         let outbound = node

@@ -13,7 +13,7 @@
 
 use bm_stack::node::LINK_LOCAL_PREFIX;
 use bm_stack::port::RtcTimeAndDate;
-use bm_stack::{Identity, Node, SoftRtc};
+use bm_stack::{Identity, Node, NodeResources, Parts, SoftRtc};
 use bm_wire::bcmp::info::DeviceInfoRequest;
 use bm_wire::bcmp::registry::PacketCfg;
 use bm_wire::bcmp::{DeviceInfo, MessageType, rx};
@@ -58,8 +58,17 @@ impl Identity for OracleIdentity {
 
 /// A node with the same link state the oracle has: `stack::oracle` brings both
 /// ports up before any comparison, and a neighbour-table reply carries that.
-fn node() -> Node<OracleIdentity, SoftRtc, 4> {
-    let mut node = Node::new(OracleIdentity, SoftRtc::new(), NUM_PORTS);
+/// Memory that lives as long as the test process, for a node to borrow.
+fn leaked<T: Default>() -> &'static mut T {
+    Box::leak(Box::default())
+}
+
+fn node() -> Node<'static, OracleIdentity, SoftRtc> {
+    let mut node = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(OracleIdentity, SoftRtc::new()),
+        NUM_PORTS,
+    );
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }
@@ -272,7 +281,8 @@ fn our_system_time_response_is_byte_identical_to_the_c() {
     let captured = drain();
     assert!(!captured.is_empty(), "the oracle answered nothing");
 
-    let mut node: Node<OracleIdentity, SoftRtc, 4> = Node::new(OracleIdentity, rtc, NUM_PORTS);
+    let mut resources: NodeResources = NodeResources::new();
+    let mut node = Node::new(&mut resources, Parts::new(OracleIdentity, rtc), NUM_PORTS);
     for port in 1..=NUM_PORTS {
         node.set_link_up(port, true);
     }

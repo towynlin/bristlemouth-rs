@@ -257,11 +257,34 @@ pub enum InfoRequestKind {
 ///   full list rather than growing.
 /// * **Thirty-two bit keys.** `LLItem::id` is a `uint32_t` while node ids are
 ///   64-bit, so the list is keyed on the low half of one. See divergence #33.
+///
+/// [`InfoRequests<N>`] owns an array of `N`; [`InfoRequestsView`] is the same
+/// list with its capacity erased, which it derefs to. The methods are on the
+/// view.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct InfoRequests<const N: usize> {
-    entries: [(u32, InfoRequestKind); N],
+pub struct InfoRequestsInner<S: ?Sized> {
     len: usize,
+    entries: S,
+}
+
+/// An [`InfoRequestsInner`] holding up to `N` requests.
+pub type InfoRequests<const N: usize> = InfoRequestsInner<[(u32, InfoRequestKind); N]>;
+
+/// An [`InfoRequestsInner`] of any capacity.
+pub type InfoRequestsView = InfoRequestsInner<[(u32, InfoRequestKind)]>;
+
+impl<const N: usize> core::ops::Deref for InfoRequests<N> {
+    type Target = InfoRequestsView;
+    fn deref(&self) -> &InfoRequestsView {
+        self
+    }
+}
+
+impl<const N: usize> core::ops::DerefMut for InfoRequests<N> {
+    fn deref_mut(&mut self) -> &mut InfoRequestsView {
+        self
+    }
 }
 
 impl<const N: usize> Default for InfoRequests<N> {
@@ -279,7 +302,9 @@ impl<const N: usize> InfoRequests<N> {
             len: 0,
         }
     }
+}
 
+impl InfoRequestsView {
     /// The key `ll_create_item` is given: the low 32 bits of the node id.
     #[must_use]
     pub const fn key(node_id: u64) -> u32 {
@@ -301,7 +326,7 @@ impl<const N: usize> InfoRequests<N> {
     /// Most entries the list can hold.
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        N
+        self.entries.len()
     }
 
     /// The outstanding requests, in the order they were made.
@@ -323,7 +348,7 @@ impl<const N: usize> InfoRequests<N> {
     /// reaches the same place only on a `bm_malloc` failure, which it reports
     /// as `BmENOMEM` and does not transmit for either.
     pub fn record(&mut self, target_node_id: u64, kind: InfoRequestKind) -> bool {
-        if self.len == N {
+        if self.len == self.entries.len() {
             return false;
         }
         self.entries[self.len] = (Self::key(target_node_id), kind);
@@ -373,15 +398,43 @@ pub struct CachedInfo<'a> {
 /// longest a `u8` length can describe and nothing is ever truncated. A smaller
 /// value is a deliberate divergence for a node that cannot spare the memory:
 /// the excess is dropped, and what is kept is still the prefix that arrived.
+///
+/// [`InfoCache<N, STRING>`] owns an array of `N`; [`InfoCacheView`] is the
+/// same cache with `N` erased, which it derefs to. The methods are on the
+/// view.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct InfoCache<const N: usize, const STRING: usize = CACHED_STRING_BYTES> {
-    entries: [CacheEntry<STRING>; N],
+pub struct InfoCacheInner<const STRING: usize, S: ?Sized> {
     len: usize,
+    entries: S,
 }
 
+/// An [`InfoCacheInner`] describing up to `N` nodes.
+pub type InfoCache<const N: usize, const STRING: usize = CACHED_STRING_BYTES> =
+    InfoCacheInner<STRING, [CacheEntry<STRING>; N]>;
+
+/// An [`InfoCacheInner`] of any capacity.
+pub type InfoCacheView<const STRING: usize = CACHED_STRING_BYTES> =
+    InfoCacheInner<STRING, [CacheEntry<STRING>]>;
+
+impl<const N: usize, const STRING: usize> core::ops::Deref for InfoCache<N, STRING> {
+    type Target = InfoCacheView<STRING>;
+    fn deref(&self) -> &InfoCacheView<STRING> {
+        self
+    }
+}
+
+impl<const N: usize, const STRING: usize> core::ops::DerefMut for InfoCache<N, STRING> {
+    fn deref_mut(&mut self) -> &mut InfoCacheView<STRING> {
+        self
+    }
+}
+
+/// One slot of an [`InfoCacheInner`]. Opaque: read entries through
+/// [`InfoCacheInner::get`] and [`InfoCacheInner::iter`].
 #[derive(Debug, Clone, Copy)]
-struct CacheEntry<const STRING: usize> {
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct CacheEntry<const STRING: usize> {
     node_id: u64,
     info: DeviceInfo,
     version_len: usize,
@@ -434,7 +487,9 @@ impl<const N: usize, const STRING: usize> InfoCache<N, STRING> {
             len: 0,
         }
     }
+}
 
+impl<const STRING: usize> InfoCacheView<STRING> {
     /// How many nodes are described.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -450,7 +505,7 @@ impl<const N: usize, const STRING: usize> InfoCache<N, STRING> {
     /// Most nodes the cache can describe.
     #[must_use]
     pub const fn capacity(&self) -> usize {
-        N
+        self.entries.len()
     }
 
     /// The node ids described, in insertion order.
@@ -491,7 +546,7 @@ impl<const N: usize, const STRING: usize> InfoCache<N, STRING> {
         {
             Some(index) => index,
             None => {
-                if self.len == N {
+                if self.len == self.entries.len() {
                     return false;
                 }
                 self.entries[self.len] = CacheEntry::EMPTY;
@@ -674,7 +729,7 @@ mod tests {
     fn a_request_list_is_keyed_on_the_low_half_of_the_node_id() {
         // `LLItem::id` is a uint32_t; `bcmp_request_info` hands it a uint64_t.
         assert_eq!(
-            InfoRequests::<4>::key(0xDEAD_BEEF_1234_5678),
+            InfoRequestsView::key(0xDEAD_BEEF_1234_5678),
             0x1234_5678,
             "the top half never reaches the list"
         );

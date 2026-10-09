@@ -18,7 +18,7 @@
 //! integration tests.
 
 use bm_stack::mock::{MockError, MockPhy, Script, frames};
-use bm_stack::{App, Event, Identity, Node, Outbound, SoftRtc};
+use bm_stack::{App, Event, Identity, Node, NodeResources, Outbound, Parts, SoftRtc};
 use bm_wire::bcmp::info::DeviceInfoReply;
 use bm_wire::bcmp::ping::EchoReply;
 use bm_wire::bcmp::{DeviceInfo, rx};
@@ -63,7 +63,7 @@ impl Identity for ExampleIdentity {
     }
 }
 
-type ExampleNode = Node<ExampleIdentity, SoftRtc, 4>;
+type ExampleNode<'r> = Node<'r, ExampleIdentity, SoftRtc>;
 
 /// On the first tick of its own ticker, subscribes to [`SUBSCRIPTION`] and
 /// pings every node; on the second, publishes; on the third, logs to the
@@ -82,7 +82,7 @@ struct Hello {
     sys_info: Option<(u32, u64, u32, u32, Vec<u8>)>,
 }
 
-impl App<ExampleNode> for Hello {
+impl App<ExampleNode<'_>> for Hello {
     async fn ready(&mut self) {
         if self.ticks == 4 {
             core::future::pending::<()>().await;
@@ -91,7 +91,7 @@ impl App<ExampleNode> for Hello {
         self.ticker.next().await;
     }
 
-    fn act<'n>(&mut self, node: &'n mut ExampleNode, now_ms: u32) -> Option<Outbound<'n>> {
+    fn act<'n>(&mut self, node: &'n mut ExampleNode<'_>, now_ms: u32) -> Option<Outbound<'n>> {
         self.ticks += 1;
         if self.ticks == 1 {
             println!("{now_ms:>5} ms  subscribe to hello/*, ping every node");
@@ -213,7 +213,12 @@ fn sys_info_reply() -> Vec<u8> {
 }
 
 fn main() {
-    let mut node = ExampleNode::new(ExampleIdentity, SoftRtc::new(), PORTS);
+    let mut resources: NodeResources = NodeResources::new();
+    let mut node = Node::new(
+        &mut resources,
+        Parts::new(ExampleIdentity, SoftRtc::new()),
+        PORTS,
+    );
 
     // Idle steps are short so the loop's tickers never have a backlog: a burst
     // would let `receive` take the echo reply before the ping went out.

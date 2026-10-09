@@ -47,10 +47,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use arbitrary::Arbitrary;
 
-use bm_stack::node::{INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, RESOURCE_REQUESTS_DEFAULT};
-use bm_stack::{Event, Node, PublishError, SoftRtc, SubscribeError};
-use bm_wire::bcmp::info::CACHED_STRING_BYTES;
-use bm_wire::bcmp::resource::{RESOURCE_NAME_BYTES, ResourceType};
+use bm_stack::{Event, Node, NodeResources, Parts, PublishError, SoftRtc, SubscribeError};
+use bm_wire::bcmp::resource::ResourceType;
 use bm_wire::pubsub::{self as codec, SubscriptionError};
 use bm_wire::udp;
 use bm_wire::util::{BmIpAddr, bm_wildcard_match};
@@ -102,20 +100,12 @@ pub const SUBSCRIPTIONS: usize = 1 + PATTERNS.len();
 /// topic, and [`DUPLICATE_PATTERN`].
 pub const RESOURCES: usize = 1 + PATTERNS.len() + TOPICS.len() + 1;
 
-/// The mirrored Rust node.
-pub type PubSubNode = Node<
-    OracleIdentity,
-    SoftRtc,
-    4,
-    4,
-    PING_PAYLOAD_BYTES,
-    INFO_REQUESTS_DEFAULT,
-    CACHED_STRING_BYTES,
-    RESOURCES,
-    RESOURCE_NAME_BYTES,
-    RESOURCE_REQUESTS_DEFAULT,
-    SUBSCRIPTIONS,
->;
+/// The mirrored Rust node's memory.
+pub type PubSubResources = NodeResources<RESOURCES, SUBSCRIPTIONS>;
+
+/// The mirrored Rust node, in a [`PubSubResources`] that lives as long as the
+/// process.
+pub type PubSubNode = Node<'static, OracleIdentity, SoftRtc>;
 
 /// A topic argument.
 #[derive(Debug, Clone, Copy, Arbitrary)]
@@ -240,7 +230,12 @@ fn state() -> (MutexGuard<'static, ()>, MutexGuard<'static, Option<State>>) {
         assert!(pubs.is_empty(), "PUB_LIST: {pubs:?}");
         assert_eq!(subs, vec![metrics_request_topic()], "SUB_LIST");
         assert_eq!(oracle_subscriptions(), subs, "the subscription list");
-        let node: PubSubNode = Node::new(OracleIdentity, SoftRtc::new(), NUM_PORTS);
+        let resources: &'static mut PubSubResources = Box::leak(Box::default());
+        let node: PubSubNode = Node::new(
+            resources,
+            Parts::new(OracleIdentity, SoftRtc::new()),
+            NUM_PORTS,
+        );
         assert!(
             node.subscriptions().iter().eq([&subs[0][..]]),
             "the metrics service's, subscribed at construction"
@@ -486,8 +481,12 @@ fn publish(state: &mut State, topic: &[u8], kind: u8, version: u8, data: &[u8]) 
 
     // The oracle's publication, received by a Rust node subscribed alike.
     for (port, mut frame) in c {
-        let mut receiver =
-            Node::<Peer, SoftRtc, 4, 4>::new(Peer(!stack::NODE_ID), SoftRtc::new(), NUM_PORTS);
+        let mut resources: NodeResources = NodeResources::new();
+        let mut receiver = Node::new(
+            &mut resources,
+            Parts::new(Peer(!stack::NODE_ID), SoftRtc::new()),
+            NUM_PORTS,
+        );
         for pattern in &state.subscriptions {
             receiver.subscribe(pattern).expect("room for every pattern");
         }
@@ -530,7 +529,12 @@ fn receive(state: &mut State, arrival: &Arrival) {
         &payload,
     );
     if arrival.from_pubsub_port && !publication.topic.is_empty() && publication.topic.len() < 255 {
-        let mut peer: Node<Peer, SoftRtc, 4> = Node::new(Peer(PEER), SoftRtc::new(), NUM_PORTS);
+        let mut resources: NodeResources = NodeResources::new();
+        let mut peer = Node::new(
+            &mut resources,
+            Parts::new(Peer(PEER), SoftRtc::new()),
+            NUM_PORTS,
+        );
         let sent = peer
             .publish(
                 publication.topic,

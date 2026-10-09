@@ -60,21 +60,23 @@ pub use header::{
 pub use heartbeat::Heartbeat;
 pub use info::{
     CACHED_STRING_BYTES, CachedInfo, DeviceInfo, DeviceInfoReply, DeviceInfoRequest, InfoCache,
-    InfoRequestKind, InfoRequests,
+    InfoCacheInner, InfoCacheView, InfoRequestKind, InfoRequests, InfoRequestsInner,
+    InfoRequestsView,
 };
 pub use neighbors::{
     NEIGHBOR_REQUEST_TIMEOUT_MS, NEIGHBOR_TABLE_MAX_LEN, NeighborInfo, NeighborTableReply,
     NeighborTableRequest, PortInfo, TableReplyOutcome, TableRequestKind, TableRequests,
-    encode_neighbor_table_reply, neighbor_table_reply_len,
+    encode_neighbor_table_reply, encode_neighbor_table_reply_from, neighbor_table_reply_len,
 };
 pub use ping::{ECHO_HEADER_LEN, EchoReply, EchoRequest, MAX_ECHO_PAYLOAD};
 pub use registry::{
     DEFAULT_MESSAGE_TIMEOUT_MS, Delivery, MESSAGE_TIMER_EXPIRY_PERIOD_MS, Outgoing, PacketCfg,
-    PendingRequest, Registry, RegistryError,
+    PendingRequest, Registry, RegistryError, RegistryInner, RegistryView,
 };
 pub use resource::{
     FindReadsOutOfBounds, RESOURCE_NAME_BYTES, Resource, ResourceAddError, ResourceReplyOutcome,
-    ResourceRequestKind, ResourceRequests, ResourceTable, ResourceTableReply, ResourceTableRequest,
+    ResourceRequestKind, ResourceRequests, ResourceRequestsInner, ResourceRequestsView,
+    ResourceTable, ResourceTableInner, ResourceTableReply, ResourceTableRequest, ResourceTableView,
     ResourceType, encode_resource_table_reply,
 };
 pub use rx::{Received, RxError, accept};

@@ -1,10 +1,14 @@
 //! The node, driven with a mock PHY.
 
 use bm_stack::mock::{MockPhy, Script, Sent, frames};
-use bm_stack::node::{EXPIRY_PERIOD_MS, HOP_LIMIT, LINK_LOCAL_PREFIX, NEIGHBOR_REQUEST_TIMEOUT_MS};
+use bm_stack::node::{
+    EXPIRY_PERIOD_MS, HOP_LIMIT, LINK_LOCAL_PREFIX, NEIGHBOR_REQUEST_TIMEOUT_MS, RESOURCES_DEFAULT,
+    SUBSCRIPTIONS_DEFAULT,
+};
 use bm_stack::utc_time::{self, UtcTimeError, UtcTimeSetter};
 use bm_stack::{
-    App, Egress, Event, Identity, Node, Outbound, Rtc, RtcTimeAndDate, SoftRtc, deliver, transmit,
+    App, Egress, Event, Identity, Node, NodeResources, Outbound, Parts, Rtc, RtcTimeAndDate,
+    SoftRtc, deliver, transmit,
 };
 use bm_wire::addr;
 use bm_wire::bcmp::info::{DeviceInfoReply, DeviceInfoRequest, InfoRequestKind};
@@ -75,8 +79,17 @@ impl Identity for TestIdentity {
     }
 }
 
-fn node() -> Node<TestIdentity, SoftRtc, 4> {
-    Node::new(TestIdentity, SoftRtc::new(), PORTS)
+/// Memory that lives as long as the test process, for a node to borrow.
+fn leaked<T: Default>() -> &'static mut T {
+    Box::leak(Box::default())
+}
+
+fn node() -> Node<'static, TestIdentity, SoftRtc> {
+    Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::new()),
+        PORTS,
+    )
 }
 
 /// A BCMP frame from the peer, as the wire would deliver it.
@@ -397,7 +410,7 @@ fn the_run_loop_answers_and_heartbeats() {
 
 /// The frames a node put on the wire for one received frame, in order.
 fn relay_through(
-    node: &mut Node<TestIdentity, SoftRtc, 4>,
+    node: &mut Node<'_, TestIdentity, SoftRtc>,
     ingress_port: u8,
     frame: &mut [u8],
 ) -> MockPhy {
@@ -557,7 +570,11 @@ fn a_chain_of_nodes_relays_a_global_multicast_message() {
     assert_eq!(phy.sent[0].egress, Egress::Port(2));
 
     // Far node: in on port 1 again, out on port 2 again, unchanged.
-    let mut far = Node::<TestIdentity, SoftRtc, 4>::new(TestIdentity, SoftRtc::new(), PORTS);
+    let mut far = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::new()),
+        PORTS,
+    );
     let mut hop = phy.sent[0].frame.clone();
     let phy = relay_through(&mut far, 1, &mut hop);
     assert_eq!(phy.sent.len(), 1);
@@ -760,7 +777,7 @@ const REPLY_TYPE: MessageType = MessageType::CONFIG_VALUE;
 
 /// A node knowing the two config types. [`Node::new`] registers them with the
 /// flags `bcmp_config_init` gives them.
-fn requesting_node() -> Node<TestIdentity, SoftRtc, 4> {
+fn requesting_node() -> Node<'static, TestIdentity, SoftRtc> {
     let node = node();
     assert_eq!(node.registry().cfg(REQUEST_TYPE), Some(PacketCfg::REQUEST));
     assert_eq!(node.registry().cfg(REPLY_TYPE), Some(PacketCfg::REPLY));
@@ -1456,8 +1473,11 @@ fn a_second_ping_forgets_the_first() {
 /// refused outright — and refused *before* anything is disturbed.
 #[test]
 fn a_ping_longer_than_the_slot_is_refused_and_changes_nothing() {
-    let mut node: Node<TestIdentity, SoftRtc, 4, 4, 8> =
-        Node::new(TestIdentity, SoftRtc::new(), PORTS);
+    let mut node = Node::new(
+        leaked::<NodeResources<RESOURCES_DEFAULT, SUBSCRIPTIONS_DEFAULT, 4, 4, 8>>(),
+        Parts::new(TestIdentity, SoftRtc::new()),
+        PORTS,
+    );
     node.ping(0, &BmIpAddr::LINK_LOCAL_MULTICAST, PEER_ID, b"eight!!!")
         .expect("exactly the slot size fits");
     assert_eq!(node.ping_sequence(), 1);
@@ -1509,8 +1529,12 @@ const NOON_ISH: RtcTimeAndDate = RtcTimeAndDate {
 };
 
 /// A node whose clock already reads [`NOON_ISH`].
-fn node_with_a_clock() -> Node<TestIdentity, SoftRtc, 4> {
-    Node::new(TestIdentity, SoftRtc::at(NOON_ISH), PORTS)
+fn node_with_a_clock() -> Node<'static, TestIdentity, SoftRtc> {
+    Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::at(NOON_ISH)),
+        PORTS,
+    )
 }
 
 fn time_frame(message_type: MessageType, target_node_id: u64, utc_time_us: u64) -> Vec<u8> {
@@ -1550,7 +1574,7 @@ fn time_frame(message_type: MessageType, target_node_id: u64, utc_time_us: u64) 
 
 /// The body of whatever the node replied, parsed back as a `0x11`.
 fn response_body(
-    node: &mut Node<TestIdentity, SoftRtc, 4>,
+    node: &mut Node<'_, TestIdentity, SoftRtc>,
     frame: &mut [u8],
 ) -> SystemTimeResponse {
     let owed = node.on_frame(1000, 1, frame);
@@ -1650,8 +1674,11 @@ fn a_broadcast_time_set_is_honoured_and_answered() {
 /// returning an error does in the C.
 #[test]
 fn a_set_that_the_clock_refuses_is_not_answered() {
-    let mut node =
-        Node::<TestIdentity, SoftRtc, 4>::new(TestIdentity, SoftRtc::read_only(NOON_ISH), PORTS);
+    let mut node = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::read_only(NOON_ISH)),
+        PORTS,
+    );
     let mut frame = time_frame(MessageType::SYSTEM_TIME_SET, NODE_ID, 1_000_000);
     let owed = node.on_frame(1000, 1, &mut frame);
     assert!(owed.reply.is_none());
@@ -1874,7 +1901,7 @@ const SPOTTER_ID: u64 = 0x5428_d5d7_3b4e_298a;
 const BENCH_UTC_TIME: &[u8] = b"\xb0*M.\xbf\\\x06\x00";
 const BENCH_UTC_US: u64 = 0x0006_5CBF_2E4D_2AB0;
 
-type ClockNode = Node<TestIdentity, SoftRtc, 4>;
+type ClockNode = Node<'static, TestIdentity, SoftRtc>;
 
 /// An app that only sets the clock, as `hello_world` does beside its ticker.
 struct ClockSetter {
@@ -1934,7 +1961,11 @@ fn the_spotters_utc_time_sets_the_clock() {
         },
     ];
     let mut phy = MockPhy::new(PORTS, script);
-    let mut node: ClockNode = Node::new(TestIdentity, SoftRtc::new(), PORTS);
+    let mut node: ClockNode = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::new()),
+        PORTS,
+    );
     node.subscribe(utc_time::TOPIC).unwrap();
     let mut app = ClockSetter {
         setter: UtcTimeSetter::new(),
@@ -1965,7 +1996,11 @@ fn the_spotters_utc_time_sets_the_clock() {
 /// The C handler is registered for its own subscription only.
 #[test]
 fn utc_time_through_another_subscription_sets_nothing() {
-    let mut node: ClockNode = Node::new(TestIdentity, SoftRtc::new(), PORTS);
+    let mut node: ClockNode = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::new()),
+        PORTS,
+    );
     node.subscribe(b"spotter/*").unwrap();
     let mut setter = UtcTimeSetter::new();
     let mut frame = frames::publication(SPOTTER_ID, utc_time::TOPIC, 1, 1, BENCH_UTC_TIME);
@@ -1981,7 +2016,11 @@ fn utc_time_through_another_subscription_sets_nothing() {
 /// Version 2, the pub/sub version `spotter_log` sends, is not the C's 1.
 #[test]
 fn utc_time_with_another_version_sets_nothing() {
-    let mut node: ClockNode = Node::new(TestIdentity, SoftRtc::new(), PORTS);
+    let mut node: ClockNode = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::new()),
+        PORTS,
+    );
     node.subscribe(utc_time::TOPIC).unwrap();
     let mut setter = UtcTimeSetter::new();
     let mut frame = frames::publication(SPOTTER_ID, utc_time::TOPIC, 1, 2, BENCH_UTC_TIME);
@@ -2251,7 +2290,11 @@ fn table_request_target(outbound: &bm_stack::Outbound<'_>) -> u64 {
 }
 
 /// Every `Event` a step produced, in order.
-fn table_events(node: &mut Node<TestIdentity, SoftRtc, 4>, now_ms: u32, frame: &[u8]) -> Vec<Seen> {
+fn table_events(
+    node: &mut Node<'_, TestIdentity, SoftRtc>,
+    now_ms: u32,
+    frame: &[u8],
+) -> Vec<Seen> {
     let mut frame = frame.to_vec();
     let mut seen_events = Vec::new();
     node.on_frame_with(now_ms, 1, &mut frame, |event| {
@@ -2635,7 +2678,7 @@ const METRICS_REQ: &[u8] = b"c0ffee0012345678/metrics/req";
 
 /// A node advertising two topics it publishes and two it subscribes to: the
 /// metrics service's request topic and `button`.
-fn node_with_resources() -> Node<TestIdentity, SoftRtc, 4> {
+fn node_with_resources() -> Node<'static, TestIdentity, SoftRtc> {
     let mut node = node();
     node.add_resource(b"spotter/utc-time", PUB).unwrap();
     node.add_resource(b"sensor/temp", PUB).unwrap();
@@ -2719,27 +2762,9 @@ impl bm_stack::Services for NoMetrics {
 /// A node with nothing to advertise still answers, with the head alone.
 #[test]
 fn an_empty_table_is_still_answered() {
-    let mut node: Node<
-        TestIdentity,
-        SoftRtc,
-        4,
-        4,
-        { bm_stack::node::PING_PAYLOAD_BYTES },
-        { bm_stack::node::INFO_REQUESTS_DEFAULT },
-        { bm_wire::bcmp::info::CACHED_STRING_BYTES },
-        { bm_stack::node::RESOURCES_DEFAULT },
-        { bm_wire::bcmp::resource::RESOURCE_NAME_BYTES },
-        { bm_stack::node::RESOURCE_REQUESTS_DEFAULT },
-        { bm_stack::node::SUBSCRIPTIONS_DEFAULT },
-        bm_stack::NoConfig,
-        bm_stack::NoDfu,
-        NoMetrics,
-    > = Node::with_services(
-        TestIdentity,
-        SoftRtc::new(),
-        bm_stack::NoConfig,
-        bm_stack::NoDfu,
-        NoMetrics,
+    let mut node = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(TestIdentity, SoftRtc::new()).with_services(NoMetrics),
         PORTS,
     );
     assert_eq!(node.service_table().len(), 0, "no metrics service");
@@ -3019,7 +3044,7 @@ const APP_PORT: u16 = 4000;
 
 /// The `Event::Udp`s one received frame produced, owned.
 fn udp_events(
-    node: &mut Node<TestIdentity, SoftRtc, 4>,
+    node: &mut Node<'_, TestIdentity, SoftRtc>,
     ingress_port: u8,
     frame: &mut [u8],
 ) -> Vec<(u16, u16, u64, Vec<u8>)> {
@@ -3217,7 +3242,11 @@ fn a_datagram_crosses_between_two_nodes() {
             b""
         }
     }
-    let mut sender = Node::<Peer, SoftRtc, 4>::new(Peer, SoftRtc::new(), PORTS);
+    let mut sender = Node::new(
+        leaked::<NodeResources>(),
+        Parts::new(Peer, SoftRtc::new()),
+        PORTS,
+    );
     let mut receiver = node();
     receiver.bind_udp(APP_PORT).unwrap();
     let mut frame = sender
@@ -3243,14 +3272,14 @@ struct Pinger {
     replies: Vec<Seen>,
 }
 
-impl bm_stack::App<Node<TestIdentity, SoftRtc, 4>> for Pinger {
+impl bm_stack::App<Node<'static, TestIdentity, SoftRtc>> for Pinger {
     async fn ready(&mut self) {
         self.ticker.next().await;
     }
 
     fn act<'n>(
         &mut self,
-        node: &'n mut Node<TestIdentity, SoftRtc, 4>,
+        node: &'n mut Node<'static, TestIdentity, SoftRtc>,
         now_ms: u32,
     ) -> Option<bm_stack::Outbound<'n>> {
         self.pinged_at_ms.push(now_ms);
@@ -3409,7 +3438,7 @@ fn delivered(event: Event<'_>) -> Option<Delivered> {
     }
 }
 
-fn subscribed_node(topics: &[&[u8]]) -> Node<TestIdentity, SoftRtc, 4> {
+fn subscribed_node(topics: &[&[u8]]) -> Node<'static, TestIdentity, SoftRtc> {
     let mut node = node();
     for port in 1..=PORTS {
         node.set_link_up(port, true);
@@ -3465,8 +3494,11 @@ fn subscribing_advertises_and_unsubscribing_does_not_withdraw() {
 #[test]
 fn a_full_resource_table_still_subscribes() {
     // The metrics service's subscription takes one of the two.
-    let mut node: Node<TestIdentity, SoftRtc, 4, 4, 64, 8, 64, 2> =
-        Node::new(TestIdentity, SoftRtc::new(), PORTS);
+    let mut node = Node::new(
+        leaked::<NodeResources<2>>(),
+        Parts::new(TestIdentity, SoftRtc::new()),
+        PORTS,
+    );
     node.subscribe(b"a").unwrap();
     assert_eq!(
         node.subscribe(b"b"),
@@ -3559,7 +3591,7 @@ fn a_publication_too_long_to_send_is_still_delivered_locally() {
     assert_eq!(count, 0);
 }
 
-fn received(node: &mut Node<TestIdentity, SoftRtc, 4>, frame: &[u8]) -> (Vec<Delivered>, bool) {
+fn received(node: &mut Node<'_, TestIdentity, SoftRtc>, frame: &[u8]) -> (Vec<Delivered>, bool) {
     let mut frame = frame.to_vec();
     let mut events = Vec::new();
     let mut udp = false;

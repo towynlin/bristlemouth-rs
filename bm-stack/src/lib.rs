@@ -22,7 +22,9 @@
 //!   [`port::NoInitRam`].
 //! * [`service`] is the service layer's application side: [`Services`], the
 //!   handlers a node's `S` supplies.
-//! * [`node::Node`] is the protocol. Its three receive/timer entry points are
+//! * [`node::Node`] is the protocol. It borrows its tables from a
+//!   [`NodeResources`] the firmware owns, and takes the integrator's types as
+//!   [`Parts`]. Its three receive/timer entry points are
 //!   synchronous and take the current time, so they are testable without an
 //!   executor.
 //! * [`node::Node::run`] joins them, and is the only async code here.
@@ -56,8 +58,8 @@ pub use app::App;
 pub use channel::{ChannelApp, Channels, Command, NodeHandle, Notification};
 pub use config::{Config, Configuration, NoConfig};
 pub use node::{
-    Event, MTU, Node, Outbound, Owed, PublishError, Reflood, SpotterError, SubscribeError,
-    UdpBindError, deliver, transmit,
+    Event, MTU, Node, NodeResources, Outbound, Owed, Parts, PublishError, Reflood, SpotterError,
+    SubscribeError, UdpBindError, deliver, transmit,
 };
 pub use port::{
     BootRequests, ConfigStorage, DfuSlot, Egress, Identity, NoDfu, NoInitRam, NoRtc, Phy,

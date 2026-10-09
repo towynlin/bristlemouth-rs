@@ -618,7 +618,8 @@ pub fn check(input: &ConfigInput) {
     );
 
     let config = reset(&input.seeds);
-    let mut node = stack::node_with_config(config);
+    let mut resources = bm_stack::NodeResources::new();
+    let mut node = stack::node_with_config(&mut resources, config);
 
     inject(input.ingress_port, &frame);
     let c = drain();
@@ -683,7 +684,7 @@ pub fn check(input: &ConfigInput) {
 
 /// [`capture_reflood`] for a [`stack::ConfigNode`].
 fn capture_reflood_config(
-    node: &mut stack::ConfigNode,
+    node: &mut stack::ConfigNode<'_>,
     reflood: bm_stack::Reflood,
     frame: &[u8],
 ) -> Vec<(u8, Vec<u8>)> {

@@ -9,7 +9,7 @@
 //! [`Node::register_service`], [`Node::unregister_service`],
 //! [`Node::register_echo_service`], [`Node::register_sys_info_service`],
 //! [`Node::register_config_map_service`],
-//! [`Node::register_power_info_service`], [`Node::with_services`],
+//! [`Node::register_power_info_service`], [`Node::new`],
 //! [`Node::on_frame_with`], [`Node::service_request_with`],
 //! [`Node::sys_info_request_with`], [`Node::config_map_request_with`],
 //! [`Node::power_info_request_with`], [`Node::metrics_request_with`] and
@@ -40,7 +40,7 @@
 //! Both nodes keep a config store, emptied at the start of each input by
 //! [`crate::config`]'s reset and written by [`Step::Configure`]. Both list
 //! the metrics service first: `bm_shim_stack_init` and
-//! [`Node::with_services`] register it. The oracle's components are
+//! [`Node::new`] register it. The oracle's components are
 //! [`COMPONENTS`], added once at bring-up; [`Step::Metrics`] sets which of
 //! them report and with what, on both sides, and each input starts with none
 //! reporting. A sys_info
@@ -100,11 +100,9 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use arbitrary::Arbitrary;
 
 use bm_stack::config::Config;
-use bm_stack::node::{INFO_REQUESTS_DEFAULT, PING_PAYLOAD_BYTES, RESOURCE_REQUESTS_DEFAULT};
 use bm_stack::service::{SERVICE_REQUESTS, SERVICES, ServiceHandler, ServiceRequestError};
-use bm_stack::{Event, NoDfu, Node, RamConfigStorage, Services, SoftRtc};
-use bm_wire::bcmp::info::CACHED_STRING_BYTES;
-use bm_wire::bcmp::resource::{RESOURCE_NAME_BYTES, ResourceType};
+use bm_stack::{Event, NoDfu, Node, NodeResources, Parts, RamConfigStorage, Services, SoftRtc};
+use bm_wire::bcmp::resource::ResourceType;
 use bm_wire::cbor::parser::CborError;
 use bm_wire::configuration::{MapError, Partition};
 use bm_wire::pubsub::{self as codec, CALLBACKS, Subscriber, SubscriptionError};
@@ -233,23 +231,13 @@ pub const RESOURCES: usize = 48;
 /// bits.
 pub const PEERS: [u64; 2] = [0x0b54_ccce_5c79_78bf, 0x7777_7777_5c79_78bf];
 
-/// The mirrored Rust node.
-pub type ServicesNode = Node<
-    OracleIdentity,
-    SoftRtc,
-    4,
-    4,
-    PING_PAYLOAD_BYTES,
-    INFO_REQUESTS_DEFAULT,
-    CACHED_STRING_BYTES,
-    RESOURCES,
-    RESOURCE_NAME_BYTES,
-    RESOURCE_REQUESTS_DEFAULT,
-    SUBSCRIPTIONS,
-    Config<RamConfigStorage>,
-    NoDfu,
-    StandIn,
->;
+/// The mirrored Rust node's memory.
+pub type ServicesResources = NodeResources<RESOURCES, SUBSCRIPTIONS>;
+
+/// The mirrored Rust node, in a [`ServicesResources`] that lives as long as
+/// the process.
+pub type ServicesNode =
+    Node<'static, OracleIdentity, SoftRtc, Config<RamConfigStorage>, NoDfu, StandIn>;
 
 /// A handler call: `(service, request data)`.
 pub type Call = (Vec<u8>, Vec<u8>);
@@ -1016,12 +1004,12 @@ fn state() -> (MutexGuard<'static, ()>, MutexGuard<'static, Option<State>>) {
             assert_eq!(err, bm_wire_sys::BmErr_BmOK, "{key:?}");
         }
 
-        let node = Node::with_services(
-            OracleIdentity,
-            SoftRtc::new(),
-            config_diff::reset(&[]),
-            NoDfu,
-            StandIn::default(),
+        let resources: &'static mut ServicesResources = Box::leak(Box::default());
+        let node = Node::new(
+            resources,
+            Parts::new(OracleIdentity, SoftRtc::new())
+                .with_config(config_diff::reset(&[]))
+                .with_services(StandIn::default()),
             NUM_PORTS,
         );
         assert!(
