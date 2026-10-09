@@ -1,8 +1,9 @@
 # bm-devkit
 
 Board support for the Bristlemouth dev kit's mote. `src/lib.rs` brings the
-board up; `src/bin/bringup.rs` runs a node on it, and `src/bin/hello_world.rs`
-is the hello-world app.
+board up; `src/bin/bringup.rs` runs a node on it, `src/bin/hello_world.rs`
+is the hello-world app, and `src/bin/bm_soft_module.rs` is the soft module
+app without its sensor ("Soft module", below).
 
 ```
 cd bm-devkit && ./build.sh --release                  # ELFs and their .dfu.bin
@@ -46,7 +47,7 @@ Everything below was read from these trees; no other copy is in this repo.
 
 | Tree | Commit | Path |
 |---|---|---|
-| `bristlemouth/bm_protocol` | `62d8b5d0ad5aa71a6a7b69b157a6ebba8fc77929` | BSP `src/bsp/bm_mote_v1.0/`; integration `src/lib/`; app `src/apps/bm_devkit/` |
+| `bristlemouth/bm_protocol` | `62d8b5d0ad5aa71a6a7b69b157a6ebba8fc77929` | BSPs `src/bsp/bm_mote_v1.0/`, `src/bsp/bm_mote_spi_v1_0/`; integration `src/lib/`; apps `src/apps/bm_devkit/`, `src/apps/bm_soft_module/` |
 | `towynlin/embassy` | `2735ead18a538aca3bc083614f91e9938b532046` | `examples/stm32u575/src/bin/spe_adin2111_http_server.rs`, a working ADIN2111 example on a dev kit |
 | `embassy-rs/embassy` | `c7e712858f18d71fda040b603e068a502da8ad49` (the pin) | the same example, later revision, with per-port beacons |
 
@@ -86,7 +87,7 @@ low (`Core/Src/gpio.c:56-66`).
 | PB1 | `VBUS_BF_EN` | Bristlefin VBUS enable; C leaves it low |
 | PA2 / PA3 | `PAYLOAD_TX` / `PAYLOAD_RX` | LPUART1, the payload UART |
 | PA7 / PA5 | `BM_MOSI_TX3` / `BM_SCK_RX3` | USART3 TX / RX, the serial console when USB is absent (`app_main.cpp` `usart3`) |
-| PA4 / PA6 / PB0 | `BM_CS` / `BM_MISO` / `BM_INT` | SPI1 header |
+| PA4 / PA6 / PB0 | `BM_CS` / `BM_MISO` / `BM_INT` | SPI1 header; PA6 is AF5 (SPI1 MISO) with SPI1 off (`Core/Src/gpio.c:92-100`). The soft module remuxes PA5-PA7: "Soft module" |
 | PA11 / PA12 | USB OTG FS DM / DP | the C console and pcap stream (CDC 0 and 1) |
 | PA9 | `VUSB_DETECT` | EXTI9, both edges |
 | PH3 | `BOOT_LED` | BOOT0; input |
@@ -94,7 +95,11 @@ low (`Core/Src/gpio.c:56-66`).
 | PA13 / PA14 | SWDIO / SWCLK | debug probe |
 
 GPDMA1 channels: 12 = SPI3 RX, 13 = SPI3 TX (`.ioc:21-22`); 8/9 = I2C1 in the
-embassy example.
+embassy example; 0 = SPI1 TX, 1 = SPI1 RX here (`bm_header_spi`).
+
+`start` drops what it does not use except `Board::spare` (`Spare`): SPI1,
+PA4-PA7, PB0 and EXTI0, I2C1, PB6/PB7, PA10 and EXTI10, PA1, PB1, and
+GPDMA1 channels 0-11, 14 and 15.
 
 Bristlefin PCA9535 pins (`bsp_pins.c`): 0 `BF_IO1` in, 1 `BF_IO2` in, 2
 `BF_HFIO`, 3 `BF_3V3_EN`, 4 `BF_5V_EN`, 5 `BF_IMU_INT` in, 6 `BF_IMU_RST`, 7
@@ -144,9 +149,11 @@ each binary passes `env!("CARGO_BIN_NAME")`.
 | Order | C | Here |
 |---|---|---|
 | 1 | `metrics_service_init`, from `bristlemouth_init` (`bm_metrics_enabled`), in `bcl_init` | `Node::new`, as `Services::METRICS` defaults to true |
-| 2 | `echo_service_init()`, `app_main.cpp:413` | `hello_world`: `Node::register_echo_service` |
+| 2 | `echo_service_init()`, `app_main.cpp:413` | `bm_devkit::register_services`: `Node::register_echo_service` |
 | 3 | `sys_info_service_init()`, `app_main.cpp:414` | `Node::register_sys_info_service` |
 | 4 | `config_cbor_map_service_init()`, `app_main.cpp:415` | `Node::register_config_map_service` |
+
+`hello_world` and `bm_soft_module` call `register_services`.
 
 Not reproduced: `memory_metrics_init()`, after `bcl_init()` in
 `defaultTask`, adds a `memory` metrics component of FreeRTOS heap
@@ -535,7 +542,7 @@ time messages from the same RTC.
 
 | Item | C | Here |
 |---|---|---|
-| Subscription | `bm_sub(APP_PUB_SUB_UTC_TOPIC, handle_bm_subscriptions)`, `src/apps/bm_devkit/bmdk_common/app_main.cpp:412` | `hello_world` subscribes to `bm_stack::utc_time::TOPIC` |
+| Subscription | `bm_sub(APP_PUB_SUB_UTC_TOPIC, handle_bm_subscriptions)`, `src/apps/bm_devkit/bmdk_common/app_main.cpp:412`; `src/apps/bm_soft_module/app_main.cpp:411` | `hello_world` and `bm_soft_module` subscribe to `bm_stack::utc_time::TOPIC` |
 | Handler | `handle_bm_subscriptions`, `app_main.cpp:238-272` | `bm_stack::utc_time::UtcTimeSetter` |
 | Topic check | `strncmp(APP_PUB_SUB_UTC_TOPIC, topic, topic_len) == 0` | the same, in `utc_time::decode` |
 | Type, version | both 1 (`bmdk_common/app_pub_sub.h:10-12`); else prints "Unrecognized version" | `UtcTimeError::Unrecognized` |
@@ -571,6 +578,45 @@ in `docs/c-divergences.md`):
 |---|---|
 | `calculate_rtc_ms` counts from `2 * PREDIV_S`, not `2 * PREDIV_S + 1`, while `SSR > PREDIV_S` | 1/256 s low; at `SSR` 511 the `uint32_t` wraps and `ms` reads 65531 |
 | `SSR > PREDIV_S` follows every `rtcSet`, since the shift adds `adjust` (up to 256) to `SSR` | the `decrement_one_second` workaround runs for up to a second after each set |
+
+## Soft module
+
+`bm_soft_module` (`src/apps/bm_soft_module/`) builds with the `soft` preset:
+`APP=bm_soft_module`, `BSP=bm_mote_spi_v1_0` (`CMakePresets.json:258-264`);
+releases are Release builds, signed (`tools/scripts/release/configs/default.yml:63-70`).
+`bm_mote_spi_v1_0` is `bm_mote_v1.0` with the BM header remuxed. Every
+difference, from `diff -r` of the two BSP directories (paths relative to
+`src/bsp/<bsp>/`; `.ioc`, linker-script comment and whitespace differences
+omitted):
+
+| Item | `bm_mote_v1.0` | `bm_mote_spi_v1_0` | Here |
+|---|---|---|---|
+| Board define | `BSP_MOTE_V1_0` (`CMakeLists.txt:71`) | `BSP_MOTE_SOFT_V1_0` | — |
+| USART3 | `MX_USART3_UART_Init` (`Core/Src/usart.c:94-153`), from `main.c:112` and `mxInit` (`bsp.cpp:112`): PA5 RX, PA7 TX, AF7, 115200 | not built; `bsp.h:16` still defines `DEBUG_USE_USART3` and `app_main.cpp:80-83` a `usart3` handle | not set up on either |
+| PA6 | AF5, from `MX_GPIO_Init` (`Core/Src/gpio.c:92-100`) | from `HAL_SPI_MspInit` | — |
+| SPI1 | off | `MX_SPI1_Init` (`Core/Src/spi.c:36-85`), from `main.c:113` and `spiInit(&spi1)` (`bsp.cpp:49`, `:66`): master, 2 lines, 8-bit, CPOL low, CPHA 1st edge, soft NSS, prescaler 128, MSB first, CRC off (`:46-71`) | `bm_header_spi`: the same; mode 0 is embassy's default |
+| SPI1 clock | — | SYSCLK, 160 MHz (`spi.c:203`); /128 = 1.25 MHz | PCLK2, 160 MHz (embassy's reset-value mux); /128 = 1.25 MHz, `BM_HEADER_SPI_HZ` |
+| SPI1 pins | — | PA5 SCK, PA6 MISO, PA7 MOSI, AF5, no pull, low speed (`spi.c:218-222`) | the same |
+| SPI1 DMA | — | none; `HAL_SPI_*` without DMA | GPDMA1 channels 0 (TX) and 1 (RX), for `embedded-hal-async` |
+| `BM_CS` (PA4) | output, low (`gpio.c:62`, `:85`) | output, low (`gpio.c:61`, `:84`); `TSYS01`'s constructor and `begin` drive it high (`src/lib/drivers/TSYS01.cpp:14`, `:26`) | output, high, from `bm_header_spi` |
+| LPUART1 | HSI, prescaler /8, autonomous in Stop (`usart.c:43`, `:71`, `:85-90`) | PCLK3, /64, not in Stop (`usart.c:44`, `:73`) | not set up on either |
+| INA232 | `0x43` and `0x41`, `NUM_INA232_DEV 2` (`bsp.h:87-89`) | `0x41` only, `NUM_INA232_DEV 1` (`bsp.h:87-88`) | not yet |
+| Bristlefin | linked | not linked (`src/lib/CMakeLists.txt:139-146`) | not used on either |
+
+MCU, clocks, ADIN2111, W25, flash layout and linker script are the same, so
+everything above "Soft module" in this file applies.
+
+`bm_soft_module` here, against `src/apps/bm_soft_module/app_main.cpp`
+`defaultTask`:
+
+| Item | C | Here |
+|---|---|---|
+| `bm_app_name` | `bm_soft_module` | `env!("CARGO_BIN_NAME")` |
+| Subscriptions | `spotter/utc-time` only (`:411`) | the same, `UtcTimeSetter` |
+| Services | metrics, then echo, sys_info, config_map (`:411-414`) | `Node::new`, then `register_services` |
+| SPI1, `BM_CS` | `MX_SPI1_Init`; `user_code.cpp:32` `TSYS01 soft(&spi1, &BM_CS)` | `bm_header_spi`, held by `main`; no driver |
+| DFU, watchdog, RTC | as the dev kit's | as `hello_world` |
+| Sensor, sensor watchdog, power sampler, config reads, `soft.log` | `user_code.cpp`, `sensors/`, `SensorWatchdog`, `sensorSamplerInit` | not yet (#82) |
 
 ## Not used yet
 
