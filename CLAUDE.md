@@ -63,7 +63,7 @@ contract.
 | `bm-wire/fuzz/` | `cargo fuzz` targets, ~6 lines each; the work is in `bm-wire-diff`. |
 | `bm-stack/` | The node on embassy: `Node`, the `port` traits, `App`, `Services`, DFU, the `channel` feature, the `mock` PHY. |
 | `bm-phy-adin2111/` | `bm_stack::Phy` for the ADIN2111 over OPEN Alliance TC6 SPI. |
-| `bm-devkit/` | Board support and firmware (`bringup`, `hello_world`) for the dev kit's mote: STM32U575CI, ADIN2111, W25Q64JV. |
+| `bm-devkit/` | Board support and firmware (`bringup`, `hello_world`, `bm_soft_module`) for the dev kit's mote and the soft module: STM32U575CI, ADIN2111, W25Q64JV. |
 | `bm-wire-diff/` | The differential harness: one comparator per surface, shared by fuzz targets and `#[test]`s. |
 | `bm-wire-sys/` | The oracle: FFI bindings to the real bm_core C. |
 | `bm-mcuboot/` | MCUboot's image header, TLV area and slot trailer. |
@@ -147,6 +147,11 @@ Firmware:
   `runner.sh`, which programs the `.dfu.bin` at `0x0800C000` and attaches.
 - The bootloader starts the IWDG and it cannot be stopped; `bm_devkit::start`
   spawns the task that feeds it.
+- `bm_devkit::start` returns the peripherals it does not use in
+  `Board::spare`. `bm_soft_module` is bm_protocol's soft module
+  (`bm_mote_spi_v1_0` BSP): SPI1 on the BM header via
+  `bm_devkit::bm_header_spi`. Its binary name is its sys_info app name; do
+  not rename it.
 - bm_protocol is not vendored. `bm-devkit/README.md` records its BSP (pins,
   clocks, ADIN2111 sequence, node id, flash layout) with file and line
   references; read it there rather than re-deriving it.
